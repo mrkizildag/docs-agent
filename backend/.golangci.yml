@@ -1,0 +1,55 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - containedctx
+    - contextcheck
+    - depguard
+    - errorlint
+    - exhaustive
+    - forbidigo
+    - forcetypeassert
+    - gochecknoglobals
+    - gochecknoinits
+    - gosec
+    - ireturn
+    - nilerr
+    - noctx
+    - rowserrcheck
+    - sqlclosecheck
+    - testpackage
+    - wrapcheck
+  settings:
+    depguard:
+      rules:
+        tests:
+          deny:
+            - pkg: github.com/stretchr/testify
+              desc: use the stdlib and go-cmp
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: ^os\.(Getenv|LookupEnv)$
+          msg: read the environment only in internal/config
+        - pattern: ^(os\.Exit|log\.Fatal.*)$
+          msg: only main exits
+        - pattern: ^http\.(Get|Post|DefaultClient)$
+          msg: inject an *http.Client with a timeout
+  exclusions:
+    rules:
+      - path: internal/config/
+        linters: [forbidigo]
+        text: os\.(Getenv|LookupEnv)
+      - path: cmd/
+        linters: [forbidigo]
+        text: os\.Exit
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/mrkizildag/docs-agent
