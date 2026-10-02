@@ -15,7 +15,7 @@ Requires Go (version in `backend/go.mod`) and golangci-lint v2.
 
 | Command      | Does                                                   |
 |--------------|--------------------------------------------------------|
-| `make run`   | Start the backend on `:8080`; check `GET /healthz`.    |
+| `make run`   | Start the backend on `:8080` (needs the env vars below); check `GET /healthz`. |
 | `make test`  | `go test -race ./...`                                  |
 | `make lint`  | golangci-lint, including formatting and import rules.  |
 | `make fmt`   | Apply gofmt and goimports.                             |
@@ -25,7 +25,13 @@ Requires Go (version in `backend/go.mod`) and golangci-lint v2.
 
 Only `backend/internal/config` reads the environment (a lint rule enforces it). Copy `backend/.env.example` for the variables.
 
-| Variable    | Default | Meaning                                  |
-|-------------|---------|------------------------------------------|
-| `ADDR`      | `:8080` | Listen address.                          |
-| `LOG_LEVEL` | `info`  | `debug`, `info`, `warn`, or `error`.     |
+| Variable                      | Default  | Meaning                                                        |
+|-------------------------------|----------|-----------------------------------------------------------------|
+| `ADDR`                        | `:8080`  | Listen address.                                                 |
+| `LOG_LEVEL`                   | `info`   | `debug`, `info`, `warn`, or `error`.                            |
+| `GITHUB_APP_ID`                | required | The GitHub App's numeric ID.                                    |
+| `GITHUB_APP_PRIVATE_KEY_FILE`  | required | Path to the App's private key `.pem` file. See [github-app.md](github-app.md). |
+| `GITHUB_WEBHOOK_SECRET`        | required | Shared secret used to verify `POST /webhook` signatures.        |
+| `ANTHROPIC_API_KEY`            | required | Key for the LLM that reviews docs impact.                       |
+
+See [Registering the GitHub App](github-app.md) for how to get the App ID, private key, and webhook secret.

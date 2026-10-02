@@ -11,7 +11,7 @@ docs-agent is a GitHub App. GitHub sends pull request events to the backend; the
 
 ## Parts
 
-- **Backend** (`backend/`, Go): receives GitHub webhooks, talks to the GitHub and LLM APIs, owns the check run. Today it only serves `GET /healthz`.
+- **Backend** (`backend/`, Go): receives GitHub webhooks, talks to the GitHub and LLM APIs, owns the check run. Today `POST /webhook` verifies GitHub's signature and accepts deliveries; processing the payload comes in a later task.
 - **Frontend** (phase 2, TypeScript + shadcn/ui): org and repo settings, configurable docs structures.
 - **Doc targets**: phase 1 writes to the repo's own `docs/` folder. Notion comes in phase 3.
 
