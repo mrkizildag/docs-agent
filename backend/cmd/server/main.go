@@ -13,9 +13,13 @@ import (
 
 	"github.com/mrkizildag/docs-agent/backend/internal/config"
 	"github.com/mrkizildag/docs-agent/backend/internal/gate"
+	"github.com/mrkizildag/docs-agent/backend/internal/gate/sqlite"
 	"github.com/mrkizildag/docs-agent/backend/internal/github"
 	"github.com/mrkizildag/docs-agent/backend/internal/httpapi"
+	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
 )
+
+const maxParallelJobs = 8
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -34,16 +38,35 @@ func run(ctx context.Context) error {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 
+	store, err := sqlite.Open(ctx, cfg.DatabasePath)
+	if err != nil {
+		return fmt.Errorf("open database %s: %w", cfg.DatabasePath, err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			logger.Error("close database", "err", err)
+		}
+	}()
+
 	ghHTTPClient := &http.Client{Timeout: 20 * time.Second}
 	ghClient, err := github.NewClient(ghHTTPClient, cfg.GitHubAppID, []byte(cfg.GitHubPrivateKey.Reveal()), "")
 	if err != nil {
 		return fmt.Errorf("create GitHub client: %w", err)
 	}
-	gateSvc := gate.NewService(ghClient)
+	gateSvc := gate.NewService(ghClient, store)
+
+	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, maxParallelJobs)
+	workerCtx, cancelWorker := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelWorker()
+
+	workerErr := make(chan error, 1)
+	go func() {
+		workerErr <- worker.Run(workerCtx)
+	}()
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpapi.NewHandler(logger, []byte(cfg.WebhookSecret.Reveal()), gateSvc),
+		Handler:           httpapi.NewHandler(logger, []byte(cfg.WebhookSecret.Reveal()), worker),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -58,17 +81,38 @@ func run(ctx context.Context) error {
 
 	select {
 	case err := <-serveErr:
+		cancelWorker()
+		<-workerErr
 		return fmt.Errorf("serve %s: %w", cfg.Addr, err)
+	case err := <-workerErr:
+		shutdownErr := shutdownServer(ctx, srv)
+		return errors.Join(fmt.Errorf("run worker: %w", err), shutdownErr)
 	case <-ctx.Done():
 	}
 
+	if err := shutdownServer(ctx, srv); err != nil {
+		cancelWorker()
+		<-workerErr
+		return err
+	}
+	if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
+		cancelWorker()
+		<-workerErr
+		return fmt.Errorf("serve %s: %w", cfg.Addr, err)
+	}
+
+	cancelWorker()
+	if err := <-workerErr; err != nil {
+		return fmt.Errorf("run worker: %w", err)
+	}
+	return nil
+}
+
+func shutdownServer(ctx context.Context, srv *http.Server) error {
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
-	}
-	if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("serve %s: %w", cfg.Addr, err)
 	}
 	return nil
 }

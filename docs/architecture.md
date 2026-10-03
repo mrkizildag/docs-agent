@@ -11,11 +11,11 @@ docs-agent is a GitHub App. GitHub sends pull request events to the backend; the
 
 ## Parts
 
-- **Backend** (`backend/`, Go): receives GitHub webhooks, talks to the GitHub and LLM APIs, owns the check run. Today `POST /webhook` verifies GitHub's signature; a `pull_request` event (opened, synchronize, reopened) creates the `docs-agent` check run on the PR head commit, tracer-only so it always succeeds. The backend handles it synchronously within the request until a durable job queue lands; analysis itself comes in a later task.
+- **Backend** (`backend/`, Go): receives GitHub webhooks, talks to the GitHub and LLM APIs, owns the check run. `POST /webhook` verifies GitHub's signature. For a `pull_request` event (opened, synchronize, reopened) it stores the delivery and a durable job in one SQLite transaction, deduplicated by GitHub's delivery ID; other events are acknowledged without being stored. Accepted deliveries return 202. A worker processes jobs off that queue: it runs at most one job per PR at a time but PRs in parallel, a newer push supersedes the older job for the same PR, cancelling it if it is already running, and jobs left unfinished by a restart resume afterward. For a `pull_request` event (opened, synchronize, reopened) the job creates the `docs-agent` check run on the PR head commit, tracer-only so it always succeeds; analysis itself comes in a later task.
 - **Frontend** (phase 2, TypeScript + shadcn/ui): org and repo settings, configurable docs structures.
 - **Doc targets**: phase 1 writes to the repo's own `docs/` folder. Notion comes in phase 3.
 
-Inside the backend, `internal/gate` is the domain and imports nothing else from the module. It declares the GitHub interface it needs; `internal/github` implements it and `internal/httpapi` calls `gate.Service`. Only `cmd/server` wires concrete types together.
+Inside the backend, `internal/gate` is the domain and imports nothing else from the module. It declares the GitHub interface it needs; `internal/github` implements it. `internal/httpapi` turns webhooks into jobs on `internal/jobqueue`, the durable queue, and decodes them back into `gate.Service` calls when the worker runs them; `internal/gate/sqlite` implements both `gate`'s and `jobqueue`'s storage interfaces on one SQLite database. `internal/gate/sqlite` is an adapter, not part of the domain. Only `cmd/server` wires concrete types together. The queue's guarantees are in [Job queue](features/job-queue.md).
 
 ## Flow (phase 1 target)
 

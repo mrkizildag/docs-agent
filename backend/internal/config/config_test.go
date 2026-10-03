@@ -66,7 +66,7 @@ func mergeEnv(base, overrides map[string]string) map[string]string {
 
 func envVars() []string {
 	return []string{
-		"ADDR", "LOG_LEVEL", "GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY_FILE",
+		"ADDR", "LOG_LEVEL", "DATABASE_PATH", "GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY_FILE",
 		"GITHUB_WEBHOOK_SECRET", "ANTHROPIC_API_KEY",
 	}
 }
@@ -85,12 +85,12 @@ func TestLoad(t *testing.T) {
 		{
 			name: "defaults with required vars set",
 			env:  requiredEnv(keyPath),
-			want: config.Config{Addr: ":8080", LogLevel: slog.LevelInfo, GitHubAppID: 123},
+			want: config.Config{Addr: ":8080", LogLevel: slog.LevelInfo, DatabasePath: "docs-agent.db", GitHubAppID: 123},
 		},
 		{
 			name: "overrides",
-			env:  mergeEnv(requiredEnv(keyPath), map[string]string{"ADDR": ":9000", "LOG_LEVEL": "debug"}),
-			want: config.Config{Addr: ":9000", LogLevel: slog.LevelDebug, GitHubAppID: 123},
+			env:  mergeEnv(requiredEnv(keyPath), map[string]string{"ADDR": ":9000", "LOG_LEVEL": "debug", "DATABASE_PATH": "/data/docs-agent.db"}),
+			want: config.Config{Addr: ":9000", LogLevel: slog.LevelDebug, DatabasePath: "/data/docs-agent.db", GitHubAppID: 123},
 		},
 		{
 			name:    "invalid log level",

@@ -32,6 +32,7 @@ func (Secret) MarshalJSON() ([]byte, error) { return []byte(`"[redacted]"`), nil
 type Config struct {
 	Addr             string
 	LogLevel         slog.Level
+	DatabasePath     string
 	GitHubAppID      int64
 	GitHubPrivateKey Secret
 	WebhookSecret    Secret
@@ -43,7 +44,8 @@ func Load() (Config, error) {
 	var errs []error
 
 	cfg := Config{
-		Addr: envOr("ADDR", ":8080"),
+		Addr:         envOr("ADDR", ":8080"),
+		DatabasePath: envOr("DATABASE_PATH", "docs-agent.db"),
 	}
 
 	if err := cfg.LogLevel.UnmarshalText([]byte(envOr("LOG_LEVEL", "info"))); err != nil {

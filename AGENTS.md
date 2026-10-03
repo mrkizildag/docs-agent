@@ -13,5 +13,5 @@ Read [docs/README.md](docs/README.md) first; it indexes every doc. Before editin
 
 ## Layout
 
-- `backend/`: Go module. `cmd/server` wires; `internal/config` is the only package that reads the environment; `internal/httpapi` is transport; `internal/gate` is the domain (what check run a PR gets) and declares the `GitHub` interface it needs; `internal/github` implements it over the GitHub API.
+- `backend/`: Go module. `cmd/server` wires; `internal/config` is the only package that reads the environment; `internal/httpapi` is transport: it turns webhooks into jobs and decodes them back into `gate` calls; `internal/jobqueue` is the durable per-PR queue and worker; `internal/gate` is the domain (what check run a PR gets) and declares the `GitHub` and `Store` interfaces it needs; `internal/github` implements `GitHub` over the GitHub API; `internal/gate/sqlite` is an adapter implementing `gate.Store` and `jobqueue.Store`.
 - `frontend/`: phase 2, TypeScript + shadcn/ui. Not created yet.
