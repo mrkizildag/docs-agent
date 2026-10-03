@@ -2,17 +2,41 @@ package httpapi_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
+	"github.com/mrkizildag/docs-agent/backend/internal/gate"
 	"github.com/mrkizildag/docs-agent/backend/internal/httpapi"
 )
+
+type fakePullRequestHandler struct {
+	calls []gate.PullRequest
+	err   error
+}
+
+func (f *fakePullRequestHandler) HandlePullRequest(_ context.Context, pr gate.PullRequest) error {
+	f.calls = append(f.calls, pr)
+	return f.err
+}
+
+type fakePullRequestHandlerFunc struct {
+	fn func(ctx context.Context, pr gate.PullRequest) error
+}
+
+func (f *fakePullRequestHandlerFunc) HandlePullRequest(ctx context.Context, pr gate.PullRequest) error {
+	return f.fn(ctx, pr)
+}
 
 func TestHealthz(t *testing.T) {
 	t.Parallel()
@@ -21,7 +45,7 @@ func TestHealthz(t *testing.T) {
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, []byte("secret")).ServeHTTP(rec, req)
+	httpapi.NewHandler(logger, []byte("secret"), &fakePullRequestHandler{}).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
 		t.Errorf("GET /healthz = %d %q, want 200 \"ok\"", rec.Code, rec.Body.String())
@@ -97,7 +121,7 @@ func TestWebhook(t *testing.T) {
 			}
 			rec := httptest.NewRecorder()
 
-			httpapi.NewHandler(logger, secret).ServeHTTP(rec, req)
+			httpapi.NewHandler(logger, secret, &fakePullRequestHandler{}).ServeHTTP(rec, req)
 
 			if rec.Code != tc.wantStatus {
 				t.Errorf("POST /webhook = %d, want %d", rec.Code, tc.wantStatus)
@@ -117,9 +141,193 @@ func TestWebhookBodyTooLarge(t *testing.T) {
 	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, secret).ServeHTTP(rec, req)
+	httpapi.NewHandler(logger, secret, &fakePullRequestHandler{}).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("POST /webhook with oversized body = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func pullRequestPayload(t *testing.T, action string) []byte {
+	t.Helper()
+
+	payload := map[string]any{
+		"action": action,
+		"number": 7,
+		"pull_request": map[string]any{
+			"head": map[string]any{"sha": "abc123"},
+		},
+		"repository": map[string]any{
+			"name":  "widgets",
+			"owner": map[string]any{"login": "acme"},
+		},
+		"installation": map[string]any{"id": 42},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal pull_request payload: %v", err)
+	}
+	return body
+}
+
+func postWebhook(t *testing.T, secret []byte, prs httpapi.PullRequestHandler, event string, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+
+	logger := slog.New(slog.DiscardHandler)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", event)
+	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
+	rec := httptest.NewRecorder()
+
+	httpapi.NewHandler(logger, secret, prs).ServeHTTP(rec, req)
+	return rec
+}
+
+func TestWebhookPullRequest(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("test-secret")
+
+	tests := []struct {
+		name       string
+		action     string
+		wantCalled bool
+	}{
+		{name: "opened", action: "opened", wantCalled: true},
+		{name: "synchronize", action: "synchronize", wantCalled: true},
+		{name: "reopened", action: "reopened", wantCalled: true},
+		{name: "closed", action: "closed", wantCalled: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			handler := &fakePullRequestHandler{}
+			body := pullRequestPayload(t, tc.action)
+			rec := postWebhook(t, secret, handler, "pull_request", body)
+
+			if rec.Code != http.StatusAccepted {
+				t.Errorf("POST /webhook action=%s = %d, want %d", tc.action, rec.Code, http.StatusAccepted)
+			}
+
+			if !tc.wantCalled {
+				if len(handler.calls) != 0 {
+					t.Errorf("HandlePullRequest calls = %v, want none", handler.calls)
+				}
+				return
+			}
+
+			want := []gate.PullRequest{
+				{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123"},
+			}
+			if diff := cmp.Diff(want, handler.calls); diff != "" {
+				t.Errorf("HandlePullRequest calls (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestWebhookPing(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("test-secret")
+	handler := &fakePullRequestHandler{}
+	rec := postWebhook(t, secret, handler, "ping", []byte(`{"zen":"test"}`))
+
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("POST /webhook ping = %d, want %d", rec.Code, http.StatusAccepted)
+	}
+	if len(handler.calls) != 0 {
+		t.Errorf("HandlePullRequest calls = %v, want none", handler.calls)
+	}
+}
+
+func TestWebhookPullRequestMalformedPayload(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "not json", body: []byte(`not json`)},
+		{name: "missing installation", body: []byte(`{"action":"opened","number":7,"pull_request":{"head":{"sha":"abc123"}},"repository":{"name":"widgets","owner":{"login":"acme"}}}`)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			secret := []byte("test-secret")
+			handler := &fakePullRequestHandler{}
+			rec := postWebhook(t, secret, handler, "pull_request", tc.body)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("POST /webhook = %d, want %d", rec.Code, http.StatusBadRequest)
+			}
+			if len(handler.calls) != 0 {
+				t.Errorf("HandlePullRequest calls = %v, want none", handler.calls)
+			}
+		})
+	}
+}
+
+func TestWebhookPullRequestHandlerError(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("test-secret")
+	handler := &fakePullRequestHandler{err: errors.New("boom")}
+	rec := postWebhook(t, secret, handler, "pull_request", pullRequestPayload(t, "opened"))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("POST /webhook handler error = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestWebhookPullRequestClosedWithMissingFields(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("test-secret")
+	handler := &fakePullRequestHandler{}
+	body := []byte(`{"action":"closed","number":7,"pull_request":{"head":{"sha":""}},"repository":{"name":"","owner":{"login":""}}}`)
+	rec := postWebhook(t, secret, handler, "pull_request", body)
+
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("POST /webhook closed with missing fields = %d, want %d", rec.Code, http.StatusAccepted)
+	}
+	if len(handler.calls) != 0 {
+		t.Errorf("HandlePullRequest calls = %v, want none", handler.calls)
+	}
+}
+
+func TestWebhookPullRequestContextDetachedFromRequest(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("test-secret")
+	var sawErr error
+	handler := &fakePullRequestHandlerFunc{
+		fn: func(ctx context.Context, _ gate.PullRequest) error {
+			sawErr = ctx.Err()
+			return nil
+		},
+	}
+
+	logger := slog.New(slog.DiscardHandler)
+	body := pullRequestPayload(t, "opened")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
+	rec := httptest.NewRecorder()
+
+	httpapi.NewHandler(logger, secret, handler).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("POST /webhook with cancelled request context = %d, want %d", rec.Code, http.StatusAccepted)
+	}
+	if sawErr != nil {
+		t.Errorf("ctx.Err() inside HandlePullRequest = %v, want nil", sawErr)
 	}
 }

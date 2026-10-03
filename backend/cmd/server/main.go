@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/mrkizildag/docs-agent/backend/internal/config"
+	"github.com/mrkizildag/docs-agent/backend/internal/gate"
+	"github.com/mrkizildag/docs-agent/backend/internal/github"
 	"github.com/mrkizildag/docs-agent/backend/internal/httpapi"
 )
 
@@ -32,9 +34,16 @@ func run(ctx context.Context) error {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 
+	ghHTTPClient := &http.Client{Timeout: 20 * time.Second}
+	ghClient, err := github.NewClient(ghHTTPClient, cfg.GitHubAppID, []byte(cfg.GitHubPrivateKey.Reveal()), "")
+	if err != nil {
+		return fmt.Errorf("create GitHub client: %w", err)
+	}
+	gateSvc := gate.NewService(ghClient)
+
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpapi.NewHandler(logger, []byte(cfg.WebhookSecret.Reveal())),
+		Handler:           httpapi.NewHandler(logger, []byte(cfg.WebhookSecret.Reveal()), gateSvc),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,

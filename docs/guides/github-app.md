@@ -4,6 +4,7 @@ summary: Create the docs-agent GitHub App, point it at the backend, and install 
 covers:
   - backend/internal/config/**
   - backend/internal/httpapi/**
+  - backend/internal/github/**
 ---
 
 # Registering the GitHub App
@@ -51,3 +52,5 @@ Once installed, an org admin adds `docs-agent` as a required status check in the
 ## Verify
 
 Open the App's "Advanced → Recent deliveries" tab. The initial `ping` delivery should show a `202` response. Redeliver it after changing the webhook secret in the App settings (without updating `GITHUB_WEBHOOK_SECRET`) to confirm it now gets a `401`.
+
+Open a pull request in the sandbox repo and confirm it shows a passing `docs-agent` check.

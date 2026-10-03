@@ -23,7 +23,7 @@ Requires Go (version in `backend/go.mod`) and golangci-lint v2.
 
 ## Configuration
 
-Only `backend/internal/config` reads the environment (a lint rule enforces it). Copy `backend/.env.example` for the variables.
+Only `backend/internal/config` reads the environment (a lint rule enforces it). Copy `backend/.env.example` for the variables. Secret variables load into `config.Secret`, which prints and logs as `[redacted]`; call `Reveal()` only in `cmd/server` where the value is handed to its consumer.
 
 | Variable                      | Default  | Meaning                                                        |
 |-------------------------------|----------|-----------------------------------------------------------------|
@@ -32,6 +32,6 @@ Only `backend/internal/config` reads the environment (a lint rule enforces it). 
 | `GITHUB_APP_ID`                | required | The GitHub App's numeric ID.                                    |
 | `GITHUB_APP_PRIVATE_KEY_FILE`  | required | Path to the App's private key `.pem` file. See [github-app.md](github-app.md). |
 | `GITHUB_WEBHOOK_SECRET`        | required | Shared secret used to verify `POST /webhook` signatures.        |
-| `ANTHROPIC_API_KEY`            | required | Key for the LLM that reviews docs impact.                       |
+| `ANTHROPIC_API_KEY`            | required | Key for the LLM that reviews docs impact. Required at startup; unused until analysis lands. |
 
 See [Registering the GitHub App](github-app.md) for how to get the App ID, private key, and webhook secret.
