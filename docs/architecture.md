@@ -3,6 +3,7 @@ title: Architecture
 summary: The parts of docs-agent, how they connect, and the phase plan.
 covers:
   - backend/**
+  - action/**
 ---
 
 # Architecture
@@ -11,11 +12,15 @@ docs-agent is a GitHub App. GitHub sends pull request events to the backend; the
 
 ## Parts
 
-- **Backend** (`backend/`, Go): receives GitHub webhooks, talks to the GitHub and LLM APIs, owns the check run. Today `POST /webhook` verifies GitHub's signature; a `pull_request` event (opened, synchronize, reopened) creates the `docs-agent` check run on the PR head commit, tracer-only so it always succeeds. The backend handles it synchronously within the request until a durable job queue lands; analysis itself comes in a later task.
+- **Backend** (`backend/`, Go): receives GitHub webhooks, talks to the GitHub and LLM APIs, owns the check run. `POST /webhook` verifies GitHub's signature; a `pull_request` event (opened, synchronize, reopened) picks an analysis runner for the repo and reports its result as the `docs-agent` check run on the PR head commit. The backend handles it synchronously within the request until a durable job queue lands.
 - **Frontend** (phase 2, TypeScript + shadcn/ui): org and repo settings, configurable docs structures.
 - **Doc targets**: phase 1 writes to the repo's own `docs/` folder. Notion comes in phase 3.
 
-Inside the backend, `internal/gate` is the domain and imports nothing else from the module. It declares the GitHub interface it needs; `internal/github` implements it and `internal/httpapi` calls `gate.Service`. Only `cmd/server` wires concrete types together.
+Inside the backend, `internal/gate` is the domain and imports only `internal/review`, the contracts shared with the analysis runners. It declares the GitHub interface it needs; `internal/github` implements it and `internal/httpapi` calls `gate.Service`. Only `cmd/server` wires concrete types together.
+
+Runner selection: a repo that has the docs-agent Actions workflow on its default branch runs analysis through the Actions runner; otherwise, if the server has `LLM_PROVIDER` configured, it runs through the server runner; otherwise the PR gets a neutral check titled "No analysis runner configured" linking the setup guide. No runner is wired into the server today, so every PR currently gets that neutral check. A repo with the workflow never falls back to the server runner.
+
+Analysis contract: `internal/review` defines what a runner is asked to review and the proposals it returns. `action/proposal.schema.json` is generated from the proposal type by `make generate` and checked in; never edit it by hand, a test fails when it drifts. The schema checks shape and the `docs/` prefix; proposal validation in `internal/review` is the full check (anchor inside a diff hunk, one-line reason, index entry exactly when the proposal creates a new doc), and every runner's output must pass it before the gate acts on it.
 
 ## Flow (phase 1 target)
 

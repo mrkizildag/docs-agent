@@ -49,7 +49,6 @@ func requiredEnv(keyPath string) map[string]string {
 		"GITHUB_APP_ID":               "123",
 		"GITHUB_APP_PRIVATE_KEY_FILE": keyPath,
 		"GITHUB_WEBHOOK_SECRET":       "whsecret",
-		"ANTHROPIC_API_KEY":           "anthropic-secret",
 	}
 }
 
@@ -67,20 +66,23 @@ func mergeEnv(base, overrides map[string]string) map[string]string {
 func envVars() []string {
 	return []string{
 		"ADDR", "LOG_LEVEL", "GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY_FILE",
-		"GITHUB_WEBHOOK_SECRET", "ANTHROPIC_API_KEY",
+		"GITHUB_WEBHOOK_SECRET",
+		"LLM_PROVIDER", "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL", "LLM_TRIAGE_MODEL",
 	}
 }
 
 func TestLoad(t *testing.T) {
 	keyPath, wantKeyPEM := writeTestKey(t)
 	// The external test package cannot construct a Secret, so secrets are checked via Reveal.
-	ignoreSecrets := cmpopts.IgnoreFields(config.Config{}, "GitHubPrivateKey", "WebhookSecret", "AnthropicAPIKey")
+	ignoreSecrets := cmpopts.IgnoreFields(config.Config{}, "GitHubPrivateKey", "WebhookSecret")
+	ignoreLLMSecrets := cmpopts.IgnoreFields(config.LLM{}, "APIKey")
 
 	tests := []struct {
-		name    string
-		env     map[string]string
-		want    config.Config
-		wantErr bool
+		name          string
+		env           map[string]string
+		want          config.Config
+		wantLLMAPIKey string
+		wantErr       bool
 	}{
 		{
 			name: "defaults with required vars set",
@@ -128,9 +130,99 @@ func TestLoad(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "missing anthropic key",
-			env:     mergeEnv(requiredEnv(keyPath), map[string]string{"ANTHROPIC_API_KEY": ""}),
+			name:    "LLM_MODEL set without LLM_PROVIDER",
+			env:     mergeEnv(requiredEnv(keyPath), map[string]string{"LLM_MODEL": "claude-opus"}),
 			wantErr: true,
+		},
+		{
+			name:    "LLM_BASE_URL set without LLM_PROVIDER",
+			env:     mergeEnv(requiredEnv(keyPath), map[string]string{"LLM_BASE_URL": "https://example.com"}),
+			wantErr: true,
+		},
+		{
+			name:    "LLM_API_KEY set without LLM_PROVIDER",
+			env:     mergeEnv(requiredEnv(keyPath), map[string]string{"LLM_API_KEY": "key"}),
+			wantErr: true,
+		},
+		{
+			name:    "LLM_TRIAGE_MODEL set without LLM_PROVIDER",
+			env:     mergeEnv(requiredEnv(keyPath), map[string]string{"LLM_TRIAGE_MODEL": "claude-haiku"}),
+			wantErr: true,
+		},
+		{
+			name: "unknown LLM provider",
+			env: mergeEnv(requiredEnv(keyPath), map[string]string{
+				"LLM_PROVIDER": "bedrock", "LLM_MODEL": "claude-opus", "LLM_API_KEY": "key",
+			}),
+			wantErr: true,
+		},
+		{
+			name: "LLM_MODEL required when provider set",
+			env: mergeEnv(requiredEnv(keyPath), map[string]string{
+				"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "key",
+			}),
+			wantErr: true,
+		},
+		{
+			name: "anthropic requires LLM_API_KEY",
+			env: mergeEnv(requiredEnv(keyPath), map[string]string{
+				"LLM_PROVIDER": "anthropic", "LLM_MODEL": "claude-opus",
+			}),
+			wantErr: true,
+		},
+		{
+			name: "openai requires LLM_BASE_URL",
+			env: mergeEnv(requiredEnv(keyPath), map[string]string{
+				"LLM_PROVIDER": "openai", "LLM_MODEL": "gpt-4o",
+			}),
+			wantErr: true,
+		},
+		{
+			name: "LLM_BASE_URL must be an absolute http(s) URL",
+			env: mergeEnv(requiredEnv(keyPath), map[string]string{
+				"LLM_PROVIDER": "openai", "LLM_MODEL": "gpt-4o", "LLM_BASE_URL": "not-a-url",
+			}),
+			wantErr: true,
+		},
+		{
+			name: "valid anthropic provider",
+			env: mergeEnv(requiredEnv(keyPath), map[string]string{
+				"LLM_PROVIDER": "anthropic", "LLM_MODEL": "claude-opus", "LLM_API_KEY": "anthropic-secret",
+			}),
+			want: config.Config{
+				Addr: ":8080", LogLevel: slog.LevelInfo, GitHubAppID: 123,
+				LLM: &config.LLM{
+					Provider: config.LLMProviderAnthropic, Model: "claude-opus", TriageModel: "claude-opus",
+				},
+			},
+			wantLLMAPIKey: "anthropic-secret",
+		},
+		{
+			name: "valid openai-compatible provider without an API key (e.g. Ollama)",
+			env: mergeEnv(requiredEnv(keyPath), map[string]string{
+				"LLM_PROVIDER": "openai", "LLM_MODEL": "llama3", "LLM_BASE_URL": "http://localhost:11434/v1",
+			}),
+			want: config.Config{
+				Addr: ":8080", LogLevel: slog.LevelInfo, GitHubAppID: 123,
+				LLM: &config.LLM{
+					Provider: config.LLMProviderOpenAI, Model: "llama3", TriageModel: "llama3",
+					BaseURL: "http://localhost:11434/v1",
+				},
+			},
+		},
+		{
+			name: "LLM_TRIAGE_MODEL overrides the default",
+			env: mergeEnv(requiredEnv(keyPath), map[string]string{
+				"LLM_PROVIDER": "anthropic", "LLM_MODEL": "claude-opus", "LLM_API_KEY": "anthropic-secret",
+				"LLM_TRIAGE_MODEL": "claude-haiku",
+			}),
+			want: config.Config{
+				Addr: ":8080", LogLevel: slog.LevelInfo, GitHubAppID: 123,
+				LLM: &config.LLM{
+					Provider: config.LLMProviderAnthropic, Model: "claude-opus", TriageModel: "claude-haiku",
+				},
+			},
+			wantLLMAPIKey: "anthropic-secret",
 		},
 	}
 
@@ -154,17 +246,19 @@ func TestLoad(t *testing.T) {
 				t.Fatalf("Load() error = %v", err)
 			}
 
-			if diff := cmp.Diff(tc.want, got, ignoreSecrets); diff != "" {
+			if diff := cmp.Diff(tc.want, got, ignoreSecrets, ignoreLLMSecrets); diff != "" {
 				t.Errorf("Load() (-want +got):\n%s", diff)
 			}
 			if got.WebhookSecret.Reveal() != "whsecret" {
 				t.Errorf("WebhookSecret.Reveal() = %q, want %q", got.WebhookSecret.Reveal(), "whsecret")
 			}
-			if got.AnthropicAPIKey.Reveal() != "anthropic-secret" {
-				t.Errorf("AnthropicAPIKey.Reveal() = %q, want %q", got.AnthropicAPIKey.Reveal(), "anthropic-secret")
-			}
 			if got.GitHubPrivateKey.Reveal() != string(wantKeyPEM) {
 				t.Errorf("GitHubPrivateKey.Reveal() = %q, want %q", got.GitHubPrivateKey.Reveal(), wantKeyPEM)
+			}
+			if tc.want.LLM != nil {
+				if got.LLM.APIKey.Reveal() != tc.wantLLMAPIKey {
+					t.Errorf("LLM.APIKey.Reveal() = %q, want %q", got.LLM.APIKey.Reveal(), tc.wantLLMAPIKey)
+				}
 			}
 		})
 	}

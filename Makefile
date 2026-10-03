@@ -1,6 +1,9 @@
-.PHONY: check fmt lint test vuln run
+.PHONY: check fmt lint test vuln run generate
 
 check: lint test vuln
+
+generate:
+	cd backend && go run ./cmd/genschema ../action/proposal.schema.json
 
 fmt:
 	cd backend && golangci-lint fmt ./...

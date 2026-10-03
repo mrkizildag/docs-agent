@@ -19,6 +19,7 @@ Requires Go (version in `backend/go.mod`) and golangci-lint v2.
 | `make test`  | `go test -race ./...`                                  |
 | `make lint`  | golangci-lint, including formatting and import rules.  |
 | `make fmt`   | Apply gofmt and goimports.                             |
+| `make generate` | Regenerate `action/proposal.schema.json` from the proposal type; a test fails when it is stale. |
 | `make check` | lint, test, and govulncheck; what CI runs.             |
 
 ## Configuration
@@ -32,6 +33,12 @@ Only `backend/internal/config` reads the environment (a lint rule enforces it). 
 | `GITHUB_APP_ID`                | required | The GitHub App's numeric ID.                                    |
 | `GITHUB_APP_PRIVATE_KEY_FILE`  | required | Path to the App's private key `.pem` file. See [github-app.md](github-app.md). |
 | `GITHUB_WEBHOOK_SECRET`        | required | Shared secret used to verify `POST /webhook` signatures.        |
-| `ANTHROPIC_API_KEY`            | required | Key for the LLM that reviews docs impact. Required at startup; unused until analysis lands. |
+| `LLM_PROVIDER`                 | optional | `anthropic` or `openai` (any OpenAI-compatible chat completions endpoint: Gemini, GitHub Models, OpenRouter, Ollama). Unset turns the analysis runner off. |
+| `LLM_BASE_URL`                 | optional | API base URL. Required for `openai`; optional for `anthropic` (empty uses the adapter's default). |
+| `LLM_API_KEY`                  | optional | Key for the LLM provider. Required for `anthropic`; optional for `openai` (e.g. Ollama has none). |
+| `LLM_MODEL`                    | required when `LLM_PROVIDER` is set | Model used to review docs impact. |
+| `LLM_TRIAGE_MODEL`             | defaults to `LLM_MODEL` | Cheaper model used for triage, if different. |
+
+Without `LLM_PROVIDER` set, the analysis runner is off, and repos without the docs-agent workflow get a neutral "No analysis runner configured" check.
 
 See [Registering the GitHub App](github-app.md) for how to get the App ID, private key, and webhook secret.

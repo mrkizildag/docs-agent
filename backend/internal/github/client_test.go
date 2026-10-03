@@ -104,6 +104,66 @@ func TestCreateCheckRun(t *testing.T) {
 	}
 }
 
+func TestWorkflowExists(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		status     int
+		wantExists bool
+		wantErr    bool
+	}{
+		{name: "present", status: http.StatusOK, wantExists: true},
+		{name: "absent", status: http.StatusNotFound, wantExists: false},
+		{name: "server error", status: http.StatusInternalServerError, wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("POST /app/installations/{id}/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if _, err := fmt.Fprintf(w, `{"token":"ghs_test","expires_at":%q}`, time.Now().Add(time.Hour).Format(time.RFC3339)); err != nil {
+					t.Errorf("write access_tokens response: %v", err)
+				}
+			})
+			mux.HandleFunc("GET /repos/o/r/contents/.github/workflows/docs-agent.yml", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				if tc.status == http.StatusOK {
+					if _, err := fmt.Fprint(w, `{"type":"file","name":"docs-agent.yml","path":".github/workflows/docs-agent.yml"}`); err != nil {
+						t.Errorf("write contents response: %v", err)
+					}
+				}
+			})
+
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+
+			client, err := ghclient.NewClient(&http.Client{Timeout: 5 * time.Second}, 1, testPrivateKeyPEM(t), srv.URL)
+			if err != nil {
+				t.Fatalf("NewClient() = %v, want nil error", err)
+			}
+
+			exists, err := client.WorkflowExists(t.Context(), 99, "o", "r")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("WorkflowExists() = nil error, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("WorkflowExists() = %v, want nil error", err)
+			}
+			if exists != tc.wantExists {
+				t.Errorf("WorkflowExists() = %v, want %v", exists, tc.wantExists)
+			}
+		})
+	}
+}
+
 func TestCreateCheckRunConcurrentInstallations(t *testing.T) {
 	t.Parallel()
 

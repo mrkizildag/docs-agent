@@ -13,5 +13,5 @@ Read [docs/README.md](docs/README.md) first; it indexes every doc. Before editin
 
 ## Layout
 
-- `backend/`: Go module. `cmd/server` wires; `internal/config` is the only package that reads the environment; `internal/httpapi` is transport; `internal/gate` is the domain (what check run a PR gets) and declares the `GitHub` interface it needs; `internal/github` implements it over the GitHub API.
+- `backend/`: Go module. `cmd/server` wires; `internal/config` is the only package that reads the environment; `internal/httpapi` is transport; `internal/gate` is the domain (what check run a PR gets), imports only `internal/review` (contracts shared with the analysis runners), and declares the `GitHub` interface it needs; `cmd/genschema` generates `action/proposal.schema.json`; `internal/github` implements it over the GitHub API.
 - `frontend/`: phase 2, TypeScript + shadcn/ui. Not created yet.

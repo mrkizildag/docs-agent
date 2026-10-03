@@ -39,7 +39,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create GitHub client: %w", err)
 	}
-	gateSvc := gate.NewService(ghClient)
+	gateSvc := gate.NewService(ghClient, gate.Runners{})
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
