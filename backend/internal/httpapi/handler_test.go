@@ -162,6 +162,7 @@ func pullRequestPayload(t *testing.T, action string) []byte {
 		"action": action,
 		"number": 7,
 		"pull_request": map[string]any{
+			"base": map[string]any{"sha": "base123"},
 			"head": map[string]any{"sha": "abc123"},
 		},
 		"repository": map[string]any{
@@ -241,7 +242,7 @@ func TestWebhookPullRequest(t *testing.T) {
 			if err := json.Unmarshal(job.Payload, &pr); err != nil {
 				t.Fatalf("decode job payload: %v", err)
 			}
-			want := gate.PullRequest{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123"}
+			want := gate.PullRequest{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, BaseSHA: "base123", HeadSHA: "abc123"}
 			if diff := cmp.Diff(want, pr); diff != "" {
 				t.Errorf("job payload (-want +got):\n%s", diff)
 			}

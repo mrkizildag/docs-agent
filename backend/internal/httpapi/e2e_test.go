@@ -28,6 +28,10 @@ type e2eGitHub struct {
 	calls chan e2eCheckRunCall
 }
 
+func (f *e2eGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (bool, error) {
+	return false, nil
+}
+
 func (f *e2eGitHub) CreateCheckRun(_ context.Context, installationID int64, owner, repo string, run gate.CheckRun) error {
 	f.calls <- e2eCheckRunCall{installationID: installationID, owner: owner, repo: repo, run: run}
 	return nil
@@ -85,7 +89,7 @@ func TestWebhookToCheckRunEndToEnd(t *testing.T) {
 	})
 
 	gh := &e2eGitHub{calls: make(chan e2eCheckRunCall, 10)}
-	gateSvc := gate.NewService(gh, store)
+	gateSvc := gate.NewService(gh, store, gate.Runners{})
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)

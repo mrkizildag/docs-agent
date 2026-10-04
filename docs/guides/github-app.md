@@ -24,7 +24,7 @@ Generate the webhook secret with `openssl rand -hex 32`. Set the same value in t
 Grant only what the bot uses:
 
 - **Checks**: read & write — sets the `docs-agent` check run.
-- **Contents**: read & write — reads the diff, commits doc edits.
+- **Contents**: read & write — reads the diff, detects the `.github/workflows/docs-agent.yml` workflow, commits doc edits.
 - **Pull requests**: read & write — review comments and suggestions.
 - **Issues**: read & write — the PR conversation comment and summary comment use the issues API.
 - **Metadata**: read-only — mandatory for every App.
@@ -53,4 +53,4 @@ Once installed, an org admin adds `docs-agent` as a required status check in the
 
 Open the App's "Advanced → Recent deliveries" tab. The initial `ping` delivery should show a `202` response. Redeliver it after changing the webhook secret in the App settings (without updating `GITHUB_WEBHOOK_SECRET`) to confirm it now gets a `401`.
 
-Open a pull request in the sandbox repo and confirm it shows a passing `docs-agent` check.
+Open a pull request in the sandbox repo and confirm it shows a `docs-agent` check. With no analysis runner configured, it is neutral and titled "No analysis runner configured".

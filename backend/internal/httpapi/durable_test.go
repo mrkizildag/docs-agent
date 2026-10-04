@@ -27,6 +27,10 @@ type blockingGitHub struct {
 	created   chan string
 }
 
+func (f *blockingGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (bool, error) {
+	return false, nil
+}
+
 func (f *blockingGitHub) CreateCheckRun(ctx context.Context, _ int64, _, _ string, run gate.CheckRun) error {
 	f.started <- run.HeadSHA
 	if run.HeadSHA == f.blockSHA {
@@ -112,6 +116,10 @@ func newFailThenSucceedGitHub() *failThenSucceedGitHub {
 	return &failThenSucceedGitHub{calls: make(chan string, 10), failed: make(map[string]bool)}
 }
 
+func (f *failThenSucceedGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (bool, error) {
+	return false, nil
+}
+
 func (f *failThenSucceedGitHub) CreateCheckRun(_ context.Context, _ int64, _, _ string, run gate.CheckRun) error {
 	f.calls <- run.HeadSHA
 
@@ -132,7 +140,7 @@ func TestWebhookRedeliveryAfterFailedJobEnqueuesNewJob(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close() })
 
 	gh := newFailThenSucceedGitHub()
-	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, store)), slog.New(slog.DiscardHandler), 8)
+	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, store, gate.Runners{})), slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	t.Cleanup(func() { _ = stop() })
 	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker)
@@ -178,7 +186,7 @@ func TestWebhookSecondSynchronizeCancelsFirst(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close() })
 
 	gh := newBlockingGitHub("sha1")
-	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, store)), slog.New(slog.DiscardHandler), 8)
+	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, store, gate.Runners{})), slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	t.Cleanup(func() { _ = stop() })
 	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker)
@@ -211,7 +219,7 @@ func TestWebhookPendingJobRunsAfterRestartAndDuplicateStaysNoOp(t *testing.T) {
 	// Process 1 accepts the webhook but dies before any worker runs it.
 	store1 := openStore(t, path)
 	gh1 := newBlockingGitHub("")
-	worker1 := jobqueue.NewWorker(store1, httpapi.HandleJob(gate.NewService(gh1, store1)), logger, 8)
+	worker1 := jobqueue.NewWorker(store1, httpapi.HandleJob(gate.NewService(gh1, store1, gate.Runners{})), logger, 8)
 	h1 := httpapi.NewHandler(logger, secret, worker1)
 	if code := postSigned(t, h1, secret, "d1", prBody(t, "opened", 1, "sha1")); code != http.StatusAccepted {
 		t.Fatalf("POST = %d, want 202", code)
@@ -224,7 +232,7 @@ func TestWebhookPendingJobRunsAfterRestartAndDuplicateStaysNoOp(t *testing.T) {
 	store2 := openStore(t, path)
 	t.Cleanup(func() { _ = store2.Close() })
 	gh2 := newBlockingGitHub("")
-	worker2 := jobqueue.NewWorker(store2, httpapi.HandleJob(gate.NewService(gh2, store2)), logger, 8)
+	worker2 := jobqueue.NewWorker(store2, httpapi.HandleJob(gate.NewService(gh2, store2, gate.Runners{})), logger, 8)
 	stop := runWorker(worker2)
 	t.Cleanup(func() { _ = stop() })
 	if got := waitString(t, gh2.created); got != "sha1" {

@@ -53,7 +53,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create GitHub client: %w", err)
 	}
-	gateSvc := gate.NewService(ghClient, store)
+	gateSvc := gate.NewService(ghClient, store, gate.Runners{})
 
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, maxParallelJobs)
 	workerCtx, cancelWorker := context.WithCancel(context.WithoutCancel(ctx))

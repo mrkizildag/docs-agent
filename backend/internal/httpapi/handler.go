@@ -43,6 +43,9 @@ type pullRequestEvent struct {
 	Action      string `json:"action"`
 	Number      int    `json:"number"`
 	PullRequest struct {
+		Base struct {
+			SHA string `json:"sha"`
+		} `json:"base"`
 		Head struct {
 			SHA string `json:"sha"`
 		} `json:"head"`
@@ -124,6 +127,7 @@ func webhookHandler(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer) ht
 			Owner:          payload.Repository.Owner.Login,
 			Repo:           payload.Repository.Name,
 			Number:         payload.Number,
+			BaseSHA:        payload.PullRequest.Base.SHA,
 			HeadSHA:        payload.PullRequest.Head.SHA,
 		}
 

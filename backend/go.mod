@@ -6,6 +6,7 @@ require (
 	github.com/bradleyfalzon/ghinstallation/v2 v2.19.0
 	github.com/google/go-cmp v0.7.0
 	github.com/google/go-github/v92 v92.0.0
+	github.com/google/jsonschema-go v0.4.3
 	modernc.org/sqlite v1.60.1
 )
 
