@@ -1,0 +1,71 @@
+{
+  "type": "object",
+  "properties": {
+    "no_impact_reason": {
+      "type": "string",
+      "description": "Why the PR needs no doc change; empty when proposals is non-empty."
+    },
+    "proposals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "doc_path": {
+            "type": "string",
+            "description": "Repo-relative path, under docs/, of the doc this proposal changes or creates.",
+            "pattern": "^docs/"
+          },
+          "section": {
+            "type": "string",
+            "description": "Heading of the section to replace, or empty to create a new doc."
+          },
+          "anchor": {
+            "type": "object",
+            "properties": {
+              "file": {
+                "type": "string",
+                "description": "Path of the changed file the anchor points into."
+              },
+              "line": {
+                "type": "integer",
+                "description": "Head-side, 1-based line number within the changed file."
+              }
+            },
+            "description": "Line in the PR diff that caused this proposal.",
+            "required": [
+              "file",
+              "line"
+            ],
+            "additionalProperties": false
+          },
+          "reason": {
+            "type": "string",
+            "description": "One-line explanation of why this doc change is needed."
+          },
+          "content": {
+            "type": "string",
+            "description": "Replacement content for the section, or the full content of a new doc."
+          },
+          "index_entry": {
+            "type": "string",
+            "description": "Entry to add to the docs index; set iff section is empty."
+          }
+        },
+        "required": [
+          "doc_path",
+          "section",
+          "anchor",
+          "reason",
+          "content"
+        ],
+        "additionalProperties": false
+      },
+      "description": "Doc changes the PR needs; empty when the PR has no doc impact."
+    }
+  },
+  "required": [
+    "no_impact_reason",
+    "proposals"
+  ],
+  "additionalProperties": false
+}

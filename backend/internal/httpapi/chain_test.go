@@ -39,8 +39,12 @@ func (f *chainGitHub) ListChangedFiles(context.Context, int64, string, string, i
 	}}, nil
 }
 
-func (f *chainGitHub) CreateCheckRun(_ context.Context, installationID int64, owner, repo string, run gate.CheckRun) error {
+func (f *chainGitHub) CreateCheckRun(_ context.Context, installationID int64, owner, repo string, run gate.CheckRun) (int64, error) {
 	f.calls <- e2eCheckRunCall{installationID: installationID, owner: owner, repo: repo, run: run}
+	return 0, nil
+}
+
+func (f *chainGitHub) UpdateCheckRun(context.Context, int64, string, string, int64, gate.CheckRun) error {
 	return nil
 }
 
@@ -129,7 +133,7 @@ func TestWebhookToServerRunnerChain(t *testing.T) {
 		}
 	})
 
-	handler := httpapi.NewHandler(logger, secret, worker)
+	handler := httpapi.NewHandler(logger, secret, worker, store)
 	body := e2ePullRequestBody(t, 1, headSHA)
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-GitHub-Event", "pull_request")

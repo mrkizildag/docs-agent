@@ -6,7 +6,7 @@ import (
 	"github.com/mrkizildag/docs-agent/backend/internal/config"
 )
 
-func TestBuildRunners_ServerRunnerOnlyWithLLMProvider(t *testing.T) {
+func TestBuildRunners_ServerRunnerOnlyWithLLMProviderActionsAlways(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -30,8 +30,8 @@ func TestBuildRunners_ServerRunnerOnlyWithLLMProvider(t *testing.T) {
 			if got := runners.Server != nil; got != tc.wantServer {
 				t.Errorf("Server runner set = %t, want %t", got, tc.wantServer)
 			}
-			if runners.Actions != nil {
-				t.Errorf("Actions runner = %v, want nil", runners.Actions)
+			if !tc.wantErr && runners.Actions == nil {
+				t.Error("Actions runner = nil, want it set regardless of LLM config")
 			}
 		})
 	}

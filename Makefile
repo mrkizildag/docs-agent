@@ -3,7 +3,7 @@
 check: lint test vuln
 
 generate:
-	cd backend && go run ./cmd/genschema ../action/proposal.schema.json
+	cd backend && go run ./cmd/genschema ../action/proposal.schema.json ../action/result.schema.json
 
 fmt:
 	cd backend && golangci-lint fmt ./...

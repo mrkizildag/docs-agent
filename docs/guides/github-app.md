@@ -23,6 +23,7 @@ Generate the webhook secret with `openssl rand -hex 32`. Set the same value in t
 
 Grant only what the bot uses:
 
+- **Actions**: read & write — dispatches the docs-agent workflow in repos that use the [Actions runner](actions-runner.md), reads its run, and downloads its result artifact.
 - **Checks**: read & write — sets the `docs-agent` check run.
 - **Contents**: read & write — clones the PR head for the server runner (with a token narrowed to that repo and `contents: read`), detects the `.github/workflows/docs-agent.yml` workflow, commits doc edits.
 - **Pull requests**: read & write — lists the PR's changed files and patches; review comments and suggestions.
@@ -33,7 +34,7 @@ Nothing else.
 
 ## Events
 
-Subscribe to: Pull request, Pull request review comment, Issue comment, Check run.
+Subscribe to: Pull request, Pull request review comment, Issue comment, Check run, Workflow run (tells the backend a dispatched analysis run finished).
 
 ## Installation scope
 

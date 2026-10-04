@@ -3,6 +3,7 @@ package sqlite_test
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -94,6 +95,48 @@ func TestSavePR_RoundTripAndOverwrite(t *testing.T) {
 	}
 	if diff := cmp.Diff(overwrite, got); diff != "" {
 		t.Errorf("LoadPR() after overwrite mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestSavePR_AwaitingRunRoundTripAndPRForRun(t *testing.T) {
+	t.Parallel()
+
+	store, _ := open(t)
+	ctx := t.Context()
+
+	state := gate.PRState{
+		InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1", CheckRunID: 555,
+		Run: &gate.AwaitingRun{RunID: 99, Nonce: "n1", Deadline: time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)},
+	}
+	if err := store.SavePR(ctx, state); err != nil {
+		t.Fatalf("SavePR() = %v, want nil error", err)
+	}
+
+	got, err := store.LoadPR(ctx, "acme", "widgets", 7)
+	if err != nil {
+		t.Fatalf("LoadPR() = %v, want nil error", err)
+	}
+	if diff := cmp.Diff(state, got); diff != "" {
+		t.Errorf("LoadPR() mismatch (-want +got):\n%s", diff)
+	}
+
+	number, ok, err := store.PRForRun(ctx, "acme", "widgets", 99)
+	if err != nil || !ok || number != 7 {
+		t.Errorf("PRForRun(run 99) = %d, %v, %v, want 7, true, nil", number, ok, err)
+	}
+	if _, ok, err := store.PRForRun(ctx, "acme", "widgets", 100); err != nil || ok {
+		t.Errorf("PRForRun(unknown run) = %v, %v, want false, nil", ok, err)
+	}
+	if _, ok, err := store.PRForRun(ctx, "other", "widgets", 99); err != nil || ok {
+		t.Errorf("PRForRun(other repo) = %v, %v, want false, nil", ok, err)
+	}
+
+	state.Run = nil
+	if err := store.SavePR(ctx, state); err != nil {
+		t.Fatalf("SavePR() clearing run = %v, want nil error", err)
+	}
+	if _, ok, err := store.PRForRun(ctx, "acme", "widgets", 99); err != nil || ok {
+		t.Errorf("PRForRun(cleared run) = %v, %v, want false, nil", ok, err)
 	}
 }
 
@@ -432,4 +475,31 @@ func enqueueWithResult(t *testing.T, store *sqlite.Store, deliveryID, key, kind 
 		t.Fatalf("Enqueue(%q) = false, want true", deliveryID)
 	}
 	return superseded
+}
+
+func TestOverdueRuns(t *testing.T) {
+	t.Parallel()
+
+	store, _ := open(t)
+	ctx := t.Context()
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	for _, st := range []gate.PRState{
+		{Owner: "acme", Repo: "widgets", Number: 1, HeadSHA: "a", CheckRunID: 1, Run: &gate.AwaitingRun{RunID: 1, Nonce: "n1", Deadline: base}},
+		{Owner: "acme", Repo: "widgets", Number: 2, HeadSHA: "b", CheckRunID: 2, Run: &gate.AwaitingRun{RunID: 2, Nonce: "n2", Deadline: base.Add(time.Hour)}},
+		{Owner: "acme", Repo: "widgets", Number: 3, HeadSHA: "c"},
+	} {
+		if err := store.SavePR(ctx, st); err != nil {
+			t.Fatalf("SavePR(%+v) = %v, want nil error", st, err)
+		}
+	}
+
+	got, err := store.OverdueRuns(ctx, base.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("OverdueRuns() = %v, want nil error", err)
+	}
+	want := []gate.OverdueRun{{PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 1}, Nonce: "n1"}}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("OverdueRuns() mismatch (-want +got):\n%s", diff)
+	}
 }

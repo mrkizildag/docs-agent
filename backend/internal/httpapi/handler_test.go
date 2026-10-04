@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -21,7 +22,20 @@ import (
 	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
 )
 
-const pullRequestJobKind = "pull_request"
+const (
+	pullRequestJobKind = "pull_request"
+	workflowRunJobKind = "workflow_run"
+)
+
+type fakeRunLookup struct {
+	numbers map[int64]int
+	err     error
+}
+
+func (f fakeRunLookup) PRForRun(_ context.Context, _, _ string, runID int64) (int, bool, error) {
+	number, ok := f.numbers[runID]
+	return number, ok, f.err
+}
 
 type fakeEnqueuer struct {
 	jobs   []jobqueue.NewJob
@@ -48,7 +62,7 @@ func TestHealthz(t *testing.T) {
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, []byte("secret"), newFakeEnqueuer()).ServeHTTP(rec, req)
+	httpapi.NewHandler(logger, []byte("secret"), newFakeEnqueuer(), fakeRunLookup{}).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
 		t.Errorf("GET /healthz = %d %q, want 200 \"ok\"", rec.Code, rec.Body.String())
@@ -125,7 +139,7 @@ func TestWebhook(t *testing.T) {
 			}
 			rec := httptest.NewRecorder()
 
-			httpapi.NewHandler(logger, secret, enqueuer).ServeHTTP(rec, req)
+			httpapi.NewHandler(logger, secret, enqueuer, fakeRunLookup{}).ServeHTTP(rec, req)
 
 			if rec.Code != tc.wantStatus {
 				t.Errorf("POST /webhook = %d, want %d", rec.Code, tc.wantStatus)
@@ -148,7 +162,7 @@ func TestWebhookBodyTooLarge(t *testing.T) {
 	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, secret, newFakeEnqueuer()).ServeHTTP(rec, req)
+	httpapi.NewHandler(logger, secret, newFakeEnqueuer(), fakeRunLookup{}).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("POST /webhook with oversized body = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
@@ -191,7 +205,7 @@ func postWebhook(t *testing.T, secret []byte, jobs httpapi.Enqueuer, event strin
 	}
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, secret, jobs).ServeHTTP(rec, req)
+	httpapi.NewHandler(logger, secret, jobs, fakeRunLookup{}).ServeHTTP(rec, req)
 	return rec
 }
 
@@ -355,8 +369,18 @@ func TestWebhookPullRequestClosedWithMissingFields(t *testing.T) {
 }
 
 type fakePullRequestHandler struct {
-	calls []gate.PullRequest
-	err   error
+	calls    []gate.PullRequest
+	runCalls []gate.RunCompleted
+	err      error
+}
+
+func (f *fakePullRequestHandler) HandleDeadline(context.Context, gate.PRRef, string, time.Time) error {
+	return f.err
+}
+
+func (f *fakePullRequestHandler) HandleRunCompleted(_ context.Context, rc gate.RunCompleted) error {
+	f.runCalls = append(f.runCalls, rc)
+	return f.err
 }
 
 func (f *fakePullRequestHandler) HandlePullRequest(_ context.Context, pr gate.PullRequest) error {
@@ -388,6 +412,26 @@ func TestHandleJob(t *testing.T) {
 		}
 	})
 
+	t.Run("dispatches workflow runs", func(t *testing.T) {
+		t.Parallel()
+
+		rc := gate.RunCompleted{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, RunID: 99, Conclusion: "success"}
+		rcPayload, err := json.Marshal(rc)
+		if err != nil {
+			t.Fatalf("marshal run completed: %v", err)
+		}
+		handler := &fakePullRequestHandler{}
+		job := jobqueue.Job{ID: 4, Key: "acme/widgets#7", Kind: workflowRunJobKind, Payload: rcPayload}
+
+		if err := httpapi.HandleJob(handler)(t.Context(), job); err != nil {
+			t.Fatalf("HandleJob() error = %v", err)
+		}
+
+		if diff := cmp.Diff([]gate.RunCompleted{rc}, handler.runCalls); diff != "" {
+			t.Errorf("HandleRunCompleted calls (-want +got):\n%s", diff)
+		}
+	})
+
 	t.Run("unknown kind errors", func(t *testing.T) {
 		t.Parallel()
 
@@ -414,4 +458,82 @@ func TestHandleJob(t *testing.T) {
 			t.Errorf("HandleJob() error = %v, want wrapping %v", err, wantErr)
 		}
 	})
+}
+
+func workflowRunBody(t *testing.T, action, path string, runID int64) []byte {
+	t.Helper()
+
+	body, err := json.Marshal(map[string]any{
+		"action": action,
+		"workflow_run": map[string]any{
+			"id": runID, "path": path, "conclusion": "success",
+		},
+		"repository":   map[string]any{"name": "widgets", "owner": map[string]any{"login": "acme"}},
+		"installation": map[string]any{"id": 42},
+	})
+	if err != nil {
+		t.Fatalf("marshal workflow_run payload: %v", err)
+	}
+	return body
+}
+
+func postWorkflowRun(t *testing.T, runs httpapi.RunLookup, jobs httpapi.Enqueuer, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+
+	secret := []byte("test-secret")
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "workflow_run")
+	req.Header.Set("X-GitHub-Delivery", "d-run")
+	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
+	rec := httptest.NewRecorder()
+
+	httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, jobs, runs).ServeHTTP(rec, req)
+	return rec
+}
+
+func TestWebhookWorkflowRun(t *testing.T) {
+	t.Parallel()
+
+	const path = ".github/workflows/docs-agent.yml"
+	known := fakeRunLookup{numbers: map[int64]int{99: 7}}
+
+	tests := []struct {
+		name     string
+		runs     fakeRunLookup
+		body     []byte
+		wantCode int
+		wantJob  bool
+	}{
+		{name: "known run", runs: known, body: workflowRunBody(t, "completed", path, 99), wantCode: http.StatusAccepted, wantJob: true},
+		{name: "unknown run", runs: known, body: workflowRunBody(t, "completed", path, 100), wantCode: http.StatusAccepted},
+		{name: "other workflow", runs: known, body: workflowRunBody(t, "completed", ".github/workflows/ci.yml", 99), wantCode: http.StatusAccepted},
+		{name: "not completed", runs: known, body: workflowRunBody(t, "requested", path, 99), wantCode: http.StatusAccepted},
+		{name: "lookup error", runs: fakeRunLookup{err: errors.New("boom")}, body: workflowRunBody(t, "completed", path, 99), wantCode: http.StatusInternalServerError},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			jobs := newFakeEnqueuer()
+			if rec := postWorkflowRun(t, tc.runs, jobs, tc.body); rec.Code != tc.wantCode {
+				t.Fatalf("POST /webhook = %d, want %d", rec.Code, tc.wantCode)
+			}
+			if !tc.wantJob {
+				if len(jobs.jobs) != 0 {
+					t.Errorf("Enqueue calls = %v, want none", jobs.jobs)
+				}
+				return
+			}
+
+			wantPayload, err := json.Marshal(gate.RunCompleted{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, RunID: 99, Conclusion: "success"})
+			if err != nil {
+				t.Fatalf("marshal want payload: %v", err)
+			}
+			want := []jobqueue.NewJob{{DeliveryID: "d-run", Key: "acme/widgets#7", Kind: workflowRunJobKind, Payload: wantPayload}}
+			if diff := cmp.Diff(want, jobs.jobs); diff != "" {
+				t.Errorf("Enqueue calls (-want +got):\n%s", diff)
+			}
+		})
+	}
 }
