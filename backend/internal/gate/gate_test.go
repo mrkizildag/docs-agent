@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -14,7 +15,10 @@ import (
 
 type fakeGitHub struct {
 	calls          []createCheckRunCall
+	updates        []updateCheckRunCall
+	checkRunID     int64
 	err            error
+	updateErr      error
 	workflowExists bool
 	workflowErr    error
 }
@@ -26,9 +30,19 @@ type createCheckRunCall struct {
 	run            gate.CheckRun
 }
 
-func (f *fakeGitHub) CreateCheckRun(_ context.Context, installationID int64, owner, repo string, run gate.CheckRun) error {
+type updateCheckRunCall struct {
+	id  int64
+	run gate.CheckRun
+}
+
+func (f *fakeGitHub) CreateCheckRun(_ context.Context, installationID int64, owner, repo string, run gate.CheckRun) (int64, error) {
 	f.calls = append(f.calls, createCheckRunCall{installationID: installationID, owner: owner, repo: repo, run: run})
-	return f.err
+	return f.checkRunID, f.err
+}
+
+func (f *fakeGitHub) UpdateCheckRun(_ context.Context, _ int64, _, _ string, id int64, run gate.CheckRun) error {
+	f.updates = append(f.updates, updateCheckRunCall{id: id, run: run})
+	return f.updateErr
 }
 
 func (f *fakeGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (bool, error) {
@@ -36,9 +50,17 @@ func (f *fakeGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (bo
 }
 
 type fakeRunner struct {
-	calls   []review.Request
-	started review.Started
-	err     error
+	calls      []review.Request
+	started    review.Started
+	err        error
+	collected  []review.Completion
+	result     review.Result
+	collectErr error
+}
+
+func (f *fakeRunner) Collect(_ context.Context, c review.Completion) (review.Result, error) {
+	f.collected = append(f.collected, c)
+	return f.result, f.collectErr
 }
 
 func (f *fakeRunner) Start(_ context.Context, req review.Request) (review.Started, error) {
@@ -51,6 +73,7 @@ type fakeStore struct {
 	saveCalls []gate.PRState
 	loadErr   error
 	saveErr   error
+	stored    gate.PRState
 }
 
 type loadPRCall struct {
@@ -64,7 +87,14 @@ func (f *fakeStore) LoadPR(_ context.Context, owner, repo string, number int) (g
 	if f.loadErr != nil {
 		return gate.PRState{}, f.loadErr
 	}
+	if f.stored.Number == number {
+		return f.stored, nil
+	}
 	return gate.PRState{Owner: owner, Repo: repo, Number: number}, nil
+}
+
+func (f *fakeStore) PRForRun(context.Context, string, string, int64) (int, bool, error) {
+	return 0, false, nil
 }
 
 func (f *fakeStore) SavePR(_ context.Context, state gate.PRState) error {
@@ -175,6 +205,7 @@ func TestHandlePullRequestNoImpact(t *testing.T) {
 	want := gate.CheckRun{
 		Name:       "docs-agent",
 		HeadSHA:    "abc123",
+		Status:     gate.StatusCompleted,
 		Conclusion: gate.ConclusionSuccess,
 		Title:      "No doc impact",
 		Summary:    "docs already cover this",
@@ -246,11 +277,11 @@ func TestHandlePullRequestEmptyProposals(t *testing.T) {
 	runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{}}}
 	svc := gate.NewService(gh, &fakeStore{}, gate.Runners{Server: runner})
 
-	if err := svc.HandlePullRequest(t.Context(), testPR()); err == nil {
-		t.Fatalf("HandlePullRequest() = nil, want error for an empty proposal list")
+	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
+		t.Fatalf("HandlePullRequest() = %v, want nil", err)
 	}
-	if len(gh.calls) != 0 {
-		t.Errorf("CreateCheckRun calls = %+v, want none", gh.calls)
+	if got := gh.calls[0].run; got.Conclusion != gate.ConclusionNeutral || !strings.Contains(got.Summary, "empty proposal list") {
+		t.Errorf("check run = %+v, want neutral naming the empty proposal list", got)
 	}
 }
 
@@ -355,5 +386,376 @@ func TestHandlePullRequestSaveError(t *testing.T) {
 	err := svc.HandlePullRequest(t.Context(), testPR())
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("HandlePullRequest() = %v, want wrapping %v", err, wantErr)
+	}
+}
+
+func TestHandlePullRequestActionsStartsRun(t *testing.T) {
+	t.Parallel()
+
+	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	gh := &fakeGitHub{workflowExists: true, checkRunID: 555}
+	runner := &fakeRunner{started: review.Pending{RunID: 99, Nonce: "n1", Deadline: deadline}}
+	store := &fakeStore{}
+	svc := gate.NewService(gh, store, gate.Runners{Actions: runner})
+
+	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
+		t.Fatalf("HandlePullRequest() = %v, want nil", err)
+	}
+
+	if got := gh.calls[0].run; got.Status != gate.StatusInProgress || got.Conclusion != "" {
+		t.Errorf("check run = %+v, want in progress without a conclusion", got)
+	}
+	want := []gate.PRState{{
+		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123", CheckRunID: 555,
+		Run: &gate.AwaitingRun{RunID: 99, Nonce: "n1", Deadline: deadline},
+	}}
+	if diff := cmp.Diff(want, store.saveCalls); diff != "" {
+		t.Errorf("SavePR calls (-want +got):\n%s", diff)
+	}
+}
+
+func awaitingState() gate.PRState {
+	return gate.PRState{
+		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123", CheckRunID: 555,
+		Run: &gate.AwaitingRun{RunID: 99, Nonce: "n1"},
+	}
+}
+
+func completedRun(conclusion string) gate.RunCompleted {
+	return gate.RunCompleted{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, RunID: 99, Conclusion: conclusion}
+}
+
+func TestHandleRunCompleted(t *testing.T) {
+	t.Parallel()
+
+	proposals := review.Proposals{{DocPath: "docs/a.md", Reason: "endpoint changed"}}
+	invalid := &review.InvalidResultError{Cause: errors.New("bad nonce")}
+
+	tests := []struct {
+		name           string
+		conclusion     string
+		runner         *fakeRunner
+		wantConclusion gate.Conclusion
+		wantSummary    string
+		wantCollected  bool
+	}{
+		{
+			name:           "no impact",
+			conclusion:     "success",
+			runner:         &fakeRunner{result: review.Result{Verdict: review.NoImpact{Reason: "fine"}}},
+			wantConclusion: gate.ConclusionSuccess,
+			wantSummary:    "fine",
+			wantCollected:  true,
+		},
+		{
+			name:           "proposals",
+			conclusion:     "success",
+			runner:         &fakeRunner{result: review.Result{Verdict: proposals}},
+			wantConclusion: gate.ConclusionActionRequired,
+			wantSummary:    "- docs/a.md: endpoint changed",
+			wantCollected:  true,
+		},
+		{
+			name:           "invalid result",
+			conclusion:     "success",
+			runner:         &fakeRunner{collectErr: invalid},
+			wantConclusion: gate.ConclusionNeutral,
+			wantSummary:    invalid.Error(),
+			wantCollected:  true,
+		},
+		{
+			name:           "failed run",
+			conclusion:     "cancelled",
+			runner:         &fakeRunner{},
+			wantConclusion: gate.ConclusionNeutral,
+			wantSummary:    "workflow run cancelled",
+			wantCollected:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			gh := &fakeGitHub{}
+			store := &fakeStore{stored: awaitingState()}
+			svc := gate.NewService(gh, store, gate.Runners{Actions: tc.runner})
+
+			if err := svc.HandleRunCompleted(t.Context(), completedRun(tc.conclusion)); err != nil {
+				t.Fatalf("HandleRunCompleted() = %v, want nil", err)
+			}
+
+			if (len(tc.runner.collected) == 1) != tc.wantCollected {
+				t.Errorf("Collect calls = %+v, want called = %v", tc.runner.collected, tc.wantCollected)
+			}
+			if tc.wantCollected {
+				want := review.Completion{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123", RunID: 99, Nonce: "n1"}
+				if diff := cmp.Diff(want, tc.runner.collected[0]); diff != "" {
+					t.Errorf("Collect completion (-want +got):\n%s", diff)
+				}
+			}
+
+			wantRun := gate.CheckRun{
+				Name: "docs-agent", HeadSHA: "abc123", Status: gate.StatusCompleted,
+				Conclusion: tc.wantConclusion, Title: gh.updates[0].run.Title, Summary: tc.wantSummary,
+			}
+			if diff := cmp.Diff([]updateCheckRunCall{{id: 555, run: wantRun}}, gh.updates, cmp.AllowUnexported(updateCheckRunCall{})); diff != "" {
+				t.Errorf("UpdateCheckRun calls (-want +got):\n%s", diff)
+			}
+
+			saved := awaitingState()
+			saved.Run = nil
+			if diff := cmp.Diff([]gate.PRState{saved}, store.saveCalls); diff != "" {
+				t.Errorf("SavePR calls (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestHandleRunCompletedFailedRunCause(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		runner      *fakeRunner
+		wantSummary string
+	}{
+		{
+			name:        "invalid result adds its cause",
+			runner:      &fakeRunner{collectErr: &review.InvalidResultError{Cause: errors.New("claude is_error: 401")}},
+			wantSummary: "workflow run failure: claude is_error: 401",
+		},
+		{
+			name:        "other collect error falls back to the conclusion",
+			runner:      &fakeRunner{collectErr: errors.New("no artifact")},
+			wantSummary: "workflow run failure",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			gh := &fakeGitHub{}
+			svc := gate.NewService(gh, &fakeStore{stored: awaitingState()}, gate.Runners{Actions: tc.runner})
+
+			if err := svc.HandleRunCompleted(t.Context(), completedRun("failure")); err != nil {
+				t.Fatalf("HandleRunCompleted() = %v, want nil", err)
+			}
+			if len(gh.updates) != 1 || gh.updates[0].run.Conclusion != gate.ConclusionNeutral || gh.updates[0].run.Summary != tc.wantSummary {
+				t.Errorf("UpdateCheckRun calls = %+v, want one neutral with summary %q", gh.updates, tc.wantSummary)
+			}
+		})
+	}
+}
+
+func TestHandlePullRequestSupersedesAwaitedRun(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{workflowExists: true, checkRunID: 556}
+	runner := &fakeRunner{started: review.Pending{RunID: 100, Nonce: "n2"}}
+	store := &fakeStore{stored: awaitingState()}
+	svc := gate.NewService(gh, store, gate.Runners{Actions: runner})
+
+	pr := testPR()
+	pr.HeadSHA = "def4567890"
+	if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
+		t.Fatalf("HandlePullRequest() = %v, want nil", err)
+	}
+
+	wantUpdate := updateCheckRunCall{id: 555, run: gate.CheckRun{
+		Name: "docs-agent", HeadSHA: "abc123", Status: gate.StatusCompleted, Conclusion: gate.ConclusionNeutral,
+		Title: "Superseded", Summary: "Superseded by def4567",
+	}}
+	if diff := cmp.Diff([]updateCheckRunCall{wantUpdate}, gh.updates, cmp.AllowUnexported(updateCheckRunCall{})); diff != "" {
+		t.Errorf("UpdateCheckRun calls (-want +got):\n%s", diff)
+	}
+	saved := store.saveCalls[len(store.saveCalls)-1]
+	if saved.HeadSHA != "def4567890" || saved.CheckRunID != 556 || saved.Run == nil || saved.Run.RunID != 100 {
+		t.Errorf("saved state = %+v, want new head awaiting run 100", saved)
+	}
+
+	store.stored = saved
+	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
+		t.Fatalf("HandleRunCompleted(old run) = %v, want nil", err)
+	}
+	if len(gh.updates) != 1 || len(store.saveCalls) != 1 {
+		t.Errorf("updates = %d, saves = %d after the old run completed, want 1 and 1", len(gh.updates), len(store.saveCalls))
+	}
+}
+
+func TestHandlePullRequestSupersedesAwaitedRunOnSameHead(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{workflowExists: true, checkRunID: 556}
+	runner := &fakeRunner{started: review.Pending{RunID: 100, Nonce: "n2"}}
+	svc := gate.NewService(gh, &fakeStore{stored: awaitingState()}, gate.Runners{Actions: runner})
+
+	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
+		t.Fatalf("HandlePullRequest() = %v, want nil", err)
+	}
+
+	wantUpdate := updateCheckRunCall{id: 555, run: gate.CheckRun{
+		Name: "docs-agent", HeadSHA: "abc123", Status: gate.StatusCompleted, Conclusion: gate.ConclusionNeutral,
+		Title: "Superseded", Summary: "Superseded by abc123",
+	}}
+	if diff := cmp.Diff([]updateCheckRunCall{wantUpdate}, gh.updates, cmp.AllowUnexported(updateCheckRunCall{})); diff != "" {
+		t.Errorf("UpdateCheckRun calls (-want +got):\n%s", diff)
+	}
+}
+
+func TestHandlePullRequestSupersedeUpdateError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("boom")
+	gh := &fakeGitHub{updateErr: wantErr}
+	svc := gate.NewService(gh, &fakeStore{stored: awaitingState()}, gate.Runners{})
+
+	pr := testPR()
+	pr.HeadSHA = "def4567"
+	if err := svc.HandlePullRequest(t.Context(), pr); !errors.Is(err, wantErr) {
+		t.Fatalf("HandlePullRequest() = %v, want wrapping %v", err, wantErr)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("CreateCheckRun calls = %d, want 0 after supersede failure", len(gh.calls))
+	}
+}
+
+func TestHandleDeadline(t *testing.T) {
+	t.Parallel()
+
+	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	ref := gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}
+	awaiting := awaitingState()
+	awaiting.Run.Deadline = deadline
+	pushed := gate.PRState{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "def456", CheckRunID: 556}
+	concluded := awaitingState()
+	concluded.Run = nil
+
+	tests := []struct {
+		name     string
+		state    gate.PRState
+		nonce    string
+		now      time.Time
+		wantEnds bool
+	}{
+		{name: "overdue run ends neutral", state: awaiting, nonce: "n1", now: deadline.Add(time.Second), wantEnds: true},
+		{name: "not yet overdue", state: awaiting, nonce: "n1", now: deadline.Add(-time.Second)},
+		{name: "after completion", state: concluded, nonce: "n1", now: deadline.Add(time.Second)},
+		{name: "after a new push", state: pushed, nonce: "n1", now: deadline.Add(time.Second)},
+		{name: "other nonce", state: awaiting, nonce: "n0", now: deadline.Add(time.Second)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			gh := &fakeGitHub{}
+			store := &fakeStore{stored: tc.state}
+			svc := gate.NewService(gh, store, gate.Runners{})
+
+			if err := svc.HandleDeadline(t.Context(), ref, tc.nonce, tc.now); err != nil {
+				t.Fatalf("HandleDeadline() = %v, want nil", err)
+			}
+			if !tc.wantEnds {
+				if len(gh.updates) != 0 || len(store.saveCalls) != 0 {
+					t.Errorf("updates = %v, saves = %v, want none", gh.updates, store.saveCalls)
+				}
+				return
+			}
+			if len(gh.updates) != 1 || gh.updates[0].id != 555 || gh.updates[0].run.Conclusion != gate.ConclusionNeutral ||
+				!strings.Contains(gh.updates[0].run.Summary, "before the deadline") {
+				t.Errorf("UpdateCheckRun calls = %+v, want one neutral naming the deadline", gh.updates)
+			}
+			if len(store.saveCalls) != 1 || store.saveCalls[0].Run != nil {
+				t.Errorf("SavePR calls = %+v, want one with the run cleared", store.saveCalls)
+			}
+		})
+	}
+}
+
+func TestHandleRunCompletedIgnoresUnmatchedRun(t *testing.T) {
+	t.Parallel()
+
+	other := completedRun("success")
+	other.RunID = 100
+
+	tests := []struct {
+		name  string
+		state gate.PRState
+		rc    gate.RunCompleted
+	}{
+		{name: "other run", state: awaitingState(), rc: other},
+		{name: "not awaiting", state: gate.PRState{Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123"}, rc: completedRun("success")},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			gh := &fakeGitHub{}
+			runner := &fakeRunner{}
+			store := &fakeStore{stored: tc.state}
+			svc := gate.NewService(gh, store, gate.Runners{Actions: runner})
+
+			if err := svc.HandleRunCompleted(t.Context(), tc.rc); err != nil {
+				t.Fatalf("HandleRunCompleted() = %v, want nil", err)
+			}
+			if len(gh.updates) != 0 || len(store.saveCalls) != 0 || len(runner.collected) != 0 {
+				t.Errorf("updates = %v, saves = %v, collects = %v, want none", gh.updates, store.saveCalls, runner.collected)
+			}
+		})
+	}
+}
+
+func TestHandleRunCompletedTransientCollectError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("download failed")
+	gh := &fakeGitHub{}
+	store := &fakeStore{stored: awaitingState()}
+	svc := gate.NewService(gh, store, gate.Runners{Actions: &fakeRunner{collectErr: wantErr}})
+
+	err := svc.HandleRunCompleted(t.Context(), completedRun("success"))
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("HandleRunCompleted() = %v, want wrapping %v", err, wantErr)
+	}
+	if len(gh.updates) != 0 || len(store.saveCalls) != 0 {
+		t.Errorf("updates = %v, saves = %v, want none so the job can retry", gh.updates, store.saveCalls)
+	}
+}
+
+func TestOnPushDropsAwaitedRun(t *testing.T) {
+	t.Parallel()
+
+	got := gate.OnPush(awaitingState(), testPR())
+	if got.Run != nil || got.CheckRunID != 0 {
+		t.Errorf("OnPush() = %+v, want no awaited run and no check run", got)
+	}
+}
+
+func TestMatchesRun(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		state gate.PRState
+		runID int64
+		want  bool
+	}{
+		{name: "same run", state: awaitingState(), runID: 99, want: true},
+		{name: "other run", state: awaitingState(), runID: 100},
+		{name: "zero run id", state: awaitingState(), runID: 0},
+		{name: "not awaiting", state: gate.PRState{}, runID: 99},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := gate.MatchesRun(tc.state, gate.RunCompleted{RunID: tc.runID}); got != tc.want {
+				t.Errorf("MatchesRun(%+v, run %d) = %v, want %v", tc.state, tc.runID, got, tc.want)
+			}
+		})
 	}
 }

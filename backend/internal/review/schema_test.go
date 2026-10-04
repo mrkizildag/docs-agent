@@ -9,20 +9,34 @@ import (
 	"github.com/mrkizildag/docs-agent/backend/internal/review"
 )
 
-func TestProposalSchemaUpToDate(t *testing.T) {
+func TestSchemasUpToDate(t *testing.T) {
 	t.Parallel()
 
-	want, err := review.ProposalSchema()
-	if err != nil {
-		t.Fatalf("ProposalSchema() error = %v", err)
+	tests := []struct {
+		name     string
+		generate func() ([]byte, error)
+		path     string
+	}{
+		{"proposal", review.ProposalSchema, "../../../action/proposal.schema.json"},
+		{"result", review.ResultSchema, "../../../action/result.schema.json"},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	got, err := os.ReadFile("../../../action/proposal.schema.json")
-	if err != nil {
-		t.Fatalf("read action/proposal.schema.json: %v", err)
-	}
+			want, err := tc.generate()
+			if err != nil {
+				t.Fatalf("generate %s schema: %v", tc.name, err)
+			}
 
-	if diff := cmp.Diff(string(want), string(got)); diff != "" {
-		t.Errorf("action/proposal.schema.json is stale; run make generate (-want +got):\n%s", diff)
+			got, err := os.ReadFile(tc.path)
+			if err != nil {
+				t.Fatalf("read %s: %v", tc.path, err)
+			}
+
+			if diff := cmp.Diff(string(want), string(got)); diff != "" {
+				t.Errorf("%s is stale; run make generate (-want +got):\n%s", tc.path, diff)
+			}
+		})
 	}
 }

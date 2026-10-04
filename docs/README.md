@@ -12,8 +12,10 @@ Start here. Each entry is one file with a one-line summary; open only what the t
 
 - [Architecture](architecture.md): the parts of docs-agent, how they connect, and the phase plan.
 - [Job queue](features/job-queue.md): how webhook work is queued, deduplicated, superseded, and recovered after a restart.
+- [Actions runner](features/actions-runner.md): how analysis runs in the repo's own GitHub Actions, and the invariants that keep its result trustworthy and its check from sticking.
 - [Setup](guides/setup.md): run, test, and lint the backend locally.
 - [Registering the GitHub App](guides/github-app.md): create the GitHub App, set its webhook and permissions, and install it.
+- [Using the Actions runner](guides/actions-runner.md): set up a target repo so analysis runs in its own GitHub Actions with its own Claude credential.
 - [0001: In-repo docs first](decisions/0001-in-repo-docs-first.md): why phase 1 targets a `docs/` folder, not Notion.
 - [0002: Docs structure](decisions/0002-docs-structure.md): the folder layout and frontmatter every doc follows.
 

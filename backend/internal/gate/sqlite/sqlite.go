@@ -84,6 +84,11 @@ func migrations() []string {
 		)`,
 		`ALTER TABLE jobs ADD COLUMN delivery_id TEXT NOT NULL DEFAULT '';
 		CREATE INDEX idx_jobs_delivery_id ON jobs(delivery_id)`,
+		`ALTER TABLE pull_requests ADD COLUMN check_run_id INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE pull_requests ADD COLUMN run_id INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE pull_requests ADD COLUMN run_nonce TEXT NOT NULL DEFAULT '';
+		ALTER TABLE pull_requests ADD COLUMN run_deadline TEXT NOT NULL DEFAULT '';
+		CREATE UNIQUE INDEX idx_pull_requests_run ON pull_requests(owner, repo, run_id) WHERE run_id != 0`,
 	}
 }
 

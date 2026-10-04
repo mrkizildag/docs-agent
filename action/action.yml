@@ -1,0 +1,106 @@
+name: docs-agent
+description: Review a pull request for documentation impact with Claude Code and upload the result for the docs-agent server.
+inputs:
+  head_sha:
+    description: Head commit SHA of the pull request.
+    required: true
+  pr_number:
+    description: Pull request number.
+    required: true
+  nonce:
+    description: Dispatch nonce, echoed back in the result.
+    required: true
+  claude_code_oauth_token:
+    description: Claude subscription token. One of this or anthropic_api_key is required.
+    required: false
+  anthropic_api_key:
+    description: Anthropic API key. One of this or claude_code_oauth_token is required.
+    required: false
+runs:
+  using: composite
+  steps:
+    - name: Require a credential
+      shell: bash
+      env:
+        OAUTH_TOKEN: ${{ inputs.claude_code_oauth_token }}
+        API_KEY: ${{ inputs.anthropic_api_key }}
+      run: |
+        if [ -z "$OAUTH_TOKEN" ] && [ -z "$API_KEY" ]; then
+          echo "::error::Set the CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY secret and pass it to the docs-agent action."
+          exit 1
+        fi
+
+    - name: Check out the PR head
+      uses: actions/checkout@v5
+      with:
+        ref: refs/pull/${{ inputs.pr_number }}/head
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Verify the head commit and write the diff
+      shell: bash
+      env:
+        HEAD_SHA: ${{ inputs.head_sha }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        set -euo pipefail
+        actual="$(git rev-parse HEAD)"
+        if [ "$actual" != "$HEAD_SHA" ]; then
+          echo "::error::PR head is $actual, expected $HEAD_SHA"
+          exit 1
+        fi
+        mkdir -p "$RUNNER_TEMP/docs-agent"
+        git diff "origin/$DEFAULT_BRANCH...HEAD" > "$RUNNER_TEMP/docs-agent/pr.diff"
+
+    - name: Install Claude Code
+      shell: bash
+      run: npm install -g @anthropic-ai/claude-code@2.1.289
+
+    - name: Review
+      shell: bash
+      env:
+        CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude_code_oauth_token }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        HEAD_SHA: ${{ inputs.head_sha }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        NONCE: ${{ inputs.nonce }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -uo pipefail
+        out="$RUNNER_TEMP/docs-agent"
+        [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || unset CLAUDE_CODE_OAUTH_TOKEN
+        [ -n "$ANTHROPIC_API_KEY" ] || unset ANTHROPIC_API_KEY
+
+        prompt="$(cat "$ACTION_PATH/prompt.md")
+
+        ## Pull request
+
+        - Number: $PR_NUMBER
+        - Head commit: $HEAD_SHA (checked out in the working directory)
+        - Default branch: $DEFAULT_BRANCH
+        - Diff of the head against the merge base, unified format: $out/pr.diff"
+
+        status=0
+        claude -p "$prompt" \
+          --output-format json \
+          --json-schema "$(cat "$ACTION_PATH/result.schema.json")" \
+          --tools Read,Grep,Glob \
+          --allowedTools Read,Grep,Glob \
+          --disallowedTools Bash,Edit,Write,WebFetch,WebSearch,NotebookEdit,Task \
+          --add-dir "$out" \
+          > "$out/claude.json" || status=$?
+
+        jq -n --arg head_sha "$HEAD_SHA" --arg nonce "$NONCE" --rawfile raw "$out/claude.json" \
+          '{head_sha: $head_sha, nonce: $nonce,
+            claude: ($raw | try fromjson catch {is_error: true, result: "claude produced no JSON output"})}' \
+          > "$out/result.json"
+        exit "$status"
+
+    - name: Upload result
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: docs-agent-result
+        path: ${{ runner.temp }}/docs-agent/result.json
+        if-no-files-found: ignore

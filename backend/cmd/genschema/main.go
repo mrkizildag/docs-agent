@@ -1,5 +1,5 @@
-// Command genschema writes the JSON Schema for review.Proposal to the path
-// given as its single argument.
+// Command genschema writes the JSON Schemas for review.Proposal and
+// review.StructuredOutput to the two paths given as its arguments.
 package main
 
 import (
@@ -17,17 +17,26 @@ func main() {
 }
 
 func run(args []string) error {
-	if len(args) != 2 {
-		return fmt.Errorf("usage: %s <output-path>", args[0])
+	if len(args) != 3 {
+		return fmt.Errorf("usage: %s <proposal-schema-path> <result-schema-path>", args[0])
 	}
 
-	schema, err := review.ProposalSchema()
-	if err != nil {
-		return fmt.Errorf("generate proposal schema: %w", err)
+	outputs := []struct {
+		name     string
+		generate func() ([]byte, error)
+		path     string
+	}{
+		{"proposal", review.ProposalSchema, args[1]},
+		{"result", review.ResultSchema, args[2]},
 	}
-
-	if err := os.WriteFile(args[1], schema, 0o600); err != nil { //nolint:gosec // the path is the developer's own argument
-		return fmt.Errorf("write schema to %s: %w", args[1], err)
+	for _, o := range outputs {
+		schema, err := o.generate()
+		if err != nil {
+			return fmt.Errorf("generate %s schema: %w", o.name, err)
+		}
+		if err := os.WriteFile(o.path, schema, 0o600); err != nil { //nolint:gosec // the path is the developer's own argument
+			return fmt.Errorf("write schema to %s: %w", o.path, err)
+		}
 	}
 	return nil
 }

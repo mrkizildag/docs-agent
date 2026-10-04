@@ -17,9 +17,14 @@ import (
 	"github.com/mrkizildag/docs-agent/backend/internal/github"
 	"github.com/mrkizildag/docs-agent/backend/internal/httpapi"
 	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/docs-agent/backend/internal/review/actions"
 )
 
-const maxParallelJobs = 8
+const (
+	maxParallelJobs    = 8
+	actionsRunTimeout  = 10 * time.Minute
+	deadlineSweepEvery = 30 * time.Second
+)
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -53,7 +58,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create GitHub client: %w", err)
 	}
-	gateSvc := gate.NewService(ghClient, store, gate.Runners{})
+	gateSvc := gate.NewService(ghClient, store, gate.Runners{Actions: actions.New(ghClient, actionsRunTimeout)})
 
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, maxParallelJobs)
 	workerCtx, cancelWorker := context.WithCancel(context.WithoutCancel(ctx))
@@ -64,9 +69,20 @@ func run(ctx context.Context) error {
 		workerErr <- worker.Run(workerCtx)
 	}()
 
+	sweepCtx, cancelSweep := context.WithCancel(context.WithoutCancel(ctx))
+	sweepDone := make(chan struct{})
+	go func() {
+		defer close(sweepDone)
+		sweepDeadlines(sweepCtx, store, worker, logger)
+	}()
+	defer func() {
+		cancelSweep()
+		<-sweepDone
+	}()
+
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpapi.NewHandler(logger, []byte(cfg.WebhookSecret.Reveal()), worker),
+		Handler:           httpapi.NewHandler(logger, []byte(cfg.WebhookSecret.Reveal()), worker, store),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -106,6 +122,22 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("run worker: %w", err)
 	}
 	return nil
+}
+
+// sweepDeadlines enqueues deadline jobs for overdue runs until ctx is done.
+func sweepDeadlines(ctx context.Context, src httpapi.OverdueSource, jobs httpapi.Enqueuer, logger *slog.Logger) {
+	ticker := time.NewTicker(deadlineSweepEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			if err := httpapi.EnqueueDeadlineJobs(ctx, src, jobs, now); err != nil {
+				logger.Error("sweep deadlines", "err", err)
+			}
+		}
+	}
 }
 
 func shutdownServer(ctx context.Context, srv *http.Server) error {

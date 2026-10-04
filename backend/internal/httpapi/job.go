@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/mrkizildag/docs-agent/backend/internal/gate"
 	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
@@ -13,9 +14,46 @@ import (
 // payload. webhookHandler encodes jobs with this kind; HandleJob decodes them.
 const pullRequestJobKind = "pull_request"
 
+// workflowRunJobKind identifies durable jobs carrying a gate.RunCompleted payload.
+const workflowRunJobKind = "workflow_run"
+
+// runDeadlineJobKind identifies durable jobs carrying a gate.OverdueRun payload.
+const runDeadlineJobKind = "run_deadline"
+
+// OverdueSource lists the awaited analysis runs that are past their deadline.
+type OverdueSource interface {
+	OverdueRuns(ctx context.Context, now time.Time) ([]gate.OverdueRun, error)
+}
+
+// EnqueueDeadlineJobs enqueues one deadline job per overdue run. Jobs dedupe
+// by nonce, so sweeping again before the job finishes adds nothing.
+func EnqueueDeadlineJobs(ctx context.Context, src OverdueSource, jobs Enqueuer, now time.Time) error {
+	overdue, err := src.OverdueRuns(ctx, now)
+	if err != nil {
+		return fmt.Errorf("enqueue deadline jobs: %w", err)
+	}
+	for _, run := range overdue {
+		payload, err := json.Marshal(run)
+		if err != nil {
+			return fmt.Errorf("encode deadline job payload for %s/%s#%d: %w", run.Owner, run.Repo, run.Number, err)
+		}
+		if _, err := jobs.Enqueue(ctx, jobqueue.NewJob{
+			DeliveryID: "deadline:" + run.Nonce,
+			Key:        fmt.Sprintf("%s/%s#%d", run.Owner, run.Repo, run.Number),
+			Kind:       runDeadlineJobKind,
+			Payload:    payload,
+		}); err != nil {
+			return fmt.Errorf("enqueue deadline job for %s/%s#%d: %w", run.Owner, run.Repo, run.Number, err)
+		}
+	}
+	return nil
+}
+
 // PullRequestHandler reports the docs-agent check run for a pull request.
 type PullRequestHandler interface {
 	HandlePullRequest(ctx context.Context, pr gate.PullRequest) error
+	HandleRunCompleted(ctx context.Context, rc gate.RunCompleted) error
+	HandleDeadline(ctx context.Context, ref gate.PRRef, nonce string, now time.Time) error
 }
 
 // HandleJob decodes a durable job's payload by its Kind and dispatches it to prs.
@@ -29,6 +67,24 @@ func HandleJob(prs PullRequestHandler) jobqueue.Handler {
 			}
 			if err := prs.HandlePullRequest(ctx, pr); err != nil {
 				return fmt.Errorf("handle pull request job %d: %w", job.ID, err)
+			}
+			return nil
+		case workflowRunJobKind:
+			var rc gate.RunCompleted
+			if err := json.Unmarshal(job.Payload, &rc); err != nil {
+				return fmt.Errorf("decode job %d payload (kind %s): %w", job.ID, job.Kind, err)
+			}
+			if err := prs.HandleRunCompleted(ctx, rc); err != nil {
+				return fmt.Errorf("handle workflow run job %d: %w", job.ID, err)
+			}
+			return nil
+		case runDeadlineJobKind:
+			var run gate.OverdueRun
+			if err := json.Unmarshal(job.Payload, &run); err != nil {
+				return fmt.Errorf("decode job %d payload (kind %s): %w", job.ID, job.Kind, err)
+			}
+			if err := prs.HandleDeadline(ctx, run.PRRef, run.Nonce, time.Now()); err != nil {
+				return fmt.Errorf("handle deadline job %d: %w", job.ID, err)
 			}
 			return nil
 		default:

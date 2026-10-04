@@ -14,11 +14,43 @@ type Runner interface {
 	Start(ctx context.Context, req Request) (Started, error)
 }
 
+// AsyncRunner is a Runner whose Start may return Pending; Collect produces
+// the Result once the external run completes.
+type AsyncRunner interface {
+	Runner
+	// Collect returns *InvalidResultError when the run finished but its output
+	// is unusable; any other error is transient and may be retried.
+	Collect(ctx context.Context, c Completion) (Result, error)
+}
+
+// Completion identifies a finished external run and what it was started for.
+type Completion struct {
+	InstallationID int64
+	Owner          string
+	Repo           string
+	Number         int
+	HeadSHA        string
+	RunID          int64
+	Nonce          string
+}
+
+// InvalidResultError means an external run finished with output that cannot
+// be turned into a Result.
+type InvalidResultError struct {
+	Cause error
+}
+
+func (e *InvalidResultError) Error() string { return "invalid analysis result: " + e.Cause.Error() }
+
+func (e *InvalidResultError) Unwrap() error { return e.Cause }
+
 // Started is Pending or Result.
 type Started interface{ isStarted() }
 
-// Pending means the analysis runs elsewhere; its Result must arrive before Deadline.
+// Pending means the analysis runs elsewhere as run RunID; its Result must
+// arrive before Deadline.
 type Pending struct {
+	RunID    int64
 	Nonce    string
 	Deadline time.Time
 }

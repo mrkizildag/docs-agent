@@ -31,14 +31,18 @@ func (f *blockingGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string)
 	return false, nil
 }
 
-func (f *blockingGitHub) CreateCheckRun(ctx context.Context, _ int64, _, _ string, run gate.CheckRun) error {
+func (f *blockingGitHub) CreateCheckRun(ctx context.Context, _ int64, _, _ string, run gate.CheckRun) (int64, error) {
 	f.started <- run.HeadSHA
 	if run.HeadSHA == f.blockSHA {
 		<-ctx.Done()
 		f.cancelled <- run.HeadSHA
-		return fmt.Errorf("create check run: %w", context.Cause(ctx))
+		return 0, fmt.Errorf("create check run: %w", context.Cause(ctx))
 	}
 	f.created <- run.HeadSHA
+	return 1, nil
+}
+
+func (f *blockingGitHub) UpdateCheckRun(_ context.Context, _ int64, _, _ string, _ int64, _ gate.CheckRun) error {
 	return nil
 }
 
@@ -120,15 +124,19 @@ func (f *failThenSucceedGitHub) WorkflowExists(_ context.Context, _ int64, _, _ 
 	return false, nil
 }
 
-func (f *failThenSucceedGitHub) CreateCheckRun(_ context.Context, _ int64, _, _ string, run gate.CheckRun) error {
+func (f *failThenSucceedGitHub) CreateCheckRun(_ context.Context, _ int64, _, _ string, run gate.CheckRun) (int64, error) {
 	f.calls <- run.HeadSHA
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.failed[run.HeadSHA] {
 		f.failed[run.HeadSHA] = true
-		return fmt.Errorf("create check run: boom")
+		return 0, fmt.Errorf("create check run: boom")
 	}
+	return 1, nil
+}
+
+func (f *failThenSucceedGitHub) UpdateCheckRun(_ context.Context, _ int64, _, _ string, _ int64, _ gate.CheckRun) error {
 	return nil
 }
 
@@ -143,7 +151,7 @@ func TestWebhookRedeliveryAfterFailedJobEnqueuesNewJob(t *testing.T) {
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, store, gate.Runners{})), slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	t.Cleanup(func() { _ = stop() })
-	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker)
+	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store)
 
 	body := prBody(t, "opened", 1, "sha1")
 	if code := postSigned(t, h, secret, "d1", body); code != http.StatusAccepted {
@@ -189,7 +197,7 @@ func TestWebhookSecondSynchronizeCancelsFirst(t *testing.T) {
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, store, gate.Runners{})), slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	t.Cleanup(func() { _ = stop() })
-	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker)
+	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store)
 
 	if code := postSigned(t, h, secret, "d1", prBody(t, "synchronize", 1, "sha1")); code != http.StatusAccepted {
 		t.Fatalf("first synchronize = %d, want 202", code)
@@ -220,7 +228,7 @@ func TestWebhookPendingJobRunsAfterRestartAndDuplicateStaysNoOp(t *testing.T) {
 	store1 := openStore(t, path)
 	gh1 := newBlockingGitHub("")
 	worker1 := jobqueue.NewWorker(store1, httpapi.HandleJob(gate.NewService(gh1, store1, gate.Runners{})), logger, 8)
-	h1 := httpapi.NewHandler(logger, secret, worker1)
+	h1 := httpapi.NewHandler(logger, secret, worker1, store1)
 	if code := postSigned(t, h1, secret, "d1", prBody(t, "opened", 1, "sha1")); code != http.StatusAccepted {
 		t.Fatalf("POST = %d, want 202", code)
 	}
@@ -240,7 +248,7 @@ func TestWebhookPendingJobRunsAfterRestartAndDuplicateStaysNoOp(t *testing.T) {
 	}
 
 	// The same delivery redelivered after restart is still a no-op.
-	h2 := httpapi.NewHandler(logger, secret, worker2)
+	h2 := httpapi.NewHandler(logger, secret, worker2, store2)
 	if code := postSigned(t, h2, secret, "d1", prBody(t, "opened", 1, "sha1")); code != http.StatusAccepted {
 		t.Fatalf("duplicate POST = %d, want 202", code)
 	}
@@ -254,5 +262,48 @@ func TestWebhookPendingJobRunsAfterRestartAndDuplicateStaysNoOp(t *testing.T) {
 	case extra := <-gh2.created:
 		t.Errorf("duplicate delivery produced a check run for %q", extra)
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+type countingEnqueuer struct {
+	next     httpapi.Enqueuer
+	enqueued int
+}
+
+func (c *countingEnqueuer) Enqueue(ctx context.Context, job jobqueue.NewJob) (bool, error) {
+	ok, err := c.next.Enqueue(ctx, job)
+	if ok {
+		c.enqueued++
+	}
+	if err != nil {
+		return ok, fmt.Errorf("enqueue %s: %w", job.DeliveryID, err)
+	}
+	return ok, nil
+}
+
+func TestEnqueueDeadlineJobsIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	store := openStore(t, filepath.Join(t.TempDir(), "db"))
+	t.Cleanup(func() { _ = store.Close() })
+	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	state := gate.PRState{
+		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1", CheckRunID: 5,
+		Run: &gate.AwaitingRun{RunID: 9, Nonce: "n1", Deadline: deadline},
+	}
+	if err := store.SavePR(t.Context(), state); err != nil {
+		t.Fatalf("SavePR() = %v", err)
+	}
+
+	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(&blockingGitHub{}, store, gate.Runners{})), slog.New(slog.DiscardHandler), 1)
+	jobs := &countingEnqueuer{next: worker}
+
+	for _, now := range []time.Time{deadline.Add(-time.Second), deadline.Add(time.Second), deadline.Add(time.Minute)} {
+		if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, jobs, now); err != nil {
+			t.Fatalf("EnqueueDeadlineJobs(%v) = %v", now, err)
+		}
+	}
+	if jobs.enqueued != 1 {
+		t.Errorf("deadline jobs enqueued = %d, want 1 across a not-yet-due sweep and two overdue sweeps", jobs.enqueued)
 	}
 }
