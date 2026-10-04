@@ -4,37 +4,38 @@
 package llmrunner
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"io/fs"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/mrkizildag/docs-agent/backend/internal/agent"
+	"github.com/mrkizildag/docs-agent/backend/internal/docs"
 	"github.com/mrkizildag/docs-agent/backend/internal/llm"
 	"github.com/mrkizildag/docs-agent/backend/internal/review"
 )
 
 const runnerName = "llmrunner"
 
-// Caps on one analysis run: thinnest-path placeholders, narrowed once the
-// spike (#11) reports real step and token counts on a free-tier model.
+// Caps on one analysis run, sized from measured runs on the Gemini free tier
+// (1-3 steps, at most 46k tokens).
 const (
-	stepCap         = 25
-	tokenBudget     = 200_000
+	stepCap         = 12
+	tokenBudget     = 120_000
 	analysisTimeout = 150 * time.Second
+
+	// maxCandidateDocs bounds the triage calls one PR can trigger.
+	maxCandidateDocs = 10
 )
 
 // Runner implements review.Runner by triaging candidate docs with a small
 // model and drafting proposals with an agent loop.
 type Runner struct {
 	m           llm.Model
-	token       func(ctx context.Context, installationID int64) (string, error)
+	token       func(ctx context.Context, installationID int64, repo string) (string, error)
 	triageModel string
 	model       string
 
@@ -48,15 +49,15 @@ var _ review.Runner = (*Runner)(nil)
 
 // New returns a Runner that triages with triageModel, drafts with model, both
 // served by m, and authenticates clones with a token from token.
-func New(m llm.Model, token func(ctx context.Context, installationID int64) (string, error), triageModel, model string) *Runner {
+func New(m llm.Model, token func(ctx context.Context, installationID int64, repo string) (string, error), triageModel, model string) *Runner {
 	return &Runner{m: m, token: token, triageModel: triageModel, model: model, timeout: analysisTimeout, budget: tokenBudget}
 }
 
 // Start implements review.Runner. Errors from a hit limit satisfy
 // errors.Is with agent.ErrStepLimit, agent.ErrTokenBudget or agent.ErrDeadline.
 func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started, error) {
-	if len(req.CandidateDocs) == 0 {
-		return r.noImpact("no candidate docs"), nil
+	if len(req.ChangedFiles) == 0 {
+		return r.noImpact("no changed files"), nil
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
@@ -78,7 +79,7 @@ func (r *Runner) noImpact(reason string) review.Result {
 }
 
 func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result, error) {
-	token, err := r.token(ctx, req.InstallationID)
+	token, err := r.token(ctx, req.InstallationID, req.Repo)
 	if err != nil {
 		return review.Result{}, fmt.Errorf("get installation token: %w", err)
 	}
@@ -102,19 +103,46 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	}
 	defer func() { _ = root.Close() }()
 
+	tree, err := docs.Parse(root.FS())
+	if err != nil {
+		return review.Result{}, fmt.Errorf("parse docs of %s: %w", req.HeadSHA, err)
+	}
+	changed := make([]string, 0, len(req.ChangedFiles))
+	for _, f := range req.ChangedFiles {
+		changed = append(changed, f.Path)
+		if f.PreviousPath != "" {
+			changed = append(changed, f.PreviousPath)
+		}
+	}
+	candidates := tree.Match(changed)
+	if len(candidates) == 0 {
+		return r.noImpact("no doc covers the changed files"), nil
+	}
+	if len(candidates) > maxCandidateDocs {
+		return review.Result{}, fmt.Errorf("%d candidate docs exceed the cap of %d", len(candidates), maxCandidateDocs)
+	}
+
+	index := make(docIndex, len(tree.Docs))
+	for _, d := range tree.Docs {
+		index[d.Path] = d
+	}
+	fence, err := newFence()
+	if err != nil {
+		return review.Result{}, err
+	}
 	budget := agent.NewBudget(r.budget)
 	patch := combinedPatch(req.ChangedFiles)
 
 	var impacted, reasons []string
-	for _, docPath := range req.CandidateDocs {
-		v, err := r.triage(ctx, root, budget, docPath, patch)
+	for _, docPath := range candidates {
+		isImpacted, why, err := r.triage(ctx, index, budget, fence, docPath, patch)
 		if err != nil {
 			return review.Result{}, fmt.Errorf("triage %s: %w", docPath, err)
 		}
-		if v.Impacted {
+		if isImpacted {
 			impacted = append(impacted, docPath)
 		} else {
-			reasons = append(reasons, docPath+": "+v.Reason)
+			reasons = append(reasons, docPath+": "+why)
 		}
 	}
 
@@ -122,7 +150,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		return r.noImpact(oneLine("no candidate doc is affected: "+strings.Join(reasons, "; "), maxReasonLen)), nil
 	}
 
-	proposals, err := r.draft(ctx, root, budget, req, impacted, patch)
+	proposals, err := r.draft(ctx, root, index, budget, fence, req, impacted, patch)
 	if err != nil {
 		return review.Result{}, err
 	}
@@ -133,14 +161,14 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	var kept []review.Proposal
 	var rejected []string
 	for _, p := range proposals {
-		v, err := r.verify(ctx, root, budget, p, patch)
+		supported, why, err := r.verify(ctx, index, budget, fence, p, patch)
 		if err != nil {
 			return review.Result{}, fmt.Errorf("verify proposal %s: %w", p.DocPath, err)
 		}
-		if v.Supported {
+		if supported {
 			kept = append(kept, p)
 		} else {
-			rejected = append(rejected, p.DocPath+": "+v.Reason)
+			rejected = append(rejected, p.DocPath+": "+why)
 		}
 	}
 	if len(kept) == 0 {
@@ -161,13 +189,18 @@ func oneLine(s string, max int) string {
 	return s
 }
 
+// docIndex maps a repo-relative doc path to its parsed doc at the head commit.
+type docIndex map[string]docs.Doc
+
+// The verdict flags are pointers so a reply that omits them is an error, not
+// a silent "no".
 type triageVerdict struct {
-	Impacted bool   `json:"impacted"`
+	Impacted *bool  `json:"impacted"`
 	Reason   string `json:"reason"`
 }
 
 type verifyVerdict struct {
-	Supported bool   `json:"supported"`
+	Supported *bool  `json:"supported"`
 	Reason    string `json:"reason"`
 }
 
@@ -178,99 +211,106 @@ func decodeVerdict(reply string, v any) error {
 	if start < 0 {
 		return fmt.Errorf("decode verdict from reply %q: no JSON object", oneLine(reply, 200))
 	}
-	if err := json.NewDecoder(bytes.NewReader([]byte(reply[start:]))).Decode(v); err != nil {
+	if err := json.NewDecoder(strings.NewReader(reply[start:])).Decode(v); err != nil {
 		return fmt.Errorf("decode verdict from reply %q: %w", oneLine(reply, 200), err)
 	}
 	return nil
 }
 
 // ask sends one tool-less prompt to model, charges its usage to budget, and
-// decodes the JSON verdict in the reply into v.
-func (r *Runner) ask(ctx context.Context, budget *agent.Budget, model, system, prompt string, v any) error {
+// decodes the JSON verdict in the reply into v. It returns the reply text for
+// error messages.
+func (r *Runner) ask(ctx context.Context, budget *agent.Budget, model, system, prompt string, v any) (string, error) {
 	resp, err := r.m.Complete(ctx, llm.Request{
 		Model:    model,
 		System:   system,
 		Messages: []llm.Message{{Role: llm.RoleUser, Text: prompt}},
 	})
 	if err != nil {
-		return fmt.Errorf("complete: %w", err)
+		return "", fmt.Errorf("complete: %w", err)
 	}
 	if err := budget.Charge(resp.Usage); err != nil {
-		return fmt.Errorf("charge token budget: %w", err)
+		return "", fmt.Errorf("charge token budget: %w", err)
 	}
-	return decodeVerdict(resp.Text, v)
+	return resp.Text, decodeVerdict(resp.Text, v)
 }
 
 // triage runs one small-model call for docPath, returning whether the PR's
-// diff makes it stale.
-func (r *Runner) triage(ctx context.Context, root *os.Root, budget *agent.Budget, docPath, patch string) (triageVerdict, error) {
-	content, err := readDoc(root, docPath)
-	if err != nil {
-		return triageVerdict{}, fmt.Errorf("read doc %s: %w", docPath, err)
-	}
-
+// diff makes it stale and why.
+func (r *Runner) triage(ctx context.Context, index docIndex, budget *agent.Budget, f fence, docPath, patch string) (impacted bool, reason string, err error) {
 	var v triageVerdict
-	if err := r.ask(ctx, budget, r.triageModel, triageSystemPrompt, triageUserPrompt(docPath, content, patch), &v); err != nil {
-		return triageVerdict{}, err
+	reply, err := r.ask(ctx, budget, r.triageModel, triageSystemPrompt, triageUserPrompt(f, index[docPath], patch), &v)
+	if err != nil {
+		return false, "", err
 	}
-	return v, nil
+	if v.Impacted == nil {
+		return false, "", fmt.Errorf("triage verdict has no \"impacted\" field in reply %q", oneLine(reply, 200))
+	}
+	return *v.Impacted, v.Reason, nil
 }
 
 // verify asks the triage model whether p is supported by the patch, given the
 // doc section p replaces.
-func (r *Runner) verify(ctx context.Context, root *os.Root, budget *agent.Budget, p review.Proposal, patch string) (verifyVerdict, error) {
+func (r *Runner) verify(ctx context.Context, index docIndex, budget *agent.Budget, f fence, p review.Proposal, patch string) (supported bool, reason string, err error) {
 	section := "(new doc)"
 	if p.Section != "" {
-		content, err := readDoc(root, p.DocPath)
-		switch {
-		case errors.Is(err, fs.ErrNotExist):
+		doc, ok := index[p.DocPath]
+		if ok {
+			text, _, found := lookupSection(doc, p.Section)
+			if !found {
+				text = string(doc.Source)
+			}
+			section = text
+		} else {
 			section = "(doc does not exist)"
-		case err != nil:
-			return verifyVerdict{}, fmt.Errorf("read doc %s: %w", p.DocPath, err)
-		default:
-			section = docSection(content, p.Section)
 		}
 	}
 
 	var v verifyVerdict
-	if err := r.ask(ctx, budget, r.triageModel, verifySystemPrompt, verifyUserPrompt(p, section, patch), &v); err != nil {
-		return verifyVerdict{}, err
+	reply, err := r.ask(ctx, budget, r.triageModel, verifySystemPrompt, verifyUserPrompt(f, p, section, patch), &v)
+	if err != nil {
+		return false, "", err
 	}
-	return v, nil
+	if v.Supported == nil {
+		return false, "", fmt.Errorf("verify verdict has no \"supported\" field in reply %q", oneLine(reply, 200))
+	}
+	return *v.Supported, v.Reason, nil
 }
 
-// docSection returns the markdown section under the heading titled heading,
-// up to the next heading of the same or a higher level, or the whole doc if
-// no heading matches.
-func docSection(content, heading string) string {
-	lines := strings.Split(content, "\n")
-	level := 0
-	start := -1
-	for i, line := range lines {
-		l, title := headingOf(line)
-		if start < 0 {
-			if l > 0 && title == strings.TrimSpace(strings.TrimLeft(heading, "#")) {
-				start, level = i, l
-			}
+// normalizeSection strips leading '#'s and surrounding spaces from a section
+// heading as models write it.
+func normalizeSection(section string) string {
+	return strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(section), "#"))
+}
+
+// lookupSection returns the markdown under the heading titled heading. When
+// none matches it returns the quoted headings of the doc instead.
+func lookupSection(doc docs.Doc, heading string) (text string, headings []string, found bool) {
+	want := normalizeSection(heading)
+	for _, s := range doc.Sections {
+		if s.Level == 0 {
 			continue
 		}
-		if l > 0 && l <= level {
-			return strings.Join(lines[start:i], "\n")
+		if s.Heading == want {
+			return string(doc.Source[s.Start:s.End]), nil, true
 		}
+		headings = append(headings, fmt.Sprintf("%q", s.Heading))
 	}
-	if start < 0 {
-		return content
-	}
-	return strings.Join(lines[start:], "\n")
+	return "", headings, false
 }
 
-func headingOf(line string) (int, string) {
-	trimmed := strings.TrimLeft(line, "#")
-	level := len(line) - len(trimmed)
-	if level == 0 || level > 6 || !strings.HasPrefix(trimmed, " ") {
-		return 0, ""
+// checkSection reports an error listing the doc's headings when section names
+// none of them. A doc missing at the head commit has no headings to check.
+func checkSection(index docIndex, docPath, section string) error {
+	doc, ok := index[docPath]
+	if !ok {
+		return nil
 	}
-	return level, strings.TrimSpace(trimmed)
+	_, headings, found := lookupSection(doc, section)
+	if found {
+		return nil
+	}
+	return fmt.Errorf("section %q: no such heading in %s; headings are: %s", section, docPath, strings.Join(headings, ", "))
 }
 
 // submitProposalsArgs is the argument shape of the submit_proposals finishing
@@ -281,21 +321,21 @@ type submitProposalsArgs struct {
 }
 
 // draft runs the agent loop that drafts proposals for the impacted docs.
-func (r *Runner) draft(ctx context.Context, root *os.Root, budget *agent.Budget, req review.Request, impacted []string, patch string) ([]review.Proposal, error) {
+func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budget *agent.Budget, f fence, req review.Request, impacted []string, patch string) ([]review.Proposal, error) {
 	finish, err := submitProposalsTool()
 	if err != nil {
 		return nil, err
 	}
 
-	docsContent, err := readDocs(root, impacted)
-	if err != nil {
-		return nil, fmt.Errorf("read impacted docs: %w", err)
+	impactedDocs := make([]docs.Doc, len(impacted))
+	for i, p := range impacted {
+		impactedDocs[i] = index[p]
 	}
 
 	task := agent.Task{
 		Model:  r.model,
 		System: draftSystemPrompt,
-		Prompt: draftUserPrompt(impacted, docsContent, patch),
+		Prompt: draftUserPrompt(f, impactedDocs, req.ChangedFiles, patch),
 		Root:   root,
 		Finish: finish,
 		Accept: func(args json.RawMessage) error {
@@ -305,6 +345,12 @@ func (r *Runner) draft(ctx context.Context, root *os.Root, budget *agent.Budget,
 			}
 			for _, p := range parsed.Proposals {
 				if err := p.Validate(req.ChangedFiles); err != nil {
+					return fmt.Errorf("proposal %s: %w", p.DocPath, err)
+				}
+				if p.Section == "" {
+					continue
+				}
+				if err := checkSection(index, p.DocPath, normalizeSection(p.Section)); err != nil {
 					return fmt.Errorf("proposal %s: %w", p.DocPath, err)
 				}
 			}
@@ -323,6 +369,9 @@ func (r *Runner) draft(ctx context.Context, root *os.Root, budget *agent.Budget,
 		return nil, fmt.Errorf("decode accepted submit_proposals arguments: %w", err)
 	}
 
+	for i := range parsed.Proposals {
+		parsed.Proposals[i].Section = normalizeSection(parsed.Proposals[i].Section)
+	}
 	return parsed.Proposals, nil
 }
 
@@ -355,30 +404,4 @@ func submitProposalsTool() (llm.Tool, error) {
 		Description: "Submit the final list of doc proposals for this PR. An empty list means no doc needs to change.",
 		Schema:      schema,
 	}, nil
-}
-
-func readDoc(root *os.Root, docPath string) (string, error) {
-	f, err := root.Open(docPath)
-	if err != nil {
-		return "", fmt.Errorf("open %s: %w", docPath, err)
-	}
-	defer func() { _ = f.Close() }()
-
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return "", fmt.Errorf("read %s: %w", docPath, err)
-	}
-	return string(data), nil
-}
-
-func readDocs(root *os.Root, paths []string) (string, error) {
-	var b strings.Builder
-	for _, p := range paths {
-		content, err := readDoc(root, p)
-		if err != nil {
-			return "", fmt.Errorf("read doc %s: %w", p, err)
-		}
-		fmt.Fprintf(&b, "## %s\n\n%s\n\n", p, content)
-	}
-	return b.String(), nil
 }

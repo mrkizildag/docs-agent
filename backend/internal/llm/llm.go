@@ -4,8 +4,12 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
 )
 
 // Role is who sent a Message.
@@ -52,6 +56,8 @@ type ToolCall struct {
 	ID   string
 	Name string
 	Args json.RawMessage
+	// Extra is provider data echoed back verbatim on the next turn.
+	Extra json.RawMessage
 }
 
 // ToolResult is what running a ToolCall produced.
@@ -72,4 +78,52 @@ type Response struct {
 type Usage struct {
 	InputTokens  int
 	OutputTokens int
+}
+
+const maxResponseBytes = 8 << 20
+
+// postJSON POSTs body as JSON to url with headers and returns the response
+// body of any 2xx reply. A non-2xx status or a body over maxResponseBytes is
+// an error.
+func postJSON(ctx context.Context, hc *http.Client, url string, headers map[string]string, body any) ([]byte, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		httpReq.Header.Set(k, v)
+	}
+
+	resp, err := hc.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("send request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if len(respBody) > maxResponseBytes {
+		return nil, fmt.Errorf("response exceeds %d bytes", maxResponseBytes)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, truncate(respBody))
+	}
+	return respBody, nil
+}
+
+func truncate(b []byte) string {
+	const max = 200
+	if len(b) <= max {
+		return string(b)
+	}
+	return string(b[:max]) + "..."
 }

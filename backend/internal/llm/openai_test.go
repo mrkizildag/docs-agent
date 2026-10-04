@@ -111,3 +111,96 @@ func TestOpenAIComplete_RejectsMissingChoices(t *testing.T) {
 		t.Fatal("Complete() = nil error, want error for a response without choices")
 	}
 }
+
+func TestOpenAIComplete_GeminiQuirks(t *testing.T) {
+	t.Parallel()
+
+	const extra = `{"google":{"thought_signature":"sig=="}}`
+	responses := []string{
+		`{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","extra_content":` + extra + `,"function":{"name":"read_file","arguments":"{}"}},{"id":"c2","type":"function","function":{"name":"read_file","arguments":"{}"}}]}}],
+			"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":40}}`,
+		`{"choices":[{"finish_reason":"function_call_filter: MALFORMED_FUNCTION_CALL","message":{"role":"assistant"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`,
+	}
+	var bodies []json.RawMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var raw json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		bodies = append(bodies, raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, responses[len(bodies)-1])
+	}))
+	t.Cleanup(srv.Close)
+
+	model := llm.NewOpenAI(&http.Client{Timeout: 5 * time.Second}, srv.URL, "k")
+	first, err := model.Complete(t.Context(), llm.Request{Model: "m"})
+	if err != nil {
+		t.Fatalf("first Complete: %v", err)
+	}
+	if first.Usage.OutputTokens != 30 {
+		t.Errorf("OutputTokens = %d, want 30 (total - prompt)", first.Usage.OutputTokens)
+	}
+	if string(first.ToolCalls[0].Extra) != extra {
+		t.Errorf("Extra = %s, want %s", first.ToolCalls[0].Extra, extra)
+	}
+	if first.ToolCalls[1].Extra != nil {
+		t.Errorf("absent extra_content decoded as %s, want nil", first.ToolCalls[1].Extra)
+	}
+
+	second, err := model.Complete(t.Context(), llm.Request{
+		Model:    "m",
+		Messages: []llm.Message{{Role: llm.RoleAssistant, ToolCalls: first.ToolCalls}},
+	})
+	if err != nil {
+		t.Fatalf("second Complete: %v", err)
+	}
+	var sent struct {
+		Messages []struct {
+			ToolCalls []map[string]json.RawMessage `json:"tool_calls"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(bodies[1], &sent); err != nil {
+		t.Fatalf("unmarshal sent body: %v", err)
+	}
+	calls := sent.Messages[0].ToolCalls
+	if got := string(calls[0]["extra_content"]); got != extra {
+		t.Errorf("echoed extra_content = %s, want %s", got, extra)
+	}
+	if _, ok := calls[1]["extra_content"]; ok {
+		t.Error("extra_content present on call without it")
+	}
+
+	if second.Text != "" || len(second.ToolCalls) != 0 {
+		t.Errorf("malformed-call response = %+v, want empty", second)
+	}
+}
+
+func TestOpenAIComplete_EmptyToolResultKeepsContent(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var raw struct {
+			Messages []map[string]json.RawMessage `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		if c, ok := raw.Messages[0]["content"]; ok {
+			got = string(c)
+		} else {
+			got = "<missing>"
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer srv.Close()
+
+	// Trailing slash must be tolerated.
+	m := llm.NewOpenAI(srv.Client(), srv.URL+"/", "k")
+	_, err := m.Complete(t.Context(), llm.Request{Messages: []llm.Message{
+		{Role: llm.RoleUser, ToolResults: []llm.ToolResult{{CallID: "c1", Content: ""}}},
+	}})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if got != `""` {
+		t.Errorf("tool message content = %s, want \"\"", got)
+	}
+}

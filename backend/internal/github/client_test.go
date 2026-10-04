@@ -168,7 +168,11 @@ func TestInstallationToken(t *testing.T) {
 	t.Parallel()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /app/installations/{id}/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
+	var body map[string]any
+	mux.HandleFunc("POST /app/installations/{id}/access_tokens", func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode access_tokens body: %v", err)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if _, err := fmt.Fprintf(w, `{"token":"ghs_test","expires_at":%q}`, time.Now().Add(time.Hour).Format(time.RFC3339)); err != nil {
 			t.Errorf("write access_tokens response: %v", err)
@@ -183,12 +187,20 @@ func TestInstallationToken(t *testing.T) {
 		t.Fatalf("NewClient() = %v, want nil error", err)
 	}
 
-	token, err := client.InstallationToken(t.Context(), 99)
+	token, err := client.InstallationToken(t.Context(), 99, "r")
 	if err != nil {
 		t.Fatalf("InstallationToken() = %v, want nil error", err)
 	}
 	if token != "ghs_test" {
 		t.Errorf("InstallationToken() = %q, want %q", token, "ghs_test")
+	}
+
+	wantBody := map[string]any{
+		"repositories": []any{"r"},
+		"permissions":  map[string]any{"contents": "read"},
+	}
+	if diff := cmp.Diff(wantBody, body); diff != "" {
+		t.Errorf("access_tokens body (-want +got):\n%s", diff)
 	}
 }
 

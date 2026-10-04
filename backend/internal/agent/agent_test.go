@@ -393,3 +393,61 @@ func TestRun_CancelIsNotErrDeadline(t *testing.T) {
 		}
 	})
 }
+
+func emptyReply(llm.Request) (llm.Response, error) { return llm.Response{}, nil }
+
+func finishReply(llm.Request) (llm.Response, error) {
+	return llm.Response{ToolCalls: []llm.ToolCall{{ID: "1", Name: "submit", Args: json.RawMessage(`{}`)}}}, nil
+}
+
+func emptyReplyTask(t *testing.T) agent.Task {
+	t.Helper()
+	return agent.Task{
+		Model: "m", Prompt: "go", Root: testRoot(t), Finish: finishTool(),
+		Accept:   func(json.RawMessage) error { return nil },
+		MaxSteps: 10,
+	}
+}
+
+func TestRun_ThreeEmptyRepliesIsErrMalformed(t *testing.T) {
+	t.Parallel()
+
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){emptyReply, emptyReply, emptyReply}}
+	_, _, err := agent.Run(t.Context(), model, emptyReplyTask(t), agent.NewBudget(1000))
+	if !errors.Is(err, agent.ErrMalformed) {
+		t.Fatalf("Run() = %v, want ErrMalformed", err)
+	}
+	if !strings.Contains(err.Error(), "3 consecutive") {
+		t.Errorf("Run() = %q, want the count named", err)
+	}
+}
+
+func TestRun_TwoEmptyRepliesThenFinishSucceeds(t *testing.T) {
+	t.Parallel()
+
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){emptyReply, emptyReply, finishReply}}
+	_, stats, err := agent.Run(t.Context(), model, emptyReplyTask(t), agent.NewBudget(1000))
+	if err != nil {
+		t.Fatalf("Run() = %v, want nil error", err)
+	}
+	if stats.Steps != 3 {
+		t.Errorf("stats.Steps = %d, want 3", stats.Steps)
+	}
+}
+
+func TestRun_EmptyReplyAppendsNoEmptyAssistantMessage(t *testing.T) {
+	t.Parallel()
+
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){emptyReply, finishReply}}
+	if _, _, err := agent.Run(t.Context(), model, emptyReplyTask(t), agent.NewBudget(1000)); err != nil {
+		t.Fatalf("Run() = %v, want nil error", err)
+	}
+	for _, m := range model.calls[1].Messages {
+		if m.Role == llm.RoleAssistant {
+			t.Errorf("messages contain assistant message %+v, want none after an empty reply", m)
+		}
+	}
+	if n := len(model.calls[1].Messages); n != 2 {
+		t.Errorf("len(messages) = %d, want prompt and nudge", n)
+	}
+}

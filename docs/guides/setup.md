@@ -34,7 +34,7 @@ Only `backend/internal/config` reads the environment (a lint rule enforces it). 
 | `GITHUB_APP_ID`                | required | The GitHub App's numeric ID.                                    |
 | `GITHUB_APP_PRIVATE_KEY_FILE`  | required | Path to the App's private key `.pem` file. See [github-app.md](github-app.md). |
 | `GITHUB_WEBHOOK_SECRET`        | required | Shared secret used to verify `POST /webhook` signatures.        |
-| `LLM_PROVIDER`                 | optional | `anthropic` or `openai` (any OpenAI-compatible chat completions endpoint: Gemini, GitHub Models, OpenRouter, Ollama). Unset turns the analysis runner off. |
+| `LLM_PROVIDER`                 | optional | `anthropic` or `openai` (any OpenAI-compatible chat completions endpoint: Gemini, OpenRouter, Ollama). Unset turns the analysis runner off. |
 | `LLM_BASE_URL`                 | optional | API base URL. Required for `openai`; optional for `anthropic` (empty uses the adapter's default). |
 | `LLM_API_KEY`                  | optional | Key for the LLM provider. Required for `anthropic`; optional for `openai` (e.g. Ollama has none). |
 | `LLM_MODEL`                    | required when `LLM_PROVIDER` is set | Model used to review docs impact. |
@@ -48,9 +48,10 @@ Without `LLM_PROVIDER` set, the analysis runner is off, and repos without the do
 LLM_PROVIDER=openai
 LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
 LLM_API_KEY=<key from https://aistudio.google.com/apikey>
-LLM_MODEL=<a Gemini model name>
+LLM_MODEL=gemini-3.7-flash
+LLM_TRIAGE_MODEL=gemini-3.5-flash-lite
 ```
 
-The free tier may train on your inputs, so use it only with a sandbox repo.
+The free tier may train on your inputs, so use it only with a sandbox repo. It allows about 20 requests per model per day (roughly five PRs) and often answers 503 under load, so it suits development, not a team. These models were measured on 2026-10-04; see [Server runner](../features/server-runner.md).
 
 See [Registering the GitHub App](github-app.md) for how to get the App ID, private key, and webhook secret.

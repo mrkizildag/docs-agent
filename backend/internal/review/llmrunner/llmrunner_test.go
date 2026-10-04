@@ -72,7 +72,7 @@ func submitResponse(proposals ...any) func(llm.Request) (llm.Response, error) {
 	}
 }
 
-func testRequest(headSHA string, docs ...string) review.Request {
+func testRequest(headSHA string) review.Request {
 	return review.Request{
 		InstallationID: 1,
 		Owner:          "o",
@@ -82,7 +82,6 @@ func testRequest(headSHA string, docs ...string) review.Request {
 		ChangedFiles: []review.ChangedFile{
 			{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 3}}, Patch: "@@ -1,2 +1,3 @@\n func main() {}\n"},
 		},
-		CandidateDocs: docs,
 	}
 }
 
@@ -111,7 +110,7 @@ func newGitRepo(t *testing.T) (string, string) {
 	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0o700); err != nil {
 		t.Fatalf("mkdir docs: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "docs", "x.md"), []byte("# X\n\nold behavior.\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "docs", "x.md"), []byte("---\ntitle: X\nsummary: Describes X.\ncovers:\n  - main.go\n---\n# X\n\nold behavior.\n"), 0o600); err != nil {
 		t.Fatalf("write docs/x.md: %v", err)
 	}
 
@@ -128,7 +127,7 @@ func newGitRepo(t *testing.T) (string, string) {
 	return dir, headSHA
 }
 
-func noToken(context.Context, int64) (string, error) { return "", nil }
+func noToken(context.Context, int64, string) (string, error) { return "", nil }
 
 func TestStart_ImpactedDocProducesProposal(t *testing.T) {
 	t.Parallel()
@@ -178,7 +177,6 @@ func TestStart_ImpactedDocProducesProposal(t *testing.T) {
 		ChangedFiles: []review.ChangedFile{
 			{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 3}}, Patch: "@@ -1,2 +1,3 @@\n func main() {}\n"},
 		},
-		CandidateDocs: []string{"docs/x.md"},
 	}
 
 	started, err := runner.Start(t.Context(), req)
@@ -223,7 +221,6 @@ func TestStart_AllTriageNoIsNoImpact(t *testing.T) {
 		ChangedFiles: []review.ChangedFile{
 			{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 3}}, Patch: "@@ -1,2 +1,3 @@\n func main() {}\n"},
 		},
-		CandidateDocs: []string{"docs/x.md"},
 	}
 
 	started, err := runner.Start(t.Context(), req)
@@ -243,17 +240,42 @@ func TestStart_AllTriageNoIsNoImpact(t *testing.T) {
 	}
 }
 
-func TestStart_NoCandidateDocsSkipsTheModel(t *testing.T) {
+func TestStart_CoveredFileIsTriagedWithItsPatch(t *testing.T) {
 	t.Parallel()
 
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+		triageResponse(false),
+	}}
+
+	if _, _, err := startResult(t, model); err != nil {
+		t.Fatalf("Start() = %v, want nil error", err)
+	}
+	if len(model.calls) != 1 {
+		t.Fatalf("model saw %d calls, want 1 triage call", len(model.calls))
+	}
+	prompt := model.calls[0].Messages[0].Text
+	for _, want := range []string{"docs/x.md", "@@ -1,2 +1,3 @@\n func main() {}\n"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("triage prompt = %q, want it to contain %q", prompt, want)
+		}
+	}
+}
+
+func TestStart_UncoveredFileIsNoImpactWithoutModelCalls(t *testing.T) {
+	t.Parallel()
+
+	repoDir, headSHA := newGitRepo(t)
 	model := &fakeModel{}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner.SetRemote(repoDir)
 
-	started, err := runner.Start(t.Context(), review.Request{Owner: "o", Repo: "r", Number: 1, HeadSHA: "deadbeef"})
+	req := testRequest(headSHA)
+	req.ChangedFiles[0].Path = "other.go"
+
+	started, err := runner.Start(t.Context(), req)
 	if err != nil {
 		t.Fatalf("Start() = %v, want nil error", err)
 	}
-
 	result, ok := started.(review.Result)
 	if !ok {
 		t.Fatalf("Start() = %T, want review.Result", started)
@@ -266,12 +288,34 @@ func TestStart_NoCandidateDocsSkipsTheModel(t *testing.T) {
 	}
 }
 
-func startResult(t *testing.T, model llm.Model, docs ...string) (review.Verdict, *llmrunner.Runner, error) {
+func TestStart_NoChangedFilesIsNoImpactWithoutCloneOrModel(t *testing.T) {
+	t.Parallel()
+
+	model := &fakeModel{}
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+
+	started, err := runner.Start(t.Context(), review.Request{Owner: "o", Repo: "r", Number: 1, HeadSHA: "deadbeef"})
+	if err != nil {
+		t.Fatalf("Start() = %v, want nil error", err)
+	}
+	result, ok := started.(review.Result)
+	if !ok {
+		t.Fatalf("Start() = %T, want review.Result", started)
+	}
+	if _, ok := result.Verdict.(review.NoImpact); !ok {
+		t.Fatalf("Verdict = %T, want review.NoImpact", result.Verdict)
+	}
+	if len(model.calls) != 0 {
+		t.Errorf("model saw %d calls, want 0", len(model.calls))
+	}
+}
+
+func startResult(t *testing.T, model llm.Model) (review.Verdict, *llmrunner.Runner, error) {
 	t.Helper()
 	repoDir, headSHA := newGitRepo(t)
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 	runner.SetRemote(repoDir)
-	started, err := runner.Start(t.Context(), testRequest(headSHA, docs...))
+	started, err := runner.Start(t.Context(), testRequest(headSHA))
 	if err != nil {
 		return nil, runner, fmt.Errorf("start: %w", err)
 	}
@@ -292,7 +336,7 @@ func TestStart_VerificationDropsRejectedProposal(t *testing.T) {
 		verifyResponse(false),
 	}}
 
-	verdict, _, err := startResult(t, model, "docs/x.md")
+	verdict, _, err := startResult(t, model)
 	if err != nil {
 		t.Fatalf("Start() = %v, want nil error", err)
 	}
@@ -311,7 +355,7 @@ func TestStart_VerificationRejectsAllIsNoImpact(t *testing.T) {
 		textResponse(`{"supported": false, "reason": "diff\nunrelated"}`),
 	}}
 
-	verdict, _, err := startResult(t, model, "docs/x.md")
+	verdict, _, err := startResult(t, model)
 	if err != nil {
 		t.Fatalf("Start() = %v, want nil error", err)
 	}
@@ -331,7 +375,7 @@ func TestStart_NoImpactReasonJoinsTriageReasons(t *testing.T) {
 		triageResponse(false),
 	}}
 
-	verdict, _, err := startResult(t, model, "docs/x.md")
+	verdict, _, err := startResult(t, model)
 	if err != nil {
 		t.Fatalf("Start() = %v, want nil error", err)
 	}
@@ -348,7 +392,7 @@ func TestStart_FencedTriageReplyParses(t *testing.T) {
 		textResponse("Sure:\n```json\n{\"impacted\": false, \"reason\": \"fenced\"}\n```\nDone."),
 	}}
 
-	verdict, _, err := startResult(t, model, "docs/x.md")
+	verdict, _, err := startResult(t, model)
 	if err != nil {
 		t.Fatalf("Start() = %v, want nil error", err)
 	}
@@ -365,7 +409,7 @@ func TestStart_UnparseableTriageReplyErrorsWithReply(t *testing.T) {
 		textResponse("I cannot decide."),
 	}}
 
-	_, _, err := startResult(t, model, "docs/x.md")
+	_, _, err := startResult(t, model)
 	if err == nil || !strings.Contains(err.Error(), "I cannot decide.") {
 		t.Fatalf("Start() = %v, want an error quoting the reply", err)
 	}
@@ -387,7 +431,7 @@ func TestStart_InvalidProposalIsReturnedToModel(t *testing.T) {
 		verifyResponse(true),
 	}}
 
-	verdict, _, err := startResult(t, model, "docs/x.md")
+	verdict, _, err := startResult(t, model)
 	if err != nil {
 		t.Fatalf("Start() = %v, want nil error", err)
 	}
@@ -410,7 +454,7 @@ func TestStart_TokenBudgetExceededDuringTriage(t *testing.T) {
 	runner.SetRemote(repoDir)
 	runner.SetTokenBudget(10)
 
-	_, err := runner.Start(t.Context(), testRequest(headSHA, "docs/x.md"))
+	_, err := runner.Start(t.Context(), testRequest(headSHA))
 	if !errors.Is(err, agent.ErrTokenBudget) {
 		t.Fatalf("Start() = %v, want errors.Is agent.ErrTokenBudget", err)
 	}
@@ -431,7 +475,7 @@ func TestStart_DeadlineIsErrDeadline(t *testing.T) {
 	runner.SetRemote(repoDir)
 	runner.SetTimeout(200 * time.Millisecond)
 
-	_, err := runner.Start(t.Context(), testRequest(headSHA, "docs/x.md"))
+	_, err := runner.Start(t.Context(), testRequest(headSHA))
 	if !errors.Is(err, agent.ErrDeadline) {
 		t.Fatalf("Start() = %v, want errors.Is agent.ErrDeadline", err)
 	}
@@ -446,11 +490,183 @@ func TestStart_RejectsHeadSHAThatIsNotAFullObjectID(t *testing.T) {
 	model := &fakeModel{}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 
-	_, err := runner.Start(t.Context(), testRequest("--upload-pack=x", "docs/x.md"))
+	_, err := runner.Start(t.Context(), testRequest("--upload-pack=x"))
 	if err == nil {
 		t.Fatal("Start(head sha \"--upload-pack=x\") = nil error, want an error")
 	}
 	if len(model.calls) != 0 {
 		t.Errorf("model saw %d calls, want 0", len(model.calls))
+	}
+}
+
+func TestStart_SectionWithHashesIsNormalized(t *testing.T) {
+	t.Parallel()
+
+	p := proposalFor("docs/x.md", 2)
+	p["section"] = "## X"
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+		triageResponse(true),
+		submitResponse(p),
+		verifyResponse(true),
+	}}
+
+	verdict, _, err := startResult(t, model)
+	if err != nil {
+		t.Fatalf("Start() = %v, want nil error", err)
+	}
+	if proposals, ok := verdict.(review.Proposals); !ok || len(proposals) != 1 || proposals[0].Section != "X" {
+		t.Fatalf("Verdict = %#v, want one proposal with section \"X\"", verdict)
+	}
+}
+
+func TestStart_UnknownSectionIsReturnedToModelWithHeadings(t *testing.T) {
+	t.Parallel()
+
+	bad := proposalFor("docs/x.md", 2)
+	bad["section"] = "Nope"
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+		triageResponse(true),
+		submitResponse(bad),
+		func(req llm.Request) (llm.Response, error) {
+			last := req.Messages[len(req.Messages)-1]
+			if len(last.ToolResults) != 1 || !last.ToolResults[0].IsError || !strings.Contains(last.ToolResults[0].Content, `"X"`) {
+				t.Errorf("last message = %+v, want an error tool result listing heading \"X\"", last)
+			}
+			return submitResponse(proposalFor("docs/x.md", 2))(req)
+		},
+		verifyResponse(true),
+	}}
+
+	verdict, _, err := startResult(t, model)
+	if err != nil {
+		t.Fatalf("Start() = %v, want nil error", err)
+	}
+	if proposals, ok := verdict.(review.Proposals); !ok || len(proposals) != 1 {
+		t.Fatalf("Verdict = %#v, want the resubmitted proposal", verdict)
+	}
+}
+
+func TestStart_DraftPromptListsHunkRanges(t *testing.T) {
+	t.Parallel()
+
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+		triageResponse(true),
+		submitResponse(),
+	}}
+	if _, _, err := startResult(t, model); err != nil {
+		t.Fatalf("Start() = %v, want nil error", err)
+	}
+	if got := model.calls[1].Messages[0].Text; !strings.Contains(got, "main.go: 1-3") {
+		t.Errorf("draft prompt = %q, want it to contain \"main.go: 1-3\"", got)
+	}
+}
+
+func TestStart_RenameMatchesDocCoveringOnlyOldPath(t *testing.T) {
+	t.Parallel()
+
+	repoDir, headSHA := newGitRepo(t)
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner.SetRemote(repoDir)
+
+	req := testRequest(headSHA)
+	req.ChangedFiles[0].Path = "renamed.go"
+	req.ChangedFiles[0].PreviousPath = "main.go"
+	if _, err := runner.Start(t.Context(), req); err != nil {
+		t.Fatalf("Start() = %v, want nil error", err)
+	}
+	if len(model.calls) != 1 {
+		t.Fatalf("model saw %d calls, want 1 triage call for docs/x.md", len(model.calls))
+	}
+}
+
+func TestStart_TriageReplyWithoutImpactedErrors(t *testing.T) {
+	t.Parallel()
+
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){textResponse(`{"reason": "hmm"}`)}}
+	_, _, err := startResult(t, model)
+	if err == nil || !strings.Contains(err.Error(), "impacted") || !strings.Contains(err.Error(), "hmm") {
+		t.Fatalf("Start() = %v, want an error naming the missing field and quoting the reply", err)
+	}
+}
+
+func TestStart_VerifyReplyWithoutSupportedErrors(t *testing.T) {
+	t.Parallel()
+
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+		triageResponse(true),
+		submitResponse(proposalFor("docs/x.md", 2)),
+		textResponse(`{"reason": "hmm"}`),
+	}}
+	_, _, err := startResult(t, model)
+	if err == nil || !strings.Contains(err.Error(), "supported") || !strings.Contains(err.Error(), "hmm") {
+		t.Fatalf("Start() = %v, want an error naming the missing field and quoting the reply", err)
+	}
+}
+
+func TestStart_PromptsFencePatchAndMarkOmittedPatch(t *testing.T) {
+	t.Parallel()
+
+	repoDir, headSHA := newGitRepo(t)
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner.SetRemote(repoDir)
+
+	req := testRequest(headSHA)
+	req.ChangedFiles = append(req.ChangedFiles, review.ChangedFile{Path: "big.bin"})
+	if _, err := runner.Start(t.Context(), req); err != nil {
+		t.Fatalf("Start() = %v, want nil error", err)
+	}
+	prompt := model.calls[0].Messages[0].Text
+	patchAt := strings.Index(prompt, "func main() {}")
+	open := strings.LastIndex(prompt[:patchAt], "<<<UNTRUSTED-")
+	end := strings.Index(prompt[patchAt:], "<<<END-")
+	if open < 0 || end < 0 {
+		t.Errorf("triage prompt does not fence the patch:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "(patch omitted by GitHub: large or binary file)") {
+		t.Errorf("triage prompt does not mark the omitted patch:\n%s", prompt)
+	}
+	if !strings.Contains(model.calls[0].System, "<<<UNTRUSTED-") {
+		t.Errorf("triage system prompt does not explain the markers: %q", model.calls[0].System)
+	}
+}
+
+func TestStart_TooManyCandidateDocsIsAnError(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	run("init", "-q", "-b", "main")
+	run("config", "user.email", "test@example.com")
+	run("config", "user.name", "test")
+	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0o700); err != nil {
+		t.Fatalf("mkdir docs: %v", err)
+	}
+	for i := range 11 {
+		doc := fmt.Sprintf("---\ntitle: D%d\nsummary: Describes D.\ncovers:\n  - main.go\n---\n# D\n", i)
+		if err := os.WriteFile(filepath.Join(dir, "docs", fmt.Sprintf("d%d.md", i)), []byte(doc), 0o600); err != nil {
+			t.Fatalf("write doc: %v", err)
+		}
+	}
+	run("add", "-A")
+	run("commit", "-q", "-m", "init")
+	out, err := exec.CommandContext(t.Context(), "git", "-C", dir, "rev-parse", "HEAD").Output() //nolint:gosec // dir is a t.TempDir path
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+
+	runner := llmrunner.New(&fakeModel{}, noToken, "triage-model", "draft-model")
+	runner.SetRemote(dir)
+	_, err = runner.Start(t.Context(), testRequest(strings.TrimSpace(string(out))))
+	if err == nil || !strings.Contains(err.Error(), "cap of 10") {
+		t.Fatalf("Start() = %v, want an error naming the candidate cap", err)
 	}
 }

@@ -29,7 +29,7 @@ func TestStart_DeadlineDuringCloneIsErrDeadline(t *testing.T) {
 	runner.SetRemote(srv.URL + "/o/r.git")
 	runner.SetTimeout(300 * time.Millisecond)
 
-	_, err := runner.Start(t.Context(), testRequest(strings.Repeat("a", 40), "docs/x.md"))
+	_, err := runner.Start(t.Context(), testRequest(strings.Repeat("a", 40)))
 	if !errors.Is(err, agent.ErrDeadline) {
 		t.Fatalf("Start() = %v, want errors.Is agent.ErrDeadline", err)
 	}

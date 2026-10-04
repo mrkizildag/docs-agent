@@ -7,9 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 )
+
+const maxGitOutputLen = 500
 
 var fullSHA = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
 
@@ -33,7 +36,7 @@ func cloneHead(ctx context.Context, remoteURL, headSHA, token string) (string, e
 		{"checkout", "--detach", "FETCH_HEAD"},
 	}
 	for _, args := range steps {
-		if err := runGit(ctx, dir, token, args...); err != nil {
+		if err := runGit(ctx, dir, remoteURL, token, args...); err != nil {
 			return dir, fmt.Errorf("clone %s at %s: %w", remoteURL, headSHA, err)
 		}
 	}
@@ -41,10 +44,10 @@ func cloneHead(ctx context.Context, remoteURL, headSHA, token string) (string, e
 	return dir, nil
 }
 
-func runGit(ctx context.Context, dir, token string, args ...string) error {
+func runGit(ctx context.Context, dir, remoteURL, token string, args ...string) error {
 	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // args are fixed git subcommands plus a validated SHA and the runner's remote, not request text
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), gitAuthEnv(token)...)
+	cmd.Env = gitEnv(dir, remoteURL, token)
 	// git fetch forks git-remote-http, which inherits the output pipe; killing
 	// only git leaves it holding the pipe open, so kill the whole group.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -56,9 +59,41 @@ func runGit(ctx context.Context, dir, token string, args ...string) error {
 		return fmt.Errorf("git %v: %w", args, ctxErr)
 	}
 	if err != nil {
-		return fmt.Errorf("git %v: %w: %s", args, err, out)
+		return fmt.Errorf("git %v: %w: %s", args, err, oneLine(string(out), maxGitOutputLen))
 	}
 	return nil
+}
+
+// gitEnv is the whole environment git runs in: it handles attacker-controlled
+// repository content, so it gets none of the server's secrets, no system or
+// user config, and only https and local-path remotes (plus http when the
+// remote itself is http). Without a token the caller's
+// GIT_CONFIG_COUNT/KEY_n/VALUE_n pass through so tests can redirect the remote
+// with url.<path>.insteadOf.
+func gitEnv(home, remoteURL, token string) []string {
+	protocols := "https:file"
+	if strings.HasPrefix(remoteURL, "http://") {
+		protocols += ":http"
+	}
+	env := []string{
+		"HOME=" + home,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ALLOW_PROTOCOL=" + protocols,
+	}
+	if token != "" {
+		env = append(env, gitAuthEnv(token)...)
+	}
+	for _, kv := range os.Environ() { //nolint:forbidigo // the one place the git subprocess's environment is allowed through, field by field
+		switch {
+		case strings.HasPrefix(kv, "PATH="):
+			env = append(env, kv)
+		case token == "" && (strings.HasPrefix(kv, "GIT_CONFIG_COUNT=") || strings.HasPrefix(kv, "GIT_CONFIG_KEY_") || strings.HasPrefix(kv, "GIT_CONFIG_VALUE_")):
+			env = append(env, kv)
+		}
+	}
+	return env
 }
 
 // gitAuthEnv carries the clone's bearer token as an HTTP header through git's

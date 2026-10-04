@@ -1,11 +1,9 @@
 package llm
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 )
@@ -37,32 +35,10 @@ func NewAnthropic(hc *http.Client, baseURL, apiKey string) *Anthropic {
 // Complete implements Model over the Messages endpoint. It rejects a response
 // that isn't JSON or that has no content field, mirroring OpenAI.Complete.
 func (a *Anthropic) Complete(ctx context.Context, req Request) (Response, error) {
-	body, err := json.Marshal(anthropicRequestFrom(req))
-	if err != nil {
-		return Response{}, fmt.Errorf("anthropic: marshal request: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return Response{}, fmt.Errorf("anthropic: build request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", a.apiKey)
-	httpReq.Header.Set("anthropic-version", anthropicVersion)
-
-	resp, err := a.hc.Do(httpReq)
+	headers := map[string]string{"x-api-key": a.apiKey, "anthropic-version": anthropicVersion}
+	respBody, err := postJSON(ctx, a.hc, a.baseURL+"/v1/messages", headers, anthropicRequestFrom(req))
 	if err != nil {
 		return Response{}, fmt.Errorf("anthropic: create message: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return Response{}, fmt.Errorf("anthropic: read response: %w", err)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return Response{}, fmt.Errorf("anthropic: create message: status %d: %s", resp.StatusCode, truncate(respBody))
 	}
 
 	var wireResp anthropicResponse

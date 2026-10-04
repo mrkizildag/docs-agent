@@ -125,18 +125,18 @@ func buildRunners(cfg config.Config, ghClient *github.Client) (gate.Runners, err
 		return gate.Runners{}, nil
 	}
 
+	var model llm.Model
 	switch cfg.LLM.Provider {
 	case config.LLMProviderOpenAI:
-		model := llm.NewOpenAI(&http.Client{Timeout: llmHTTPTimeout}, cfg.LLM.BaseURL, cfg.LLM.APIKey.Reveal())
-		runner := llmrunner.New(model, ghClient.InstallationToken, cfg.LLM.TriageModel, cfg.LLM.Model)
-		return gate.Runners{Server: runner}, nil
+		model = llm.NewOpenAI(&http.Client{Timeout: llmHTTPTimeout}, cfg.LLM.BaseURL, cfg.LLM.APIKey.Reveal())
 	case config.LLMProviderAnthropic:
-		model := llm.NewAnthropic(&http.Client{Timeout: llmHTTPTimeout}, cfg.LLM.BaseURL, cfg.LLM.APIKey.Reveal())
-		runner := llmrunner.New(model, ghClient.InstallationToken, cfg.LLM.TriageModel, cfg.LLM.Model)
-		return gate.Runners{Server: runner}, nil
+		model = llm.NewAnthropic(&http.Client{Timeout: llmHTTPTimeout}, cfg.LLM.BaseURL, cfg.LLM.APIKey.Reveal())
 	default:
 		return gate.Runners{}, fmt.Errorf("LLM_PROVIDER: unknown provider %q", cfg.LLM.Provider)
 	}
+
+	runner := llmrunner.New(model, ghClient.InstallationToken, cfg.LLM.TriageModel, cfg.LLM.Model)
+	return gate.Runners{Server: runner}, nil
 }
 
 func shutdownServer(ctx context.Context, srv *http.Server) error {

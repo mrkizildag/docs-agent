@@ -24,6 +24,12 @@ var ErrTokenBudget = errors.New("agent: token budget exceeded")
 // deadline and never wraps this error.
 var ErrDeadline = errors.New("agent: deadline exceeded")
 
+// ErrMalformed means the model returned maxEmptyReplies consecutive replies
+// with neither text nor tool calls.
+var ErrMalformed = errors.New("agent: model returned no usable reply")
+
+const maxEmptyReplies = 3
+
 // Task describes one agent run.
 type Task struct {
 	Model    string
@@ -72,6 +78,7 @@ func Run(ctx context.Context, m llm.Model, t Task, b *Budget) (json.RawMessage, 
 	tools := append(readTools(), t.Finish)
 	messages := []llm.Message{{Role: llm.RoleUser, Text: t.Prompt}}
 	var stats Stats
+	empty := 0
 
 	for step := 0; step < t.MaxSteps; step++ {
 		if err := ctx.Err(); err != nil {
@@ -96,12 +103,19 @@ func Run(ctx context.Context, m llm.Model, t Task, b *Budget) (json.RawMessage, 
 		}
 
 		if len(resp.ToolCalls) == 0 {
-			messages = append(messages,
-				llm.Message{Role: llm.RoleAssistant, Text: resp.Text},
-				llm.Message{Role: llm.RoleUser, Text: "Continue by calling a tool, or call " + t.Finish.Name + " when you are done."},
-			)
+			if resp.Text == "" {
+				empty++
+				if empty >= maxEmptyReplies {
+					return nil, stats, fmt.Errorf("agent: %d consecutive empty replies by step %d: %w", empty, stats.Steps, ErrMalformed)
+				}
+			} else {
+				empty = 0
+				messages = append(messages, llm.Message{Role: llm.RoleAssistant, Text: resp.Text})
+			}
+			messages = append(messages, llm.Message{Role: llm.RoleUser, Text: "Continue by calling a tool, or call " + t.Finish.Name + " when you are done."})
 			continue
 		}
+		empty = 0
 
 		messages = append(messages, llm.Message{Role: llm.RoleAssistant, Text: resp.Text, ToolCalls: resp.ToolCalls})
 
