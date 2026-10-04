@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 )
 
 func now() string {

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/gate"
-	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 )
 
 // prJobKey is the per-PR queue key that serializes a pull request's jobs.
@@ -54,7 +54,7 @@ func EnqueueDeadlineJobs(ctx context.Context, src OverdueSource, jobs Enqueuer, 
 	return nil
 }
 
-// PullRequestHandler reports the docs-agent check run for a pull request.
+// PullRequestHandler reports the pollux-agent check run for a pull request.
 type PullRequestHandler interface {
 	HandlePullRequest(ctx context.Context, pr gate.PullRequest) error
 	HandleRunCompleted(ctx context.Context, rc gate.RunCompleted) error

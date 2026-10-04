@@ -11,15 +11,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/config"
-	"github.com/mrkizildag/docs-agent/backend/internal/gate"
-	"github.com/mrkizildag/docs-agent/backend/internal/gate/sqlite"
-	"github.com/mrkizildag/docs-agent/backend/internal/github"
-	"github.com/mrkizildag/docs-agent/backend/internal/httpapi"
-	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
-	"github.com/mrkizildag/docs-agent/backend/internal/llm"
-	"github.com/mrkizildag/docs-agent/backend/internal/review/actions"
-	"github.com/mrkizildag/docs-agent/backend/internal/review/llmrunner"
+	"github.com/mrkizildag/pollux-agent/backend/internal/config"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
+	"github.com/mrkizildag/pollux-agent/backend/internal/github"
+	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
+	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
 
 const (

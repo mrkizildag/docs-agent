@@ -1,6 +1,6 @@
 ---
 title: Registering the GitHub App
-summary: Create the docs-agent GitHub App, point it at the backend, and install it.
+summary: Create the pollux-agent GitHub App, point it at the backend, and install it.
 covers:
   - backend/internal/config/**
   - backend/internal/httpapi/**
@@ -9,9 +9,9 @@ covers:
 
 # Registering the GitHub App
 
-docs-agent runs as a GitHub App. This covers creating the App, wiring its credentials into the backend's config, and installing it on a repo.
+pollux runs as a GitHub App. This covers creating the App, wiring its credentials into the backend's config, and installing it on a repo.
 
-Use the StartMunich org for production. For local development, create a separate personal App (e.g. `docs-agent-dev`) against a sandbox repo, so test deliveries never reach production.
+Use the StartMunich org for production. For local development, create a separate personal App (e.g. `pollux-agent-dev`) against a sandbox repo, so test deliveries never reach production.
 
 ## Webhook URL and secret
 
@@ -23,9 +23,9 @@ Generate the webhook secret with `openssl rand -hex 32`. Set the same value in t
 
 Grant only what the bot uses:
 
-- **Actions**: read & write — dispatches the docs-agent workflow in repos that use the [Actions runner](actions-runner.md), reads its run, and downloads its result artifact.
-- **Checks**: read & write — sets the `docs-agent` check run.
-- **Contents**: read & write — clones the PR head for the server runner (with a token narrowed to that repo and `contents: read`), detects the `.github/workflows/docs-agent.yml` workflow, commits doc edits.
+- **Actions**: read & write — dispatches the pollux-agent workflow in repos that use the [Actions runner](actions-runner.md), reads its run, and downloads its result artifact.
+- **Checks**: read & write — sets the `pollux-agent` check run.
+- **Contents**: read & write — clones the PR head for the server runner (with a token narrowed to that repo and `contents: read`), detects the `.github/workflows/pollux-agent.yml` workflow, commits doc edits.
 - **Pull requests**: read & write — lists the PR's changed files and patches; review comments and suggestions.
 - **Issues**: read & write — the PR conversation comment and summary comment use the issues API.
 - **Metadata**: read-only — mandatory for every App.
@@ -48,10 +48,10 @@ Under "Where can this GitHub App be installed?", choose "Only on this account".
 
 ## Required status check
 
-Once installed, an org admin adds `docs-agent` as a required status check in the repo's branch ruleset. The bot never creates or edits rulesets itself.
+Once installed, an org admin adds `pollux-agent` as a required status check in the repo's branch ruleset. The bot never creates or edits rulesets itself.
 
 ## Verify
 
 Open the App's "Advanced → Recent deliveries" tab. The initial `ping` delivery should show a `202` response. Redeliver it after changing the webhook secret in the App settings (without updating `GITHUB_WEBHOOK_SECRET`) to confirm it now gets a `401`.
 
-Open a pull request in the sandbox repo and confirm it shows a `docs-agent` check. With no analysis runner configured, it is neutral and titled "No analysis runner configured".
+Open a pull request in the sandbox repo and confirm it shows a `pollux-agent` check. With no analysis runner configured, it is neutral and titled "No analysis runner configured".

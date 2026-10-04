@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	ghclient "github.com/mrkizildag/docs-agent/backend/internal/github"
+	ghclient "github.com/mrkizildag/pollux-agent/backend/internal/github"
 )
 
 func TestFileAtRef(t *testing.T) {

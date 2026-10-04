@@ -17,9 +17,9 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/gate"
-	ghclient "github.com/mrkizildag/docs-agent/backend/internal/github"
-	"github.com/mrkizildag/docs-agent/backend/internal/review/actions"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	ghclient "github.com/mrkizildag/pollux-agent/backend/internal/github"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
 )
 
 func testPrivateKeyPEM(t *testing.T) []byte {
@@ -76,10 +76,10 @@ func TestCreateCheckRun(t *testing.T) {
 	}
 
 	run := gate.CheckRun{
-		Name:       "docs-agent",
+		Name:       "pollux-agent",
 		HeadSHA:    "abc123",
 		Conclusion: gate.ConclusionSuccess,
-		Title:      "docs-agent tracer",
+		Title:      "pollux-agent tracer",
 		Summary:    "Analysis not implemented yet.",
 	}
 
@@ -96,12 +96,12 @@ func TestCreateCheckRun(t *testing.T) {
 	}
 
 	want := map[string]any{
-		"name":       "docs-agent",
+		"name":       "pollux-agent",
 		"head_sha":   "abc123",
 		"status":     "completed",
 		"conclusion": "success",
 		"output": map[string]any{
-			"title":   "docs-agent tracer",
+			"title":   "pollux-agent tracer",
 			"summary": "Analysis not implemented yet.",
 		},
 	}
@@ -136,11 +136,11 @@ func TestWorkflowExists(t *testing.T) {
 					t.Errorf("write access_tokens response: %v", err)
 				}
 			})
-			mux.HandleFunc("GET /repos/o/r/contents/.github/workflows/docs-agent.yml", func(w http.ResponseWriter, _ *http.Request) {
+			mux.HandleFunc("GET /repos/o/r/contents/.github/workflows/pollux-agent.yml", func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(tc.status)
 				if tc.status == http.StatusOK {
-					if _, err := fmt.Fprint(w, `{"type":"file","name":"docs-agent.yml","path":".github/workflows/docs-agent.yml"}`); err != nil {
+					if _, err := fmt.Fprint(w, `{"type":"file","name":"pollux-agent.yml","path":".github/workflows/pollux-agent.yml"}`); err != nil {
 						t.Errorf("write contents response: %v", err)
 					}
 				}
@@ -238,10 +238,10 @@ func TestCreateCheckRunConcurrentInstallations(t *testing.T) {
 	}
 
 	run := gate.CheckRun{
-		Name:       "docs-agent",
+		Name:       "pollux-agent",
 		HeadSHA:    "abc123",
 		Conclusion: gate.ConclusionSuccess,
-		Title:      "docs-agent tracer",
+		Title:      "pollux-agent tracer",
 		Summary:    "Analysis not implemented yet.",
 	}
 
@@ -320,25 +320,25 @@ func TestCreateAndUpdateCheckRunInProgress(t *testing.T) {
 	})
 	client := newTestClient(t, mux)
 
-	run := gate.CheckRun{Name: "docs-agent", HeadSHA: "abc", Status: gate.StatusInProgress, Title: "t", Summary: "s"}
+	run := gate.CheckRun{Name: "pollux-agent", HeadSHA: "abc", Status: gate.StatusInProgress, Title: "t", Summary: "s"}
 	id, err := client.CreateCheckRun(t.Context(), 99, "o", "r", run)
 	if err != nil || id != 77 {
 		t.Fatalf("CreateCheckRun() = %d, %v, want 77, nil", id, err)
 	}
 	wantCreated := map[string]any{
-		"name": "docs-agent", "head_sha": "abc", "status": "in_progress",
+		"name": "pollux-agent", "head_sha": "abc", "status": "in_progress",
 		"output": map[string]any{"title": "t", "summary": "s"},
 	}
 	if diff := cmp.Diff(wantCreated, created); diff != "" {
 		t.Errorf("create body (-want +got):\n%s", diff)
 	}
 
-	done := gate.CheckRun{Name: "docs-agent", HeadSHA: "abc", Status: gate.StatusCompleted, Conclusion: gate.ConclusionActionRequired, Title: "t2", Summary: "s2"}
+	done := gate.CheckRun{Name: "pollux-agent", HeadSHA: "abc", Status: gate.StatusCompleted, Conclusion: gate.ConclusionActionRequired, Title: "t2", Summary: "s2"}
 	if err := client.UpdateCheckRun(t.Context(), 99, "o", "r", 77, done); err != nil {
 		t.Fatalf("UpdateCheckRun() = %v, want nil", err)
 	}
 	wantUpdated := map[string]any{
-		"name": "docs-agent", "status": "completed", "conclusion": "action_required",
+		"name": "pollux-agent", "status": "completed", "conclusion": "action_required",
 		"output": map[string]any{"title": "t2", "summary": "s2"},
 	}
 	if diff := cmp.Diff(wantUpdated, updated); diff != "" {
@@ -355,7 +355,7 @@ func TestDispatch(t *testing.T) {
 	mux.HandleFunc("GET /repos/o/r", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(t, w, http.StatusOK, `{"default_branch":"trunk"}`)
 	})
-	mux.HandleFunc("POST /repos/o/r/actions/workflows/docs-agent.yml/dispatches", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /repos/o/r/actions/workflows/pollux-agent.yml/dispatches", func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
 			t.Errorf("decode dispatch body: %v", err)
 		}
@@ -397,7 +397,7 @@ func TestResultArtifact(t *testing.T) {
 	mux := http.NewServeMux()
 	handleAccessToken(t, mux)
 	mux.HandleFunc("GET /repos/o/r/actions/runs/4242/artifacts", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(t, w, http.StatusOK, `{"total_count":2,"artifacts":[{"id":1,"name":"docs-agent-result","workflow_run":{"id":7}},{"id":3,"name":"other","workflow_run":{"id":4242}},{"id":2,"name":"docs-agent-result","workflow_run":{"id":4242}}]}`)
+		writeJSON(t, w, http.StatusOK, `{"total_count":2,"artifacts":[{"id":1,"name":"pollux-agent-result","workflow_run":{"id":7}},{"id":3,"name":"other","workflow_run":{"id":4242}},{"id":2,"name":"pollux-agent-result","workflow_run":{"id":4242}}]}`)
 	})
 	var blobURL string
 	mux.HandleFunc("GET /repos/o/r/actions/artifacts/2/zip", func(w http.ResponseWriter, r *http.Request) {

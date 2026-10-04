@@ -14,8 +14,8 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-github/v92/github"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/gate"
-	ghclient "github.com/mrkizildag/docs-agent/backend/internal/github"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	ghclient "github.com/mrkizildag/pollux-agent/backend/internal/github"
 )
 
 func newCommentsClient(t *testing.T, routes map[string]http.HandlerFunc) *ghclient.Client {
@@ -31,7 +31,7 @@ func newCommentsClient(t *testing.T, routes map[string]http.HandlerFunc) *ghclie
 	if _, ok := routes["GET /app"]; !ok {
 		mux.HandleFunc("GET /app", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			if _, err := fmt.Fprint(w, `{"id":1,"slug":"docs-agent"}`); err != nil {
+			if _, err := fmt.Fprint(w, `{"id":1,"slug":"pollux-agent"}`); err != nil {
 				t.Errorf("write app response: %v", err)
 			}
 		})
@@ -153,14 +153,14 @@ func TestListComments(t *testing.T) {
 	client := newCommentsClient(t, map[string]http.HandlerFunc{
 		"GET /repos/o/r/pulls/7/comments": func(w http.ResponseWriter, r *http.Request) {
 			writePage(t, w, r, "/repos/o/r/pulls/7/comments", map[string]string{
-				"":  `[{"id":1,"html_url":"https://gh/r/1","body":"r1","path":"a.go","start_line":2,"line":4,"user":{"login":"docs-agent[bot]"}}]`,
+				"":  `[{"id":1,"html_url":"https://gh/r/1","body":"r1","path":"a.go","start_line":2,"line":4,"user":{"login":"pollux-agent[bot]"}}]`,
 				"2": `[{"id":2,"html_url":"https://gh/r/2","body":"r2"}]`,
 			})
 		},
 		"GET /repos/o/r/issues/7/comments": func(w http.ResponseWriter, r *http.Request) {
 			writePage(t, w, r, "/repos/o/r/issues/7/comments", map[string]string{
 				"":  `[{"id":3,"html_url":"https://gh/i/3","body":"i3","user":{"login":"mallory"}}]`,
-				"2": `[{"id":4,"html_url":"https://gh/i/4","body":"i4","user":{"login":"docs-agent[bot]"}}]`,
+				"2": `[{"id":4,"html_url":"https://gh/i/4","body":"i4","user":{"login":"pollux-agent[bot]"}}]`,
 			})
 		},
 	})
@@ -198,7 +198,7 @@ func TestListCommentsResolvesBotLoginOnce(t *testing.T) {
 				t.Errorf("GET /app Authorization = %q, want an App JWT bearer token", got)
 			}
 			w.Header().Set("Content-Type", "application/json")
-			if _, err := fmt.Fprint(w, `{"id":1,"slug":"docs-agent"}`); err != nil {
+			if _, err := fmt.Fprint(w, `{"id":1,"slug":"pollux-agent"}`); err != nil {
 				t.Errorf("write app response: %v", err)
 			}
 		},

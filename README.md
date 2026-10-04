@@ -1,4 +1,4 @@
-# docs-agent
+# pollux
 
 A GitHub App that keeps project docs up to date. On every pull request it reads the diff, finds the docs that describe the changed code, and proposes updates. A required check blocks the merge until the docs are updated or the change is waived.
 
@@ -7,8 +7,8 @@ A GitHub App that keeps project docs up to date. On every pull request it reads 
 ## How it works
 
 1. Docs live in the repo's `docs/` folder. Each doc declares the code it covers in its frontmatter.
-2. When a PR changes covered code, docs-agent asks an LLM whether those docs still hold.
-3. It proposes edits in a `docs-agent` check run. Apply, edit, or waive them to unblock the merge.
+2. When a PR changes covered code, pollux asks an LLM whether those docs still hold.
+3. It proposes edits in a `pollux-agent` check run. Apply, edit, or waive them to unblock the merge.
 
 The docs are plain markdown with relative links, so the folder also opens as an [Obsidian](https://obsidian.md) vault. See this repo's own [docs/](docs/README.md) for the structure.
 

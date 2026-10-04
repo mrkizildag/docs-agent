@@ -1,4 +1,4 @@
-module github.com/mrkizildag/docs-agent/backend
+module github.com/mrkizildag/pollux-agent/backend
 
 go 1.26.6
 

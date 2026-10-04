@@ -1,5 +1,5 @@
 // Package github adapts the GitHub REST API to the gate package's GitHub
-// interface, authenticating as the docs-agent GitHub App.
+// interface, authenticating as the pollux-agent GitHub App.
 package github
 
 import (
@@ -17,12 +17,12 @@ import (
 	githubv88 "github.com/google/go-github/v88/github"
 	"github.com/google/go-github/v92/github"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/gate"
-	"github.com/mrkizildag/docs-agent/backend/internal/review/actions"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
 )
 
 // Client creates GitHub check runs, authenticating per installation as the
-// docs-agent GitHub App.
+// pollux-agent GitHub App.
 type Client struct {
 	transport     http.RoundTripper
 	appID         int64
@@ -171,12 +171,12 @@ func (c *Client) WorkflowExists(ctx context.Context, installationID int64, owner
 }
 
 const (
-	resultArtifactName = "docs-agent-result"
+	resultArtifactName = "pollux-agent-result"
 	resultFileName     = "result.json"
 	maxArtifactBytes   = 10 << 20
 )
 
-// Dispatch runs the docs-agent workflow on owner/repo's default branch and
+// Dispatch runs the pollux-agent workflow on owner/repo's default branch and
 // returns the ID of the run it started.
 func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo string, in actions.DispatchInputs) (int64, error) {
 	client, err := c.installationClient(installationID)

@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 )
 
 // ErrStepLimit means the loop reached Task.MaxSteps without the model calling

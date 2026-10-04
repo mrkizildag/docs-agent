@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/llm"
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
-	"github.com/mrkizildag/docs-agent/backend/internal/review/llmrunner"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
 
 // A nested file matched by a ** covers glob reaches triage with its doc and

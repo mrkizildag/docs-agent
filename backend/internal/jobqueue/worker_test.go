@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/gate/sqlite"
-	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
+	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 )
 
 const testTimeout = 5 * time.Second

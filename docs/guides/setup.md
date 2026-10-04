@@ -30,7 +30,7 @@ Only `backend/internal/config` reads the environment (a lint rule enforces it). 
 |-------------------------------|----------|-----------------------------------------------------------------|
 | `ADDR`                        | `:8080`  | Listen address.                                                 |
 | `LOG_LEVEL`                   | `info`   | `debug`, `info`, `warn`, or `error`.                            |
-| `DATABASE_PATH`               | `docs-agent.db` | Path to the SQLite database holding webhook deliveries, the job queue, and PR state. Created on first start. |
+| `DATABASE_PATH`               | `pollux.db` | Path to the SQLite database holding webhook deliveries, the job queue, and PR state. Created on first start. |
 | `GITHUB_APP_ID`                | required | The GitHub App's numeric ID.                                    |
 | `GITHUB_APP_PRIVATE_KEY_FILE`  | required | Path to the App's private key `.pem` file. See [github-app.md](github-app.md). |
 | `GITHUB_WEBHOOK_SECRET`        | required | Shared secret used to verify `POST /webhook` signatures.        |
@@ -40,7 +40,7 @@ Only `backend/internal/config` reads the environment (a lint rule enforces it). 
 | `LLM_MODEL`                    | required when `LLM_PROVIDER` is set | Model used to review docs impact. |
 | `LLM_TRIAGE_MODEL`             | defaults to `LLM_MODEL` | Cheaper model used for triage, if different. |
 
-Without `LLM_PROVIDER` set, the analysis runner is off, and repos without the docs-agent workflow get a neutral "No analysis runner configured" check. With it set, `git` must be on the PATH: the server runner clones the PR head. See [Server runner](../features/server-runner.md).
+Without `LLM_PROVIDER` set, the analysis runner is off, and repos without the pollux-agent workflow get a neutral "No analysis runner configured" check. With it set, `git` must be on the PATH: the server runner clones the PR head. See [Server runner](../features/server-runner.md).
 
 ### Example: Gemini free tier
 

@@ -12,10 +12,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/agent"
-	"github.com/mrkizildag/docs-agent/backend/internal/docs"
-	"github.com/mrkizildag/docs-agent/backend/internal/llm"
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
+	"github.com/mrkizildag/pollux-agent/backend/internal/docs"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 const runnerName = "llmrunner"

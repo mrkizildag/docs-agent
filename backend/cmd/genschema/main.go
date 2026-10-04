@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 func main() {

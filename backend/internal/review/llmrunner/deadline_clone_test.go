@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/agent"
-	"github.com/mrkizildag/docs-agent/backend/internal/review/llmrunner"
+	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
 
 func TestStart_DeadlineDuringCloneIsErrDeadline(t *testing.T) {

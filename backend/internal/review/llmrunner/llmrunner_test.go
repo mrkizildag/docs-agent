@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/agent"
-	"github.com/mrkizildag/docs-agent/backend/internal/llm"
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
-	"github.com/mrkizildag/docs-agent/backend/internal/review/llmrunner"
+	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
 
 // fakeModel scripts one llm.Response (or error) per call, in order, and

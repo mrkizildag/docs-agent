@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/docs"
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/docs"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 const (

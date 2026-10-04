@@ -10,8 +10,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	ghclient "github.com/mrkizildag/docs-agent/backend/internal/github"
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
+	ghclient "github.com/mrkizildag/pollux-agent/backend/internal/github"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 func newFilesClient(t *testing.T, files http.HandlerFunc) *ghclient.Client {

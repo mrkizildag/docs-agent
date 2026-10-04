@@ -20,13 +20,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/gate"
-	"github.com/mrkizildag/docs-agent/backend/internal/gate/sqlite"
-	ghclient "github.com/mrkizildag/docs-agent/backend/internal/github"
-	"github.com/mrkizildag/docs-agent/backend/internal/httpapi"
-	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
-	"github.com/mrkizildag/docs-agent/backend/internal/review/actions"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
+	ghclient "github.com/mrkizildag/pollux-agent/backend/internal/github"
+	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
+	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
 )
 
 type e2eCheckRunCall struct {
@@ -120,7 +120,7 @@ func TestWebhookToCheckRunEndToEnd(t *testing.T) {
 	t.Parallel()
 
 	secret := []byte("test-secret")
-	dbPath := filepath.Join(t.TempDir(), "docs-agent.db")
+	dbPath := filepath.Join(t.TempDir(), "pollux.db")
 
 	store, err := sqlite.Open(t.Context(), dbPath)
 	if err != nil {
@@ -210,7 +210,7 @@ func (s *savedStore) SavePR(ctx context.Context, state gate.PRState) error {
 	return nil
 }
 
-// fakeActionsGitHub serves the GitHub API surface of a repo with the docs-agent
+// fakeActionsGitHub serves the GitHub API surface of a repo with the pollux-agent
 // workflow, recording the dispatch and check run requests.
 type fakeActionsGitHub struct {
 	t       *testing.T
@@ -281,13 +281,13 @@ func (f *fakeActionsGitHub) handler() http.Handler {
 	mux.HandleFunc("POST /app/installations/{id}/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
 		f.json(w, http.StatusCreated, fmt.Sprintf(`{"token":"ghs_test","expires_at":%q}`, time.Now().Add(time.Hour).Format(time.RFC3339)))
 	})
-	mux.HandleFunc("GET /repos/acme/widgets/contents/.github/workflows/docs-agent.yml", func(w http.ResponseWriter, _ *http.Request) {
-		f.json(w, http.StatusOK, `{"type":"file","name":"docs-agent.yml","path":".github/workflows/docs-agent.yml"}`)
+	mux.HandleFunc("GET /repos/acme/widgets/contents/.github/workflows/pollux-agent.yml", func(w http.ResponseWriter, _ *http.Request) {
+		f.json(w, http.StatusOK, `{"type":"file","name":"pollux-agent.yml","path":".github/workflows/pollux-agent.yml"}`)
 	})
 	mux.HandleFunc("GET /repos/acme/widgets", func(w http.ResponseWriter, _ *http.Request) {
 		f.json(w, http.StatusOK, `{"default_branch":"main"}`)
 	})
-	mux.HandleFunc("POST /repos/acme/widgets/actions/workflows/docs-agent.yml/dispatches", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /repos/acme/widgets/actions/workflows/pollux-agent.yml/dispatches", func(w http.ResponseWriter, r *http.Request) {
 		body := f.decode(r)
 		f.mu.Lock()
 		f.dispatched = body
@@ -303,7 +303,7 @@ func (f *fakeActionsGitHub) handler() http.Handler {
 		f.json(w, http.StatusOK, `{"id":555}`)
 	})
 	mux.HandleFunc("GET /repos/acme/widgets/actions/runs/4242/artifacts", func(w http.ResponseWriter, _ *http.Request) {
-		f.json(w, http.StatusOK, `{"total_count":1,"artifacts":[{"id":9,"name":"docs-agent-result","workflow_run":{"id":4242}}]}`)
+		f.json(w, http.StatusOK, `{"total_count":1,"artifacts":[{"id":9,"name":"pollux-agent-result","workflow_run":{"id":4242}}]}`)
 	})
 	mux.HandleFunc("GET /repos/acme/widgets/actions/artifacts/9/zip", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -328,7 +328,7 @@ func e2eWorkflowRunBody(t *testing.T) []byte {
 	body, err := json.Marshal(map[string]any{
 		"action": "completed",
 		"workflow_run": map[string]any{
-			"id": 4242, "path": ".github/workflows/docs-agent.yml", "conclusion": "success",
+			"id": 4242, "path": ".github/workflows/pollux-agent.yml", "conclusion": "success",
 		},
 		"repository":   map[string]any{"name": "widgets", "owner": map[string]any{"login": "acme"}},
 		"installation": map[string]any{"id": 42},
@@ -344,7 +344,7 @@ func TestActionsRunnerEndToEnd(t *testing.T) {
 
 	secret := []byte("test-secret")
 
-	baseStore, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "docs-agent.db"))
+	baseStore, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "pollux.db"))
 	if err != nil {
 		t.Fatalf("sqlite.Open() error = %v", err)
 	}
@@ -493,7 +493,7 @@ func TestWebhookToProposalCommentsEndToEnd(t *testing.T) {
 	t.Parallel()
 
 	secret := []byte("test-secret")
-	store, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "docs-agent.db"))
+	store, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "pollux.db"))
 	if err != nil {
 		t.Fatalf("sqlite.Open() error = %v", err)
 	}
@@ -560,8 +560,8 @@ func TestWebhookToProposalCommentsEndToEnd(t *testing.T) {
 		t.Errorf("check run conclusion = %q, want %q", run.Conclusion, gate.ConclusionActionRequired)
 	}
 	for i, want := range []struct{ path, marker string }{
-		{"a.go", "<!-- docs-agent:proposal:" + gate.ProposalID("docs/a.md", "Usage") + " -->"},
-		{"b.go", "<!-- docs-agent:proposal:" + gate.ProposalID("docs/b.md", "") + " -->"},
+		{"a.go", "<!-- pollux-agent:proposal:" + gate.ProposalID("docs/a.md", "Usage") + " -->"},
+		{"b.go", "<!-- pollux-agent:proposal:" + gate.ProposalID("docs/b.md", "") + " -->"},
 	} {
 		if reviews[i].Path != want.path || reviews[i].CommitSHA != "sha1" || !strings.Contains(reviews[i].Body, want.marker) {
 			t.Errorf("review comment %d = %+v, want path %s on sha1 with marker %s", i, reviews[i], want.path, want.marker)
@@ -570,7 +570,7 @@ func TestWebhookToProposalCommentsEndToEnd(t *testing.T) {
 			t.Errorf("summary missing link to comment %d:\n%s", i+1, summary)
 		}
 	}
-	if !strings.Contains(summary, "<!-- docs-agent:summary -->") {
+	if !strings.Contains(summary, "<!-- pollux-agent:summary -->") {
 		t.Errorf("summary missing marker:\n%s", summary)
 	}
 
@@ -698,7 +698,7 @@ type pushHarness struct {
 func newPushHarness(t *testing.T, verdicts ...review.Verdict) *pushHarness {
 	t.Helper()
 
-	store, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "docs-agent.db"))
+	store, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "pollux.db"))
 	if err != nil {
 		t.Fatalf("sqlite.Open() error = %v", err)
 	}
@@ -789,9 +789,9 @@ func (h *pushHarness) commentWith(marker string) gate.Comment {
 func TestWebhookReconcilesProposalCommentsAcrossPushes(t *testing.T) {
 	t.Parallel()
 
-	markerA := "<!-- docs-agent:proposal:" + gate.ProposalID("docs/a.md", "Usage") + " -->"
-	markerB := "<!-- docs-agent:proposal:" + gate.ProposalID("docs/b.md", "") + " -->"
-	summaryMarker := "<!-- docs-agent:summary -->"
+	markerA := "<!-- pollux-agent:proposal:" + gate.ProposalID("docs/a.md", "Usage") + " -->"
+	markerB := "<!-- pollux-agent:proposal:" + gate.ProposalID("docs/b.md", "") + " -->"
+	summaryMarker := "<!-- pollux-agent:summary -->"
 
 	t.Run("same proposals edit in place", func(t *testing.T) {
 		t.Parallel()

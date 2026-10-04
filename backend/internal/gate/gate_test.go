@@ -12,8 +12,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/gate"
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 type fakeGitHub struct {
@@ -286,7 +286,7 @@ func TestHandlePullRequestNoImpact(t *testing.T) {
 	}
 
 	want := gate.CheckRun{
-		Name:       "docs-agent",
+		Name:       "pollux-agent",
 		HeadSHA:    "abc123",
 		Status:     gate.StatusCompleted,
 		Conclusion: gate.ConclusionSuccess,
@@ -621,7 +621,7 @@ func TestHandleRunCompleted(t *testing.T) {
 			}
 
 			wantRun := gate.CheckRun{
-				Name: "docs-agent", HeadSHA: "abc123", Status: gate.StatusCompleted,
+				Name: "pollux-agent", HeadSHA: "abc123", Status: gate.StatusCompleted,
 				Conclusion: tc.wantConclusion, Title: gh.updates[0].run.Title, Summary: tc.wantSummary,
 			}
 			if diff := cmp.Diff([]updateCheckRunCall{{id: 555, run: wantRun}}, gh.updates, cmp.AllowUnexported(updateCheckRunCall{})); diff != "" {
@@ -691,7 +691,7 @@ func TestHandlePullRequestSupersedesAwaitedRun(t *testing.T) {
 	}
 
 	wantUpdate := updateCheckRunCall{id: 555, run: gate.CheckRun{
-		Name: "docs-agent", HeadSHA: "abc123", Status: gate.StatusCompleted, Conclusion: gate.ConclusionNeutral,
+		Name: "pollux-agent", HeadSHA: "abc123", Status: gate.StatusCompleted, Conclusion: gate.ConclusionNeutral,
 		Title: "Superseded", Summary: "Superseded by def4567",
 	}}
 	if diff := cmp.Diff([]updateCheckRunCall{wantUpdate}, gh.updates, cmp.AllowUnexported(updateCheckRunCall{})); diff != "" {
@@ -723,7 +723,7 @@ func TestHandlePullRequestSupersedesAwaitedRunOnSameHead(t *testing.T) {
 	}
 
 	wantUpdate := updateCheckRunCall{id: 555, run: gate.CheckRun{
-		Name: "docs-agent", HeadSHA: "abc123", Status: gate.StatusCompleted, Conclusion: gate.ConclusionNeutral,
+		Name: "pollux-agent", HeadSHA: "abc123", Status: gate.StatusCompleted, Conclusion: gate.ConclusionNeutral,
 		Title: "Superseded", Summary: "Superseded by abc123",
 	}}
 	if diff := cmp.Diff([]updateCheckRunCall{wantUpdate}, gh.updates, cmp.AllowUnexported(updateCheckRunCall{})); diff != "" {
@@ -1025,9 +1025,9 @@ func TestReconcile(t *testing.T) {
 		{ID: idB, DocPath: "docs/b.md", Section: "B", CommentID: 2, CommentURL: "u2", State: gate.ProposalOpen},
 	}}
 	old := []gate.Comment{
-		{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: "<!-- docs-agent:proposal:" + idA + " -->\n\nold A body"},
-		{ID: 2, Mine: true, Kind: gate.CommentKindReview, Body: "<!-- docs-agent:proposal:" + idB + " -->\n\nold B body"},
-		{ID: 90, Mine: true, Kind: gate.CommentKindIssue, Body: "<!-- docs-agent:summary -->"},
+		{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: "<!-- pollux-agent:proposal:" + idA + " -->\n\nold A body"},
+		{ID: 2, Mine: true, Kind: gate.CommentKindReview, Body: "<!-- pollux-agent:proposal:" + idB + " -->\n\nold B body"},
+		{ID: 90, Mine: true, Kind: gate.CommentKindIssue, Body: "<!-- pollux-agent:summary -->"},
 	}
 
 	tests := []struct {
@@ -1087,7 +1087,7 @@ func TestReconcile(t *testing.T) {
 		},
 		{
 			name: "crash recovery reuses marked comments", verdict: review.Proposals{a, b},
-			existing:  append(slices.Clone(old), gate.Comment{ID: 91, Mine: true, Kind: gate.CommentKindIssue, Body: "<!-- docs-agent:summary -->\nrows"}),
+			existing:  append(slices.Clone(old), gate.Comment{ID: 91, Mine: true, Kind: gate.CommentKindIssue, Body: "<!-- pollux-agent:summary -->\nrows"}),
 			wantEdits: 3, wantStates: map[string]gate.ProposalStatus{"docs/a.md#A": "open", "docs/b.md#B": "open"}, wantSummary: true, wantSumID: 90,
 		},
 	}
@@ -1288,8 +1288,8 @@ func TestHandlePullRequestRecoversUnrecordedComments(t *testing.T) {
 	gh := &fakeGitHub{}
 	p := proposal("docs/a.md", "A")
 	id := gate.ProposalID(p.DocPath, p.Section)
-	gh.addComment(gate.CommentKindReview, "<!-- docs-agent:proposal:"+id+" -->\n\nold")
-	gh.addComment(gate.CommentKindIssue, "<!-- docs-agent:summary -->")
+	gh.addComment(gate.CommentKindReview, "<!-- pollux-agent:proposal:"+id+" -->\n\nold")
+	gh.addComment(gate.CommentKindIssue, "<!-- pollux-agent:summary -->")
 
 	proposalService(t, gh, &fakeStore{}, review.Proposals{p})
 	if gh.createReview+gh.createIssue != 0 || gh.editReview != 1 || gh.editIssue != 1 || len(gh.comments) != 2 {
@@ -1370,15 +1370,15 @@ func TestReconcileIgnoresForeignMarkers(t *testing.T) {
 
 	a := proposal("docs/a.md", "A")
 	id := gate.ProposalID("docs/a.md", "A")
-	marker := "<!-- docs-agent:proposal:" + id + " -->"
+	marker := "<!-- pollux-agent:proposal:" + id + " -->"
 	tests := []struct {
 		name     string
 		existing gate.Comment
 	}{
 		{"forged proposal marker", gate.Comment{ID: 7, Kind: gate.CommentKindReview, Body: marker + "\n\nfake"}},
-		{"forged summary marker", gate.Comment{ID: 8, Kind: gate.CommentKindIssue, Body: "<!-- docs-agent:summary -->\nfake"}},
+		{"forged summary marker", gate.Comment{ID: 8, Kind: gate.CommentKindIssue, Body: "<!-- pollux-agent:summary -->\nfake"}},
 		{"own comment with marker not on first line", gate.Comment{ID: 9, Mine: true, Kind: gate.CommentKindReview, Body: "text\n" + marker}},
-		{"own summary with marker not on first line", gate.Comment{ID: 10, Mine: true, Kind: gate.CommentKindIssue, Body: "text <!-- docs-agent:summary -->"}},
+		{"own summary with marker not on first line", gate.Comment{ID: 10, Mine: true, Kind: gate.CommentKindIssue, Body: "text <!-- pollux-agent:summary -->"}},
 	}
 
 	for _, tc := range tests {
