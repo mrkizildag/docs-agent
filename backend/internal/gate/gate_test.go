@@ -46,6 +46,32 @@ func (f *fakeRunner) Start(_ context.Context, req review.Request) (review.Starte
 	return f.started, f.err
 }
 
+type fakeStore struct {
+	loadCalls []loadPRCall
+	saveCalls []gate.PRState
+	loadErr   error
+	saveErr   error
+}
+
+type loadPRCall struct {
+	owner  string
+	repo   string
+	number int
+}
+
+func (f *fakeStore) LoadPR(_ context.Context, owner, repo string, number int) (gate.PRState, error) {
+	f.loadCalls = append(f.loadCalls, loadPRCall{owner: owner, repo: repo, number: number})
+	if f.loadErr != nil {
+		return gate.PRState{}, f.loadErr
+	}
+	return gate.PRState{Owner: owner, Repo: repo, Number: number}, nil
+}
+
+func (f *fakeStore) SavePR(_ context.Context, state gate.PRState) error {
+	f.saveCalls = append(f.saveCalls, state)
+	return f.saveErr
+}
+
 func testPR() gate.PullRequest {
 	return gate.PullRequest{
 		InstallationID: 42,
@@ -100,7 +126,7 @@ func TestHandlePullRequestRunnerSelection(t *testing.T) {
 				runners.Server = tc.server
 			}
 
-			svc := gate.NewService(gh, runners)
+			svc := gate.NewService(gh, &fakeStore{}, runners)
 			pr := testPR()
 			if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
 				t.Fatalf("HandlePullRequest(%+v) = %v, want nil", pr, err)
@@ -139,7 +165,7 @@ func TestHandlePullRequestNoImpact(t *testing.T) {
 
 	gh := &fakeGitHub{workflowExists: false}
 	runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "docs already cover this"}}}
-	svc := gate.NewService(gh, gate.Runners{Server: runner})
+	svc := gate.NewService(gh, &fakeStore{}, gate.Runners{Server: runner})
 
 	pr := testPR()
 	if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
@@ -167,7 +193,7 @@ func TestHandlePullRequestProposals(t *testing.T) {
 		{DocPath: "docs/b.md", Reason: "config added"},
 	}
 	runner := &fakeRunner{started: review.Result{Verdict: proposals}}
-	svc := gate.NewService(gh, gate.Runners{Server: runner})
+	svc := gate.NewService(gh, &fakeStore{}, gate.Runners{Server: runner})
 
 	pr := testPR()
 	if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
@@ -190,7 +216,7 @@ func TestHandlePullRequestWorkflowExistsError(t *testing.T) {
 
 	wantErr := errors.New("boom")
 	gh := &fakeGitHub{workflowErr: wantErr}
-	svc := gate.NewService(gh, gate.Runners{Server: &fakeRunner{}})
+	svc := gate.NewService(gh, &fakeStore{}, gate.Runners{Server: &fakeRunner{}})
 
 	err := svc.HandlePullRequest(t.Context(), testPR())
 	if !errors.Is(err, wantErr) {
@@ -202,7 +228,7 @@ func TestHandlePullRequestNoRunnersSkipsWorkflowLookup(t *testing.T) {
 	t.Parallel()
 
 	gh := &fakeGitHub{workflowErr: errors.New("boom")}
-	svc := gate.NewService(gh, gate.Runners{})
+	svc := gate.NewService(gh, &fakeStore{}, gate.Runners{})
 
 	pr := testPR()
 	if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
@@ -218,7 +244,7 @@ func TestHandlePullRequestEmptyProposals(t *testing.T) {
 
 	gh := &fakeGitHub{}
 	runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{}}}
-	svc := gate.NewService(gh, gate.Runners{Server: runner})
+	svc := gate.NewService(gh, &fakeStore{}, gate.Runners{Server: runner})
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err == nil {
 		t.Fatalf("HandlePullRequest() = nil, want error for an empty proposal list")
@@ -234,7 +260,7 @@ func TestHandlePullRequestRunnerStartError(t *testing.T) {
 	wantErr := errors.New("boom")
 	gh := &fakeGitHub{}
 	runner := &fakeRunner{err: wantErr}
-	svc := gate.NewService(gh, gate.Runners{Server: runner})
+	svc := gate.NewService(gh, &fakeStore{}, gate.Runners{Server: runner})
 
 	err := svc.HandlePullRequest(t.Context(), testPR())
 	if !errors.Is(err, wantErr) {
@@ -247,7 +273,84 @@ func TestHandlePullRequestCreateCheckRunError(t *testing.T) {
 
 	wantErr := errors.New("boom")
 	gh := &fakeGitHub{err: wantErr}
-	svc := gate.NewService(gh, gate.Runners{})
+	store := &fakeStore{}
+	svc := gate.NewService(gh, store, gate.Runners{})
+
+	err := svc.HandlePullRequest(t.Context(), testPR())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("HandlePullRequest() = %v, want wrapping %v", err, wantErr)
+	}
+	if len(store.saveCalls) != 0 {
+		t.Errorf("SavePR calls = %d, want 0 after CreateCheckRun error", len(store.saveCalls))
+	}
+}
+
+func TestOnPush(t *testing.T) {
+	t.Parallel()
+
+	want := gate.PRState{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123"}
+
+	tests := []struct {
+		name  string
+		state gate.PRState
+	}{
+		{name: "fresh state", state: gate.PRState{Owner: "acme", Repo: "widgets", Number: 7}},
+		{name: "state with older head", state: gate.PRState{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "old111"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if diff := cmp.Diff(want, gate.OnPush(tt.state, testPR())); diff != "" {
+				t.Errorf("OnPush() (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestHandlePullRequestSavesState(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{}
+	store := &fakeStore{}
+	svc := gate.NewService(gh, store, gate.Runners{})
+
+	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
+		t.Fatalf("HandlePullRequest() = %v, want nil", err)
+	}
+
+	wantLoad := []loadPRCall{{owner: "acme", repo: "widgets", number: 7}}
+	if diff := cmp.Diff(wantLoad, store.loadCalls, cmp.AllowUnexported(loadPRCall{})); diff != "" {
+		t.Errorf("LoadPR calls (-want +got):\n%s", diff)
+	}
+	wantSave := []gate.PRState{{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123"}}
+	if diff := cmp.Diff(wantSave, store.saveCalls); diff != "" {
+		t.Errorf("SavePR calls (-want +got):\n%s", diff)
+	}
+}
+
+func TestHandlePullRequestLoadError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("boom")
+	gh := &fakeGitHub{}
+	svc := gate.NewService(gh, &fakeStore{loadErr: wantErr}, gate.Runners{})
+
+	err := svc.HandlePullRequest(t.Context(), testPR())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("HandlePullRequest() = %v, want wrapping %v", err, wantErr)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("CreateCheckRun calls = %d, want 0 after LoadPR error", len(gh.calls))
+	}
+}
+
+func TestHandlePullRequestSaveError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("boom")
+	svc := gate.NewService(&fakeGitHub{}, &fakeStore{saveErr: wantErr}, gate.Runners{})
 
 	err := svc.HandlePullRequest(t.Context(), testPR())
 	if !errors.Is(err, wantErr) {
