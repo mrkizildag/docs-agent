@@ -17,6 +17,9 @@ type fakeGitHub struct {
 	err            error
 	workflowExists bool
 	workflowErr    error
+	changed        []review.ChangedFile
+	changedErr     error
+	changedCalls   int
 }
 
 type createCheckRunCall struct {
@@ -33,6 +36,11 @@ func (f *fakeGitHub) CreateCheckRun(_ context.Context, installationID int64, own
 
 func (f *fakeGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (bool, error) {
 	return f.workflowExists, f.workflowErr
+}
+
+func (f *fakeGitHub) ListChangedFiles(_ context.Context, _ int64, _, _ string, _ int) ([]review.ChangedFile, error) {
+	f.changedCalls++
+	return f.changed, f.changedErr
 }
 
 type fakeRunner struct {
@@ -224,6 +232,45 @@ func TestHandlePullRequestWorkflowExistsError(t *testing.T) {
 	}
 }
 
+func TestHandlePullRequestPassesChangedFiles(t *testing.T) {
+	t.Parallel()
+
+	changed := []review.ChangedFile{{Path: "a.go", Hunks: []review.LineRange{{Start: 3, End: 9}}, Patch: "@@ -1 +3,7 @@"}}
+	gh := &fakeGitHub{changed: changed}
+	runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
+	svc := gate.NewService(gh, &fakeStore{}, gate.Runners{Server: runner})
+
+	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
+		t.Fatalf("HandlePullRequest() = %v, want nil", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("runner calls = %d, want 1", len(runner.calls))
+	}
+	if diff := cmp.Diff(changed, runner.calls[0].ChangedFiles); diff != "" {
+		t.Errorf("Request.ChangedFiles (-want +got):\n%s", diff)
+	}
+}
+
+func TestHandlePullRequestListChangedFilesError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("boom")
+	gh := &fakeGitHub{changedErr: wantErr}
+	runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
+	svc := gate.NewService(gh, &fakeStore{}, gate.Runners{Server: runner})
+
+	err := svc.HandlePullRequest(t.Context(), testPR())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("HandlePullRequest() = %v, want wrapping %v", err, wantErr)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("CreateCheckRun calls = %+v, want none", gh.calls)
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("runner calls = %d, want 0", len(runner.calls))
+	}
+}
+
 func TestHandlePullRequestNoRunnersSkipsWorkflowLookup(t *testing.T) {
 	t.Parallel()
 
@@ -236,6 +283,9 @@ func TestHandlePullRequestNoRunnersSkipsWorkflowLookup(t *testing.T) {
 	}
 	if len(gh.calls) != 1 || gh.calls[0].run.Conclusion != gate.ConclusionNeutral {
 		t.Errorf("CreateCheckRun calls = %+v, want one neutral check run", gh.calls)
+	}
+	if gh.changedCalls != 0 {
+		t.Errorf("ListChangedFiles calls = %d, want 0 when no runner is selected", gh.changedCalls)
 	}
 }
 

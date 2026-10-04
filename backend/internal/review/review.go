@@ -73,13 +73,14 @@ type Request struct {
 	BaseSHA        string
 	HeadSHA        string
 	ChangedFiles   []ChangedFile
-	CandidateDocs  []string
 }
 
 // ChangedFile is a file in the PR diff and the head-side line ranges its hunks cover.
 type ChangedFile struct {
-	Path  string
-	Hunks []LineRange
+	Path         string
+	PreviousPath string // old path of a renamed or moved file; empty otherwise.
+	Hunks        []LineRange
+	Patch        string // unified diff text for Path, as GitHub returns it; empty when GitHub omits it.
 }
 
 // LineRange is an inclusive range of 1-based line numbers.

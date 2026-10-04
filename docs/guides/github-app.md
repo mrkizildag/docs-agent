@@ -24,8 +24,8 @@ Generate the webhook secret with `openssl rand -hex 32`. Set the same value in t
 Grant only what the bot uses:
 
 - **Checks**: read & write — sets the `docs-agent` check run.
-- **Contents**: read & write — reads the diff, detects the `.github/workflows/docs-agent.yml` workflow, commits doc edits.
-- **Pull requests**: read & write — review comments and suggestions.
+- **Contents**: read & write — clones the PR head for the server runner (with a token narrowed to that repo and `contents: read`), detects the `.github/workflows/docs-agent.yml` workflow, commits doc edits.
+- **Pull requests**: read & write — lists the PR's changed files and patches; review comments and suggestions.
 - **Issues**: read & write — the PR conversation comment and summary comment use the issues API.
 - **Metadata**: read-only — mandatory for every App.
 

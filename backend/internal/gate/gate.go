@@ -51,6 +51,8 @@ type GitHub interface {
 	// WorkflowExists reports whether the repo's default branch has the
 	// docs-agent Actions workflow.
 	WorkflowExists(ctx context.Context, installationID int64, owner, repo string) (bool, error)
+	// ListChangedFiles returns the files in the pull request's diff with their head-side hunk ranges.
+	ListChangedFiles(ctx context.Context, installationID int64, owner, repo string, number int) ([]review.ChangedFile, error)
 }
 
 const checkName = "docs-agent"
@@ -174,6 +176,11 @@ func selectRunner(hasWorkflow bool, runners Runners) runnerSelection {
 }
 
 func (s *Service) runCheck(ctx context.Context, runner review.Runner, pr PullRequest) (CheckRun, error) {
+	changed, err := s.gh.ListChangedFiles(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number)
+	if err != nil {
+		return CheckRun{}, fmt.Errorf("list changed files: %w", err)
+	}
+
 	req := review.Request{
 		InstallationID: pr.InstallationID,
 		Owner:          pr.Owner,
@@ -181,6 +188,7 @@ func (s *Service) runCheck(ctx context.Context, runner review.Runner, pr PullReq
 		Number:         pr.Number,
 		BaseSHA:        pr.BaseSHA,
 		HeadSHA:        pr.HeadSHA,
+		ChangedFiles:   changed,
 	}
 
 	started, err := runner.Start(ctx, req)
