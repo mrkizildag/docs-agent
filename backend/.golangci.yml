@@ -36,6 +36,14 @@ linters:
           msg: only main exits
         - pattern: ^http\.(Get|Post|DefaultClient)$
           msg: inject an *http.Client with a timeout
+    ireturn:
+      allow:
+        - error
+        - empty
+        - stdlib
+        - anon
+        - github.com/mrkizildag/docs-agent/backend/internal/review.Started
+        - github.com/mrkizildag/docs-agent/backend/internal/review.Verdict
   exclusions:
     rules:
       - path: internal/config/
@@ -44,6 +52,9 @@ linters:
       - path: cmd/
         linters: [forbidigo]
         text: os\.Exit
+      - path: _test\.go
+        linters: [gosec]
+        text: G101
 
 formatters:
   enable:

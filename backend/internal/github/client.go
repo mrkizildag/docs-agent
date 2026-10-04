@@ -78,6 +78,28 @@ func (c *Client) CreateCheckRun(ctx context.Context, installationID int64, owner
 	return nil
 }
 
+// workflowPath is the Actions workflow whose presence on the default branch
+// means a repo runs analysis through Actions rather than the server.
+const workflowPath = ".github/workflows/docs-agent.yml"
+
+// WorkflowExists reports whether owner/repo's default branch has workflowPath.
+func (c *Client) WorkflowExists(ctx context.Context, installationID int64, owner, repo string) (bool, error) {
+	client, err := c.installationClient(installationID)
+	if err != nil {
+		return false, fmt.Errorf("check workflow %s/%s: %w", owner, repo, err)
+	}
+
+	_, _, resp, err := client.Repositories.GetContents(ctx, owner, repo, workflowPath, nil)
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return false, nil
+		}
+		return false, fmt.Errorf("check workflow %s/%s: %w", owner, repo, err)
+	}
+
+	return true, nil
+}
+
 func (c *Client) installationClient(installationID int64) (*github.Client, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

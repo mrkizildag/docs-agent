@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 )
@@ -35,7 +36,27 @@ type Config struct {
 	GitHubAppID      int64
 	GitHubPrivateKey Secret
 	WebhookSecret    Secret
-	AnthropicAPIKey  Secret
+	LLM              *LLM
+}
+
+// LLMProvider selects which wire format to speak to the LLM. OpenAI covers any
+// OpenAI-compatible chat completions endpoint: Gemini, GitHub Models,
+// OpenRouter, Ollama.
+type LLMProvider string
+
+const (
+	LLMProviderAnthropic LLMProvider = "anthropic"
+	LLMProviderOpenAI    LLMProvider = "openai"
+)
+
+// LLM configures the analysis runner. A nil *LLM on Config means the runner
+// is off: LLM_PROVIDER was unset.
+type LLM struct {
+	Provider    LLMProvider
+	BaseURL     string
+	APIKey      Secret
+	Model       string
+	TriageModel string
 }
 
 // Load reads the environment and returns one error listing every invalid variable.
@@ -74,13 +95,89 @@ func Load() (Config, error) {
 	}
 	cfg.WebhookSecret = Secret{value: webhookSecret}
 
-	anthropicKey, err := requireString("ANTHROPIC_API_KEY")
-	if err != nil {
-		errs = append(errs, err)
+	llmProvider := os.Getenv("LLM_PROVIDER")
+	llmBaseURL := os.Getenv("LLM_BASE_URL")
+	llmAPIKey := os.Getenv("LLM_API_KEY")
+	llmModel := os.Getenv("LLM_MODEL")
+	llmTriageModel := os.Getenv("LLM_TRIAGE_MODEL")
+
+	if llmProvider == "" {
+		if llmBaseURL != "" {
+			errs = append(errs, errors.New("LLM_BASE_URL: set but LLM_PROVIDER is unset"))
+		}
+		if llmAPIKey != "" {
+			errs = append(errs, errors.New("LLM_API_KEY: set but LLM_PROVIDER is unset"))
+		}
+		if llmModel != "" {
+			errs = append(errs, errors.New("LLM_MODEL: set but LLM_PROVIDER is unset"))
+		}
+		if llmTriageModel != "" {
+			errs = append(errs, errors.New("LLM_TRIAGE_MODEL: set but LLM_PROVIDER is unset"))
+		}
+	} else {
+		llm, llmErrs := loadLLM(LLMProvider(llmProvider), llmBaseURL, llmAPIKey, llmModel, llmTriageModel)
+		errs = append(errs, llmErrs...)
+		cfg.LLM = llm
 	}
-	cfg.AnthropicAPIKey = Secret{value: anthropicKey}
 
 	return cfg, errors.Join(errs...)
+}
+
+// loadLLM validates the LLM_* variables once LLM_PROVIDER is set and returns
+// the resulting LLM, or nil and the collected errors.
+func loadLLM(provider LLMProvider, baseURL, apiKey, model, triageModel string) (*LLM, []error) {
+	var errs []error
+
+	switch provider {
+	case LLMProviderAnthropic:
+		if apiKey == "" {
+			errs = append(errs, errors.New("LLM_API_KEY is required when LLM_PROVIDER=anthropic"))
+		}
+	case LLMProviderOpenAI:
+		if baseURL == "" {
+			errs = append(errs, errors.New("LLM_BASE_URL is required when LLM_PROVIDER=openai"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("LLM_PROVIDER: unknown provider %q", provider))
+	}
+
+	if model == "" {
+		errs = append(errs, errors.New("LLM_MODEL is required when LLM_PROVIDER is set"))
+	}
+	if triageModel == "" {
+		triageModel = model
+	}
+
+	if baseURL != "" {
+		if err := validateAbsoluteHTTPURL(baseURL); err != nil {
+			errs = append(errs, fmt.Errorf("LLM_BASE_URL: %w", err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return nil, errs
+	}
+
+	return &LLM{
+		Provider:    provider,
+		BaseURL:     baseURL,
+		APIKey:      Secret{value: apiKey},
+		Model:       model,
+		TriageModel: triageModel,
+	}, nil
+}
+
+// validateAbsoluteHTTPURL reports an error unless raw parses as an absolute
+// http or https URL.
+func validateAbsoluteHTTPURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("parse %q: %w", raw, err)
+	}
+	if !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("%q is not an absolute http(s) URL", raw)
+	}
+	return nil
 }
 
 func requireString(key string) (string, error) {
