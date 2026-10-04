@@ -80,6 +80,7 @@ type Request struct {
 type ChangedFile struct {
 	Path  string
 	Hunks []LineRange
+	Patch string // unified diff text for Path, as GitHub returns it; filled by #8.
 }
 
 // LineRange is an inclusive range of 1-based line numbers.

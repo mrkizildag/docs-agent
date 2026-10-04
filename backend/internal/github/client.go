@@ -23,8 +23,9 @@ type Client struct {
 	httpClient    *http.Client
 	baseURL       string
 
-	mu                  sync.Mutex
-	installationClients map[int64]*github.Client
+	mu                     sync.Mutex
+	installationClients    map[int64]*github.Client
+	installationTransports map[int64]*ghinstallation.Transport
 }
 
 var _ gate.GitHub = (*Client)(nil)
@@ -44,13 +45,30 @@ func NewClient(httpClient *http.Client, appID int64, privateKeyPEM []byte, baseU
 	}
 
 	return &Client{
-		transport:           transport,
-		appID:               appID,
-		privateKeyPEM:       privateKeyPEM,
-		httpClient:          httpClient,
-		baseURL:             baseURL,
-		installationClients: make(map[int64]*github.Client),
+		transport:              transport,
+		appID:                  appID,
+		privateKeyPEM:          privateKeyPEM,
+		httpClient:             httpClient,
+		baseURL:                baseURL,
+		installationClients:    make(map[int64]*github.Client),
+		installationTransports: make(map[int64]*ghinstallation.Transport),
 	}, nil
+}
+
+// InstallationToken returns a short-lived installation access token for
+// installationID, authenticating a git clone or other call outside the
+// go-github client.
+func (c *Client) InstallationToken(ctx context.Context, installationID int64) (string, error) {
+	transport, err := c.installationTransport(installationID)
+	if err != nil {
+		return "", fmt.Errorf("installation token %d: %w", installationID, err)
+	}
+
+	token, err := transport.Token(ctx)
+	if err != nil {
+		return "", fmt.Errorf("installation token %d: %w", installationID, err)
+	}
+	return token, nil
 }
 
 // CreateCheckRun creates a completed check run on head_sha in owner/repo,
@@ -108,18 +126,10 @@ func (c *Client) installationClient(installationID int64) (*github.Client, error
 		return client, nil
 	}
 
-	// ghinstallation.refreshToken mutates the AppsTransport it wraps, so each
-	// installation needs its own rather than sharing one across goroutines.
-	appsTransport, err := ghinstallation.NewAppsTransport(c.transport, c.appID, c.privateKeyPEM)
+	installationTransport, err := c.newInstallationTransportLocked(installationID)
 	if err != nil {
-		return nil, fmt.Errorf("create GitHub App transport for installation %d: %w", installationID, err)
+		return nil, err
 	}
-	if c.baseURL != "" {
-		appsTransport.BaseURL = c.baseURL
-	}
-
-	installationTransport := ghinstallation.NewFromAppsTransport(appsTransport, installationID)
-	installationTransport.Client = c.httpClient
 
 	httpClient := &http.Client{
 		Transport: installationTransport,
@@ -138,4 +148,38 @@ func (c *Client) installationClient(installationID int64) (*github.Client, error
 
 	c.installationClients[installationID] = client
 	return client, nil
+}
+
+func (c *Client) installationTransport(installationID int64) (*ghinstallation.Transport, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if transport, ok := c.installationTransports[installationID]; ok {
+		return transport, nil
+	}
+	return c.newInstallationTransportLocked(installationID)
+}
+
+// newInstallationTransportLocked creates and caches installationID's
+// transport. Callers must hold c.mu.
+func (c *Client) newInstallationTransportLocked(installationID int64) (*ghinstallation.Transport, error) {
+	if transport, ok := c.installationTransports[installationID]; ok {
+		return transport, nil
+	}
+
+	// ghinstallation.refreshToken mutates the AppsTransport it wraps, so each
+	// installation needs its own rather than sharing one across goroutines.
+	appsTransport, err := ghinstallation.NewAppsTransport(c.transport, c.appID, c.privateKeyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("create GitHub App transport for installation %d: %w", installationID, err)
+	}
+	if c.baseURL != "" {
+		appsTransport.BaseURL = c.baseURL
+	}
+
+	installationTransport := ghinstallation.NewFromAppsTransport(appsTransport, installationID)
+	installationTransport.Client = c.httpClient
+
+	c.installationTransports[installationID] = installationTransport
+	return installationTransport, nil
 }

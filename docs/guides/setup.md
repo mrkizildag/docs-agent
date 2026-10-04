@@ -40,6 +40,17 @@ Only `backend/internal/config` reads the environment (a lint rule enforces it). 
 | `LLM_MODEL`                    | required when `LLM_PROVIDER` is set | Model used to review docs impact. |
 | `LLM_TRIAGE_MODEL`             | defaults to `LLM_MODEL` | Cheaper model used for triage, if different. |
 
-Without `LLM_PROVIDER` set, the analysis runner is off, and repos without the docs-agent workflow get a neutral "No analysis runner configured" check.
+Without `LLM_PROVIDER` set, the analysis runner is off, and repos without the docs-agent workflow get a neutral "No analysis runner configured" check. With it set, `git` must be on the PATH: the server runner clones the PR head. See [Server runner](../features/server-runner.md).
+
+### Example: Gemini free tier
+
+```
+LLM_PROVIDER=openai
+LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+LLM_API_KEY=<key from https://aistudio.google.com/apikey>
+LLM_MODEL=<a Gemini model name>
+```
+
+The free tier may train on your inputs, so use it only with a sandbox repo.
 
 See [Registering the GitHub App](github-app.md) for how to get the App ID, private key, and webhook secret.

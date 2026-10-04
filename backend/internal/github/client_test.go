@@ -164,6 +164,34 @@ func TestWorkflowExists(t *testing.T) {
 	}
 }
 
+func TestInstallationToken(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /app/installations/{id}/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprintf(w, `{"token":"ghs_test","expires_at":%q}`, time.Now().Add(time.Hour).Format(time.RFC3339)); err != nil {
+			t.Errorf("write access_tokens response: %v", err)
+		}
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	client, err := ghclient.NewClient(&http.Client{Timeout: 5 * time.Second}, 1, testPrivateKeyPEM(t), srv.URL)
+	if err != nil {
+		t.Fatalf("NewClient() = %v, want nil error", err)
+	}
+
+	token, err := client.InstallationToken(t.Context(), 99)
+	if err != nil {
+		t.Fatalf("InstallationToken() = %v, want nil error", err)
+	}
+	if token != "ghs_test" {
+		t.Errorf("InstallationToken() = %q, want %q", token, "ghs_test")
+	}
+}
+
 func TestCreateCheckRunConcurrentInstallations(t *testing.T) {
 	t.Parallel()
 
