@@ -11,7 +11,7 @@ covers:
 
 # Setup
 
-Requires Go (version in `backend/go.mod`) and golangci-lint v2.
+Requires Go (version in `backend/go.mod`) and golangci-lint v2. To run it in production, see [Deploy](deploy.md).
 
 | Command      | Does                                                   |
 |--------------|--------------------------------------------------------|

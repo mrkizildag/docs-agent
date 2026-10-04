@@ -1,0 +1,8 @@
+*
+!backend/
+backend/bin
+**/*.db*
+**/.env
+**/*.pem
+**/coverage.out
+**/.DS_Store
