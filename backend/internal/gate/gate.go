@@ -55,6 +55,33 @@ type GitHub interface {
 
 const checkName = "docs-agent"
 
+// PRState is what the gate remembers about one pull request between events.
+type PRState struct {
+	InstallationID int64
+	Owner          string
+	Repo           string
+	Number         int
+	HeadSHA        string // head commit the gate last reported a check run for; "" if never
+}
+
+// Store persists PRState.
+type Store interface {
+	// LoadPR returns the zero-HeadSHA state (identity fields filled from the args) for a PR never saved.
+	LoadPR(ctx context.Context, owner, repo string, number int) (PRState, error)
+	SavePR(ctx context.Context, state PRState) error
+}
+
+// OnPush is the state transition for a new head commit: pure, no I/O.
+func OnPush(_ PRState, pr PullRequest) PRState {
+	return PRState{
+		InstallationID: pr.InstallationID,
+		Owner:          pr.Owner,
+		Repo:           pr.Repo,
+		Number:         pr.Number,
+		HeadSHA:        pr.HeadSHA,
+	}
+}
+
 // Runners are the analysis runners a repo may use. A nil Runner means that
 // runner is unavailable.
 type Runners struct {
@@ -65,20 +92,25 @@ type Runners struct {
 // Service decides and reports the docs-agent check run for a pull request.
 type Service struct {
 	gh      GitHub
+	store   Store
 	runners Runners
 }
 
-// NewService returns a Service that reports check runs through gh, selecting
-// among runners for analysis.
-func NewService(gh GitHub, runners Runners) *Service {
-	return &Service{gh: gh, runners: runners}
+// NewService returns a Service that reports check runs through gh, persists
+// state through store, and selects among runners for analysis.
+func NewService(gh GitHub, store Store, runners Runners) *Service {
+	return &Service{gh: gh, store: store, runners: runners}
 }
 
 // HandlePullRequest selects an analysis runner for pr, runs it, and reports
 // the result as the docs-agent check run.
 func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
+	state, err := s.store.LoadPR(ctx, pr.Owner, pr.Repo, pr.Number)
+	if err != nil {
+		return fmt.Errorf("handle pull request %s/%s#%d: load state: %w", pr.Owner, pr.Repo, pr.Number, err)
+	}
+
 	var hasWorkflow bool
-	var err error
 	if s.runners.Actions != nil || s.runners.Server != nil {
 		hasWorkflow, err = s.gh.WorkflowExists(ctx, pr.InstallationID, pr.Owner, pr.Repo)
 		if err != nil {
@@ -107,6 +139,10 @@ func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
 
 	if err := s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, run); err != nil {
 		return fmt.Errorf("handle pull request %s/%s#%d: %w", pr.Owner, pr.Repo, pr.Number, err)
+	}
+
+	if err := s.store.SavePR(ctx, OnPush(state, pr)); err != nil {
+		return fmt.Errorf("handle pull request %s/%s#%d: save state: %w", pr.Owner, pr.Repo, pr.Number, err)
 	}
 
 	return nil

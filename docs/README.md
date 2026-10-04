@@ -11,6 +11,7 @@ Start here. Each entry is one file with a one-line summary; open only what the t
 ## Index
 
 - [Architecture](architecture.md): the parts of docs-agent, how they connect, and the phase plan.
+- [Job queue](features/job-queue.md): how webhook work is queued, deduplicated, superseded, and recovered after a restart.
 - [Setup](guides/setup.md): run, test, and lint the backend locally.
 - [Registering the GitHub App](guides/github-app.md): create the GitHub App, set its webhook and permissions, and install it.
 - [0001: In-repo docs first](decisions/0001-in-repo-docs-first.md): why phase 1 targets a `docs/` folder, not Notion.

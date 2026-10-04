@@ -65,7 +65,7 @@ func mergeEnv(base, overrides map[string]string) map[string]string {
 
 func envVars() []string {
 	return []string{
-		"ADDR", "LOG_LEVEL", "GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY_FILE",
+		"ADDR", "LOG_LEVEL", "DATABASE_PATH", "GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY_FILE",
 		"GITHUB_WEBHOOK_SECRET",
 		"LLM_PROVIDER", "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL", "LLM_TRIAGE_MODEL",
 	}
@@ -87,12 +87,12 @@ func TestLoad(t *testing.T) {
 		{
 			name: "defaults with required vars set",
 			env:  requiredEnv(keyPath),
-			want: config.Config{Addr: ":8080", LogLevel: slog.LevelInfo, GitHubAppID: 123},
+			want: config.Config{Addr: ":8080", LogLevel: slog.LevelInfo, DatabasePath: "docs-agent.db", GitHubAppID: 123},
 		},
 		{
 			name: "overrides",
-			env:  mergeEnv(requiredEnv(keyPath), map[string]string{"ADDR": ":9000", "LOG_LEVEL": "debug"}),
-			want: config.Config{Addr: ":9000", LogLevel: slog.LevelDebug, GitHubAppID: 123},
+			env:  mergeEnv(requiredEnv(keyPath), map[string]string{"ADDR": ":9000", "LOG_LEVEL": "debug", "DATABASE_PATH": "/data/docs-agent.db"}),
+			want: config.Config{Addr: ":9000", LogLevel: slog.LevelDebug, DatabasePath: "/data/docs-agent.db", GitHubAppID: 123},
 		},
 		{
 			name:    "invalid log level",
@@ -190,7 +190,7 @@ func TestLoad(t *testing.T) {
 				"LLM_PROVIDER": "anthropic", "LLM_MODEL": "claude-opus", "LLM_API_KEY": "anthropic-secret",
 			}),
 			want: config.Config{
-				Addr: ":8080", LogLevel: slog.LevelInfo, GitHubAppID: 123,
+				Addr: ":8080", LogLevel: slog.LevelInfo, DatabasePath: "docs-agent.db", GitHubAppID: 123,
 				LLM: &config.LLM{
 					Provider: config.LLMProviderAnthropic, Model: "claude-opus", TriageModel: "claude-opus",
 				},
@@ -203,7 +203,7 @@ func TestLoad(t *testing.T) {
 				"LLM_PROVIDER": "openai", "LLM_MODEL": "llama3", "LLM_BASE_URL": "http://localhost:11434/v1",
 			}),
 			want: config.Config{
-				Addr: ":8080", LogLevel: slog.LevelInfo, GitHubAppID: 123,
+				Addr: ":8080", LogLevel: slog.LevelInfo, DatabasePath: "docs-agent.db", GitHubAppID: 123,
 				LLM: &config.LLM{
 					Provider: config.LLMProviderOpenAI, Model: "llama3", TriageModel: "llama3",
 					BaseURL: "http://localhost:11434/v1",
@@ -217,7 +217,7 @@ func TestLoad(t *testing.T) {
 				"LLM_TRIAGE_MODEL": "claude-haiku",
 			}),
 			want: config.Config{
-				Addr: ":8080", LogLevel: slog.LevelInfo, GitHubAppID: 123,
+				Addr: ":8080", LogLevel: slog.LevelInfo, DatabasePath: "docs-agent.db", GitHubAppID: 123,
 				LLM: &config.LLM{
 					Provider: config.LLMProviderAnthropic, Model: "claude-opus", TriageModel: "claude-haiku",
 				},

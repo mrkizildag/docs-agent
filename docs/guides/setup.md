@@ -30,6 +30,7 @@ Only `backend/internal/config` reads the environment (a lint rule enforces it). 
 |-------------------------------|----------|-----------------------------------------------------------------|
 | `ADDR`                        | `:8080`  | Listen address.                                                 |
 | `LOG_LEVEL`                   | `info`   | `debug`, `info`, `warn`, or `error`.                            |
+| `DATABASE_PATH`               | `docs-agent.db` | Path to the SQLite database holding webhook deliveries, the job queue, and PR state. Created on first start. |
 | `GITHUB_APP_ID`                | required | The GitHub App's numeric ID.                                    |
 | `GITHUB_APP_PRIVATE_KEY_FILE`  | required | Path to the App's private key `.pem` file. See [github-app.md](github-app.md). |
 | `GITHUB_WEBHOOK_SECRET`        | required | Shared secret used to verify `POST /webhook` signatures.        |

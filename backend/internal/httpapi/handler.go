@@ -8,28 +8,24 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/mrkizildag/docs-agent/backend/internal/gate"
+	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
 )
 
 const maxWebhookBodyBytes = 25 << 20 // GitHub's webhook payload cap
 
-// handlePullRequestTimeout bounds work done after GitHub's webhook delivery
-// abandons the request (10s) but stays under the server's WriteTimeout (30s)
-// so the check-run write isn't cut off mid-flight.
-const handlePullRequestTimeout = 25 * time.Second
-
-// PullRequestHandler reports the docs-agent check run for a pull request.
-type PullRequestHandler interface {
-	HandlePullRequest(ctx context.Context, pr gate.PullRequest) error
+// Enqueuer accepts a durable job for later processing by a worker.
+type Enqueuer interface {
+	Enqueue(ctx context.Context, job jobqueue.NewJob) (bool, error)
 }
 
-func NewHandler(logger *slog.Logger, webhookSecret []byte, prs PullRequestHandler) *http.ServeMux {
+func NewHandler(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -37,7 +33,7 @@ func NewHandler(logger *slog.Logger, webhookSecret []byte, prs PullRequestHandle
 			logger.Warn("write healthz response", "err", err)
 		}
 	})
-	mux.HandleFunc("POST /webhook", webhookHandler(logger, webhookSecret, prs))
+	mux.HandleFunc("POST /webhook", webhookHandler(logger, webhookSecret, jobs))
 	return mux
 }
 
@@ -65,7 +61,7 @@ type pullRequestEvent struct {
 	} `json:"installation"`
 }
 
-func webhookHandler(logger *slog.Logger, webhookSecret []byte, prs PullRequestHandler) http.HandlerFunc {
+func webhookHandler(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		deliveryID := r.Header.Get("X-GitHub-Delivery")
 
@@ -120,6 +116,12 @@ func webhookHandler(logger *slog.Logger, webhookSecret []byte, prs PullRequestHa
 			return
 		}
 
+		if deliveryID == "" {
+			logger.Warn("pull_request event missing delivery id", "delivery_id", deliveryID)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
 		pr := gate.PullRequest{
 			InstallationID: payload.Installation.ID,
 			Owner:          payload.Repository.Owner.Login,
@@ -129,12 +131,29 @@ func webhookHandler(logger *slog.Logger, webhookSecret []byte, prs PullRequestHa
 			HeadSHA:        payload.PullRequest.Head.SHA,
 		}
 
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), handlePullRequestTimeout)
-		defer cancel()
-		if err := prs.HandlePullRequest(ctx, pr); err != nil {
-			logger.Error("handle pull request", "delivery_id", deliveryID, "err", err)
+		jobPayload, err := json.Marshal(pr)
+		if err != nil {
+			logger.Error("encode pull_request job payload", "delivery_id", deliveryID, "err", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
+		}
+
+		job := jobqueue.NewJob{
+			DeliveryID: deliveryID,
+			Key:        fmt.Sprintf("%s/%s#%d", pr.Owner, pr.Repo, pr.Number),
+			Kind:       pullRequestJobKind,
+			Payload:    jobPayload,
+			Supersedes: true,
+		}
+
+		enqueued, err := jobs.Enqueue(r.Context(), job)
+		if err != nil {
+			logger.Error("enqueue pull_request job", "delivery_id", deliveryID, "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if !enqueued {
+			logger.Info("duplicate webhook delivery", "delivery_id", deliveryID)
 		}
 
 		w.WriteHeader(http.StatusAccepted)
