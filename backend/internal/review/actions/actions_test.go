@@ -11,8 +11,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
-	"github.com/mrkizildag/docs-agent/backend/internal/review/actions"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
 )
 
 type fakeAPI struct {

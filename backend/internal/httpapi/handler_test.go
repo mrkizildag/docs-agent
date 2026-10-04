@@ -17,9 +17,9 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/gate"
-	"github.com/mrkizildag/docs-agent/backend/internal/httpapi"
-	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
+	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 )
 
 const (
@@ -494,7 +494,7 @@ func postWorkflowRun(t *testing.T, runs httpapi.RunLookup, jobs httpapi.Enqueuer
 func TestWebhookWorkflowRun(t *testing.T) {
 	t.Parallel()
 
-	const path = ".github/workflows/docs-agent.yml"
+	const path = ".github/workflows/pollux-agent.yml"
 	known := fakeRunLookup{numbers: map[int64]int{99: 7}}
 
 	tests := []struct {

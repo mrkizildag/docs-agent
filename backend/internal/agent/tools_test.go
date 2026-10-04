@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/agent"
-	"github.com/mrkizildag/docs-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 )
 
 const secret = "TOP-SECRET-OUTSIDE"

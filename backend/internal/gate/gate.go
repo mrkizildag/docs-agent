@@ -12,11 +12,11 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 // setupGuideURL is linked from the neutral check when no runner is available.
-const setupGuideURL = "https://github.com/mrkizildag/docs-agent/blob/main/docs/guides/setup.md"
+const setupGuideURL = "https://github.com/mrkizildag/pollux-agent/blob/main/docs/guides/setup.md"
 
 // PullRequest is the subset of a GitHub pull request the gate needs.
 type PullRequest struct {
@@ -62,7 +62,7 @@ type GitHub interface {
 	CreateCheckRun(ctx context.Context, installationID int64, owner, repo string, run CheckRun) (int64, error)
 	UpdateCheckRun(ctx context.Context, installationID int64, owner, repo string, id int64, run CheckRun) error
 	// WorkflowExists reports whether the repo's default branch has the
-	// docs-agent Actions workflow.
+	// pollux-agent Actions workflow.
 	WorkflowExists(ctx context.Context, installationID int64, owner, repo string) (bool, error)
 	// ListChangedFiles returns the files in the pull request's diff with their head-side hunk ranges.
 	ListChangedFiles(ctx context.Context, installationID int64, owner, repo string, number int) ([]review.ChangedFile, error)
@@ -108,11 +108,11 @@ type ReviewComment struct {
 	Body      string
 }
 
-const checkName = "docs-agent"
+const checkName = "pollux-agent"
 
 // WorkflowPath is the target-repo workflow whose presence selects the Actions
 // runner and whose completion carries its result.
-const WorkflowPath = ".github/workflows/docs-agent.yml"
+const WorkflowPath = ".github/workflows/pollux-agent.yml"
 
 // PRState is what the gate remembers about one pull request between events.
 type PRState struct {
@@ -481,7 +481,7 @@ type Runners struct {
 	Server  review.Runner
 }
 
-// Service decides and reports the docs-agent check run for a pull request.
+// Service decides and reports the pollux-agent check run for a pull request.
 type Service struct {
 	gh      GitHub
 	store   Store
@@ -504,7 +504,7 @@ func (s *Service) WithCollectBackoff(d time.Duration) *Service {
 }
 
 // HandlePullRequest selects an analysis runner for pr, runs it, and reports
-// the result as the docs-agent check run. A runner that finishes later leaves
+// the result as the pollux-agent check run. A runner that finishes later leaves
 // the check run in progress until HandleRunCompleted concludes it.
 func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
 	state, err := s.store.LoadPR(ctx, pr.Owner, pr.Repo, pr.Number)
@@ -584,7 +584,7 @@ func (s *Service) startActions(ctx context.Context, state PRState, pr PullReques
 		HeadSHA: pr.HeadSHA,
 		Status:  StatusInProgress,
 		Title:   "Analyzing docs impact",
-		Summary: "Waiting for the docs-agent workflow run to finish.",
+		Summary: "Waiting for the pollux-agent workflow run to finish.",
 	})
 	if err != nil {
 		return fmt.Errorf("create check run: %w", err)
@@ -682,7 +682,7 @@ func (s *Service) HandleDeadline(ctx context.Context, ref PRRef, nonce string, n
 		return nil
 	}
 
-	next, run := conclude(state, failedOutcome("no result from the docs-agent workflow run before the deadline"))
+	next, run := conclude(state, failedOutcome("no result from the pollux-agent workflow run before the deadline"))
 	if err := s.gh.UpdateCheckRun(ctx, state.InstallationID, state.Owner, state.Repo, state.CheckRunID, run); err != nil {
 		return fmt.Errorf("handle deadline of %s/%s#%d: %w", ref.Owner, ref.Repo, ref.Number, err)
 	}

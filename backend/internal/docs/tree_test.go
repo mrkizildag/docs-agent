@@ -10,7 +10,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/docs"
+	"github.com/mrkizildag/pollux-agent/backend/internal/docs"
 )
 
 type docSummary struct {

@@ -16,7 +16,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/config"
+	"github.com/mrkizildag/pollux-agent/backend/internal/config"
 )
 
 func writeTestKey(t *testing.T) (path string, keyPEM []byte) {
@@ -87,12 +87,12 @@ func TestLoad(t *testing.T) {
 		{
 			name: "defaults with required vars set",
 			env:  requiredEnv(keyPath),
-			want: config.Config{Addr: ":8080", LogLevel: slog.LevelInfo, DatabasePath: "docs-agent.db", GitHubAppID: 123},
+			want: config.Config{Addr: ":8080", LogLevel: slog.LevelInfo, DatabasePath: "pollux.db", GitHubAppID: 123},
 		},
 		{
 			name: "overrides",
-			env:  mergeEnv(requiredEnv(keyPath), map[string]string{"ADDR": ":9000", "LOG_LEVEL": "debug", "DATABASE_PATH": "/data/docs-agent.db"}),
-			want: config.Config{Addr: ":9000", LogLevel: slog.LevelDebug, DatabasePath: "/data/docs-agent.db", GitHubAppID: 123},
+			env:  mergeEnv(requiredEnv(keyPath), map[string]string{"ADDR": ":9000", "LOG_LEVEL": "debug", "DATABASE_PATH": "/data/pollux.db"}),
+			want: config.Config{Addr: ":9000", LogLevel: slog.LevelDebug, DatabasePath: "/data/pollux.db", GitHubAppID: 123},
 		},
 		{
 			name:    "invalid log level",
@@ -190,7 +190,7 @@ func TestLoad(t *testing.T) {
 				"LLM_PROVIDER": "anthropic", "LLM_MODEL": "claude-opus", "LLM_API_KEY": "anthropic-secret",
 			}),
 			want: config.Config{
-				Addr: ":8080", LogLevel: slog.LevelInfo, DatabasePath: "docs-agent.db", GitHubAppID: 123,
+				Addr: ":8080", LogLevel: slog.LevelInfo, DatabasePath: "pollux.db", GitHubAppID: 123,
 				LLM: &config.LLM{
 					Provider: config.LLMProviderAnthropic, Model: "claude-opus", TriageModel: "claude-opus",
 				},
@@ -203,7 +203,7 @@ func TestLoad(t *testing.T) {
 				"LLM_PROVIDER": "openai", "LLM_MODEL": "llama3", "LLM_BASE_URL": "http://localhost:11434/v1",
 			}),
 			want: config.Config{
-				Addr: ":8080", LogLevel: slog.LevelInfo, DatabasePath: "docs-agent.db", GitHubAppID: 123,
+				Addr: ":8080", LogLevel: slog.LevelInfo, DatabasePath: "pollux.db", GitHubAppID: 123,
 				LLM: &config.LLM{
 					Provider: config.LLMProviderOpenAI, Model: "llama3", TriageModel: "llama3",
 					BaseURL: "http://localhost:11434/v1",
@@ -217,7 +217,7 @@ func TestLoad(t *testing.T) {
 				"LLM_TRIAGE_MODEL": "claude-haiku",
 			}),
 			want: config.Config{
-				Addr: ":8080", LogLevel: slog.LevelInfo, DatabasePath: "docs-agent.db", GitHubAppID: 123,
+				Addr: ":8080", LogLevel: slog.LevelInfo, DatabasePath: "pollux.db", GitHubAppID: 123,
 				LLM: &config.LLM{
 					Provider: config.LLMProviderAnthropic, Model: "claude-opus", TriageModel: "claude-haiku",
 				},

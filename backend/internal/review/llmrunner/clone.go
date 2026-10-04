@@ -25,7 +25,7 @@ func cloneHead(ctx context.Context, remoteURL, headSHA, token string) (string, e
 		return "", fmt.Errorf("clone %s: head sha %q is not a full hex object id", remoteURL, headSHA)
 	}
 
-	dir, err := os.MkdirTemp("", "docs-agent-clone-")
+	dir, err := os.MkdirTemp("", "pollux-agent-clone-")
 	if err != nil {
 		return "", fmt.Errorf("clone %s: create temp dir: %w", remoteURL, err)
 	}

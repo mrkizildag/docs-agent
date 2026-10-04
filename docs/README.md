@@ -10,7 +10,7 @@ Start here. Each entry is one file with a one-line summary; open only what the t
 
 ## Index
 
-- [Architecture](architecture.md): the parts of docs-agent, how they connect, and the phase plan.
+- [Architecture](architecture.md): the parts of pollux, how they connect, and the phase plan.
 - [Job queue](features/job-queue.md): how webhook work is queued, deduplicated, superseded, and recovered after a restart.
 - [Actions runner](features/actions-runner.md): how analysis runs in the repo's own GitHub Actions, and the invariants that keep its result trustworthy and its check from sticking.
 - [Server runner](features/server-runner.md): how the server decides whether a PR makes docs stale, why its tools are read-only, and its limits.
@@ -23,7 +23,7 @@ Start here. Each entry is one file with a one-line summary; open only what the t
 
 ## Conventions
 
-This folder is the default structure docs-agent creates in other repos, so it follows its own rules:
+This folder is the default structure pollux creates in other repos, so it follows its own rules:
 
 - One topic per file. Folders: `features/` (what a feature does and its invariants), `guides/` (how-to), `decisions/` (why we chose X, numbered).
 - Every doc starts with frontmatter: `title`, `summary` (one line), `covers` (globs of the code it describes).

@@ -7,9 +7,9 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/gate"
-	"github.com/mrkizildag/docs-agent/backend/internal/gate/sqlite"
-	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
+	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 )
 
 func open(t *testing.T) (*sqlite.Store, string) {

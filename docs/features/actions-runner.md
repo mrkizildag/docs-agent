@@ -10,7 +10,7 @@ covers:
 
 # Actions runner
 
-An analysis runner for repos that carry the docs-agent workflow. The server never calls an LLM for these repos; the repo's own Actions run Claude Code with the repo's credential. Setup: [Using the Actions runner](../guides/actions-runner.md).
+An analysis runner for repos that carry the pollux-agent workflow. The server never calls an LLM for these repos; the repo's own Actions run Claude Code with the repo's credential. Setup: [Using the Actions runner](../guides/actions-runner.md).
 
 ## Flow
 

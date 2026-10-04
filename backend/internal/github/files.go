@@ -9,7 +9,7 @@ import (
 
 	"github.com/google/go-github/v92/github"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 // hunkHeader matches `@@ -a,b +c,d @@`; the head side is c and d, and an

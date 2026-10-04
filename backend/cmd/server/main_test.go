@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/config"
+	"github.com/mrkizildag/pollux-agent/backend/internal/config"
 )
 
 func TestBuildRunners_ServerRunnerOnlyWithLLMProviderActionsAlways(t *testing.T) {

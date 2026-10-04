@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 )
 
 func TestOpenAIComplete_ToolCallRoundTrip(t *testing.T) {

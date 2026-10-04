@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
-const summaryMarker = "<!-- docs-agent:summary -->"
+const summaryMarker = "<!-- pollux-agent:summary -->"
 
 func proposalMarker(id string) string {
-	return "<!-- docs-agent:proposal:" + id + " -->"
+	return "<!-- pollux-agent:proposal:" + id + " -->"
 }
 
 // proposalComment is the review comment for p: a suggestion on the doc's own

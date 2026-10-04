@@ -6,7 +6,7 @@ import (
 
 	"github.com/google/go-github/v92/github"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 )
 
 // ListComments returns owner/repo#number's review comments, then its issue

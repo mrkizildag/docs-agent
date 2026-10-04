@@ -66,7 +66,7 @@ func Load() (Config, error) {
 
 	cfg := Config{
 		Addr:         envOr("ADDR", ":8080"),
-		DatabasePath: envOr("DATABASE_PATH", "docs-agent.db"),
+		DatabasePath: envOr("DATABASE_PATH", "pollux.db"),
 	}
 
 	if err := cfg.LogLevel.UnmarshalText([]byte(envOr("LOG_LEVEL", "info"))); err != nil {

@@ -3,10 +3,10 @@ on:
     inputs: {head_sha: {required: true}, pr_number: {required: true}, nonce: {required: true}}
 permissions: {contents: read}
 jobs:
-  docs-agent:
+  pollux-agent:
     runs-on: ubuntu-latest
     steps:
-      - uses: mrkizildag/docs-agent/action@main
+      - uses: mrkizildag/pollux-agent/action@main
         with:
           head_sha: ${{ inputs.head_sha }}
           pr_number: ${{ inputs.pr_number }}

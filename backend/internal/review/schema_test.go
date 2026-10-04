@@ -6,7 +6,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 func TestSchemasUpToDate(t *testing.T) {

@@ -10,7 +10,7 @@ covers:
 
 # Server runner
 
-The server runner is the analysis runner for repos without the docs-agent Actions workflow. It is on when `LLM_PROVIDER` is set; see [Setup](../guides/setup.md). It implements the runner contract from `internal/review` and returns either "no impact" with a reason or a list of validated proposals.
+The server runner is the analysis runner for repos without the pollux-agent Actions workflow. It is on when `LLM_PROVIDER` is set; see [Setup](../guides/setup.md). It implements the runner contract from `internal/review` and returns either "no impact" with a reason or a list of validated proposals.
 
 ## Pipeline
 

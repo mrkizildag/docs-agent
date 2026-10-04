@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/docs"
+	"github.com/mrkizildag/pollux-agent/backend/internal/docs"
 )
 
 const reassembleSrc = "---\ntitle: T\ncovers: [\"a/**\"]\n---\nIntro\n\n# One\nx\n## Two\ny\n```md\n# fenced\n```\n### Three\nz\n## Four\nw\n# Five\nend"

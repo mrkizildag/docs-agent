@@ -12,13 +12,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/gate"
-	"github.com/mrkizildag/docs-agent/backend/internal/gate/sqlite"
-	"github.com/mrkizildag/docs-agent/backend/internal/httpapi"
-	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
-	"github.com/mrkizildag/docs-agent/backend/internal/llm"
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
-	"github.com/mrkizildag/docs-agent/backend/internal/review/llmrunner"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
+	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
+	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
 
 const chainPatch = "@@ -1,3 +1,3 @@\n package app\n-// old wording\n+// new wording\n"
@@ -104,7 +104,7 @@ func TestWebhookToServerRunnerChain(t *testing.T) {
 	t.Setenv("GIT_CONFIG_VALUE_0", "https://github.com/acme/widgets.git")
 
 	secret := []byte("test-secret")
-	dbPath := filepath.Join(t.TempDir(), "docs-agent.db")
+	dbPath := filepath.Join(t.TempDir(), "pollux.db")
 	store, err := sqlite.Open(t.Context(), dbPath)
 	if err != nil {
 		t.Fatalf("sqlite.Open(%q) error = %v", dbPath, err)

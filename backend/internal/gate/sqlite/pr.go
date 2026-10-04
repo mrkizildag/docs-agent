@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 )
 
 // LoadPR returns the state most recently saved for owner/repo#number, or the

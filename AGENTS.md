@@ -1,4 +1,4 @@
-# docs-agent
+# pollux
 
 A GitHub App that reviews pull requests, proposes updates to the repo's docs, and blocks the merge until docs are updated or waived.
 

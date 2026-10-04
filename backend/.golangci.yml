@@ -36,16 +36,16 @@ linters:
             - "!$test"
           allow:
             - $gostd
-            - github.com/mrkizildag/docs-agent/backend/internal/review
+            - github.com/mrkizildag/pollux-agent/backend/internal/review
           deny:
-            - pkg: github.com/mrkizildag/docs-agent/backend/internal/review/llmrunner
+            - pkg: github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner
               desc: gate imports only internal/review from this module
         review-contracts:
           files:
             - "**/internal/review/*.go"
             - "!$test"
           deny:
-            - pkg: github.com/mrkizildag/docs-agent/backend/internal
+            - pkg: github.com/mrkizildag/pollux-agent/backend/internal
               desc: internal/review imports nothing else from this module
         llm-agent-leaf:
           files:
@@ -55,7 +55,7 @@ linters:
           list-mode: strict
           allow:
             - $gostd
-            - github.com/mrkizildag/docs-agent/backend/internal/llm
+            - github.com/mrkizildag/pollux-agent/backend/internal/llm
     forbidigo:
       analyze-types: true
       forbid:
@@ -71,8 +71,8 @@ linters:
         - empty
         - stdlib
         - anon
-        - github.com/mrkizildag/docs-agent/backend/internal/review.Started
-        - github.com/mrkizildag/docs-agent/backend/internal/review.Verdict
+        - github.com/mrkizildag/pollux-agent/backend/internal/review.Started
+        - github.com/mrkizildag/pollux-agent/backend/internal/review.Verdict
   exclusions:
     rules:
       - path: internal/config/
@@ -92,4 +92,4 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/mrkizildag/docs-agent
+        - github.com/mrkizildag/pollux-agent

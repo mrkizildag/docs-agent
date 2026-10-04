@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 func TestProposalCommentBodies(t *testing.T) {

@@ -1,6 +1,6 @@
 ---
 title: Architecture
-summary: The parts of docs-agent, how they connect, and the phase plan.
+summary: The parts of pollux, how they connect, and the phase plan.
 covers:
   - backend/**
   - action/**
@@ -8,17 +8,17 @@ covers:
 
 # Architecture
 
-docs-agent is a GitHub App. GitHub sends pull request events to the backend; the backend reads the diff, finds the docs that cover the changed files, asks an LLM whether they need to change, and reports the result as a check run that can block the merge.
+pollux is a GitHub App. GitHub sends pull request events to the backend; the backend reads the diff, finds the docs that cover the changed files, asks an LLM whether they need to change, and reports the result as a check run that can block the merge.
 
 ## Parts
 
-- **Backend** (`backend/`, Go): receives GitHub webhooks, talks to the GitHub and LLM APIs, owns the check run. `POST /webhook` verifies GitHub's signature. For a `pull_request` event (opened, synchronize, reopened), or a `workflow_run` completed event for a run the backend dispatched, it stores the delivery and a durable job in one SQLite transaction, deduplicated by GitHub's delivery ID; other events are acknowledged without being stored. A periodic sweep enqueues a deadline job for each awaited Actions run past its deadline (see [Job queue](features/job-queue.md)). Accepted deliveries return 202. A worker processes jobs off that queue: it runs at most one job per PR at a time but PRs in parallel, a newer push supersedes the older job for the same PR, cancelling it if it is already running, and jobs left unfinished by a restart resume afterward. The `pull_request` job picks an analysis runner for the repo and reports its result as the `docs-agent` check run on the PR head commit.
+- **Backend** (`backend/`, Go): receives GitHub webhooks, talks to the GitHub and LLM APIs, owns the check run. `POST /webhook` verifies GitHub's signature. For a `pull_request` event (opened, synchronize, reopened), or a `workflow_run` completed event for a run the backend dispatched, it stores the delivery and a durable job in one SQLite transaction, deduplicated by GitHub's delivery ID; other events are acknowledged without being stored. A periodic sweep enqueues a deadline job for each awaited Actions run past its deadline (see [Job queue](features/job-queue.md)). Accepted deliveries return 202. A worker processes jobs off that queue: it runs at most one job per PR at a time but PRs in parallel, a newer push supersedes the older job for the same PR, cancelling it if it is already running, and jobs left unfinished by a restart resume afterward. The `pull_request` job picks an analysis runner for the repo and reports its result as the `pollux-agent` check run on the PR head commit.
 - **Frontend** (phase 2, TypeScript + shadcn/ui): org and repo settings, configurable docs structures.
 - **Doc targets**: phase 1 writes to the repo's own `docs/` folder. Notion comes in phase 3.
 
 Inside the backend, `internal/gate` is the domain and imports only `internal/review`, the contracts shared with the analysis runners. It declares the GitHub and Store interfaces it needs; `internal/github` implements GitHub. `internal/httpapi` turns webhooks into jobs on `internal/jobqueue`, the durable queue, and decodes them back into `gate.Service` calls when the worker runs them; `internal/gate/sqlite` implements both `gate`'s and `jobqueue`'s storage interfaces on one SQLite database. `internal/gate/sqlite` is an adapter, not part of the domain. Only `cmd/server` wires concrete types together. The queue's guarantees are in [Job queue](features/job-queue.md). A runner that needs GitHub credentials outside the API client (the server runner's `git` clone) gets `github.Client.InstallationToken` from `cmd/server` as a function, not the client, so no runner imports `internal/github`; the token is narrowed to one repo with `contents: read`.
 
-Runner selection: a repo that has the docs-agent Actions workflow on its default branch runs analysis through the Actions runner; otherwise, if the server has `LLM_PROVIDER` configured, it runs through the server runner; otherwise the PR gets a neutral check titled "No analysis runner configured" linking the setup guide. The server runner is described in [Server runner](features/server-runner.md). A repo with the workflow never falls back to the server runner. The Actions runner makes no LLM call on the server: the gate dispatches the workflow, the repo's own Actions run Claude Code with the repo's credential, and the result comes back as an artifact. See [Actions runner](features/actions-runner.md) and the [setup guide](guides/actions-runner.md).
+Runner selection: a repo that has the pollux-agent Actions workflow on its default branch runs analysis through the Actions runner; otherwise, if the server has `LLM_PROVIDER` configured, it runs through the server runner; otherwise the PR gets a neutral check titled "No analysis runner configured" linking the setup guide. The server runner is described in [Server runner](features/server-runner.md). A repo with the workflow never falls back to the server runner. The Actions runner makes no LLM call on the server: the gate dispatches the workflow, the repo's own Actions run Claude Code with the repo's credential, and the result comes back as an artifact. See [Actions runner](features/actions-runner.md) and the [setup guide](guides/actions-runner.md).
 
 Analysis contract: `internal/review` defines what a runner is asked to review and the proposals it returns. `action/proposal.schema.json` and `action/result.schema.json` (the no-impact-or-proposals result Claude Code must emit in the Actions runner) are generated from the `internal/review` types by `make generate` and checked in; never edit them by hand, a test fails when either drifts. The schema checks shape and the `docs/` prefix; proposal validation in `internal/review` is the full check (anchor inside a diff hunk, one-line reason, index entry exactly when the proposal creates a new doc), and every runner's output must pass it before the gate acts on it.
 
@@ -29,7 +29,7 @@ Docs model: `internal/docs` reads the `docs/` tree of a checkout into docs (fron
 1. A PR is opened or updated; GitHub sends `pull_request` to the backend.
 2. The backend lists the PR's changed files; the analysis runner maps them to docs through each doc's `covers` globs on its own checkout of the head commit (see [0002](decisions/0002-docs-structure.md)).
 3. The LLM compares the diff with those docs and returns "no impact" or proposed edits.
-4. The backend sets the `docs-agent` check: `success` for no impact, `action_required` otherwise, and posts one review comment per proposal plus a summary comment (see [Proposal output](features/proposal-output.md)).
+4. The backend sets the `pollux-agent` check: `success` for no impact, `action_required` otherwise, and posts one review comment per proposal plus a summary comment (see [Proposal output](features/proposal-output.md)).
 5. A developer applies, edits, or waives the proposal; the check turns green and the PR can merge.
 
 ## Phases

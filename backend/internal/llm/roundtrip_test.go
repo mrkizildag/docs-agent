@@ -10,7 +10,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 )
 
 func scriptedRequest() llm.Request {

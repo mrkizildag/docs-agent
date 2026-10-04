@@ -13,8 +13,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/agent"
-	"github.com/mrkizildag/docs-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 )
 
 // fakeModel scripts one llm.Response (or error) per call, in order.

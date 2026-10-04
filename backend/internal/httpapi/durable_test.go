@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/gate"
-	"github.com/mrkizildag/docs-agent/backend/internal/gate/sqlite"
-	"github.com/mrkizildag/docs-agent/backend/internal/httpapi"
-	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
+	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
+	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 // blockingGitHub blocks CreateCheckRun for blockSHA until its context is cancelled.

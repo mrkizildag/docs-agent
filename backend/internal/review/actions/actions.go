@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/docs"
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/docs"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 const (
@@ -29,7 +29,7 @@ const (
 	maxCauseText = 200
 )
 
-// DispatchInputs are the workflow_dispatch inputs of the docs-agent workflow.
+// DispatchInputs are the workflow_dispatch inputs of the pollux-agent workflow.
 type DispatchInputs struct {
 	HeadSHA  string
 	PRNumber int
@@ -38,7 +38,7 @@ type DispatchInputs struct {
 
 // WorkflowAPI is the GitHub Actions surface the runner needs.
 type WorkflowAPI interface {
-	// Dispatch starts the docs-agent workflow on the repo's default branch and
+	// Dispatch starts the pollux-agent workflow on the repo's default branch and
 	// returns the ID of the run it created.
 	Dispatch(ctx context.Context, installationID int64, owner, repo string, in DispatchInputs) (runID int64, err error)
 	// ResultArtifact returns the result.json bytes of the run's result artifact.
@@ -68,7 +68,7 @@ type ClaudeOutput struct {
 	StructuredOutput *review.StructuredOutput   `json:"structured_output"`
 }
 
-// Runner dispatches the repo's docs-agent workflow and collects its result.
+// Runner dispatches the repo's pollux-agent workflow and collects its result.
 type Runner struct {
 	api     WorkflowAPI
 	timeout time.Duration

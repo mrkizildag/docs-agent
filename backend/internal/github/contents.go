@@ -7,7 +7,7 @@ import (
 
 	"github.com/google/go-github/v92/github"
 
-	"github.com/mrkizildag/docs-agent/backend/internal/docs"
+	"github.com/mrkizildag/pollux-agent/backend/internal/docs"
 )
 
 // FileAtRef returns the content of the file at path in owner/repo at ref. ok

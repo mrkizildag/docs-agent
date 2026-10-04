@@ -1,18 +1,18 @@
 ---
 title: Using the Actions runner
-summary: Set up a repo so docs-agent analysis runs in its own GitHub Actions with its own Claude credential.
+summary: Set up a repo so pollux analysis runs in its own GitHub Actions with its own Claude credential.
 covers:
   - action/**
 ---
 
 # Using the Actions runner
 
-With the Actions runner, your repo runs the analysis in its own GitHub Actions using your own Claude credential. The docs-agent server makes no LLM calls for the repo, so a team can use its Claude subscription or API key without giving the server a key. The check, proposals, and safety guarantees are the same as the server runner's. How it works: [Actions runner](../features/actions-runner.md).
+With the Actions runner, your repo runs the analysis in its own GitHub Actions using your own Claude credential. The pollux server makes no LLM calls for the repo, so a team can use its Claude subscription or API key without giving the server a key. The check, proposals, and safety guarantees are the same as the server runner's. How it works: [Actions runner](../features/actions-runner.md).
 
 ## Setup
 
-1. Install the docs-agent GitHub App on the repo (see [Registering the GitHub App](github-app.md)).
-2. Add `.github/workflows/docs-agent.yml` on the default branch. The exact file lives at [action/docs-agent.yml](../../action/docs-agent.yml) in this repo; copy it from there.
+1. Install the pollux-agent GitHub App on the repo (see [Registering the GitHub App](github-app.md)).
+2. Add `.github/workflows/pollux-agent.yml` on the default branch. The exact file lives at [action/pollux-agent.yml](../../action/pollux-agent.yml) in this repo; copy it from there.
 
    ```yaml
    on:
@@ -20,10 +20,10 @@ With the Actions runner, your repo runs the analysis in its own GitHub Actions u
        inputs: {head_sha: {required: true}, pr_number: {required: true}, nonce: {required: true}}
    permissions: {contents: read}
    jobs:
-     docs-agent:
+     pollux-agent:
        runs-on: ubuntu-latest
        steps:
-         - uses: mrkizildag/docs-agent/action@main
+         - uses: mrkizildag/pollux-agent/action@main
            with:
              head_sha: ${{ inputs.head_sha }}
              pr_number: ${{ inputs.pr_number }}
@@ -33,7 +33,7 @@ With the Actions runner, your repo runs the analysis in its own GitHub Actions u
    ```
 
 3. Add one repo secret, either:
-   - `CLAUDE_CODE_OAUTH_TOKEN`: run `claude setup-token` and copy only the single `sk-ant-oat01-...` line. A bad paste shows up as a neutral `docs-agent` check whose cause is a 401.
+   - `CLAUDE_CODE_OAUTH_TOKEN`: run `claude setup-token` and copy only the single `sk-ant-oat01-...` line. A bad paste shows up as a neutral `pollux-agent` check whose cause is a 401.
    - `ANTHROPIC_API_KEY`: an Anthropic API key.
 
 ## Detection
