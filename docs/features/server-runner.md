@@ -20,6 +20,7 @@ The server runner is the analysis runner for repos without the docs-agent Action
 4. **Triage.** One call per candidate doc to the triage model, given the PR's diff and the doc. Each answers impacted or not, with a reason. If every doc is "no", the result is "no impact" carrying those reasons, and nothing further runs. Most PRs end here, which keeps them cheap.
 5. **Agent loop.** For impacted docs, the main model reads the clone through tools and finishes by calling `submit_proposals`. Its arguments must pass proposal validation (path under `docs/`, anchor inside a diff hunk). A submission that fails is not returned: the model is told why and may resubmit while steps remain.
 6. **Verification.** One call per proposal asks whether it is right. Rejected proposals are dropped; if all are dropped, the result is "no impact".
+7. **Section text.** For each surviving proposal the runner attaches the section's current text and its head-side line range from the clone (empty for a new doc). The model never supplies them; the gate uses them to render comments (see [Proposal output](proposal-output.md)).
 
 The diff comes from GitHub's per-file patches, not from git in the clone, so anchors agree with what GitHub shows. The clone is for reading docs and the code around the change.
 

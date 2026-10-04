@@ -370,7 +370,14 @@ func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budge
 	}
 
 	for i := range parsed.Proposals {
-		parsed.Proposals[i].Section = normalizeSection(parsed.Proposals[i].Section)
+		p := &parsed.Proposals[i]
+		p.Section = normalizeSection(p.Section)
+		if p.Section == "" {
+			continue
+		}
+		if text, start, end, ok := index[p.DocPath].SectionSpan(p.Section); ok {
+			p.Original, p.Lines = text, review.LineRange{Start: start, End: end}
+		}
 	}
 	return parsed.Proposals, nil
 }

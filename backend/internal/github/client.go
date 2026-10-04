@@ -34,6 +34,7 @@ type Client struct {
 	installationClients    map[int64]*github.Client
 	installationTransports map[int64]*ghinstallation.Transport
 	cloneTransports        map[cloneKey]*ghinstallation.Transport
+	botLogin               string // "<app-slug>[bot]"; "" until resolved
 }
 
 // cloneKey identifies a token narrowed to one repository of an installation.
@@ -371,4 +372,45 @@ func (c *Client) newTransport(installationID int64) (*ghinstallation.Transport, 
 	transport := ghinstallation.NewFromAppsTransport(appsTransport, installationID)
 	transport.Client = c.httpClient
 	return transport, nil
+}
+
+// appBotLogin returns the login GitHub gives the App's bot user, resolving the
+// App's slug once with an App JWT.
+func (c *Client) appBotLogin(ctx context.Context) (string, error) {
+	c.mu.Lock()
+	login := c.botLogin
+	c.mu.Unlock()
+	if login != "" {
+		return login, nil
+	}
+
+	appsTransport, err := ghinstallation.NewAppsTransport(c.transport, c.appID, c.privateKeyPEM)
+	if err != nil {
+		return "", fmt.Errorf("create GitHub App transport for app %d: %w", c.appID, err)
+	}
+	if c.baseURL != "" {
+		appsTransport.BaseURL = c.baseURL
+	}
+	opts := []github.ClientOptionsFunc{github.WithHTTPClient(&http.Client{Transport: appsTransport, Timeout: c.httpClient.Timeout})}
+	if c.baseURL != "" {
+		opts = append(opts, github.WithURLs(&c.baseURL, &c.baseURL))
+	}
+	client, err := github.NewClient(opts...)
+	if err != nil {
+		return "", fmt.Errorf("create GitHub App client for app %d: %w", c.appID, err)
+	}
+
+	app, _, err := client.Apps.Get(ctx, "")
+	if err != nil {
+		return "", fmt.Errorf("get GitHub App %d: %w", c.appID, err)
+	}
+	if app.GetSlug() == "" {
+		return "", fmt.Errorf("get GitHub App %d: response has no slug", c.appID)
+	}
+
+	login = app.GetSlug() + "[bot]"
+	c.mu.Lock()
+	c.botLogin = login
+	c.mu.Unlock()
+	return login, nil
 }

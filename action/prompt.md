@@ -18,7 +18,7 @@ Each proposal replaces exactly one section of one doc:
 
 - `doc_path`: path of the doc, under `docs/` only. Never propose a change outside `docs/`.
 - `section`: the heading text of the section to replace.
-- `content`: the full replacement for that section, in the doc's existing style.
+- `content`: the full replacement for that section, including its heading line, in the doc's existing style.
 - `anchor`: `file` and `line` of one head-side (post-change) line in the diff that caused this proposal. The line must exist in the changed file at the head commit.
 - `reason`: one line saying why the doc must change.
 

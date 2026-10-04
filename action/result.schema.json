@@ -44,7 +44,7 @@
           },
           "content": {
             "type": "string",
-            "description": "Replacement content for the section, or the full content of a new doc."
+            "description": "Full replacement for the section including its heading line, or the full content of a new doc."
           },
           "index_entry": {
             "type": "string",

@@ -24,6 +24,7 @@ import (
 const chainPatch = "@@ -1,3 +1,3 @@\n package app\n-// old wording\n+// new wording\n"
 
 type chainGitHub struct {
+	noComments
 	calls chan e2eCheckRunCall
 }
 

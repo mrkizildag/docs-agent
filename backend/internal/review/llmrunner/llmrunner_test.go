@@ -670,3 +670,130 @@ func TestStart_TooManyCandidateDocsIsAnError(t *testing.T) {
 		t.Fatalf("Start() = %v, want an error naming the candidate cap", err)
 	}
 }
+
+func commitDoc(t *testing.T, dir, relPath, content string) string {
+	t.Helper()
+
+	if err := os.WriteFile(filepath.Join(dir, relPath), []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", relPath, err)
+	}
+	for _, args := range [][]string{{"add", "-A"}, {"commit", "-q", "-m", "doc"}} {
+		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	out, err := exec.CommandContext(t.Context(), "git", "-C", dir, "rev-parse", "HEAD").Output() //nolint:gosec // dir is a t.TempDir path, not external input
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestStart_ProposalCarriesOriginalSectionAndLines(t *testing.T) {
+	t.Parallel()
+
+	const frontmatter = "---\ntitle: X\nsummary: Describes X.\ncovers:\n  - main.go\n---\n"
+	const body = "# X\n\n## Mid\nmid body\n\n## Last\nlast body"
+
+	tests := []struct {
+		name      string
+		doc       string
+		docPath   string
+		section   string
+		indexItem string
+		want      string
+		wantLines review.LineRange
+	}{
+		{
+			name:      "middle section followed by a blank line counts frontmatter",
+			doc:       frontmatter + body + "\n",
+			docPath:   "docs/x.md",
+			section:   "Mid",
+			want:      "## Mid\nmid body\n\n",
+			wantLines: review.LineRange{Start: 9, End: 11},
+		},
+		{
+			name:      "last section with trailing newline",
+			doc:       frontmatter + body + "\n",
+			docPath:   "docs/x.md",
+			section:   "Last",
+			want:      "## Last\nlast body\n",
+			wantLines: review.LineRange{Start: 12, End: 13},
+		},
+		{
+			name:      "last section without trailing newline",
+			doc:       frontmatter + body,
+			docPath:   "docs/x.md",
+			section:   "Last",
+			want:      "## Last\nlast body",
+			wantLines: review.LineRange{Start: 12, End: 13},
+		},
+		{
+			name:      "heading written with leading hashes",
+			doc:       frontmatter + body + "\n",
+			docPath:   "docs/x.md",
+			section:   "## Mid",
+			want:      "## Mid\nmid body\n\n",
+			wantLines: review.LineRange{Start: 9, End: 11},
+		},
+		{
+			name:      "new doc has no original",
+			doc:       frontmatter + body + "\n",
+			docPath:   "docs/new.md",
+			section:   "",
+			indexItem: "new: Describes new.",
+			want:      "",
+			wantLines: review.LineRange{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			repoDir, _ := newGitRepo(t)
+			headSHA := commitDoc(t, repoDir, "docs/x.md", tc.doc)
+
+			proposal := proposalFor(tc.docPath, 2)
+			proposal["section"] = tc.section
+			if tc.indexItem != "" {
+				proposal["index_entry"] = tc.indexItem
+			}
+			model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+				triageResponse(true),
+				submitResponse(proposal),
+				verifyResponse(true),
+			}}
+			runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+			runner.SetRemote(repoDir)
+
+			started, err := runner.Start(t.Context(), testRequest(headSHA))
+			if err != nil {
+				t.Fatalf("Start() = %v, want nil error", err)
+			}
+			result, ok := started.(review.Result)
+			if !ok {
+				t.Fatalf("Start() = %T, want review.Result", started)
+			}
+			proposals, ok := result.Verdict.(review.Proposals)
+			if !ok || len(proposals) != 1 {
+				t.Fatalf("Verdict = %#v, want exactly one proposal", result.Verdict)
+			}
+			got := proposals[0]
+			if got.Original != tc.want || got.Lines != tc.wantLines {
+				t.Fatalf("Original, Lines = %q, %+v, want %q, %+v", got.Original, got.Lines, tc.want, tc.wantLines)
+			}
+
+			if tc.want == "" {
+				return
+			}
+			docLines := strings.Split(strings.TrimSuffix(tc.doc, "\n"), "\n")
+			replaced := strings.Join(docLines[got.Lines.Start-1:got.Lines.End], "\n")
+			if replaced != strings.TrimSuffix(got.Original, "\n") {
+				t.Errorf("doc lines %d-%d = %q, want them to equal Original %q", got.Lines.Start, got.Lines.End, replaced, got.Original)
+			}
+		})
+	}
+}

@@ -11,6 +11,9 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
+// MaxDocBytes is the largest doc file the package reads.
+const MaxDocBytes = maxDocBytes
+
 // Doc is one parsed markdown file under docs/.
 type Doc struct {
 	Path     string
@@ -60,6 +63,38 @@ func ParseDoc(path string, src []byte) (Doc, error) {
 		Source:   src,
 		Sections: parseSections(src, body),
 	}, nil
+}
+
+// SectionSpan returns the text of the section titled heading (leading "#"s and
+// surrounding space ignored) and its 1-based inclusive line range, from the
+// heading line through the section's last line. ok is false when no heading
+// matches or when several do, since a span for the wrong one would be edited.
+func (d Doc) SectionSpan(heading string) (text string, start, end int, ok bool) {
+	want := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(heading), "#"))
+
+	var found *Section
+
+	for i, s := range d.Sections {
+		if s.Level == 0 || s.Heading != want {
+			continue
+		}
+
+		if found != nil {
+			return "", 0, 0, false
+		}
+
+		found = &d.Sections[i]
+	}
+
+	if found == nil {
+		return "", 0, 0, false
+	}
+
+	start = 1 + bytes.Count(d.Source[:found.Start], []byte("\n"))
+	text = string(d.Source[found.Start:found.End])
+	end = start + strings.Count(strings.TrimSuffix(text, "\n"), "\n")
+
+	return text, start, end, true
 }
 
 func validateCovers(covers []string) error {
