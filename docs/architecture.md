@@ -22,6 +22,8 @@ Runner selection: a repo that has the docs-agent Actions workflow on its default
 
 Analysis contract: `internal/review` defines what a runner is asked to review and the proposals it returns. `action/proposal.schema.json` is generated from the proposal type by `make generate` and checked in; never edit it by hand, a test fails when it drifts. The schema checks shape and the `docs/` prefix; proposal validation in `internal/review` is the full check (anchor inside a diff hunk, one-line reason, index entry exactly when the proposal creates a new doc), and every runner's output must pass it before the gate acts on it.
 
+Docs model: `internal/docs` reads the `docs/` tree of a checkout into docs (frontmatter and sections) and matches changed files to docs by their `covers` globs, relative to the repo root with `**` crossing folders. It takes a file system, never calls GitHub, and imports no other internal package. A doc with no frontmatter block, unparsable YAML, wrong field types, or a `covers` glob that is invalid, not repo-relative, or too costly to match is reported and skipped, never fatal, because phase 1 must work on existing docs it does not restructure; a missing `title` or `summary` is not an error. PR content is untrusted: the walk reads only regular files under 1 MiB, never symlinks. A section runs from its heading to the next heading of the same or higher level, so replacing a `##` section replaces its `###` subsections too; this is the unit a proposal replaces. Only `#` headings start sections; setext underlines and `#` lines inside code fences are body text. Duplicate headings are allowed.
+
 ## Flow (phase 1 target)
 
 1. A PR is opened or updated; GitHub sends `pull_request` to the backend.
