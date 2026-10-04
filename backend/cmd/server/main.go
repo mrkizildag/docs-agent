@@ -17,7 +17,9 @@ import (
 	"github.com/mrkizildag/docs-agent/backend/internal/github"
 	"github.com/mrkizildag/docs-agent/backend/internal/httpapi"
 	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/docs-agent/backend/internal/llm"
 	"github.com/mrkizildag/docs-agent/backend/internal/review/actions"
+	"github.com/mrkizildag/docs-agent/backend/internal/review/llmrunner"
 )
 
 const (
@@ -58,7 +60,11 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create GitHub client: %w", err)
 	}
-	gateSvc := gate.NewService(ghClient, store, gate.Runners{Actions: actions.New(ghClient, actionsRunTimeout)})
+	runners, err := buildRunners(cfg, ghClient)
+	if err != nil {
+		return fmt.Errorf("build analysis runners: %w", err)
+	}
+	gateSvc := gate.NewService(ghClient, store, runners)
 
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, maxParallelJobs)
 	workerCtx, cancelWorker := context.WithCancel(context.WithoutCancel(ctx))
@@ -138,6 +144,32 @@ func sweepDeadlines(ctx context.Context, src httpapi.OverdueSource, jobs httpapi
 			}
 		}
 	}
+}
+
+// llmHTTPTimeout is longer than the GitHub client's 20s: chat completions
+// take longer than a REST call.
+const llmHTTPTimeout = 60 * time.Second
+
+// buildRunners wires the Actions runner and, from cfg.LLM, the server runner. A nil cfg.LLM
+// leaves the server slot empty, so a repo must run the Actions workflow.
+func buildRunners(cfg config.Config, ghClient *github.Client) (gate.Runners, error) {
+	actionsRunner := actions.New(ghClient, actionsRunTimeout)
+	if cfg.LLM == nil {
+		return gate.Runners{Actions: actionsRunner}, nil
+	}
+
+	var model llm.Model
+	switch cfg.LLM.Provider {
+	case config.LLMProviderOpenAI:
+		model = llm.NewOpenAI(&http.Client{Timeout: llmHTTPTimeout}, cfg.LLM.BaseURL, cfg.LLM.APIKey.Reveal())
+	case config.LLMProviderAnthropic:
+		model = llm.NewAnthropic(&http.Client{Timeout: llmHTTPTimeout}, cfg.LLM.BaseURL, cfg.LLM.APIKey.Reveal())
+	default:
+		return gate.Runners{}, fmt.Errorf("LLM_PROVIDER: unknown provider %q", cfg.LLM.Provider)
+	}
+
+	runner := llmrunner.New(model, ghClient.InstallationToken, cfg.LLM.TriageModel, cfg.LLM.Model)
+	return gate.Runners{Actions: actionsRunner, Server: runner}, nil
 }
 
 func shutdownServer(ctx context.Context, srv *http.Server) error {

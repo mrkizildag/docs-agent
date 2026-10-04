@@ -59,6 +59,8 @@ type GitHub interface {
 	// WorkflowExists reports whether the repo's default branch has the
 	// docs-agent Actions workflow.
 	WorkflowExists(ctx context.Context, installationID int64, owner, repo string) (bool, error)
+	// ListChangedFiles returns the files in the pull request's diff with their head-side hunk ranges.
+	ListChangedFiles(ctx context.Context, installationID int64, owner, repo string, number int) ([]review.ChangedFile, error)
 }
 
 const checkName = "docs-agent"
@@ -253,9 +255,9 @@ func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
 	switch selectRunner(hasWorkflow, s.runners) {
 	case runnerNone:
 	case runnerActions:
-		started, err = start(ctx, s.runners.Actions, pr)
+		started, err = s.start(ctx, s.runners.Actions, pr)
 	case runnerServer:
-		started, err = start(ctx, s.runners.Server, pr)
+		started, err = s.start(ctx, s.runners.Server, pr)
 	}
 	if err != nil {
 		return fmt.Errorf("handle pull request %s/%s#%d: %w", pr.Owner, pr.Repo, pr.Number, err)
@@ -404,7 +406,12 @@ func selectRunner(hasWorkflow bool, runners Runners) runnerSelection {
 	return runnerServer
 }
 
-func start(ctx context.Context, runner review.Runner, pr PullRequest) (review.Started, error) {
+func (s *Service) start(ctx context.Context, runner review.Runner, pr PullRequest) (review.Started, error) {
+	changed, err := s.gh.ListChangedFiles(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number)
+	if err != nil {
+		return nil, fmt.Errorf("list changed files: %w", err)
+	}
+
 	started, err := runner.Start(ctx, review.Request{
 		InstallationID: pr.InstallationID,
 		Owner:          pr.Owner,
@@ -412,6 +419,7 @@ func start(ctx context.Context, runner review.Runner, pr PullRequest) (review.St
 		Number:         pr.Number,
 		BaseSHA:        pr.BaseSHA,
 		HeadSHA:        pr.HeadSHA,
+		ChangedFiles:   changed,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("start analysis: %w", err)

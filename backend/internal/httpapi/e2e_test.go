@@ -24,6 +24,7 @@ import (
 	ghclient "github.com/mrkizildag/docs-agent/backend/internal/github"
 	"github.com/mrkizildag/docs-agent/backend/internal/httpapi"
 	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/docs-agent/backend/internal/review"
 	"github.com/mrkizildag/docs-agent/backend/internal/review/actions"
 )
 
@@ -40,6 +41,10 @@ type e2eGitHub struct {
 
 func (f *e2eGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (bool, error) {
 	return false, nil
+}
+
+func (f *e2eGitHub) ListChangedFiles(_ context.Context, _ int64, _, _ string, _ int) ([]review.ChangedFile, error) {
+	return nil, nil
 }
 
 func (f *e2eGitHub) CreateCheckRun(_ context.Context, installationID int64, owner, repo string, run gate.CheckRun) (int64, error) {

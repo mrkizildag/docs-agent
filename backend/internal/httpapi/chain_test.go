@@ -1,0 +1,166 @@
+package httpapi_test
+
+import (
+	"bytes"
+	"context"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mrkizildag/docs-agent/backend/internal/gate"
+	"github.com/mrkizildag/docs-agent/backend/internal/gate/sqlite"
+	"github.com/mrkizildag/docs-agent/backend/internal/httpapi"
+	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/docs-agent/backend/internal/llm"
+	"github.com/mrkizildag/docs-agent/backend/internal/review"
+	"github.com/mrkizildag/docs-agent/backend/internal/review/llmrunner"
+)
+
+const chainPatch = "@@ -1,3 +1,3 @@\n package app\n-// old wording\n+// new wording\n"
+
+type chainGitHub struct {
+	calls chan e2eCheckRunCall
+}
+
+func (f *chainGitHub) WorkflowExists(context.Context, int64, string, string) (bool, error) {
+	return false, nil
+}
+
+func (f *chainGitHub) ListChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {
+	return []review.ChangedFile{{
+		Path:  "src/app.go",
+		Hunks: []review.LineRange{{Start: 1, End: 3}},
+		Patch: chainPatch,
+	}}, nil
+}
+
+func (f *chainGitHub) CreateCheckRun(_ context.Context, installationID int64, owner, repo string, run gate.CheckRun) (int64, error) {
+	f.calls <- e2eCheckRunCall{installationID: installationID, owner: owner, repo: repo, run: run}
+	return 0, nil
+}
+
+func (f *chainGitHub) UpdateCheckRun(context.Context, int64, string, string, int64, gate.CheckRun) error {
+	return nil
+}
+
+type chainModel struct {
+	requests []llm.Request
+}
+
+func (m *chainModel) Complete(_ context.Context, req llm.Request) (llm.Response, error) {
+	m.requests = append(m.requests, req)
+	return llm.Response{Text: `{"impacted":false,"reason":"wording only"}`}, nil
+}
+
+func newChainRepo(t *testing.T) (string, string) {
+	t.Helper()
+
+	dir := t.TempDir()
+	git := func(args ...string) []byte {
+		t.Helper()
+		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return out
+	}
+
+	files := map[string]string{
+		"src/app.go":  "package app\n\n// old wording\n",
+		"docs/app.md": "---\ntitle: App\nsummary: Describes the app.\ncovers:\n  - \"src/**\"\n---\n# App\n\n## Behavior\n\nThe app greets users.\n",
+	}
+	for name, content := range files {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir for %s: %v", name, err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	git("init", "-q", "-b", "main")
+	git("config", "user.email", "test@example.com")
+	git("config", "user.name", "test")
+	git("add", "-A")
+	git("commit", "-q", "-m", "init")
+
+	return dir, strings.TrimSpace(string(git("rev-parse", "HEAD")))
+}
+
+func TestWebhookToServerRunnerChain(t *testing.T) {
+	repoDir, headSHA := newChainRepo(t)
+
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "url."+repoDir+".insteadOf")
+	t.Setenv("GIT_CONFIG_VALUE_0", "https://github.com/acme/widgets.git")
+
+	secret := []byte("test-secret")
+	dbPath := filepath.Join(t.TempDir(), "docs-agent.db")
+	store, err := sqlite.Open(t.Context(), dbPath)
+	if err != nil {
+		t.Fatalf("sqlite.Open(%q) error = %v", dbPath, err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	gh := &chainGitHub{calls: make(chan e2eCheckRunCall, 1)}
+	model := &chainModel{}
+	noToken := func(context.Context, int64, string) (string, error) { return "", nil }
+	runner := llmrunner.New(model, noToken, "triage", "draft")
+	gateSvc := gate.NewService(gh, store, gate.Runners{Server: runner})
+
+	logger := slog.New(slog.DiscardHandler)
+	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
+
+	workerCtx, cancelWorker := context.WithCancel(t.Context())
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- worker.Run(workerCtx) }()
+	t.Cleanup(func() {
+		cancelWorker()
+		if err := <-workerDone; err != nil {
+			t.Errorf("worker.Run() error = %v", err)
+		}
+	})
+
+	handler := httpapi.NewHandler(logger, secret, worker, store)
+	body := e2ePullRequestBody(t, 1, headSHA)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-GitHub-Delivery", "d1")
+	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST /webhook = %d, want %d", rec.Code, http.StatusAccepted)
+	}
+
+	call := waitCheckRun(t, gh.calls)
+	if call.run.Conclusion != gate.ConclusionSuccess || call.run.Title != "No doc impact" {
+		t.Errorf("check run = %q %q, want %q %q", call.run.Conclusion, call.run.Title, gate.ConclusionSuccess, "No doc impact")
+	}
+
+	if len(model.requests) != 1 {
+		t.Fatalf("model saw %d requests, want 1 triage request", len(model.requests))
+	}
+	var seen strings.Builder
+	seen.WriteString(model.requests[0].System)
+	for _, m := range model.requests[0].Messages {
+		seen.WriteString(m.Text)
+	}
+	for _, want := range []string{"docs/app.md", "Describes the app.", chainPatch} {
+		if !strings.Contains(seen.String(), want) {
+			t.Errorf("triage request does not contain %q:\n%s", want, seen.String())
+		}
+	}
+}

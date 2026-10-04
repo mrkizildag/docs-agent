@@ -19,7 +19,6 @@ import (
 
 	"github.com/mrkizildag/docs-agent/backend/internal/gate"
 	ghclient "github.com/mrkizildag/docs-agent/backend/internal/github"
-	"github.com/mrkizildag/docs-agent/backend/internal/review"
 	"github.com/mrkizildag/docs-agent/backend/internal/review/actions"
 )
 
@@ -169,6 +168,46 @@ func TestWorkflowExists(t *testing.T) {
 				t.Errorf("WorkflowExists() = %v, want %v", exists, tc.wantExists)
 			}
 		})
+	}
+}
+
+func TestInstallationToken(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	var body map[string]any
+	mux.HandleFunc("POST /app/installations/{id}/access_tokens", func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode access_tokens body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprintf(w, `{"token":"ghs_test","expires_at":%q}`, time.Now().Add(time.Hour).Format(time.RFC3339)); err != nil {
+			t.Errorf("write access_tokens response: %v", err)
+		}
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	client, err := ghclient.NewClient(&http.Client{Timeout: 5 * time.Second}, 1, testPrivateKeyPEM(t), srv.URL)
+	if err != nil {
+		t.Fatalf("NewClient() = %v, want nil error", err)
+	}
+
+	token, err := client.InstallationToken(t.Context(), 99, "r")
+	if err != nil {
+		t.Fatalf("InstallationToken() = %v, want nil error", err)
+	}
+	if token != "ghs_test" {
+		t.Errorf("InstallationToken() = %q, want %q", token, "ghs_test")
+	}
+
+	wantBody := map[string]any{
+		"repositories": []any{"r"},
+		"permissions":  map[string]any{"contents": "read"},
+	}
+	if diff := cmp.Diff(wantBody, body); diff != "" {
+		t.Errorf("access_tokens body (-want +got):\n%s", diff)
 	}
 }
 
@@ -387,103 +426,5 @@ func TestResultArtifact(t *testing.T) {
 	}
 	if string(got) != `{"head_sha":"abc"}` {
 		t.Errorf("ResultArtifact() = %q, want the result.json bytes", got)
-	}
-}
-
-func TestChangedFiles(t *testing.T) {
-	t.Parallel()
-
-	mux := http.NewServeMux()
-	handleAccessToken(t, mux)
-	mux.HandleFunc("GET /repos/o/r/pulls/7/files", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("page") == "2" {
-			writeJSON(t, w, http.StatusOK, `[{"filename":"new.go","status":"renamed","previous_filename":"old.go","patch":"@@ -1 +1,2 @@\n a\n+b"}]`)
-			return
-		}
-		w.Header().Set("Link", fmt.Sprintf(`<http://%s/repos/o/r/pulls/7/files?page=2>; rel="next"`, r.Host))
-		writeJSON(t, w, http.StatusOK, `[
-			{"filename":"a.go","status":"modified","patch":"@@ -1,2 +1,3 @@\n x\n+y\n z"},
-			{"filename":"gone.go","status":"removed","patch":"@@ -1,2 +0,0 @@\n-a\n-b"},
-			{"filename":"img.png","status":"added"}
-		]`)
-	})
-	client := newTestClient(t, mux)
-
-	got, err := client.ChangedFiles(t.Context(), 99, "o", "r", 7)
-	if err != nil {
-		t.Fatalf("ChangedFiles() = %v, want nil", err)
-	}
-
-	want := []review.ChangedFile{
-		{Path: "a.go", Hunks: []review.LineRange{{Start: 1, End: 3}}},
-		{Path: "gone.go"},
-		{Path: "img.png"},
-		{Path: "new.go", Hunks: []review.LineRange{{Start: 1, End: 2}}},
-	}
-	if diff := cmp.Diff(want, got); diff != "" {
-		t.Errorf("ChangedFiles() (-want +got):\n%s", diff)
-	}
-}
-
-func TestChangedFilesHunks(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name  string
-		patch string
-		want  []review.LineRange
-	}{
-		{name: "no patch"},
-		{name: "single hunk", patch: "@@ -1,3 +1,4 @@ func f()\n a\n+b\n c\n d", want: []review.LineRange{{Start: 1, End: 4}}},
-		{name: "missing count means one", patch: "@@ -5 +7 @@\n-a\n+b", want: []review.LineRange{{Start: 7, End: 7}}},
-		{name: "zero count has no range", patch: "@@ -4,2 +3,0 @@\n-a\n-b"},
-		{
-			name:  "multiple hunks",
-			patch: "@@ -1,2 +1,2 @@\n-a\n+b\n c\n@@ -10,0 +10,3 @@\n+x\n+y\n+z\n@@ -20,2 +0,0 @@\n-p\n-q",
-			want:  []review.LineRange{{Start: 1, End: 2}, {Start: 10, End: 12}},
-		},
-		{name: "new file", patch: "@@ -0,0 +1,2 @@\n+a\n+b", want: []review.LineRange{{Start: 1, End: 2}}},
-		{name: "header lookalike in body is ignored", patch: "@@ -1 +1 @@\n+@@ -9 +9 @@", want: []review.LineRange{{Start: 1, End: 1}}},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			body, err := json.Marshal([]map[string]string{{"filename": "f.go", "status": "modified", "patch": tc.patch}})
-			if err != nil {
-				t.Fatalf("marshal files: %v", err)
-			}
-			mux := http.NewServeMux()
-			handleAccessToken(t, mux)
-			mux.HandleFunc("GET /repos/o/r/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
-				writeJSON(t, w, http.StatusOK, string(body))
-			})
-			client := newTestClient(t, mux)
-
-			got, err := client.ChangedFiles(t.Context(), 99, "o", "r", 7)
-			if err != nil {
-				t.Fatalf("ChangedFiles() = %v, want nil", err)
-			}
-			want := []review.ChangedFile{{Path: "f.go", Hunks: tc.want}}
-			if diff := cmp.Diff(want, got); diff != "" {
-				t.Errorf("ChangedFiles() (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
-func TestChangedFilesError(t *testing.T) {
-	t.Parallel()
-
-	mux := http.NewServeMux()
-	handleAccessToken(t, mux)
-	mux.HandleFunc("GET /repos/o/r/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(t, w, http.StatusInternalServerError, `{"message":"boom"}`)
-	})
-	client := newTestClient(t, mux)
-
-	if _, err := client.ChangedFiles(t.Context(), 99, "o", "r", 7); err == nil {
-		t.Fatal("ChangedFiles() = nil error, want error")
 	}
 }

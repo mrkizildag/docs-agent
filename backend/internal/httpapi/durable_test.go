@@ -17,6 +17,7 @@ import (
 	"github.com/mrkizildag/docs-agent/backend/internal/gate/sqlite"
 	"github.com/mrkizildag/docs-agent/backend/internal/httpapi"
 	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/docs-agent/backend/internal/review"
 )
 
 // blockingGitHub blocks CreateCheckRun for blockSHA until its context is cancelled.
@@ -29,6 +30,10 @@ type blockingGitHub struct {
 
 func (f *blockingGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (bool, error) {
 	return false, nil
+}
+
+func (f *blockingGitHub) ListChangedFiles(_ context.Context, _ int64, _, _ string, _ int) ([]review.ChangedFile, error) {
+	return nil, nil
 }
 
 func (f *blockingGitHub) CreateCheckRun(ctx context.Context, _ int64, _, _ string, run gate.CheckRun) (int64, error) {
@@ -122,6 +127,10 @@ func newFailThenSucceedGitHub() *failThenSucceedGitHub {
 
 func (f *failThenSucceedGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (bool, error) {
 	return false, nil
+}
+
+func (f *failThenSucceedGitHub) ListChangedFiles(_ context.Context, _ int64, _, _ string, _ int) ([]review.ChangedFile, error) {
+	return nil, nil
 }
 
 func (f *failThenSucceedGitHub) CreateCheckRun(_ context.Context, _ int64, _, _ string, run gate.CheckRun) (int64, error) {

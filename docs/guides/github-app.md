@@ -25,8 +25,8 @@ Grant only what the bot uses:
 
 - **Actions**: read & write — dispatches the docs-agent workflow in repos that use the [Actions runner](actions-runner.md), reads its run, and downloads its result artifact.
 - **Checks**: read & write — sets the `docs-agent` check run.
-- **Contents**: read & write — reads the diff, detects the `.github/workflows/docs-agent.yml` workflow, commits doc edits.
-- **Pull requests**: read & write — review comments and suggestions.
+- **Contents**: read & write — clones the PR head for the server runner (with a token narrowed to that repo and `contents: read`), detects the `.github/workflows/docs-agent.yml` workflow, commits doc edits.
+- **Pull requests**: read & write — lists the PR's changed files and patches; review comments and suggestions.
 - **Issues**: read & write — the PR conversation comment and summary comment use the issues API.
 - **Metadata**: read-only — mandatory for every App.
 

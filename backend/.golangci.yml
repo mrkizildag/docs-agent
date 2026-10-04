@@ -27,6 +27,35 @@ linters:
           deny:
             - pkg: github.com/stretchr/testify
               desc: use the stdlib and go-cmp
+        # gate, llm, and agent are allow-lists (strict): a new internal package is
+        # denied until it is added here.
+        gate-domain:
+          list-mode: strict
+          files:
+            - "**/internal/gate/*.go"
+            - "!$test"
+          allow:
+            - $gostd
+            - github.com/mrkizildag/docs-agent/backend/internal/review
+          deny:
+            - pkg: github.com/mrkizildag/docs-agent/backend/internal/review/llmrunner
+              desc: gate imports only internal/review from this module
+        review-contracts:
+          files:
+            - "**/internal/review/*.go"
+            - "!$test"
+          deny:
+            - pkg: github.com/mrkizildag/docs-agent/backend/internal
+              desc: internal/review imports nothing else from this module
+        llm-agent-leaf:
+          files:
+            - "**/internal/llm/**"
+            - "**/internal/agent/**"
+            - "!$test"
+          list-mode: strict
+          allow:
+            - $gostd
+            - github.com/mrkizildag/docs-agent/backend/internal/llm
     forbidigo:
       analyze-types: true
       forbid:

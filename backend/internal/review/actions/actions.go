@@ -37,8 +37,8 @@ type WorkflowAPI interface {
 	Dispatch(ctx context.Context, installationID int64, owner, repo string, in DispatchInputs) (runID int64, err error)
 	// ResultArtifact returns the result.json bytes of the run's result artifact.
 	ResultArtifact(ctx context.Context, installationID int64, owner, repo string, runID int64) ([]byte, error)
-	// ChangedFiles returns the pull request's files with their head-side hunk ranges.
-	ChangedFiles(ctx context.Context, installationID int64, owner, repo string, number int) ([]review.ChangedFile, error)
+	// ListChangedFiles returns the pull request's files with their head-side hunk ranges.
+	ListChangedFiles(ctx context.Context, installationID int64, owner, repo string, number int) ([]review.ChangedFile, error)
 }
 
 // Artifact is the JSON document the workflow uploads as result.json.
@@ -127,7 +127,7 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 		return result, nil
 	}
 
-	changed, err := r.api.ChangedFiles(ctx, c.InstallationID, c.Owner, c.Repo, c.Number)
+	changed, err := r.api.ListChangedFiles(ctx, c.InstallationID, c.Owner, c.Repo, c.Number)
 	if err != nil {
 		return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
 	}

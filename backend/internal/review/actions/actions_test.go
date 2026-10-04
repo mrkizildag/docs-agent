@@ -31,7 +31,7 @@ func (f *fakeAPI) ResultArtifact(_ context.Context, _ int64, _, _ string, _ int6
 	return f.artifact, f.err
 }
 
-func (f *fakeAPI) ChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {
+func (f *fakeAPI) ListChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {
 	return f.changed, f.changedErr
 }
 
