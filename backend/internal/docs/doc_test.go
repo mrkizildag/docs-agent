@@ -321,3 +321,47 @@ func FuzzParseDoc(f *testing.F) {
 		}
 	})
 }
+
+func TestDocSectionSpan(t *testing.T) {
+	t.Parallel()
+
+	doc, err := docs.ParseDoc("docs/a.md", []byte("---\ntitle: T\n---\n# A\n\n## Mid\nmid\n\n## Last\nlast"))
+	if err != nil {
+		t.Fatalf("ParseDoc() = %v, want nil", err)
+	}
+
+	tests := []struct {
+		heading            string
+		wantText           string
+		wantStart, wantEnd int
+		wantOK             bool
+	}{
+		{heading: "Mid", wantText: "## Mid\nmid\n\n", wantStart: 6, wantEnd: 8, wantOK: true},
+		{heading: " ## Last ", wantText: "## Last\nlast", wantStart: 9, wantEnd: 10, wantOK: true},
+		{heading: "Nope"},
+		{heading: ""},
+	}
+	for _, tc := range tests {
+		text, start, end, ok := doc.SectionSpan(tc.heading)
+		if text != tc.wantText || start != tc.wantStart || end != tc.wantEnd || ok != tc.wantOK {
+			t.Errorf("SectionSpan(%q) = %q, %d, %d, %v; want %q, %d, %d, %v", tc.heading, text, start, end, ok, tc.wantText, tc.wantStart, tc.wantEnd, tc.wantOK)
+		}
+	}
+}
+
+func TestDocSectionSpanDuplicateHeading(t *testing.T) {
+	t.Parallel()
+
+	doc, err := docs.ParseDoc("docs/a.md", []byte("---\ntitle: T\n---\n# A\n\n## Server\n### Example\none\n\n## Actions\n### Example\ntwo\n"))
+	if err != nil {
+		t.Fatalf("ParseDoc() = %v, want nil", err)
+	}
+
+	if text, start, end, ok := doc.SectionSpan("### Example"); ok || text != "" || start != 0 || end != 0 {
+		t.Errorf("SectionSpan(duplicate) = %q, %d, %d, %v; want empty, false", text, start, end, ok)
+	}
+
+	if _, _, _, ok := doc.SectionSpan("Actions"); !ok {
+		t.Errorf("SectionSpan(unique) ok = false, want true")
+	}
+}

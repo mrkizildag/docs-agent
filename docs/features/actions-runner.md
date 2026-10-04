@@ -5,6 +5,7 @@ covers:
   - backend/internal/review/actions/**
   - backend/internal/gate/**
   - backend/internal/httpapi/**
+  - backend/internal/github/contents.go
 ---
 
 # Actions runner
@@ -18,7 +19,7 @@ An analysis runner for repos that carry the docs-agent workflow. The server neve
 3. The workflow installs Claude Code, checks out the head commit into a subdirectory, and runs Claude Code, then uploads a result artifact (always, even on failure).
 4. A `workflow_run` completed event arrives. The run ID maps to its PR.
 5. The runner downloads the artifact. The gate accepts it only if the run is the one dispatched for the PR's current head and the artifact's head SHA and nonce match.
-6. Proposals outside `docs/` or not matching the schema are rejected. Otherwise the same transition as the server runner concludes the check: success ("No doc impact" with a reason) or action_required with the proposals.
+6. Proposals outside `docs/` or not matching the schema are rejected. For each proposal that replaces a section, the server fetches that doc at the head SHA (once per doc) and fills the proposal's original section text and line range, so comments show the old text and can become suggestions; a missing doc or section leaves both empty. Otherwise the same transition as the server runner concludes the check: success ("No doc impact" with a reason) or action_required with the proposals.
 
 ## Invariants
 

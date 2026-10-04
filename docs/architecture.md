@@ -29,7 +29,7 @@ Docs model: `internal/docs` reads the `docs/` tree of a checkout into docs (fron
 1. A PR is opened or updated; GitHub sends `pull_request` to the backend.
 2. The backend lists the PR's changed files; the analysis runner maps them to docs through each doc's `covers` globs on its own checkout of the head commit (see [0002](decisions/0002-docs-structure.md)).
 3. The LLM compares the diff with those docs and returns "no impact" or proposed edits.
-4. The backend sets the `docs-agent` check: `success` for no impact, `action_required` with the proposal otherwise.
+4. The backend sets the `docs-agent` check: `success` for no impact, `action_required` otherwise, and posts one review comment per proposal plus a summary comment (see [Proposal output](features/proposal-output.md)).
 5. A developer applies, edits, or waives the proposal; the check turns green and the PR can merge.
 
 ## Phases

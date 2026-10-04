@@ -3,6 +3,8 @@ package gate_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +27,29 @@ type fakeGitHub struct {
 	changed        []review.ChangedFile
 	changedErr     error
 	changedCalls   int
+	reviewComments []gate.ReviewComment
+
+	comments                 []gate.Comment
+	listCalls                int
+	createReview, editReview int
+	createIssue, editIssue   int
+	createIssueErr           error
+	failReviewCreate         int // the nth CreateReviewComment call fails once; 0 means never
+}
+
+func (f *fakeGitHub) addComment(kind gate.CommentKind, body string) gate.Comment {
+	c := gate.Comment{ID: int64(len(f.comments) + 1), Mine: true, Kind: kind, Body: body}
+	c.URL = fmt.Sprintf("https://gh/%s/%d", kind, c.ID)
+	f.comments = append(f.comments, c)
+	return c
+}
+
+func (f *fakeGitHub) edit(id int64, body string) {
+	for i := range f.comments {
+		if f.comments[i].ID == id {
+			f.comments[i].Body = body
+		}
+	}
 }
 
 type createCheckRunCall struct {
@@ -56,6 +81,40 @@ func (f *fakeGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (bo
 func (f *fakeGitHub) ListChangedFiles(_ context.Context, _ int64, _, _ string, _ int) ([]review.ChangedFile, error) {
 	f.changedCalls++
 	return f.changed, f.changedErr
+}
+
+func (f *fakeGitHub) ListComments(context.Context, int64, string, string, int) ([]gate.Comment, error) {
+	f.listCalls++
+	return slices.Clone(f.comments), nil
+}
+
+func (f *fakeGitHub) CreateReviewComment(_ context.Context, _ int64, _, _ string, _ int, c gate.ReviewComment) (gate.Comment, error) {
+	f.createReview++
+	if f.createReview == f.failReviewCreate {
+		return gate.Comment{}, errors.New("create review comment failed")
+	}
+	f.reviewComments = append(f.reviewComments, c)
+	return f.addComment(gate.CommentKindReview, c.Body), nil
+}
+
+func (f *fakeGitHub) EditReviewComment(_ context.Context, _ int64, _, _ string, id int64, body string) error {
+	f.editReview++
+	f.edit(id, body)
+	return nil
+}
+
+func (f *fakeGitHub) CreateIssueComment(_ context.Context, _ int64, _, _ string, _ int, body string) (gate.Comment, error) {
+	f.createIssue++
+	if f.createIssueErr != nil {
+		return gate.Comment{}, f.createIssueErr
+	}
+	return f.addComment(gate.CommentKindIssue, body), nil
+}
+
+func (f *fakeGitHub) EditIssueComment(_ context.Context, _ int64, _, _ string, id int64, body string) error {
+	f.editIssue++
+	f.edit(id, body)
+	return nil
 }
 
 type fakeRunner struct {
@@ -91,6 +150,7 @@ type fakeStore struct {
 	loadErr     error
 	saveErr     error
 	stored      gate.PRState
+	saved       *gate.PRState
 	saveCtxErrs []error
 }
 
@@ -108,6 +168,9 @@ func (f *fakeStore) LoadPR(_ context.Context, owner, repo string, number int) (g
 	if f.stored.Number == number {
 		return f.stored, nil
 	}
+	if f.saved != nil {
+		return *f.saved, nil
+	}
 	return gate.PRState{Owner: owner, Repo: repo, Number: number}, nil
 }
 
@@ -118,6 +181,7 @@ func (f *fakeStore) PRForRun(context.Context, string, string, int64) (int, bool,
 func (f *fakeStore) SavePR(ctx context.Context, state gate.PRState) error {
 	f.saveCtxErrs = append(f.saveCtxErrs, ctx.Err())
 	f.saveCalls = append(f.saveCalls, state)
+	f.saved = &state
 	return f.saveErr
 }
 
@@ -566,8 +630,10 @@ func TestHandleRunCompleted(t *testing.T) {
 
 			saved := awaitingState()
 			saved.Run = nil
-			if diff := cmp.Diff([]gate.PRState{saved}, store.saveCalls); diff != "" {
-				t.Errorf("SavePR calls (-want +got):\n%s", diff)
+			got := store.saveCalls[len(store.saveCalls)-1]
+			got.Proposals, got.SummaryCommentID = nil, 0
+			if diff := cmp.Diff(saved, got); diff != "" {
+				t.Errorf("final SavePR call (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -918,5 +984,500 @@ func TestMatchesRun(t *testing.T) {
 				t.Errorf("MatchesRun(%+v, run %d) = %v, want %v", tc.state, tc.runID, got, tc.want)
 			}
 		})
+	}
+}
+
+func proposal(doc, section string) review.Proposal {
+	return review.Proposal{
+		DocPath: doc, Section: section, Reason: "why " + section,
+		Anchor:  review.Anchor{File: "a.go", Line: 4},
+		Content: "## " + section + "\nnew\n", Original: "## " + section + "\nold\n",
+	}
+}
+
+func proposalIDs(state gate.PRState) map[string]gate.ProposalStatus {
+	got := map[string]gate.ProposalStatus{}
+	for _, p := range state.Proposals {
+		got[p.DocPath+"#"+p.Section] = p.State
+	}
+	return got
+}
+
+func countWrites(writes []gate.CommentWrite) (creates, edits int) {
+	for _, w := range writes {
+		if w.ID == 0 {
+			creates++
+		} else {
+			edits++
+		}
+	}
+	return creates, edits
+}
+
+func TestReconcile(t *testing.T) {
+	t.Parallel()
+
+	pr := gate.PullRequest{InstallationID: 1, Owner: "o", Repo: "r", Number: 3, HeadSHA: "0123456789"}
+	a, b := proposal("docs/a.md", "A"), proposal("docs/b.md", "B")
+	idA, idB := gate.ProposalID("docs/a.md", "A"), gate.ProposalID("docs/b.md", "B")
+	prev := gate.PRState{SummaryCommentID: 90, Proposals: []gate.ProposalState{
+		{ID: idA, DocPath: "docs/a.md", Section: "A", CommentID: 1, CommentURL: "u1", State: gate.ProposalOpen},
+		{ID: idB, DocPath: "docs/b.md", Section: "B", CommentID: 2, CommentURL: "u2", State: gate.ProposalOpen},
+	}}
+	old := []gate.Comment{
+		{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: "<!-- docs-agent:proposal:" + idA + " -->\n\nold A body"},
+		{ID: 2, Mine: true, Kind: gate.CommentKindReview, Body: "<!-- docs-agent:proposal:" + idB + " -->\n\nold B body"},
+		{ID: 90, Mine: true, Kind: gate.CommentKindIssue, Body: "<!-- docs-agent:summary -->"},
+	}
+
+	tests := []struct {
+		name         string
+		prev         gate.PRState
+		verdict      review.Verdict
+		existing     []gate.Comment
+		wantCreates  int
+		wantEdits    int
+		wantStates   map[string]gate.ProposalStatus
+		wantSummary  bool
+		wantSumID    int64
+		wantOutdated []string
+	}{
+		{
+			name: "first run", verdict: review.Proposals{a, b},
+			wantCreates: 3, wantStates: map[string]gate.ProposalStatus{"docs/a.md#A": "open", "docs/b.md#B": "open"}, wantSummary: true,
+		},
+		{
+			name: "same proposals edit only", prev: prev, verdict: review.Proposals{a, b}, existing: old,
+			wantEdits: 3, wantStates: map[string]gate.ProposalStatus{"docs/a.md#A": "open", "docs/b.md#B": "open"}, wantSummary: true, wantSumID: 90,
+		},
+		{
+			name: "some gone are outdated", prev: prev, verdict: review.Proposals{a}, existing: old,
+			wantEdits: 3, wantStates: map[string]gate.ProposalStatus{"docs/a.md#A": "open", "docs/b.md#B": "outdated"}, wantSummary: true, wantSumID: 90,
+			wantOutdated: []string{"old B body"},
+		},
+		{
+			name: "no impact outdates all", prev: prev, verdict: review.NoImpact{Reason: "x"}, existing: old,
+			wantEdits: 3, wantStates: map[string]gate.ProposalStatus{"docs/a.md#A": "outdated", "docs/b.md#B": "outdated"}, wantSummary: true, wantSumID: 90,
+			wantOutdated: []string{"old A body", "old B body"},
+		},
+		{
+			name: "no impact without prior state writes nothing", verdict: review.NoImpact{Reason: "x"}, wantStates: map[string]gate.ProposalStatus{},
+		},
+		{
+			name: "duplicate ids keep first", verdict: review.Proposals{a, a},
+			wantCreates: 2, wantStates: map[string]gate.ProposalStatus{"docs/a.md#A": "open"}, wantSummary: true,
+		},
+		{
+			name:    "outdated returns and reopens",
+			prev:    gate.PRState{SummaryCommentID: 90, Proposals: []gate.ProposalState{{ID: idA, DocPath: "docs/a.md", Section: "A", CommentID: 1, State: gate.ProposalOutdated}}},
+			verdict: review.Proposals{a}, existing: []gate.Comment{old[0], old[2]},
+			wantEdits: 2, wantStates: map[string]gate.ProposalStatus{"docs/a.md#A": "open"}, wantSummary: true, wantSumID: 90,
+		},
+		{
+			name: "deleted open proposal is recreated", prev: prev, verdict: review.Proposals{a, b}, existing: []gate.Comment{old[0], old[2]},
+			wantCreates: 1, wantEdits: 2, wantStates: map[string]gate.ProposalStatus{"docs/a.md#A": "open", "docs/b.md#B": "open"}, wantSummary: true, wantSumID: 90,
+		},
+		{
+			name: "deleted outdated proposal is not written", prev: prev, verdict: review.Proposals{a}, existing: []gate.Comment{old[0], old[2]},
+			wantEdits: 2, wantStates: map[string]gate.ProposalStatus{"docs/a.md#A": "open", "docs/b.md#B": "outdated"}, wantSummary: true, wantSumID: 90,
+		},
+		{
+			name: "deleted summary is recreated", prev: prev, verdict: review.Proposals{a, b}, existing: old[:2],
+			wantCreates: 1, wantEdits: 2, wantStates: map[string]gate.ProposalStatus{"docs/a.md#A": "open", "docs/b.md#B": "open"}, wantSummary: true,
+		},
+		{
+			name: "crash recovery reuses marked comments", verdict: review.Proposals{a, b},
+			existing:  append(slices.Clone(old), gate.Comment{ID: 91, Mine: true, Kind: gate.CommentKindIssue, Body: "<!-- docs-agent:summary -->\nrows"}),
+			wantEdits: 3, wantStates: map[string]gate.ProposalStatus{"docs/a.md#A": "open", "docs/b.md#B": "open"}, wantSummary: true, wantSumID: 90,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			state, writes := gate.Reconcile(tc.prev, pr, tc.verdict, nil, tc.existing)
+			creates, edits := countWrites(writes)
+			if creates != tc.wantCreates || edits != tc.wantEdits {
+				t.Errorf("writes = %d creates, %d edits, want %d, %d", creates, edits, tc.wantCreates, tc.wantEdits)
+			}
+			if diff := cmp.Diff(tc.wantStates, proposalIDs(state)); diff != "" {
+				t.Errorf("states (-want +got):\n%s", diff)
+			}
+			hasSummary := len(writes) > 0 && writes[len(writes)-1].Summary
+			if hasSummary != tc.wantSummary || state.SummaryCommentID != tc.wantSumID {
+				t.Errorf("summary write = %v id %d, want %v id %d", hasSummary, state.SummaryCommentID, tc.wantSummary, tc.wantSumID)
+			}
+			for _, want := range tc.wantOutdated {
+				found := false
+				for _, w := range writes {
+					found = found || (strings.Contains(w.Body, want) && strings.Contains(w.Body, "Outdated: no longer needed as of 0123456") && strings.Contains(w.Body, "<details>"))
+				}
+				if !found {
+					t.Errorf("no outdated write keeping %q in %+v", want, writes)
+				}
+			}
+		})
+	}
+}
+
+func TestReconcileKeepsRowOrder(t *testing.T) {
+	t.Parallel()
+
+	prev := gate.PRState{Proposals: []gate.ProposalState{
+		{ID: gate.ProposalID("docs/a.md", "A"), DocPath: "docs/a.md", Section: "A", CommentID: 1, State: gate.ProposalOpen},
+	}}
+	state, _ := gate.Reconcile(prev, testPR(), review.Proposals{proposal("docs/z.md", "Z"), proposal("docs/a.md", "A")}, nil, nil)
+	if len(state.Proposals) != 2 || state.Proposals[0].DocPath != "docs/a.md" || state.Proposals[1].DocPath != "docs/z.md" {
+		t.Errorf("rows = %+v, want existing first, new appended", state.Proposals)
+	}
+}
+
+func TestReconcileVariants(t *testing.T) {
+	t.Parallel()
+
+	suggest := review.Proposal{
+		DocPath: "docs/a.md", Section: "Mid", Reason: "r", Anchor: review.Anchor{File: "a.go", Line: 4},
+		Original: "## Mid\nmid body\n\n", Content: "## Mid\nnew ```go\nx\n```\n", Lines: review.LineRange{Start: 9, End: 11},
+	}
+	single := suggest
+	single.Lines = review.LineRange{Start: 9, End: 9}
+	newDoc := review.Proposal{DocPath: "docs/n.md", Anchor: review.Anchor{File: "a.go", Line: 4}, Reason: "r", Content: "# N\n", IndexEntry: "- n"}
+	diffFile := func(path string, hunks ...review.LineRange) []review.ChangedFile {
+		return []review.ChangedFile{{Path: path, Hunks: hunks}}
+	}
+
+	tests := []struct {
+		name        string
+		p           review.Proposal
+		changed     []review.ChangedFile
+		wantPath    string
+		wantStart   int
+		wantLine    int
+		wantSuggest bool
+	}{
+		{"in hunk", suggest, diffFile("docs/a.md", review.LineRange{Start: 1, End: 20}), "docs/a.md", 9, 11, true},
+		{"single line has no start", single, diffFile("docs/a.md", review.LineRange{Start: 9, End: 9}), "docs/a.md", 0, 9, true},
+		{"partly outside hunk", suggest, diffFile("docs/a.md", review.LineRange{Start: 10, End: 20}), "a.go", 0, 4, false},
+		{"doc not in diff", suggest, diffFile("other.md", review.LineRange{Start: 1, End: 20}), "a.go", 0, 4, false},
+		{"new doc", newDoc, diffFile("docs/n.md", review.LineRange{Start: 1, End: 20}), "a.go", 0, 4, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{tc.p}, tc.changed, nil)
+			rc := writes[0].Review
+			if rc.Path != tc.wantPath || rc.StartLine != tc.wantStart || rc.Line != tc.wantLine || rc.CommitSHA != "abc123" {
+				t.Errorf("comment = %+v, want %s %d-%d on abc123", rc, tc.wantPath, tc.wantStart, tc.wantLine)
+			}
+			if got := strings.Contains(rc.Body, "suggestion\n"); got != tc.wantSuggest {
+				t.Errorf("suggestion block = %v, want %v:\n%s", got, tc.wantSuggest, rc.Body)
+			}
+			if got := strings.Contains(rc.Body, "- [ ] Apply this change"); got == tc.wantSuggest {
+				t.Errorf("checkbox = %v, want %v", got, !tc.wantSuggest)
+			}
+		})
+	}
+
+	_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{suggest}, diffFile("docs/a.md", review.LineRange{Start: 1, End: 20}), nil)
+	body := writes[0].Review.Body
+	want := "````suggestion\n## Mid\nnew ```go\nx\n```\n\n````\n"
+	if !strings.HasSuffix(body, want) {
+		t.Errorf("suggestion body = %q, want suffix %q (fence grown, trailing blank line kept)", body, want)
+	}
+}
+
+func TestReconcileEditKeepsVariantSafe(t *testing.T) {
+	t.Parallel()
+
+	p := review.Proposal{
+		DocPath: "docs/a.md", Section: "Mid", Reason: "r", Anchor: review.Anchor{File: "a.go", Line: 4},
+		Original: "## Mid\nbody\n", Content: "## Mid\nnew\n", Lines: review.LineRange{Start: 9, End: 10},
+	}
+	id := gate.ProposalID(p.DocPath, p.Section)
+	inDiff := []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 20}}}}
+	prev := gate.PRState{Proposals: []gate.ProposalState{{ID: id, DocPath: p.DocPath, Section: p.Section, CommentID: 1, State: gate.ProposalOpen}}}
+	onCode := gate.Comment{ID: 1, Mine: true, Kind: gate.CommentKindReview, Path: "a.go", Line: 4}
+	onDoc := gate.Comment{ID: 1, Mine: true, Kind: gate.CommentKindReview, Path: "docs/a.md", StartLine: 9, Line: 10}
+	moved := gate.Comment{ID: 1, Mine: true, Kind: gate.CommentKindReview, Path: "docs/a.md", StartLine: 5, Line: 6}
+
+	tests := []struct {
+		name        string
+		existing    gate.Comment
+		changed     []review.ChangedFile
+		wantSuggest bool
+	}{
+		{"checkbox on code stays checkbox when section enters the diff", onCode, inDiff, false},
+		{"suggestion on same lines stays suggestion", onDoc, inDiff, true},
+		{"suggestion whose lines moved becomes checkbox", moved, inDiff, false},
+		{"suggestion leaving the diff becomes checkbox", onDoc, nil, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, writes := gate.Reconcile(prev, testPR(), review.Proposals{p}, tc.changed, []gate.Comment{tc.existing})
+			if writes[0].ID != 1 {
+				t.Fatalf("write = %+v, want an edit of comment 1", writes[0])
+			}
+			if got := strings.Contains(writes[0].Body, "suggestion\n"); got != tc.wantSuggest {
+				t.Errorf("suggestion body = %v, want %v:\n%s", got, tc.wantSuggest, writes[0].Body)
+			}
+		})
+	}
+}
+
+func proposalService(t *testing.T, gh *fakeGitHub, store *fakeStore, verdict review.Verdict) {
+	t.Helper()
+	runner := &fakeRunner{started: review.Result{Verdict: verdict}}
+	svc := gate.NewService(gh, store, gate.Runners{Server: runner})
+	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
+		t.Fatalf("HandlePullRequest() = %v, want nil", err)
+	}
+}
+
+func TestHandlePullRequestRerunEditsInPlace(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{}
+	store := &fakeStore{}
+	both := review.Proposals{proposal("docs/a.md", "A"), proposal("docs/b.md", "B")}
+
+	proposalService(t, gh, store, both)
+	if gh.createReview != 2 || gh.createIssue != 1 || gh.editReview+gh.editIssue != 0 {
+		t.Fatalf("first run: create review/issue = %d/%d, edits = %d/%d, want 2/1, 0/0", gh.createReview, gh.createIssue, gh.editReview, gh.editIssue)
+	}
+
+	proposalService(t, gh, store, both)
+	if gh.createReview != 2 || gh.createIssue != 1 || gh.editReview != 2 || gh.editIssue != 1 || len(gh.comments) != 3 {
+		t.Errorf("same re-run: creates %d/%d edits %d/%d comments %d, want 2/1 2/1 3", gh.createReview, gh.createIssue, gh.editReview, gh.editIssue, len(gh.comments))
+	}
+
+	proposalService(t, gh, store, review.Proposals{both[0]})
+	if len(gh.comments) != 3 || !strings.Contains(gh.comments[1].Body, "Outdated") || !strings.Contains(gh.comments[2].Body, "outdated") {
+		t.Errorf("partial re-run comments = %+v, want comment 2 and summary outdated, none added", gh.comments)
+	}
+
+	proposalService(t, gh, store, review.NoImpact{Reason: "x"})
+	if len(gh.comments) != 3 || strings.Contains(gh.comments[2].Body, "| open") {
+		t.Errorf("no-impact re-run comments = %+v, want all outdated, none added", gh.comments)
+	}
+	if gh.listCalls != 4 {
+		t.Errorf("ListComments calls = %d, want 1 per run (4 runs)", gh.listCalls)
+	}
+	last := gh.calls[len(gh.calls)-1].run
+	if last.Conclusion != gate.ConclusionSuccess {
+		t.Errorf("last check conclusion = %s, want success", last.Conclusion)
+	}
+}
+
+func TestHandlePullRequestNoImpactFirstRunPostsNothing(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{}
+	proposalService(t, gh, &fakeStore{}, review.NoImpact{Reason: "x"})
+	if gh.listCalls+gh.createReview+gh.createIssue != 0 {
+		t.Errorf("list/create calls = %d/%d/%d, want none", gh.listCalls, gh.createReview, gh.createIssue)
+	}
+}
+
+func TestHandlePullRequestRecoversUnrecordedComments(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{}
+	p := proposal("docs/a.md", "A")
+	id := gate.ProposalID(p.DocPath, p.Section)
+	gh.addComment(gate.CommentKindReview, "<!-- docs-agent:proposal:"+id+" -->\n\nold")
+	gh.addComment(gate.CommentKindIssue, "<!-- docs-agent:summary -->")
+
+	proposalService(t, gh, &fakeStore{}, review.Proposals{p})
+	if gh.createReview+gh.createIssue != 0 || gh.editReview != 1 || gh.editIssue != 1 || len(gh.comments) != 2 {
+		t.Errorf("creates %d/%d edits %d/%d comments %d, want 0/0 1/1 2", gh.createReview, gh.createIssue, gh.editReview, gh.editIssue, len(gh.comments))
+	}
+}
+
+func TestHandlePullRequestOutdatesCommentsPostedByACrashedRun(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{createIssueErr: errors.New("boom")}
+	store := &fakeStore{}
+	runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
+	svc := gate.NewService(gh, store, gate.Runners{Server: runner})
+	if err := svc.HandlePullRequest(t.Context(), testPR()); err == nil {
+		t.Fatal("HandlePullRequest() = nil, want the summary create error")
+	}
+
+	gh.createIssueErr = nil
+	proposalService(t, gh, store, review.NoImpact{Reason: "x"})
+	if len(gh.comments) != 1 || !strings.Contains(gh.comments[0].Body, "Outdated") {
+		t.Errorf("comments after no-impact run = %+v, want the crashed run's comment marked outdated", gh.comments)
+	}
+}
+
+func TestHandleRunCompletedPostsComments(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{changed: []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 20}}}}}
+	runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
+	store := &fakeStore{stored: awaitingState()}
+	svc := gate.NewService(gh, store, gate.Runners{Actions: runner})
+
+	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
+		t.Fatalf("HandleRunCompleted() = %v, want nil", err)
+	}
+
+	if gh.changedCalls != 1 || gh.createReview != 1 || gh.createIssue != 1 {
+		t.Errorf("changed lists = %d, review creates = %d, summary creates = %d, want 1 each", gh.changedCalls, gh.createReview, gh.createIssue)
+	}
+	if len(gh.updates) != 1 || gh.updates[0].run.Conclusion != gate.ConclusionActionRequired {
+		t.Errorf("UpdateCheckRun calls = %+v, want one action_required", gh.updates)
+	}
+	got := store.saveCalls[len(store.saveCalls)-1]
+	if got.SummaryCommentID == 0 || len(got.Proposals) != 1 || got.Proposals[0].CommentID == 0 || got.Run != nil {
+		t.Errorf("saved state = %+v, want comment IDs recorded and no awaited run", got)
+	}
+}
+
+func TestHandleRunCompletedRetriesAfterFailedCreate(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{checkRunID: 5, failReviewCreate: 2, changed: []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 20}}}}}
+	runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A"), proposal("docs/b.md", "B")}}}
+	state := awaitingState()
+	state.CheckRunID = 5
+	store := &fakeStore{stored: state}
+	svc := gate.NewService(gh, store, gate.Runners{Actions: runner})
+
+	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err == nil {
+		t.Fatal("HandleRunCompleted() = nil, want the failed create")
+	}
+	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
+		t.Fatalf("HandleRunCompleted() retry = %v, want nil", err)
+	}
+
+	if gh.createReview != 3 || len(gh.reviewComments) != 2 || gh.createIssue != 1 {
+		t.Errorf("review creates = %d (%d succeeded), summary creates = %d, want 3 attempts, 2 comments, 1 summary", gh.createReview, len(gh.reviewComments), gh.createIssue)
+	}
+	got := store.saveCalls[len(store.saveCalls)-1]
+	if got.Run != nil || got.CheckRunID != 5 || got.SummaryCommentID == 0 || len(got.Proposals) != 2 {
+		t.Errorf("saved state = %+v, want no awaited run, check run 5, summary and 2 proposals", got)
+	}
+}
+
+func TestReconcileIgnoresForeignMarkers(t *testing.T) {
+	t.Parallel()
+
+	a := proposal("docs/a.md", "A")
+	id := gate.ProposalID("docs/a.md", "A")
+	marker := "<!-- docs-agent:proposal:" + id + " -->"
+	tests := []struct {
+		name     string
+		existing gate.Comment
+	}{
+		{"forged proposal marker", gate.Comment{ID: 7, Kind: gate.CommentKindReview, Body: marker + "\n\nfake"}},
+		{"forged summary marker", gate.Comment{ID: 8, Kind: gate.CommentKindIssue, Body: "<!-- docs-agent:summary -->\nfake"}},
+		{"own comment with marker not on first line", gate.Comment{ID: 9, Mine: true, Kind: gate.CommentKindReview, Body: "text\n" + marker}},
+		{"own summary with marker not on first line", gate.Comment{ID: 10, Mine: true, Kind: gate.CommentKindIssue, Body: "text <!-- docs-agent:summary -->"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			state, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{a}, nil, []gate.Comment{tc.existing})
+			creates, edits := countWrites(writes)
+			if creates != 2 || edits != 0 || state.SummaryCommentID != 0 || state.Proposals[0].CommentID != 0 {
+				t.Errorf("writes = %d creates, %d edits, state = %+v, want 2 creates, nothing adopted", creates, edits, state)
+			}
+		})
+	}
+}
+
+func TestReconcileRecreatesStateCommentNotMine(t *testing.T) {
+	t.Parallel()
+
+	a := proposal("docs/a.md", "A")
+	id := gate.ProposalID("docs/a.md", "A")
+	prev := gate.PRState{SummaryCommentID: 90, Proposals: []gate.ProposalState{{ID: id, DocPath: "docs/a.md", Section: "A", CommentID: 1, State: gate.ProposalOpen}}}
+	existing := []gate.Comment{
+		{ID: 1, Kind: gate.CommentKindReview, Body: "x"},
+		{ID: 90, Kind: gate.CommentKindIssue, Body: "y"},
+	}
+
+	state, writes := gate.Reconcile(prev, testPR(), review.Proposals{a}, nil, existing)
+	creates, edits := countWrites(writes)
+	if creates != 2 || edits != 0 || state.SummaryCommentID != 0 || state.Proposals[0].CommentID != 0 {
+		t.Errorf("writes = %d creates, %d edits, state = %+v, want 2 creates, no edits of foreign comments", creates, edits, state)
+	}
+}
+
+func TestHandleRunCompletedChangedFilesError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("boom")
+	gh := &fakeGitHub{changedErr: wantErr}
+	runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
+	store := &fakeStore{stored: awaitingState()}
+	svc := gate.NewService(gh, store, gate.Runners{Actions: runner})
+
+	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); !errors.Is(err, wantErr) {
+		t.Fatalf("HandleRunCompleted() = %v, want wrapping %v", err, wantErr)
+	}
+	if len(gh.updates) != 0 || gh.createReview != 0 || len(store.saveCalls) != 0 {
+		t.Errorf("updates = %d, review creates = %d, saves = %d, want no writes", len(gh.updates), gh.createReview, len(store.saveCalls))
+	}
+}
+
+func TestHandleRunCompletedFailureKeepsProposals(t *testing.T) {
+	t.Parallel()
+
+	id := gate.ProposalID("docs/a.md", "A")
+	state := awaitingState()
+	state.SummaryCommentID = 2
+	state.Proposals = []gate.ProposalState{{ID: id, DocPath: "docs/a.md", Section: "A", CommentID: 1, State: gate.ProposalOpen}}
+	gh := &fakeGitHub{}
+	store := &fakeStore{stored: state}
+	svc := gate.NewService(gh, store, gate.Runners{Actions: &fakeRunner{}})
+
+	if err := svc.HandleRunCompleted(t.Context(), completedRun("failure")); err != nil {
+		t.Fatalf("HandleRunCompleted() = %v, want nil", err)
+	}
+
+	if gh.listCalls != 0 || gh.changedCalls != 0 || gh.editReview != 0 || gh.editIssue != 0 {
+		t.Errorf("comment calls = list %d, changed %d, edits %d/%d, want none", gh.listCalls, gh.changedCalls, gh.editReview, gh.editIssue)
+	}
+	got := store.saveCalls[len(store.saveCalls)-1]
+	if diff := cmp.Diff(state.Proposals, got.Proposals); diff != "" || got.SummaryCommentID != 2 {
+		t.Errorf("saved state = %+v, want proposals and summary comment untouched (-want +got):\n%s", got, diff)
+	}
+}
+
+func TestReconcileRestoresOmittedHeading(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/a.md", "Behavior")
+	p.Original = "## Behavior\n\nold text\n"
+	p.Content = "new text\n"
+
+	_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
+	if len(writes) == 0 {
+		t.Fatal("Reconcile() returned no writes, want a review comment create")
+	}
+	want := "-## Behavior\n-\n-old text\n+## Behavior\n+\n+new text\n"
+	if body := writes[0].Review.Body; !strings.Contains(body, want) {
+		t.Errorf("review comment body = %q, want diff %q", body, want)
+	}
+
+	p.Content = "### Install\n\nnew text\n"
+	_, writes = gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
+	want = "+## Behavior\n+\n+### Install\n+\n+new text\n"
+	if body := writes[0].Review.Body; !strings.Contains(body, want) {
+		t.Errorf("subsection content: review comment body = %q, want diff %q", body, want)
+	}
+	p.Content = "## Behaviour\n\nnew text\n"
+	_, writes = gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
+	if body := writes[0].Review.Body; strings.Contains(body, "+## Behavior\n") || !strings.Contains(body, "+## Behaviour\n") {
+		t.Errorf("renamed heading: review comment body = %q, want the model's heading kept and no second heading", body)
 	}
 }

@@ -3,8 +3,12 @@ package gate
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -62,6 +66,46 @@ type GitHub interface {
 	WorkflowExists(ctx context.Context, installationID int64, owner, repo string) (bool, error)
 	// ListChangedFiles returns the files in the pull request's diff with their head-side hunk ranges.
 	ListChangedFiles(ctx context.Context, installationID int64, owner, repo string, number int) ([]review.ChangedFile, error)
+	// ListComments returns the pull request's review comments and issue comments.
+	ListComments(ctx context.Context, installationID int64, owner, repo string, number int) ([]Comment, error)
+	CreateReviewComment(ctx context.Context, installationID int64, owner, repo string, number int, c ReviewComment) (Comment, error)
+	EditReviewComment(ctx context.Context, installationID int64, owner, repo string, id int64, body string) error
+	CreateIssueComment(ctx context.Context, installationID int64, owner, repo string, number int, body string) (Comment, error)
+	EditIssueComment(ctx context.Context, installationID int64, owner, repo string, id int64, body string) error
+}
+
+// CommentKind says which GitHub comment API a Comment lives in; the two have
+// separate ID spaces and edit endpoints.
+type CommentKind string
+
+const (
+	CommentKindReview CommentKind = "review"
+	CommentKindIssue  CommentKind = "issue"
+)
+
+// Comment is a comment on a pull request. Path, StartLine and Line locate a
+// review comment and are zero for issue comments and for review comments GitHub
+// no longer anchors. Mine is true when the App's bot user wrote the comment;
+// only those are ever adopted or edited.
+type Comment struct {
+	ID        int64
+	Mine      bool
+	Kind      CommentKind
+	URL       string
+	Body      string
+	Path      string
+	StartLine int
+	Line      int
+}
+
+// ReviewComment is a new review comment on the right side of a file in the
+// head commit. StartLine 0 means a single-line comment on Line.
+type ReviewComment struct {
+	CommitSHA string
+	Path      string
+	StartLine int
+	Line      int
+	Body      string
 }
 
 const checkName = "docs-agent"
@@ -79,6 +123,9 @@ type PRState struct {
 	HeadSHA        string // head commit the gate last reported a check run for; "" if never
 	CheckRunID     int64  // check run reported for HeadSHA; 0 if none
 	Run            *AwaitingRun
+
+	SummaryCommentID int64 // 0 until the summary comment is created
+	Proposals        []ProposalState
 }
 
 // AwaitingRun is the external analysis run whose result will conclude the
@@ -112,6 +159,32 @@ type OverdueRun struct {
 	Nonce string
 }
 
+// ProposalStatus is whether a proposal still applies to the latest head.
+type ProposalStatus string
+
+const (
+	ProposalOpen     ProposalStatus = "open"
+	ProposalOutdated ProposalStatus = "outdated"
+)
+
+// ProposalState is one proposal's review comment as the gate remembers it.
+type ProposalState struct {
+	ID         string // see ProposalID
+	DocPath    string
+	Section    string
+	CommentID  int64 // 0 until the review comment is created
+	CommentURL string
+	State      ProposalStatus
+}
+
+// ProposalID is the stable identity of a proposal across re-runs: a short hash
+// of its doc path and normalized section heading (path alone for a new doc).
+func ProposalID(docPath, section string) string {
+	section = strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(section), "#"))
+	sum := sha256.Sum256([]byte(docPath + "\x00" + section))
+	return hex.EncodeToString(sum[:6])
+}
+
 // Store persists PRState.
 type Store interface {
 	// LoadPR returns the zero-HeadSHA state (identity fields filled from the args) for a PR never saved.
@@ -122,14 +195,17 @@ type Store interface {
 }
 
 // OnPush is the state transition for a new head commit: pure, no I/O. It
-// drops any awaited run, so that run's result is ignored.
-func OnPush(_ PRState, pr PullRequest) PRState {
+// drops any awaited run, so that run's result is ignored; the proposals and
+// the summary comment carry over.
+func OnPush(prev PRState, pr PullRequest) PRState {
 	return PRState{
-		InstallationID: pr.InstallationID,
-		Owner:          pr.Owner,
-		Repo:           pr.Repo,
-		Number:         pr.Number,
-		HeadSHA:        pr.HeadSHA,
+		InstallationID:   pr.InstallationID,
+		Owner:            pr.Owner,
+		Repo:             pr.Repo,
+		Number:           pr.Number,
+		HeadSHA:          pr.HeadSHA,
+		SummaryCommentID: prev.SummaryCommentID,
+		Proposals:        slices.Clone(prev.Proposals),
 	}
 }
 
@@ -244,6 +320,160 @@ func neutral(run CheckRun, title, summary string) CheckRun {
 	return run
 }
 
+// CommentWrite is a comment write Reconcile asks the Service to perform.
+// Summary writes target the summary comment; the Service renders its body from
+// the final state because it links comments created by earlier writes.
+// Otherwise Index is the proposal in State.Proposals. ID 0 means create (Review
+// holds the new review comment); else edit comment ID to Body.
+type CommentWrite struct {
+	Summary bool
+	Index   int
+	ID      int64
+	Review  ReviewComment
+	Body    string
+}
+
+// Reconcile is the state transition for a finished run: pure, no I/O. It
+// returns prev with only Proposals and SummaryCommentID changed, and the
+// comment writes that realize it. existing is the PR's current comments: our
+// own comments carrying our markers are reused when state lacks their IDs, and
+// an outdated proposal keeps its current body. Created comments' IDs and URLs
+// belong in the returned state at the writes' Index.
+func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []review.ChangedFile, existing []Comment) (PRState, []CommentWrite) {
+	next := prev
+	next.Proposals = slices.Clone(prev.Proposals)
+	proposals, _ := verdict.(review.Proposals)
+
+	index := make(map[string]int, len(next.Proposals))
+	for i, ps := range next.Proposals {
+		index[ps.ID] = i
+	}
+	current := make(map[string]bool, len(proposals))
+	var writes []CommentWrite
+
+	for _, p := range proposals {
+		id := ProposalID(p.DocPath, p.Section)
+		if current[id] {
+			continue
+		}
+		current[id] = true
+		i, ok := index[id]
+		if !ok {
+			i = len(next.Proposals)
+			index[id] = i
+			next.Proposals = append(next.Proposals, ProposalState{ID: id})
+		}
+		ps := &next.Proposals[i]
+		ps.DocPath, ps.Section, ps.State = p.DocPath, p.Section, ProposalOpen
+		adoptMarked(ps, existing)
+
+		p = withHeading(p)
+		rc := proposalComment(pr.HeadSHA, id, p, changed)
+		if c, ok := findComment(existing, CommentKindReview, ps.CommentID); ok {
+			if !sameAnchor(c, rc) {
+				rc.Body = renderCheckbox(id, p)
+			}
+			writes = append(writes, CommentWrite{Index: i, ID: ps.CommentID, Body: rc.Body})
+		} else {
+			ps.CommentID, ps.CommentURL = 0, ""
+			writes = append(writes, CommentWrite{Index: i, Review: rc})
+		}
+	}
+
+	for i := range next.Proposals {
+		ps := &next.Proposals[i]
+		if current[ps.ID] || ps.State == ProposalOutdated {
+			continue
+		}
+		adoptMarked(ps, existing)
+		ps.State = ProposalOutdated
+		if c, ok := findComment(existing, CommentKindReview, ps.CommentID); ok {
+			writes = append(writes, CommentWrite{Index: i, ID: ps.CommentID, Body: renderOutdated(ps.ID, pr.HeadSHA, c.Body)})
+		}
+	}
+
+	summaryLost := false
+	if _, ok := findComment(existing, CommentKindIssue, next.SummaryCommentID); !ok {
+		summaryLost = next.SummaryCommentID != 0
+		next.SummaryCommentID = 0
+		if c, ok := findMarked(existing, CommentKindIssue, summaryMarker); ok {
+			next.SummaryCommentID, summaryLost = c.ID, false
+		}
+	}
+	if next.SummaryCommentID != 0 || len(proposals) > 0 || summaryLost {
+		writes = append(writes, CommentWrite{Summary: true, ID: next.SummaryCommentID})
+	}
+	return next, writes
+}
+
+// withHeading restores the section's heading (and the blank lines after it)
+// when a runner's Content omits it, so rendering and applying it never drop
+// the heading from the doc.
+func withHeading(p review.Proposal) review.Proposal {
+	if p.Section == "" || p.Original == "" {
+		return p
+	}
+	heading, rest, _ := strings.Cut(p.Original, "\n")
+	if first, _, _ := strings.Cut(strings.TrimLeft(p.Content, " \t\r\n"), "\n"); headingLevel(first) == headingLevel(heading) {
+		return p
+	}
+	lead := heading + "\n"
+	for strings.HasPrefix(rest, "\n") {
+		lead += "\n"
+		rest = rest[1:]
+	}
+	p.Content = lead + strings.TrimLeft(p.Content, "\n")
+	return p
+}
+
+// headingLevel is the ATX level of line ("## x" is 2), or 0 when it is not a heading.
+func headingLevel(line string) int {
+	line = strings.TrimSpace(line)
+	level := len(line) - len(strings.TrimLeft(line, "#"))
+	if level == 0 || level > 6 || (len(line) > level && line[level] != ' ') {
+		return 0
+	}
+	return level
+}
+
+// adoptMarked records our existing review comment carrying ps's marker when
+// state has no comment ID for it (a run stopped before saving).
+func adoptMarked(ps *ProposalState, existing []Comment) {
+	if ps.CommentID != 0 {
+		return
+	}
+	if c, ok := findMarked(existing, CommentKindReview, proposalMarker(ps.ID)); ok {
+		ps.CommentID, ps.CommentURL = c.ID, c.URL
+	}
+}
+
+func findMarked(existing []Comment, kind CommentKind, marker string) (Comment, bool) {
+	for _, c := range existing {
+		first, _, _ := strings.Cut(c.Body, "\n")
+		if c.Mine && c.Kind == kind && strings.TrimRight(first, "\r") == marker {
+			return c, true
+		}
+	}
+	return Comment{}, false
+}
+
+// findComment returns our comment id; a listed comment someone else wrote
+// counts as missing so it is never edited.
+func findComment(existing []Comment, kind CommentKind, id int64) (Comment, bool) {
+	for _, c := range existing {
+		if c.Mine && c.Kind == kind && c.ID == id {
+			return c, true
+		}
+	}
+	return Comment{}, false
+}
+
+// sameAnchor reports whether existing sits where rc would be created; a
+// suggestion body is only safe to write onto the lines it was computed for.
+func sameAnchor(existing Comment, rc ReviewComment) bool {
+	return existing.Path == rc.Path && existing.StartLine == rc.StartLine && existing.Line == rc.Line
+}
+
 // Runners are the analysis runners a repo may use. A nil Runner means that
 // runner is unavailable.
 type Runners struct {
@@ -297,6 +527,7 @@ func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
 	}
 
 	var started review.Started
+	var changed []review.ChangedFile
 	switch selectRunner(hasWorkflow, s.runners) {
 	case runnerNone:
 	case runnerActions:
@@ -305,7 +536,7 @@ func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
 		}
 		return nil
 	case runnerServer:
-		started, err = s.start(ctx, s.runners.Server, pr)
+		started, changed, err = s.start(ctx, s.runners.Server, pr)
 	}
 	if err != nil {
 		return fmt.Errorf("handle pull request %s/%s#%d: %w", pr.Owner, pr.Repo, pr.Number, err)
@@ -326,7 +557,9 @@ func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
 	case review.Result:
 		var run CheckRun
 		next, run = conclude(next, resultOutcome(res))
-		_, err = s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, run)
+		if _, err = s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, run); err == nil && reconciles(res.Verdict) {
+			next, err = s.postComments(ctx, next, pr, res.Verdict, changed)
+		}
 	default:
 		err = fmt.Errorf("unknown review.Started %T", started)
 	}
@@ -360,7 +593,7 @@ func (s *Service) startActions(ctx context.Context, state PRState, pr PullReques
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
 	defer cancel()
 
-	started, err := s.start(ctx, s.runners.Actions, pr)
+	started, changed, err := s.start(ctx, s.runners.Actions, pr)
 	next := OnPush(state, pr)
 	if err == nil {
 		switch res := started.(type) {
@@ -371,6 +604,11 @@ func (s *Service) startActions(ctx context.Context, state PRState, pr PullReques
 			next, run = conclude(next, resultOutcome(res))
 			if err := s.gh.UpdateCheckRun(writeCtx, pr.InstallationID, pr.Owner, pr.Repo, id, run); err != nil {
 				return fmt.Errorf("conclude check run %d: %w", id, err)
+			}
+			if reconciles(res.Verdict) {
+				if next, err = s.postComments(writeCtx, next, pr, res.Verdict, changed); err != nil {
+					return err
+				}
 			}
 		default:
 			err = fmt.Errorf("unknown review.Started %T", started)
@@ -406,10 +644,26 @@ func (s *Service) HandleRunCompleted(ctx context.Context, rc RunCompleted) error
 		return fmt.Errorf("handle run %d of %s/%s#%d: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
 	}
 
-	next, run := conclude(state, outcome)
+	_, run := conclude(state, outcome)
+	var changed []review.ChangedFile
+	reconcile := outcome.Result != nil && reconciles(outcome.Result.Verdict)
+	pr := PullRequest{InstallationID: state.InstallationID, Owner: state.Owner, Repo: state.Repo, Number: state.Number, HeadSHA: state.HeadSHA}
+	if reconcile {
+		changed, err = s.gh.ListChangedFiles(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number)
+		if err != nil {
+			return fmt.Errorf("handle run %d of %s/%s#%d: list changed files: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
+		}
+	}
 	if err := s.gh.UpdateCheckRun(ctx, state.InstallationID, state.Owner, state.Repo, state.CheckRunID, run); err != nil {
 		return fmt.Errorf("handle run %d of %s/%s#%d: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
 	}
+	if reconcile {
+		state, err = s.postComments(ctx, state, pr, outcome.Result.Verdict, changed)
+		if err != nil {
+			return fmt.Errorf("handle run %d of %s/%s#%d: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
+		}
+	}
+	next, _ := conclude(state, outcome)
 	if err := s.store.SavePR(ctx, next); err != nil {
 		return fmt.Errorf("handle run %d of %s/%s#%d: save state: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
 	}
@@ -480,6 +734,71 @@ func (s *Service) collect(ctx context.Context, state PRState, rc RunCompleted) (
 	}
 }
 
+// postComments lists the PR's comments when there is anything to reconcile,
+// performs Reconcile's writes, and records created comment IDs and URLs in the
+// returned state, which is prev otherwise unchanged.
+func (s *Service) postComments(ctx context.Context, prev PRState, pr PullRequest, verdict review.Verdict, changed []review.ChangedFile) (PRState, error) {
+	proposals, _ := verdict.(review.Proposals)
+	if len(prev.Proposals) == 0 && prev.SummaryCommentID == 0 && len(proposals) == 0 {
+		return prev, nil
+	}
+	existing, err := s.gh.ListComments(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number)
+	if err != nil {
+		return PRState{}, fmt.Errorf("list comments: %w", err)
+	}
+
+	next, writes := Reconcile(prev, pr, verdict, changed, existing)
+	// Saving before the first create means a run that stops after posting
+	// leaves state behind, so the next run lists comments and adopts them by marker.
+	if slices.ContainsFunc(writes, func(w CommentWrite) bool { return w.ID == 0 }) {
+		if err := s.store.SavePR(ctx, next); err != nil {
+			return PRState{}, fmt.Errorf("save state before creating comments: %w", err)
+		}
+	}
+	for _, w := range writes {
+		switch {
+		case w.Summary:
+			err = s.writeSummary(ctx, pr, &next, w)
+		case w.ID == 0:
+			err = s.createProposalComment(ctx, pr, &next, w)
+		default:
+			if err = s.gh.EditReviewComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, w.ID, w.Body); err != nil {
+				err = fmt.Errorf("edit review comment for %s: %w", next.Proposals[w.Index].DocPath, err)
+			}
+		}
+		if err != nil {
+			return PRState{}, err
+		}
+	}
+	return next, nil
+}
+
+func (s *Service) createProposalComment(ctx context.Context, pr PullRequest, next *PRState, w CommentWrite) error {
+	ps := &next.Proposals[w.Index]
+	c, err := s.gh.CreateReviewComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number, w.Review)
+	if err != nil {
+		return fmt.Errorf("create review comment for %s: %w", ps.DocPath, err)
+	}
+	ps.CommentID, ps.CommentURL = c.ID, c.URL
+	return nil
+}
+
+func (s *Service) writeSummary(ctx context.Context, pr PullRequest, next *PRState, w CommentWrite) error {
+	body := renderSummary(*next)
+	if w.ID != 0 {
+		if err := s.gh.EditIssueComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, w.ID, body); err != nil {
+			return fmt.Errorf("edit summary comment: %w", err)
+		}
+		return nil
+	}
+	c, err := s.gh.CreateIssueComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number, body)
+	if err != nil {
+		return fmt.Errorf("create summary comment: %w", err)
+	}
+	next.SummaryCommentID = c.ID
+	return nil
+}
+
 // runnerSelection names which runner HandlePullRequest uses.
 type runnerSelection int
 
@@ -505,10 +824,10 @@ func selectRunner(hasWorkflow bool, runners Runners) runnerSelection {
 	return runnerServer
 }
 
-func (s *Service) start(ctx context.Context, runner review.Runner, pr PullRequest) (review.Started, error) {
+func (s *Service) start(ctx context.Context, runner review.Runner, pr PullRequest) (review.Started, []review.ChangedFile, error) {
 	changed, err := s.gh.ListChangedFiles(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number)
 	if err != nil {
-		return nil, fmt.Errorf("list changed files: %w", err)
+		return nil, nil, fmt.Errorf("list changed files: %w", err)
 	}
 
 	started, err := runner.Start(ctx, review.Request{
@@ -521,9 +840,21 @@ func (s *Service) start(ctx context.Context, runner review.Runner, pr PullReques
 		ChangedFiles:   changed,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("start analysis: %w", err)
+		return nil, nil, fmt.Errorf("start analysis: %w", err)
 	}
-	return started, nil
+	return started, changed, nil
+}
+
+// reconciles reports whether a verdict concludes the analysis, so that its
+// proposals belong in comments; an empty proposal list is a failed analysis.
+func reconciles(v review.Verdict) bool {
+	switch v := v.(type) {
+	case review.NoImpact:
+		return true
+	case review.Proposals:
+		return len(v) > 0
+	}
+	return false
 }
 
 func proposalsSummary(proposals review.Proposals) string {

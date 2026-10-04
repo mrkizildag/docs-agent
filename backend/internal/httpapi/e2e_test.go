@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -36,7 +37,31 @@ type e2eCheckRunCall struct {
 }
 
 type e2eGitHub struct {
+	noComments
 	calls chan e2eCheckRunCall
+}
+
+// noComments is the comment surface of a fake that never posts comments.
+type noComments struct{}
+
+func (noComments) ListComments(context.Context, int64, string, string, int) ([]gate.Comment, error) {
+	return nil, nil
+}
+
+func (noComments) CreateReviewComment(context.Context, int64, string, string, int, gate.ReviewComment) (gate.Comment, error) {
+	return gate.Comment{}, nil
+}
+
+func (noComments) EditReviewComment(context.Context, int64, string, string, int64, string) error {
+	return nil
+}
+
+func (noComments) CreateIssueComment(context.Context, int64, string, string, int, string) (gate.Comment, error) {
+	return gate.Comment{}, nil
+}
+
+func (noComments) EditIssueComment(context.Context, int64, string, string, int64, string) error {
+	return nil
 }
 
 func (f *e2eGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (bool, error) {
@@ -419,4 +444,457 @@ func TestActionsRunnerEndToEnd(t *testing.T) {
 	if summary, _ := output["summary"].(string); !strings.Contains(summary, "docs/features/greeting.md") {
 		t.Errorf("updated check run output = %v, want the proposal for docs/features/greeting.md", output)
 	}
+}
+
+type commentGitHub struct {
+	noComments
+	checkRuns chan gate.CheckRun
+	review    chan gate.ReviewComment
+	issue     chan string
+	created   int64
+}
+
+func (f *commentGitHub) WorkflowExists(context.Context, int64, string, string) (bool, error) {
+	return false, nil
+}
+
+func (f *commentGitHub) UpdateCheckRun(context.Context, int64, string, string, int64, gate.CheckRun) error {
+	return nil
+}
+
+func (f *commentGitHub) ListChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {
+	return nil, nil
+}
+
+func (f *commentGitHub) CreateCheckRun(_ context.Context, _ int64, _, _ string, run gate.CheckRun) (int64, error) {
+	f.checkRuns <- run
+	return 1, nil
+}
+
+func (f *commentGitHub) CreateReviewComment(_ context.Context, _ int64, _, _ string, _ int, c gate.ReviewComment) (gate.Comment, error) {
+	f.review <- c
+	f.created++
+	id := f.created
+	return gate.Comment{ID: id, URL: fmt.Sprintf("https://github.com/acme/widgets/pull/1#discussion_r%d", id)}, nil
+}
+
+func (f *commentGitHub) CreateIssueComment(_ context.Context, _ int64, _, _ string, _ int, body string) (gate.Comment, error) {
+	f.issue <- body
+	return gate.Comment{ID: 900}, nil
+}
+
+type proposalRunner struct{ proposals review.Proposals }
+
+func (r proposalRunner) Start(context.Context, review.Request) (review.Started, error) {
+	return review.Result{Runner: "fake", Verdict: r.proposals}, nil
+}
+
+func TestWebhookToProposalCommentsEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("test-secret")
+	store, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "docs-agent.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	gh := &commentGitHub{checkRuns: make(chan gate.CheckRun, 2), review: make(chan gate.ReviewComment, 4), issue: make(chan string, 2)}
+	runner := proposalRunner{proposals: review.Proposals{
+		{DocPath: "docs/a.md", Section: "Usage", Anchor: review.Anchor{File: "a.go", Line: 4}, Reason: "flag renamed", Original: "## Usage\nold\n", Lines: review.LineRange{Start: 3, End: 4}, Content: "## Usage\nnew\n"},
+		{DocPath: "docs/b.md", Anchor: review.Anchor{File: "b.go", Line: 9}, Reason: "new feature", Content: "# B\n", IndexEntry: "- [B](b.md)"},
+	}}
+	gateSvc := gate.NewService(gh, store, gate.Runners{Server: runner})
+
+	logger := slog.New(slog.DiscardHandler)
+	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
+	workerCtx, cancelWorker := context.WithCancel(t.Context())
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- worker.Run(workerCtx) }()
+	t.Cleanup(func() {
+		cancelWorker()
+		if err := <-workerDone; err != nil {
+			t.Errorf("worker.Run() error = %v", err)
+		}
+	})
+
+	body := e2ePullRequestBody(t, 1, "sha1")
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-GitHub-Delivery", "d1")
+	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
+	rec := httptest.NewRecorder()
+	httpapi.NewHandler(logger, secret, worker, store).ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST /webhook = %d, want %d", rec.Code, http.StatusAccepted)
+	}
+
+	timeout := time.After(5 * time.Second)
+	var reviews []gate.ReviewComment
+	for len(reviews) < 2 {
+		select {
+		case c := <-gh.review:
+			reviews = append(reviews, c)
+		case <-timeout:
+			t.Fatalf("timed out waiting for review comments, got %d", len(reviews))
+		}
+	}
+	var summary string
+	select {
+	case summary = <-gh.issue:
+	case <-timeout:
+		t.Fatal("timed out waiting for summary comment")
+	}
+	var run gate.CheckRun
+	select {
+	case run = <-gh.checkRuns:
+	case <-timeout:
+		t.Fatal("timed out waiting for check run")
+	}
+
+	if run.Conclusion != gate.ConclusionActionRequired {
+		t.Errorf("check run conclusion = %q, want %q", run.Conclusion, gate.ConclusionActionRequired)
+	}
+	for i, want := range []struct{ path, marker string }{
+		{"a.go", "<!-- docs-agent:proposal:" + gate.ProposalID("docs/a.md", "Usage") + " -->"},
+		{"b.go", "<!-- docs-agent:proposal:" + gate.ProposalID("docs/b.md", "") + " -->"},
+	} {
+		if reviews[i].Path != want.path || reviews[i].CommitSHA != "sha1" || !strings.Contains(reviews[i].Body, want.marker) {
+			t.Errorf("review comment %d = %+v, want path %s on sha1 with marker %s", i, reviews[i], want.path, want.marker)
+		}
+		if !strings.Contains(summary, fmt.Sprintf("discussion_r%d", i+1)) {
+			t.Errorf("summary missing link to comment %d:\n%s", i+1, summary)
+		}
+	}
+	if !strings.Contains(summary, "<!-- docs-agent:summary -->") {
+		t.Errorf("summary missing marker:\n%s", summary)
+	}
+
+	var state gate.PRState
+	for state.SummaryCommentID == 0 {
+		select {
+		case <-timeout:
+			t.Fatal("timed out waiting for saved state")
+		case <-time.After(10 * time.Millisecond):
+		}
+		if state, err = store.LoadPR(t.Context(), "acme", "widgets", 1); err != nil {
+			t.Fatalf("LoadPR() error = %v", err)
+		}
+	}
+	if len(state.Proposals) != 2 || state.Proposals[0].CommentID != 1 || state.Proposals[1].CommentID != 2 {
+		t.Errorf("saved proposals = %+v, want comment IDs 1 and 2", state.Proposals)
+	}
+}
+
+// statefulGitHub keeps the PR's comments like GitHub does: created comments are
+// listed back and edits replace bodies.
+type statefulGitHub struct {
+	checkRuns chan gate.CheckRun
+
+	mu       sync.Mutex
+	comments []gate.Comment
+	creates  int
+	edits    int
+}
+
+func (f *statefulGitHub) WorkflowExists(context.Context, int64, string, string) (bool, error) {
+	return false, nil
+}
+
+func (f *statefulGitHub) UpdateCheckRun(context.Context, int64, string, string, int64, gate.CheckRun) error {
+	return nil
+}
+
+func (f *statefulGitHub) ListChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {
+	return nil, nil
+}
+
+func (f *statefulGitHub) CreateCheckRun(_ context.Context, _ int64, _, _ string, run gate.CheckRun) (int64, error) {
+	f.checkRuns <- run
+	return 1, nil
+}
+
+func (f *statefulGitHub) ListComments(context.Context, int64, string, string, int) ([]gate.Comment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.comments), nil
+}
+
+func (f *statefulGitHub) CreateReviewComment(_ context.Context, _ int64, _, _ string, _ int, c gate.ReviewComment) (gate.Comment, error) {
+	return f.create(gate.CommentKindReview, c.Body), nil
+}
+
+func (f *statefulGitHub) CreateIssueComment(_ context.Context, _ int64, _, _ string, _ int, body string) (gate.Comment, error) {
+	return f.create(gate.CommentKindIssue, body), nil
+}
+
+func (f *statefulGitHub) EditReviewComment(_ context.Context, _ int64, _, _ string, id int64, body string) error {
+	return f.edit(gate.CommentKindReview, id, body)
+}
+
+func (f *statefulGitHub) EditIssueComment(_ context.Context, _ int64, _, _ string, id int64, body string) error {
+	return f.edit(gate.CommentKindIssue, id, body)
+}
+
+func (f *statefulGitHub) create(kind gate.CommentKind, body string) gate.Comment {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.creates++
+	id := int64(len(f.comments) + 1)
+	c := gate.Comment{ID: id, Mine: true, Kind: kind, URL: fmt.Sprintf("https://github.com/acme/widgets/pull/1#comment_%d", id), Body: body}
+	f.comments = append(f.comments, c)
+	return c
+}
+
+func (f *statefulGitHub) edit(kind gate.CommentKind, id int64, body string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, c := range f.comments {
+		if c.Kind == kind && c.ID == id {
+			f.comments[i].Body = body
+			f.edits++
+			return nil
+		}
+	}
+	return fmt.Errorf("edit %s comment %d: not found", kind, id)
+}
+
+// snapshot returns the comments and the create and edit counts so far.
+func (f *statefulGitHub) snapshot() (comments []gate.Comment, creates, edits int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.comments), f.creates, f.edits
+}
+
+// scriptedRunner returns one queued verdict per run.
+type scriptedRunner struct{ verdicts chan review.Verdict }
+
+func (r scriptedRunner) Start(context.Context, review.Request) (review.Started, error) {
+	return review.Result{Runner: "fake", Verdict: <-r.verdicts}, nil
+}
+
+func twoProposals() review.Proposals {
+	return review.Proposals{
+		{DocPath: "docs/a.md", Section: "Usage", Anchor: review.Anchor{File: "a.go", Line: 4}, Reason: "flag renamed", Original: "## Usage\nold\n", Lines: review.LineRange{Start: 3, End: 4}, Content: "## Usage\nnew\n"},
+		{DocPath: "docs/b.md", Anchor: review.Anchor{File: "b.go", Line: 9}, Reason: "new feature", Content: "# B\n", IndexEntry: "- [B](b.md)"},
+	}
+}
+
+// pushHarness drives synchronize webhooks for PR 1 through the real handler,
+// worker and sqlite store.
+type pushHarness struct {
+	t       *testing.T
+	gh      *statefulGitHub
+	store   *sqlite.Store
+	handler http.Handler
+	secret  []byte
+	deliver int
+}
+
+func newPushHarness(t *testing.T, verdicts ...review.Verdict) *pushHarness {
+	t.Helper()
+
+	store, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "docs-agent.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	queued := make(chan review.Verdict, len(verdicts))
+	for _, v := range verdicts {
+		queued <- v
+	}
+	gh := &statefulGitHub{checkRuns: make(chan gate.CheckRun, len(verdicts))}
+	gateSvc := gate.NewService(gh, store, gate.Runners{Server: scriptedRunner{verdicts: queued}})
+
+	logger := slog.New(slog.DiscardHandler)
+	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
+	workerCtx, cancelWorker := context.WithCancel(t.Context())
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- worker.Run(workerCtx) }()
+	t.Cleanup(func() {
+		cancelWorker()
+		if err := <-workerDone; err != nil {
+			t.Errorf("worker.Run() error = %v", err)
+		}
+	})
+
+	secret := []byte("test-secret")
+	return &pushHarness{t: t, gh: gh, store: store, handler: httpapi.NewHandler(logger, secret, worker, store), secret: secret}
+}
+
+// push delivers a synchronize webhook for sha and returns the check run and the
+// saved state once the run has finished.
+func (h *pushHarness) push(sha string) (gate.CheckRun, gate.PRState) {
+	h.t.Helper()
+
+	h.deliver++
+	body := bytes.Replace(e2ePullRequestBody(h.t, 1, sha), []byte(`"opened"`), []byte(`"synchronize"`), 1)
+	req := httptest.NewRequestWithContext(h.t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("d%d", h.deliver))
+	req.Header.Set("X-Hub-Signature-256", sign(h.secret, body))
+	rec := httptest.NewRecorder()
+	h.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		h.t.Fatalf("POST /webhook for %s = %d, want %d", sha, rec.Code, http.StatusAccepted)
+	}
+
+	var run gate.CheckRun
+	select {
+	case run = <-h.gh.checkRuns:
+	case <-time.After(5 * time.Second):
+		h.t.Fatalf("timed out waiting for check run on %s", sha)
+	}
+
+	// The check run is created before comments are written and state is saved.
+	deadline := time.After(5 * time.Second)
+	for {
+		state, err := h.store.LoadPR(h.t.Context(), "acme", "widgets", 1)
+		if err != nil {
+			h.t.Fatalf("LoadPR() error = %v", err)
+		}
+		if state.HeadSHA == sha {
+			return run, state
+		}
+		select {
+		case <-deadline:
+			h.t.Fatalf("timed out waiting for state on %s", sha)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func (h *pushHarness) commentWith(marker string) gate.Comment {
+	h.t.Helper()
+
+	comments, _, _ := h.gh.snapshot()
+	for _, c := range comments {
+		if strings.Contains(c.Body, marker) {
+			return c
+		}
+	}
+	h.t.Fatalf("no comment contains %q in %+v", marker, comments)
+	return gate.Comment{}
+}
+
+func TestWebhookReconcilesProposalCommentsAcrossPushes(t *testing.T) {
+	t.Parallel()
+
+	markerA := "<!-- docs-agent:proposal:" + gate.ProposalID("docs/a.md", "Usage") + " -->"
+	markerB := "<!-- docs-agent:proposal:" + gate.ProposalID("docs/b.md", "") + " -->"
+	summaryMarker := "<!-- docs-agent:summary -->"
+
+	t.Run("same proposals edit in place", func(t *testing.T) {
+		t.Parallel()
+		h := newPushHarness(t, twoProposals(), twoProposals())
+
+		h.push("sha1")
+		_, creates, _ := h.gh.snapshot()
+		if creates != 3 {
+			t.Fatalf("creates after first push = %d, want 3", creates)
+		}
+
+		run, _ := h.push("sha2")
+		comments, creates, edits := h.gh.snapshot()
+		if creates != 3 || len(comments) != 3 {
+			t.Errorf("after second push creates = %d, comments = %d, want 3 and 3", creates, len(comments))
+		}
+		if edits != 3 {
+			t.Errorf("edits = %d, want 3 (two review comments and the summary)", edits)
+		}
+		if run.Conclusion != gate.ConclusionActionRequired {
+			t.Errorf("conclusion = %q, want %q", run.Conclusion, gate.ConclusionActionRequired)
+		}
+		if body := h.commentWith(markerA).Body; strings.Contains(body, "Outdated") {
+			t.Errorf("comment A marked outdated:\n%s", body)
+		}
+	})
+
+	t.Run("dropped proposal is marked outdated", func(t *testing.T) {
+		t.Parallel()
+		h := newPushHarness(t, twoProposals(), review.Proposals{twoProposals()[0]})
+
+		h.push("sha1")
+		run, state := h.push("sha2")
+
+		if run.Conclusion != gate.ConclusionActionRequired {
+			t.Errorf("conclusion = %q, want %q", run.Conclusion, gate.ConclusionActionRequired)
+		}
+		if body := h.commentWith(markerB).Body; !strings.Contains(body, "Outdated") {
+			t.Errorf("dropped proposal comment not outdated:\n%s", body)
+		}
+		if body := h.commentWith(markerA).Body; strings.Contains(body, "Outdated") {
+			t.Errorf("kept proposal comment marked outdated:\n%s", body)
+		}
+		summary := h.commentWith(summaryMarker).Body
+		if !strings.Contains(summary, "| outdated |") || !strings.Contains(summary, "| open |") {
+			t.Errorf("summary should show one open and one outdated row:\n%s", summary)
+		}
+		if comments, _, _ := h.gh.snapshot(); len(comments) != 3 {
+			t.Errorf("comments = %d, want 3", len(comments))
+		}
+		if len(state.Proposals) != 2 {
+			t.Errorf("saved proposals = %+v, want 2", state.Proposals)
+		}
+	})
+
+	t.Run("no impact outdates everything", func(t *testing.T) {
+		t.Parallel()
+		h := newPushHarness(t, twoProposals(), review.NoImpact{Reason: "docs already match"})
+
+		h.push("sha1")
+		run, _ := h.push("sha2")
+
+		if run.Conclusion != gate.ConclusionSuccess {
+			t.Errorf("conclusion = %q, want %q", run.Conclusion, gate.ConclusionSuccess)
+		}
+		for _, marker := range []string{markerA, markerB} {
+			if body := h.commentWith(marker).Body; !strings.Contains(body, "Outdated") {
+				t.Errorf("comment %s not outdated:\n%s", marker, body)
+			}
+		}
+		summary := h.commentWith(summaryMarker).Body
+		if strings.Contains(summary, "| open |") || strings.Count(summary, "| outdated |") != 2 {
+			t.Errorf("summary should show two outdated rows:\n%s", summary)
+		}
+		if comments, _, _ := h.gh.snapshot(); len(comments) != 3 {
+			t.Errorf("comments = %d, want 3", len(comments))
+		}
+	})
+
+	t.Run("recovers after a crash before saving comment IDs", func(t *testing.T) {
+		t.Parallel()
+		h := newPushHarness(t, twoProposals(), twoProposals())
+
+		_, state := h.push("sha1")
+		state.SummaryCommentID = 0
+		for i := range state.Proposals {
+			state.Proposals[i].CommentID = 0
+			state.Proposals[i].CommentURL = ""
+		}
+		if err := h.store.SavePR(t.Context(), state); err != nil {
+			t.Fatalf("SavePR() error = %v", err)
+		}
+
+		_, state = h.push("sha2")
+		comments, creates, edits := h.gh.snapshot()
+		if creates != 3 || len(comments) != 3 {
+			t.Errorf("creates = %d, comments = %d, want 3 and 3", creates, len(comments))
+		}
+		if edits != 3 {
+			t.Errorf("edits = %d, want 3", edits)
+		}
+		if state.SummaryCommentID == 0 || state.Proposals[0].CommentID == 0 || state.Proposals[1].CommentID == 0 {
+			t.Errorf("saved state did not re-adopt comment IDs: %+v", state)
+		}
+	})
 }

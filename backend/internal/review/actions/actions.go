@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mrkizildag/docs-agent/backend/internal/docs"
 	"github.com/mrkizildag/docs-agent/backend/internal/review"
 )
 
@@ -44,6 +45,9 @@ type WorkflowAPI interface {
 	ResultArtifact(ctx context.Context, installationID int64, owner, repo string, runID int64) ([]byte, error)
 	// ListChangedFiles returns the pull request's files with their head-side hunk ranges.
 	ListChangedFiles(ctx context.Context, installationID int64, owner, repo string, number int) ([]review.ChangedFile, error)
+	// FileAtRef returns the file's content at ref, or ok=false when the file
+	// does not exist there or exceeds docs.MaxDocBytes.
+	FileAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (content []byte, ok bool, err error)
 }
 
 // Artifact is the JSON document the workflow uploads as result.json.
@@ -139,8 +143,43 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 		}
 		proposals[i] = p
 	}
+	if err := r.fillOriginals(ctx, c, proposals); err != nil {
+		return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
+	}
 	result.Verdict = proposals
 	return result, nil
+}
+
+// fillOriginals sets Original and Lines on each proposal that replaces a
+// section, from the doc at the completion's head. A doc or section missing
+// there leaves both empty.
+func (r *Runner) fillOriginals(ctx context.Context, c review.Completion, proposals review.Proposals) error {
+	parsed := map[string]*docs.Doc{}
+	for i, p := range proposals {
+		if p.Section == "" {
+			continue
+		}
+		doc, seen := parsed[p.DocPath]
+		if !seen {
+			src, ok, err := r.api.FileAtRef(ctx, c.InstallationID, c.Owner, c.Repo, p.DocPath, c.HeadSHA)
+			if err != nil {
+				return fmt.Errorf("read %s at %s: %w", p.DocPath, c.HeadSHA, err)
+			}
+			if ok {
+				if d, err := docs.ParseDoc(p.DocPath, src); err == nil {
+					doc = &d
+				}
+			}
+			parsed[p.DocPath] = doc
+		}
+		if doc == nil {
+			continue
+		}
+		if text, start, end, ok := doc.SectionSpan(p.Section); ok {
+			proposals[i].Original, proposals[i].Lines = text, review.LineRange{Start: start, End: end}
+		}
+	}
+	return nil
 }
 
 func (a Artifact) output(c review.Completion) (*review.StructuredOutput, error) {

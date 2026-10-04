@@ -89,6 +89,21 @@ func migrations() []string {
 		ALTER TABLE pull_requests ADD COLUMN run_nonce TEXT NOT NULL DEFAULT '';
 		ALTER TABLE pull_requests ADD COLUMN run_deadline TEXT NOT NULL DEFAULT '';
 		CREATE UNIQUE INDEX idx_pull_requests_run ON pull_requests(owner, repo, run_id) WHERE run_id != 0`,
+		`ALTER TABLE pull_requests ADD COLUMN summary_comment_id INTEGER NOT NULL DEFAULT 0;
+		CREATE TABLE pr_proposals (
+			owner TEXT NOT NULL,
+			repo TEXT NOT NULL,
+			number INTEGER NOT NULL,
+			position INTEGER NOT NULL,
+			id TEXT NOT NULL,
+			doc_path TEXT NOT NULL,
+			section TEXT NOT NULL,
+			comment_id INTEGER NOT NULL,
+			comment_url TEXT NOT NULL,
+			state TEXT NOT NULL,
+			PRIMARY KEY (owner, repo, number, position),
+			FOREIGN KEY (owner, repo, number) REFERENCES pull_requests(owner, repo, number) ON DELETE CASCADE
+		)`,
 	}
 }
 

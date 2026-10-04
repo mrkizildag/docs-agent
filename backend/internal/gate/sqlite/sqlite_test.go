@@ -98,15 +98,25 @@ func TestSavePR_RoundTripAndOverwrite(t *testing.T) {
 	}
 }
 
-func TestSavePR_AwaitingRunRoundTripAndPRForRun(t *testing.T) {
+func TestSavePR_RoundTripRunAndProposalsAndPRForRun(t *testing.T) {
 	t.Parallel()
 
 	store, _ := open(t)
 	ctx := t.Context()
 
 	state := gate.PRState{
-		InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1", CheckRunID: 555,
-		Run: &gate.AwaitingRun{RunID: 99, Nonce: "n1", Deadline: time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)},
+		InstallationID:   1,
+		Owner:            "acme",
+		Repo:             "widgets",
+		Number:           7,
+		HeadSHA:          "sha1",
+		CheckRunID:       555,
+		Run:              &gate.AwaitingRun{RunID: 99, Nonce: "n1", Deadline: time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)},
+		SummaryCommentID: 99,
+		Proposals: []gate.ProposalState{
+			{ID: "aaa", DocPath: "docs/a.md", Section: "Usage", CommentID: 11, CommentURL: "https://x/11", State: gate.ProposalOpen},
+			{ID: "bbb", DocPath: "docs/new.md", CommentID: 12, CommentURL: "https://x/12", State: gate.ProposalOutdated},
+		},
 	}
 	if err := store.SavePR(ctx, state); err != nil {
 		t.Fatalf("SavePR() = %v, want nil error", err)
@@ -137,6 +147,18 @@ func TestSavePR_AwaitingRunRoundTripAndPRForRun(t *testing.T) {
 	}
 	if _, ok, err := store.PRForRun(ctx, "acme", "widgets", 99); err != nil || ok {
 		t.Errorf("PRForRun(cleared run) = %v, %v, want false, nil", ok, err)
+	}
+
+	state.Proposals = state.Proposals[1:]
+	if err := store.SavePR(ctx, state); err != nil {
+		t.Fatalf("SavePR() replace = %v, want nil error", err)
+	}
+	got, err = store.LoadPR(ctx, "acme", "widgets", 7)
+	if err != nil {
+		t.Fatalf("LoadPR() after replace = %v, want nil error", err)
+	}
+	if diff := cmp.Diff(state, got); diff != "" {
+		t.Errorf("LoadPR() after replace mismatch (-want +got):\n%s", diff)
 	}
 }
 

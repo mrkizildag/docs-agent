@@ -18,11 +18,11 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 	var run gate.AwaitingRun
 	var deadline string
 	row := s.db.QueryRowContext(ctx,
-		`SELECT installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline
+		`SELECT installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, summary_comment_id
 		FROM pull_requests WHERE owner = ? AND repo = ? AND number = ?`,
 		owner, repo, number)
 
-	if err := row.Scan(&state.InstallationID, &state.HeadSHA, &state.CheckRunID, &run.RunID, &run.Nonce, &deadline); err != nil {
+	if err := row.Scan(&state.InstallationID, &state.HeadSHA, &state.CheckRunID, &run.RunID, &run.Nonce, &deadline, &state.SummaryCommentID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return state, nil
 		}
@@ -38,10 +38,31 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 		state.Run = &run
 	}
 
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, doc_path, section, comment_id, comment_url, state FROM pr_proposals
+		WHERE owner = ? AND repo = ? AND number = ? ORDER BY position`,
+		owner, repo, number)
+	if err != nil {
+		return gate.PRState{}, fmt.Errorf("load pr %s/%s#%d proposals: %w", owner, repo, number, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var p gate.ProposalState
+		if err := rows.Scan(&p.ID, &p.DocPath, &p.Section, &p.CommentID, &p.CommentURL, &p.State); err != nil {
+			return gate.PRState{}, fmt.Errorf("load pr %s/%s#%d proposals: %w", owner, repo, number, err)
+		}
+		state.Proposals = append(state.Proposals, p)
+	}
+	if err := rows.Err(); err != nil {
+		return gate.PRState{}, fmt.Errorf("load pr %s/%s#%d proposals: %w", owner, repo, number, err)
+	}
+
 	return state, nil
 }
 
-// SavePR upserts state, keyed by owner/repo/number.
+// SavePR upserts state, keyed by owner/repo/number, replacing the PR's
+// proposal rows in the same transaction.
 func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 	var run gate.AwaitingRun
 	var deadline string
@@ -50,20 +71,46 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 		deadline = run.Deadline.UTC().Format(time.RFC3339Nano)
 	}
 
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO pull_requests (owner, repo, number, installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("save pr %s/%s#%d: begin: %w", state.Owner, state.Repo, state.Number, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO pull_requests (owner, repo, number, installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, summary_comment_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (owner, repo, number) DO UPDATE SET
 			installation_id = excluded.installation_id,
 			head_sha = excluded.head_sha,
 			check_run_id = excluded.check_run_id,
 			run_id = excluded.run_id,
 			run_nonce = excluded.run_nonce,
-			run_deadline = excluded.run_deadline`,
+			run_deadline = excluded.run_deadline,
+			summary_comment_id = excluded.summary_comment_id`,
 		state.Owner, state.Repo, state.Number, state.InstallationID, state.HeadSHA,
-		state.CheckRunID, run.RunID, run.Nonce, deadline)
+		state.CheckRunID, run.RunID, run.Nonce, deadline, state.SummaryCommentID)
 	if err != nil {
 		return fmt.Errorf("save pr %s/%s#%d: %w", state.Owner, state.Repo, state.Number, err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM pr_proposals WHERE owner = ? AND repo = ? AND number = ?`,
+		state.Owner, state.Repo, state.Number); err != nil {
+		return fmt.Errorf("save pr %s/%s#%d: clear proposals: %w", state.Owner, state.Repo, state.Number, err)
+	}
+	for i, p := range state.Proposals {
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO pr_proposals (owner, repo, number, position, id, doc_path, section, comment_id, comment_url, state)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			state.Owner, state.Repo, state.Number, i, p.ID, p.DocPath, p.Section, p.CommentID, p.CommentURL, p.State)
+		if err != nil {
+			return fmt.Errorf("save pr %s/%s#%d: proposal %s: %w", state.Owner, state.Repo, state.Number, p.ID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("save pr %s/%s#%d: commit: %w", state.Owner, state.Repo, state.Number, err)
 	}
 	return nil
 }

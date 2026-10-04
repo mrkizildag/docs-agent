@@ -86,8 +86,14 @@ type Proposal struct {
 	Section    string `json:"section" jsonschema:"Heading of the section to replace, or empty to create a new doc."`
 	Anchor     Anchor `json:"anchor" jsonschema:"Line in the PR diff that caused this proposal."`
 	Reason     string `json:"reason" jsonschema:"One-line explanation of why this doc change is needed."`
-	Content    string `json:"content" jsonschema:"Replacement content for the section, or the full content of a new doc."`
+	Content    string `json:"content" jsonschema:"Full replacement for the section including its heading line, or the full content of a new doc."`
 	IndexEntry string `json:"index_entry,omitempty" jsonschema:"Entry to add to the docs index; set iff section is empty."`
+
+	// Original is the section's current text at head, heading line included;
+	// empty for a new doc. Runners fill it; the model never supplies it.
+	Original string `json:"-"`
+	// Lines is Original's head-side line range in the doc; zero for a new doc.
+	Lines LineRange `json:"-"`
 }
 
 // Anchor is the line in the PR diff that caused a proposal.

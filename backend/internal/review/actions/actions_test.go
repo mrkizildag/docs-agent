@@ -22,6 +22,8 @@ type fakeAPI struct {
 	err        error
 	changed    []review.ChangedFile
 	changedErr error
+	files      map[string][]byte
+	fileReads  map[string]int
 }
 
 func (f *fakeAPI) Dispatch(_ context.Context, _ int64, _, _ string, in actions.DispatchInputs) (int64, error) {
@@ -35,6 +37,15 @@ func (f *fakeAPI) ResultArtifact(_ context.Context, _ int64, _, _ string, _ int6
 
 func (f *fakeAPI) ListChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {
 	return f.changed, f.changedErr
+}
+
+func (f *fakeAPI) FileAtRef(_ context.Context, _ int64, _, _, path, ref string) ([]byte, bool, error) {
+	if f.fileReads == nil {
+		f.fileReads = map[string]int{}
+	}
+	f.fileReads[path+"@"+ref]++
+	src, ok := f.files[path]
+	return src, ok, nil
 }
 
 func TestStart(t *testing.T) {
@@ -242,5 +253,51 @@ func TestCollectCapsProposalErrorText(t *testing.T) {
 	_, err := actions.New(api, time.Minute).Collect(t.Context(), review.Completion{HeadSHA: "abc", Nonce: "n1"})
 	if err == nil || len(err.Error()) > 400 {
 		t.Fatalf("Collect() error = %v (len %d), want a non-nil error under 400 bytes", err, len(fmt.Sprint(err)))
+	}
+}
+
+func TestCollectFillsOriginalAndLines(t *testing.T) {
+	t.Parallel()
+
+	const doc = "---\ntitle: A\nsummary: S.\ncovers:\n  - main.go\n---\n# A\n\n## Usage\nold usage\n\n## Other\nbody\n"
+	usage := validProposal()
+	other := validProposal()
+	other["section"] = "## Other"
+	missingSection := validProposal()
+	missingSection["section"] = "Nope"
+	missingDoc := validProposal()
+	missingDoc["doc_path"] = "docs/gone.md"
+
+	raw := artifact(t, "abc", "n1", map[string]any{
+		"structured_output": map[string]any{"proposals": []any{usage, other, missingSection, missingDoc}},
+	})
+	api := &fakeAPI{
+		artifact: raw,
+		changed:  []review.ChangedFile{{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 5}}}},
+		files:    map[string][]byte{"docs/a.md": []byte(doc)},
+	}
+
+	got, err := actions.New(api, time.Minute).Collect(t.Context(), review.Completion{Owner: "o", Repo: "r", HeadSHA: "abc", Nonce: "n1"})
+	if err != nil {
+		t.Fatalf("Collect() = %v, want nil", err)
+	}
+
+	proposals, ok := got.Verdict.(review.Proposals)
+	if !ok || len(proposals) != 4 {
+		t.Fatalf("Verdict = %#v, want 4 proposals", got.Verdict)
+	}
+	if p := proposals[0]; p.Original != "## Usage\nold usage\n\n" || p.Lines != (review.LineRange{Start: 9, End: 11}) {
+		t.Errorf("usage Original, Lines = %q, %+v", p.Original, p.Lines)
+	}
+	if p := proposals[1]; p.Original != "## Other\nbody\n" || p.Lines != (review.LineRange{Start: 12, End: 13}) {
+		t.Errorf("other Original, Lines = %q, %+v", p.Original, p.Lines)
+	}
+	for _, p := range proposals[2:] {
+		if p.Original != "" || p.Lines != (review.LineRange{}) {
+			t.Errorf("proposal %s/%s Original, Lines = %q, %+v, want empty", p.DocPath, p.Section, p.Original, p.Lines)
+		}
+	}
+	if diff := cmp.Diff(map[string]int{"docs/a.md@abc": 1, "docs/gone.md@abc": 1}, api.fileReads); diff != "" {
+		t.Errorf("file reads (-want +got):\n%s", diff)
 	}
 }

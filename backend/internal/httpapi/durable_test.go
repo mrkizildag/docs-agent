@@ -22,6 +22,7 @@ import (
 
 // blockingGitHub blocks CreateCheckRun for blockSHA until its context is cancelled.
 type blockingGitHub struct {
+	noComments
 	blockSHA  string
 	started   chan string
 	cancelled chan string
@@ -115,6 +116,7 @@ func runWorker(w *jobqueue.Worker) (stop func() error) {
 
 // failThenSucceedGitHub fails CreateCheckRun once per unique SHA, then succeeds on later calls.
 type failThenSucceedGitHub struct {
+	noComments
 	calls chan string
 
 	mu     sync.Mutex
