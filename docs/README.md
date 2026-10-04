@@ -18,6 +18,7 @@ Start here. Each entry is one file with a one-line summary; open only what the t
 - [Setup](guides/setup.md): run, test, and lint the backend locally.
 - [Registering the GitHub App](guides/github-app.md): create the GitHub App, set its webhook and permissions, and install it.
 - [Using the Actions runner](guides/actions-runner.md): set up a target repo so analysis runs in its own GitHub Actions with its own Claude credential.
+- [Deploy](guides/deploy.md): run pollux in Docker on one host and expose its webhook through Tailscale Funnel.
 - [0001: In-repo docs first](decisions/0001-in-repo-docs-first.md): why phase 1 targets a `docs/` folder, not Notion.
 - [0002: Docs structure](decisions/0002-docs-structure.md): the folder layout and frontmatter every doc follows.
 
