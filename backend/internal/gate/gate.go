@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mrkizildag/docs-agent/backend/internal/review"
 )
@@ -64,6 +65,10 @@ type GitHub interface {
 }
 
 const checkName = "docs-agent"
+
+// WorkflowPath is the target-repo workflow whose presence selects the Actions
+// runner and whose completion carries its result.
+const WorkflowPath = ".github/workflows/docs-agent.yml"
 
 // PRState is what the gate remembers about one pull request between events.
 type PRState struct {
@@ -175,9 +180,40 @@ type AnalysisFailed struct {
 	Cause string
 }
 
+const (
+	// maxSummaryBytes is GitHub's limit on a check run summary.
+	maxSummaryBytes = 65535
+	maxCauseBytes   = 1000
+	truncatedMark   = "… (truncated)"
+	// writeTimeout bounds the state writes that must survive a cancelled job.
+	writeTimeout = 30 * time.Second
+	// collectAttempts is how many times a result download is tried.
+	collectAttempts = 3
+)
+
+// truncate cuts s to at most max bytes on a UTF-8 boundary, ending in a marker
+// when it cut anything.
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max - len(truncatedMark)
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + truncatedMark
+}
+
 // conclude is the state transition for an analysis that ended: pure, no I/O.
-// It clears the awaited run and returns the completed check run to report.
+// It clears the awaited run and returns the completed check run to report;
+// runner-supplied text is capped to what GitHub accepts.
 func conclude(state PRState, outcome Outcome) (PRState, CheckRun) {
+	state, run := concludeUncapped(state, outcome)
+	run.Summary = truncate(run.Summary, maxSummaryBytes)
+	return state, run
+}
+
+func concludeUncapped(state PRState, outcome Outcome) (PRState, CheckRun) {
 	state.Run = nil
 	run := CheckRun{Name: checkName, HeadSHA: state.HeadSHA, Status: StatusCompleted}
 
@@ -197,7 +233,7 @@ func conclude(state PRState, outcome Outcome) (PRState, CheckRun) {
 			return state, neutral(run, "Analysis failed", fmt.Sprintf("unknown review.Verdict %T", outcome.Result.Verdict))
 		}
 	case outcome.Failed != nil:
-		return state, neutral(run, "Analysis failed", outcome.Failed.Cause)
+		return state, neutral(run, "Analysis failed", truncate(outcome.Failed.Cause, maxCauseBytes))
 	default:
 		return state, neutral(run, "Analysis failed", "analysis ended without an outcome")
 	}
@@ -220,12 +256,21 @@ type Service struct {
 	gh      GitHub
 	store   Store
 	runners Runners
+	// collectBackoff is the wait before the first Collect retry; it doubles.
+	collectBackoff time.Duration
 }
 
 // NewService returns a Service that reports check runs through gh, persists
 // state through store, and selects among runners for analysis.
 func NewService(gh GitHub, store Store, runners Runners) *Service {
-	return &Service{gh: gh, store: store, runners: runners}
+	return &Service{gh: gh, store: store, runners: runners, collectBackoff: time.Second}
+}
+
+// WithCollectBackoff sets the wait before the first Collect retry (doubling
+// each retry) and returns s.
+func (s *Service) WithCollectBackoff(d time.Duration) *Service {
+	s.collectBackoff = d
+	return s
 }
 
 // HandlePullRequest selects an analysis runner for pr, runs it, and reports
@@ -255,7 +300,10 @@ func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
 	switch selectRunner(hasWorkflow, s.runners) {
 	case runnerNone:
 	case runnerActions:
-		started, err = s.start(ctx, s.runners.Actions, pr)
+		if err := s.startActions(ctx, state, pr); err != nil {
+			return fmt.Errorf("handle pull request %s/%s#%d: %w", pr.Owner, pr.Repo, pr.Number, err)
+		}
+		return nil
 	case runnerServer:
 		started, err = s.start(ctx, s.runners.Server, pr)
 	}
@@ -275,16 +323,6 @@ func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
 			Summary:    "Set up an analysis runner: " + setupGuideURL,
 		}
 		_, err = s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, run)
-	case review.Pending:
-		var id int64
-		id, err = s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, CheckRun{
-			Name:    checkName,
-			HeadSHA: pr.HeadSHA,
-			Status:  StatusInProgress,
-			Title:   "Analyzing docs impact",
-			Summary: "Waiting for the docs-agent workflow run to finish.",
-		})
-		next = OnStarted(next, res, id)
 	case review.Result:
 		var run CheckRun
 		next, run = conclude(next, resultOutcome(res))
@@ -300,6 +338,55 @@ func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
 		return fmt.Errorf("handle pull request %s/%s#%d: save state: %w", pr.Owner, pr.Repo, pr.Number, err)
 	}
 
+	return nil
+}
+
+// startActions reports an in-progress check run, then dispatches the Actions
+// run. The check run comes first so a failed or cancelled dispatch can still
+// close it; once dispatched, the state writes outlive a cancelled ctx so the
+// next job can find and close the check run.
+func (s *Service) startActions(ctx context.Context, state PRState, pr PullRequest) error {
+	id, err := s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, CheckRun{
+		Name:    checkName,
+		HeadSHA: pr.HeadSHA,
+		Status:  StatusInProgress,
+		Title:   "Analyzing docs impact",
+		Summary: "Waiting for the docs-agent workflow run to finish.",
+	})
+	if err != nil {
+		return fmt.Errorf("create check run: %w", err)
+	}
+
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
+	defer cancel()
+
+	started, err := s.start(ctx, s.runners.Actions, pr)
+	next := OnPush(state, pr)
+	if err == nil {
+		switch res := started.(type) {
+		case review.Pending:
+			next = OnStarted(next, res, id)
+		case review.Result:
+			var run CheckRun
+			next, run = conclude(next, resultOutcome(res))
+			if err := s.gh.UpdateCheckRun(writeCtx, pr.InstallationID, pr.Owner, pr.Repo, id, run); err != nil {
+				return fmt.Errorf("conclude check run %d: %w", id, err)
+			}
+		default:
+			err = fmt.Errorf("unknown review.Started %T", started)
+		}
+	}
+	if err != nil {
+		_, run := conclude(next, failedOutcome(err.Error()))
+		if uerr := s.gh.UpdateCheckRun(writeCtx, pr.InstallationID, pr.Owner, pr.Repo, id, run); uerr != nil {
+			return errors.Join(err, fmt.Errorf("conclude check run %d: %w", id, uerr))
+		}
+		return err
+	}
+
+	if err := s.store.SavePR(writeCtx, next); err != nil {
+		return fmt.Errorf("save state: %w", err)
+	}
 	return nil
 }
 
@@ -356,7 +443,7 @@ func (s *Service) collect(ctx context.Context, state PRState, rc RunCompleted) (
 		return Outcome{}, errors.New("collect result: no Actions runner configured")
 	}
 
-	result, err := s.runners.Actions.Collect(ctx, review.Completion{
+	completion := review.Completion{
 		InstallationID: state.InstallationID,
 		Owner:          state.Owner,
 		Repo:           state.Repo,
@@ -364,9 +451,21 @@ func (s *Service) collect(ctx context.Context, state PRState, rc RunCompleted) (
 		HeadSHA:        state.HeadSHA,
 		RunID:          state.Run.RunID,
 		Nonce:          state.Run.Nonce,
-	})
+	}
 	var invalid *review.InvalidResultError
 	failed := rc.Conclusion != "success"
+
+	result, err := s.runners.Actions.Collect(ctx, completion)
+	backoff := s.collectBackoff
+	for attempt := 1; attempt < collectAttempts && err != nil && !failed && !errors.As(err, &invalid); attempt++ {
+		select {
+		case <-ctx.Done():
+			return Outcome{}, fmt.Errorf("collect result: %w", ctx.Err())
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		result, err = s.runners.Actions.Collect(ctx, completion)
+	}
 	switch {
 	case errors.As(err, &invalid) && failed:
 		return failedOutcome("workflow run " + rc.Conclusion + ": " + invalid.Cause.Error()), nil
@@ -375,7 +474,7 @@ func (s *Service) collect(ctx context.Context, state PRState, rc RunCompleted) (
 	case failed:
 		return failedOutcome("workflow run " + rc.Conclusion), nil
 	case err != nil:
-		return Outcome{}, fmt.Errorf("collect result: %w", err)
+		return failedOutcome(fmt.Sprintf("collect result: %v", err)), nil
 	default:
 		return resultOutcome(result), nil
 	}

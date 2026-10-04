@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,6 +107,11 @@ func TestCollect(t *testing.T) {
 		"reason": "x", "content": "y",
 	}
 
+	wrongType := validProposal()
+	wrongType["anchor"] = map[string]any{"line": "three", "file": "main.go"}
+	missingContent := validProposal()
+	delete(missingContent, "content")
+
 	tests := []struct {
 		name        string
 		raw         []byte
@@ -132,6 +139,10 @@ func TestCollect(t *testing.T) {
 		{name: "head mismatch", raw: artifact(t, "other", "n1", map[string]any{"structured_output": map[string]any{}}), wantInvalid: true},
 		{name: "nonce mismatch", raw: artifact(t, "abc", "stale", map[string]any{"structured_output": map[string]any{}}), wantInvalid: true},
 		{name: "claude error", raw: artifact(t, "abc", "n1", map[string]any{"is_error": true, "result": "401"}), wantInvalid: true},
+		{name: "no proposals and no reason", raw: artifact(t, "abc", "n1", map[string]any{"structured_output": map[string]any{"no_impact_reason": "", "proposals": []any{}}}), wantInvalid: true},
+		{name: "no proposals and a blank reason", raw: artifact(t, "abc", "n1", map[string]any{"structured_output": map[string]any{"no_impact_reason": "  \n", "proposals": []any{}}}), wantInvalid: true},
+		{name: "anchor line not an integer", raw: artifact(t, "abc", "n1", map[string]any{"structured_output": map[string]any{"proposals": []any{wrongType}}}), wantInvalid: true},
+		{name: "proposal missing content", raw: artifact(t, "abc", "n1", map[string]any{"structured_output": map[string]any{"proposals": []any{missingContent}}}), wantInvalid: true},
 		{name: "missing structured output", raw: artifact(t, "abc", "n1", map[string]any{}), wantInvalid: true},
 		{name: "bad json", raw: []byte("{"), wantInvalid: true},
 		{
@@ -195,5 +206,41 @@ func TestCollectChangedFilesError(t *testing.T) {
 	var invalid *review.InvalidResultError
 	if !errors.Is(err, wantErr) || errors.As(err, &invalid) {
 		t.Fatalf("Collect() = %v, want transient error wrapping %v", err, wantErr)
+	}
+}
+
+func TestCollectErrorDoesNotEchoResult(t *testing.T) {
+	t.Parallel()
+
+	const injected = "SECRET-EXFIL"
+	raw := artifact(t, "abc", "n1", map[string]any{
+		"is_error": true, "result": injected, "subtype": "success",
+		"terminal_reason": "api_error", "api_error_status": 401,
+	})
+	_, err := actions.New(&fakeAPI{artifact: raw}, time.Minute).Collect(t.Context(), review.Completion{HeadSHA: "abc", Nonce: "n1"})
+
+	var invalid *review.InvalidResultError
+	if !errors.As(err, &invalid) {
+		t.Fatalf("Collect() = %v, want *review.InvalidResultError", err)
+	}
+	if strings.Contains(err.Error(), injected) {
+		t.Errorf("Collect() error %q contains the result text", err)
+	}
+	if want := "api_error_status 401 (terminal_reason api_error"; !strings.Contains(err.Error(), want) {
+		t.Errorf("Collect() error %q, want it to contain %q", err, want)
+	}
+}
+
+func TestCollectCapsProposalErrorText(t *testing.T) {
+	t.Parallel()
+
+	long := validProposal()
+	long["doc_path"] = strings.Repeat("x", 5000)
+	raw := artifact(t, "abc", "n1", map[string]any{"structured_output": map[string]any{"proposals": []any{long}}})
+	api := &fakeAPI{artifact: raw, changed: []review.ChangedFile{{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 5}}}}}
+
+	_, err := actions.New(api, time.Minute).Collect(t.Context(), review.Completion{HeadSHA: "abc", Nonce: "n1"})
+	if err == nil || len(err.Error()) > 400 {
+		t.Fatalf("Collect() error = %v (len %d), want a non-nil error under 400 bytes", err, len(fmt.Sprint(err)))
 	}
 }

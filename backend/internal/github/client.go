@@ -151,18 +151,14 @@ func checkStatus(run gate.CheckRun) string {
 	return string(gate.StatusCompleted)
 }
 
-// workflowPath is the Actions workflow whose presence on the default branch
-// means a repo runs analysis through Actions rather than the server.
-const workflowPath = ".github/workflows/docs-agent.yml"
-
-// WorkflowExists reports whether owner/repo's default branch has workflowPath.
+// WorkflowExists reports whether owner/repo's default branch has gate.WorkflowPath.
 func (c *Client) WorkflowExists(ctx context.Context, installationID int64, owner, repo string) (bool, error) {
 	client, err := c.installationClient(installationID)
 	if err != nil {
 		return false, fmt.Errorf("check workflow %s/%s: %w", owner, repo, err)
 	}
 
-	_, _, resp, err := client.Repositories.GetContents(ctx, owner, repo, workflowPath, nil)
+	_, _, resp, err := client.Repositories.GetContents(ctx, owner, repo, gate.WorkflowPath, nil)
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
 			return false, nil
@@ -192,7 +188,7 @@ func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo
 		return 0, fmt.Errorf("dispatch workflow %s/%s: get repository: %w", owner, repo, err)
 	}
 
-	details, _, err := client.Actions.CreateWorkflowDispatchEventByFileName(ctx, owner, repo, path.Base(workflowPath),
+	details, _, err := client.Actions.CreateWorkflowDispatchEventByFileName(ctx, owner, repo, path.Base(gate.WorkflowPath),
 		github.CreateWorkflowDispatchEventRequest{
 			Ref: r.GetDefaultBranch(),
 			Inputs: map[string]any{
@@ -226,7 +222,7 @@ func (c *Client) ResultArtifact(ctx context.Context, installationID int64, owner
 
 	var artifactID int64
 	for _, a := range list.Artifacts {
-		if a.GetName() == resultArtifactName && !a.GetExpired() {
+		if a.GetName() == resultArtifactName && !a.GetExpired() && a.GetWorkflowRun().GetID() == runID {
 			artifactID = a.GetID()
 			break
 		}

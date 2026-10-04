@@ -30,9 +30,15 @@ runs:
           exit 1
         fi
 
+    - name: Install Claude Code
+      shell: bash
+      working-directory: ${{ runner.temp }}
+      run: npm install -g @anthropic-ai/claude-code@2.1.289
+
     - name: Check out the PR head
       uses: actions/checkout@v5
       with:
+        path: pr
         ref: refs/pull/${{ inputs.pr_number }}/head
         fetch-depth: 0
         persist-credentials: false
@@ -42,8 +48,10 @@ runs:
       env:
         HEAD_SHA: ${{ inputs.head_sha }}
         DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        CHECKOUT: ${{ github.workspace }}/pr
       run: |
         set -euo pipefail
+        cd "$CHECKOUT"
         actual="$(git rev-parse HEAD)"
         if [ "$actual" != "$HEAD_SHA" ]; then
           echo "::error::PR head is $actual, expected $HEAD_SHA"
@@ -51,10 +59,6 @@ runs:
         fi
         mkdir -p "$RUNNER_TEMP/docs-agent"
         git diff "origin/$DEFAULT_BRANCH...HEAD" > "$RUNNER_TEMP/docs-agent/pr.diff"
-
-    - name: Install Claude Code
-      shell: bash
-      run: npm install -g @anthropic-ai/claude-code@2.1.289
 
     - name: Review
       shell: bash
@@ -66,9 +70,12 @@ runs:
         NONCE: ${{ inputs.nonce }}
         DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         ACTION_PATH: ${{ github.action_path }}
+        CHECKOUT: ${{ github.workspace }}/pr
       run: |
         set -uo pipefail
         out="$RUNNER_TEMP/docs-agent"
+        workdir="$RUNNER_TEMP/docs-agent-cwd"
+        mkdir -p "$workdir"
         [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || unset CLAUDE_CODE_OAUTH_TOKEN
         [ -n "$ANTHROPIC_API_KEY" ] || unset ANTHROPIC_API_KEY
 
@@ -77,19 +84,24 @@ runs:
         ## Pull request
 
         - Number: $PR_NUMBER
-        - Head commit: $HEAD_SHA (checked out in the working directory)
+        - Repository checkout: $CHECKOUT
+        - Head commit: $HEAD_SHA (checked out there)
         - Default branch: $DEFAULT_BRANCH
         - Diff of the head against the merge base, unified format: $out/pr.diff"
 
         status=0
+        cd "$workdir"
         claude -p "$prompt" \
           --output-format json \
           --json-schema "$(cat "$ACTION_PATH/result.schema.json")" \
           --tools Read,Grep,Glob \
-          --allowedTools Read,Grep,Glob \
+          --permission-mode default \
+          --setting-sources user \
+          --strict-mcp-config \
           --disallowedTools Bash,Edit,Write,WebFetch,WebSearch,NotebookEdit,Task \
+          --add-dir "$CHECKOUT" \
           --add-dir "$out" \
-          > "$out/claude.json" || status=$?
+          < /dev/null > "$out/claude.json" || status=$?
 
         jq -n --arg head_sha "$HEAD_SHA" --arg nonce "$NONCE" --rawfile raw "$out/claude.json" \
           '{head_sha: $head_sha, nonce: $nonce,

@@ -397,7 +397,7 @@ func TestResultArtifact(t *testing.T) {
 	mux := http.NewServeMux()
 	handleAccessToken(t, mux)
 	mux.HandleFunc("GET /repos/o/r/actions/runs/4242/artifacts", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(t, w, http.StatusOK, `{"total_count":2,"artifacts":[{"id":1,"name":"other"},{"id":2,"name":"docs-agent-result"}]}`)
+		writeJSON(t, w, http.StatusOK, `{"total_count":2,"artifacts":[{"id":1,"name":"docs-agent-result","workflow_run":{"id":7}},{"id":3,"name":"other","workflow_run":{"id":4242}},{"id":2,"name":"docs-agent-result","workflow_run":{"id":4242}}]}`)
 	})
 	var blobURL string
 	mux.HandleFunc("GET /repos/o/r/actions/artifacts/2/zip", func(w http.ResponseWriter, r *http.Request) {

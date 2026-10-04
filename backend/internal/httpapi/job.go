@@ -10,6 +10,11 @@ import (
 	"github.com/mrkizildag/docs-agent/backend/internal/jobqueue"
 )
 
+// prJobKey is the per-PR queue key that serializes a pull request's jobs.
+func prJobKey(owner, repo string, number int) string {
+	return fmt.Sprintf("%s/%s#%d", owner, repo, number)
+}
+
 // pullRequestJobKind identifies durable jobs carrying a gate.PullRequest
 // payload. webhookHandler encodes jobs with this kind; HandleJob decodes them.
 const pullRequestJobKind = "pull_request"
@@ -39,7 +44,7 @@ func EnqueueDeadlineJobs(ctx context.Context, src OverdueSource, jobs Enqueuer, 
 		}
 		if _, err := jobs.Enqueue(ctx, jobqueue.NewJob{
 			DeliveryID: "deadline:" + run.Nonce,
-			Key:        fmt.Sprintf("%s/%s#%d", run.Owner, run.Repo, run.Number),
+			Key:        prJobKey(run.Owner, run.Repo, run.Number),
 			Kind:       runDeadlineJobKind,
 			Payload:    payload,
 		}); err != nil {

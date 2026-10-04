@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -64,24 +65,33 @@ type fakeRunner struct {
 	collected  []review.Completion
 	result     review.Result
 	collectErr error
+	failFirst  int // Collect returns collectErr only for the first failFirst calls; 0 means always
+	onStart    func()
 }
 
 func (f *fakeRunner) Collect(_ context.Context, c review.Completion) (review.Result, error) {
 	f.collected = append(f.collected, c)
+	if f.failFirst > 0 && len(f.collected) > f.failFirst {
+		return f.result, nil
+	}
 	return f.result, f.collectErr
 }
 
 func (f *fakeRunner) Start(_ context.Context, req review.Request) (review.Started, error) {
 	f.calls = append(f.calls, req)
+	if f.onStart != nil {
+		f.onStart()
+	}
 	return f.started, f.err
 }
 
 type fakeStore struct {
-	loadCalls []loadPRCall
-	saveCalls []gate.PRState
-	loadErr   error
-	saveErr   error
-	stored    gate.PRState
+	loadCalls   []loadPRCall
+	saveCalls   []gate.PRState
+	loadErr     error
+	saveErr     error
+	stored      gate.PRState
+	saveCtxErrs []error
 }
 
 type loadPRCall struct {
@@ -105,7 +115,8 @@ func (f *fakeStore) PRForRun(context.Context, string, string, int64) (int, bool,
 	return 0, false, nil
 }
 
-func (f *fakeStore) SavePR(_ context.Context, state gate.PRState) error {
+func (f *fakeStore) SavePR(ctx context.Context, state gate.PRState) error {
+	f.saveCtxErrs = append(f.saveCtxErrs, ctx.Err())
 	f.saveCalls = append(f.saveCalls, state)
 	return f.saveErr
 }
@@ -764,14 +775,114 @@ func TestHandleRunCompletedTransientCollectError(t *testing.T) {
 	wantErr := errors.New("download failed")
 	gh := &fakeGitHub{}
 	store := &fakeStore{stored: awaitingState()}
-	svc := gate.NewService(gh, store, gate.Runners{Actions: &fakeRunner{collectErr: wantErr}})
+	runner := &fakeRunner{collectErr: wantErr}
+	svc := gate.NewService(gh, store, gate.Runners{Actions: runner}).WithCollectBackoff(0)
 
-	err := svc.HandleRunCompleted(t.Context(), completedRun("success"))
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("HandleRunCompleted() = %v, want wrapping %v", err, wantErr)
+	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
+		t.Fatalf("HandleRunCompleted() = %v, want nil", err)
 	}
-	if len(gh.updates) != 0 || len(store.saveCalls) != 0 {
-		t.Errorf("updates = %v, saves = %v, want none so the job can retry", gh.updates, store.saveCalls)
+	if len(runner.collected) != 3 {
+		t.Errorf("Collect attempts = %d, want 3", len(runner.collected))
+	}
+	if len(gh.updates) != 1 {
+		t.Fatalf("updates = %v, want one", gh.updates)
+	}
+	got := gh.updates[0].run
+	if got.Conclusion != gate.ConclusionNeutral || got.Summary != "collect result: download failed" {
+		t.Errorf("check run = %+v, want neutral with the collect error", got)
+	}
+}
+
+func TestHandleRunCompletedCollectRecovers(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{}
+	store := &fakeStore{stored: awaitingState()}
+	runner := &fakeRunner{collectErr: errors.New("502"), failFirst: 2, result: review.Result{Verdict: review.NoImpact{Reason: "fine"}}}
+	svc := gate.NewService(gh, store, gate.Runners{Actions: runner}).WithCollectBackoff(0)
+
+	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
+		t.Fatalf("HandleRunCompleted() = %v, want nil", err)
+	}
+	if len(gh.updates) != 1 || gh.updates[0].run.Conclusion != gate.ConclusionSuccess {
+		t.Errorf("updates = %+v, want one success", gh.updates)
+	}
+}
+
+func TestHandlePullRequestActionsCreatesCheckBeforeDispatch(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("dispatch refused")
+	gh := &fakeGitHub{workflowExists: true, checkRunID: 555}
+	runner := &fakeRunner{err: wantErr}
+	store := &fakeStore{}
+	svc := gate.NewService(gh, store, gate.Runners{Actions: runner})
+
+	err := svc.HandlePullRequest(t.Context(), testPR())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("HandlePullRequest() = %v, want wrapping %v", err, wantErr)
+	}
+	if len(gh.calls) != 1 || gh.calls[0].run.Status != gate.StatusInProgress {
+		t.Fatalf("CreateCheckRun calls = %+v, want one in progress", gh.calls)
+	}
+	if len(gh.updates) != 1 || gh.updates[0].id != 555 {
+		t.Fatalf("updates = %+v, want the created check concluded", gh.updates)
+	}
+	got := gh.updates[0].run
+	if got.Conclusion != gate.ConclusionNeutral || !strings.Contains(got.Summary, "dispatch refused") {
+		t.Errorf("check run = %+v, want neutral with the cause", got)
+	}
+}
+
+func TestHandlePullRequestActionsSurvivesCancelAfterDispatch(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	gh := &fakeGitHub{workflowExists: true, checkRunID: 555}
+	runner := &fakeRunner{started: review.Pending{RunID: 99, Nonce: "n1"}, onStart: cancel}
+	store := &fakeStore{}
+	svc := gate.NewService(gh, store, gate.Runners{Actions: runner})
+
+	if err := svc.HandlePullRequest(ctx, testPR()); err != nil {
+		t.Fatalf("HandlePullRequest() = %v, want nil", err)
+	}
+	if len(store.saveCalls) != 1 || store.saveCalls[0].CheckRunID != 555 || store.saveCalls[0].Run == nil {
+		t.Fatalf("SavePR calls = %+v, want one with the check run and awaited run", store.saveCalls)
+	}
+	if store.saveCtxErrs[0] != nil {
+		t.Errorf("SavePR ctx error = %v, want a context unaffected by the job's cancellation", store.saveCtxErrs[0])
+	}
+}
+
+func TestHandleRunCompletedCapsText(t *testing.T) {
+	t.Parallel()
+
+	long := strings.Repeat("é", 70000)
+	tests := []struct {
+		name     string
+		runner   *fakeRunner
+		conclude string
+		maxBytes int
+	}{
+		{name: "summary", runner: &fakeRunner{result: review.Result{Verdict: review.NoImpact{Reason: long}}}, conclude: "success", maxBytes: 65535},
+		{name: "cause", runner: &fakeRunner{collectErr: &review.InvalidResultError{Cause: errors.New(long)}}, conclude: "success", maxBytes: 1000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			gh := &fakeGitHub{}
+			store := &fakeStore{stored: awaitingState()}
+			svc := gate.NewService(gh, store, gate.Runners{Actions: tt.runner})
+
+			if err := svc.HandleRunCompleted(t.Context(), completedRun(tt.conclude)); err != nil {
+				t.Fatalf("HandleRunCompleted() = %v, want nil", err)
+			}
+			got := gh.updates[0].run.Summary
+			if len(got) > tt.maxBytes || !strings.HasSuffix(got, "… (truncated)") || !utf8.ValidString(got) {
+				t.Errorf("summary = %d bytes valid=%v, want <= %d, valid UTF-8, truncation marker", len(got), utf8.ValidString(got), tt.maxBytes)
+			}
+		})
 	}
 }
 

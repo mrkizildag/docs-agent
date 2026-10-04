@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,10 @@ import (
 const (
 	runnerName   = "actions"
 	defaultModel = "claude-code"
+
+	// maxCauseText bounds model-controlled text in an InvalidResultError, which
+	// becomes a public check-run summary.
+	maxCauseText = 200
 )
 
 // DispatchInputs are the workflow_dispatch inputs of the docs-agent workflow.
@@ -52,16 +57,11 @@ type Artifact struct {
 // runner reads.
 type ClaudeOutput struct {
 	IsError          bool                       `json:"is_error"`
-	Result           string                     `json:"result"`
+	Subtype          string                     `json:"subtype"`
+	TerminalReason   string                     `json:"terminal_reason"`
+	APIErrorStatus   *int                       `json:"api_error_status"`
 	ModelUsage       map[string]json.RawMessage `json:"modelUsage"`
-	StructuredOutput *StructuredOutput          `json:"structured_output"`
-}
-
-// StructuredOutput is the schema-enforced analysis: no impact (with a reason)
-// or proposals.
-type StructuredOutput struct {
-	NoImpactReason string            `json:"no_impact_reason"`
-	Proposals      []review.Proposal `json:"proposals"`
+	StructuredOutput *review.StructuredOutput   `json:"structured_output"`
 }
 
 // Runner dispatches the repo's docs-agent workflow and collects its result.
@@ -135,7 +135,7 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 	proposals := make(review.Proposals, len(out.Proposals))
 	for i, p := range out.Proposals {
 		if err := p.Validate(changed); err != nil {
-			return review.Result{}, &review.InvalidResultError{Cause: fmt.Errorf("proposal %d: %w", i, err)}
+			return review.Result{}, &review.InvalidResultError{Cause: fmt.Errorf("proposal %d: %s", i, capText(err.Error()))}
 		}
 		proposals[i] = p
 	}
@@ -143,7 +143,7 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 	return result, nil
 }
 
-func (a Artifact) output(c review.Completion) (*StructuredOutput, error) {
+func (a Artifact) output(c review.Completion) (*review.StructuredOutput, error) {
 	if a.HeadSHA != c.HeadSHA {
 		return nil, fmt.Errorf("artifact head_sha %q, want %q", a.HeadSHA, c.HeadSHA)
 	}
@@ -151,12 +151,30 @@ func (a Artifact) output(c review.Completion) (*StructuredOutput, error) {
 		return nil, errors.New("artifact nonce does not match the dispatch")
 	}
 	if a.Claude.IsError {
-		return nil, fmt.Errorf("claude reported an error: %s", a.Claude.Result)
+		return nil, a.Claude.failure()
 	}
 	if a.Claude.StructuredOutput == nil {
 		return nil, errors.New("claude output has no structured_output")
 	}
 	return a.Claude.StructuredOutput, nil
+}
+
+// failure describes an errored run from structured fields only; the free-form
+// result text is attacker-influenced and must not reach a public check run.
+func (o ClaudeOutput) failure() error {
+	status := "none"
+	if o.APIErrorStatus != nil {
+		status = strconv.Itoa(*o.APIErrorStatus)
+	}
+	return fmt.Errorf("claude code failed: api_error_status %s (terminal_reason %s, subtype %s)",
+		status, capText(o.TerminalReason), capText(o.Subtype))
+}
+
+func capText(s string) string {
+	if len(s) <= maxCauseText {
+		return s
+	}
+	return strings.ToValidUTF8(s[:maxCauseText], "") + "..."
 }
 
 func (o ClaudeOutput) model() string {

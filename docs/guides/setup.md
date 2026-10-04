@@ -19,7 +19,7 @@ Requires Go (version in `backend/go.mod`) and golangci-lint v2.
 | `make test`  | `go test -race ./...`                                  |
 | `make lint`  | golangci-lint, including formatting and import rules.  |
 | `make fmt`   | Apply gofmt and goimports.                             |
-| `make generate` | Regenerate `action/proposal.schema.json` from the proposal type; a test fails when it is stale. |
+| `make generate` | Regenerate `action/proposal.schema.json` and `action/result.schema.json` from the `internal/review` types; a test fails when either is stale. |
 | `make check` | lint, test, and govulncheck; what CI runs.             |
 
 ## Configuration

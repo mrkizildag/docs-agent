@@ -278,7 +278,7 @@ func (f *fakeActionsGitHub) handler() http.Handler {
 		f.json(w, http.StatusOK, `{"id":555}`)
 	})
 	mux.HandleFunc("GET /repos/acme/widgets/actions/runs/4242/artifacts", func(w http.ResponseWriter, _ *http.Request) {
-		f.json(w, http.StatusOK, `{"total_count":1,"artifacts":[{"id":9,"name":"docs-agent-result"}]}`)
+		f.json(w, http.StatusOK, `{"total_count":1,"artifacts":[{"id":9,"name":"docs-agent-result","workflow_run":{"id":4242}}]}`)
 	})
 	mux.HandleFunc("GET /repos/acme/widgets/actions/artifacts/9/zip", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()

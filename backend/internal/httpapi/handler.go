@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -61,9 +60,6 @@ type workflowRunEvent struct {
 		ID int64 `json:"id"`
 	} `json:"installation"`
 }
-
-// docsAgentWorkflowPath is the target-repo workflow whose completion carries an analysis result.
-const docsAgentWorkflowPath = ".github/workflows/docs-agent.yml"
 
 // pullRequestEvent is the subset of GitHub's pull_request webhook payload the
 // handler needs.
@@ -175,7 +171,7 @@ func handlePullRequestEvent(logger *slog.Logger, jobs Enqueuer, w http.ResponseW
 
 	job := jobqueue.NewJob{
 		DeliveryID: deliveryID,
-		Key:        fmt.Sprintf("%s/%s#%d", pr.Owner, pr.Repo, pr.Number),
+		Key:        prJobKey(pr.Owner, pr.Repo, pr.Number),
 		Kind:       pullRequestJobKind,
 		Payload:    jobPayload,
 		Supersedes: true,
@@ -202,7 +198,7 @@ func handleWorkflowRunEvent(logger *slog.Logger, jobs Enqueuer, runs RunLookup, 
 		return
 	}
 
-	if payload.Action != "completed" || payload.WorkflowRun.Path != docsAgentWorkflowPath {
+	if payload.Action != "completed" || payload.WorkflowRun.Path != gate.WorkflowPath {
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -243,7 +239,7 @@ func handleWorkflowRunEvent(logger *slog.Logger, jobs Enqueuer, runs RunLookup, 
 
 	enqueued, err := jobs.Enqueue(r.Context(), jobqueue.NewJob{
 		DeliveryID: deliveryID,
-		Key:        fmt.Sprintf("%s/%s#%d", owner, repo, number),
+		Key:        prJobKey(owner, repo, number),
 		Kind:       workflowRunJobKind,
 		Payload:    jobPayload,
 	})
