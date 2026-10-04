@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/mrkizildag/docs-agent/backend/internal/review"
@@ -119,6 +120,9 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 
 	result := review.Result{Runner: runnerName, Model: art.Claude.model()}
 	if len(out.Proposals) == 0 {
+		if strings.TrimSpace(out.NoImpactReason) == "" {
+			return review.Result{}, &review.InvalidResultError{Cause: errors.New("no proposals and an empty no_impact_reason")}
+		}
 		result.Verdict = review.NoImpact{Reason: out.NoImpactReason}
 		return result, nil
 	}
