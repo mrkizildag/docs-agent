@@ -520,8 +520,36 @@ func TestOverdueRuns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OverdueRuns() = %v, want nil error", err)
 	}
-	want := []gate.OverdueRun{{PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 1}, Nonce: "n1"}}
+	want := []gate.OverdueRun{{PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 1}, Nonce: "n1", Deadline: base}}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("OverdueRuns() mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestPRsForHead(t *testing.T) {
+	t.Parallel()
+
+	store, _ := open(t)
+	ctx := t.Context()
+	for _, st := range []gate.PRState{
+		{Owner: "acme", Repo: "widgets", Number: 8, HeadSHA: "a"},
+		{Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "a"},
+		{Owner: "acme", Repo: "widgets", Number: 9, HeadSHA: "b"},
+		{Owner: "acme", Repo: "other", Number: 1, HeadSHA: "a"},
+	} {
+		if err := store.SavePR(ctx, st); err != nil {
+			t.Fatalf("SavePR(%+v) = %v, want nil error", st, err)
+		}
+	}
+
+	got, err := store.PRsForHead(ctx, "acme", "widgets", "a")
+	if err != nil {
+		t.Fatalf("PRsForHead() = %v, want nil error", err)
+	}
+	if diff := cmp.Diff([]int{7, 8}, got); diff != "" {
+		t.Errorf("PRsForHead() mismatch (-want +got):\n%s", diff)
+	}
+	if got, err := store.PRsForHead(ctx, "acme", "widgets", "zzz"); err != nil || len(got) != 0 {
+		t.Errorf("PRsForHead(unknown head) = %v, %v, want none", got, err)
 	}
 }

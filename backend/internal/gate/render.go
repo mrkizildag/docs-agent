@@ -125,14 +125,27 @@ const (
 	rerunTicked   = "- [x] Re-run analysis"
 )
 
-// renderSummary is the summary comment body: the failure cause when the last
-// analysis failed, one row per proposal in state, and the Re-run checkbox.
+// renderSummary is the summary comment body: a heading (the failure cause when
+// the last analysis failed, else the open proposal count), one row per proposal
+// in state, and, for a failure only, the Re-run checkbox.
 func renderSummary(state PRState, cause string) string {
 	var b strings.Builder
 	b.WriteString(summaryMarker)
 	b.WriteString("\n\n")
 	if cause != "" {
 		b.WriteString("**Analysis failed:** " + cause + "\n\n")
+	} else {
+		open := 0
+		for _, p := range state.Proposals {
+			if p.State == ProposalOpen {
+				open++
+			}
+		}
+		noun := "updates"
+		if open == 1 {
+			noun = "update"
+		}
+		fmt.Fprintf(&b, "**pollux-agent** proposes %d doc %s.\n\n", open, noun)
 	}
 	if len(state.Proposals) > 0 {
 		b.WriteString("| Doc | Section | Comment | State |\n| --- | --- | --- | --- |\n")
@@ -147,19 +160,16 @@ func renderSummary(state PRState, cause string) string {
 	if len(state.Proposals) > 0 {
 		b.WriteString("\n")
 	}
-	b.WriteString(rerunUnticked + "\n")
+	if cause != "" {
+		b.WriteString(rerunUnticked + "\n")
+	}
 	return b.String()
 }
 
 // RerunTicked reports whether an edit of the summary comment from before to
 // after ticked its Re-run analysis box.
 func RerunTicked(before, after string) bool {
-	return isSummary(before) && isSummary(after) && hasLine(before, rerunUnticked) && hasLine(after, rerunTicked)
-}
-
-func isSummary(body string) bool {
-	first, _, _ := strings.Cut(body, "\n")
-	return strings.TrimRight(first, "\r") == summaryMarker
+	return hasMarker(before, summaryMarker) && hasMarker(after, summaryMarker) && hasLine(before, rerunUnticked) && hasLine(after, rerunTicked)
 }
 
 func hasLine(body, line string) bool {

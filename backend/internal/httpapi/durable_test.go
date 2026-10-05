@@ -10,9 +10,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
@@ -163,7 +166,7 @@ func TestWebhookRedeliveryAfterFailedJobEnqueuesNewJob(t *testing.T) {
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, store, gate.Runners{})), slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	t.Cleanup(func() { _ = stop() })
-	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store)
+	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, testAppID, worker, store)
 
 	body := prBody(t, "opened", 1, "sha1")
 	if code := postSigned(t, h, secret, "d1", body); code != http.StatusAccepted {
@@ -209,7 +212,7 @@ func TestWebhookSecondSynchronizeCancelsFirst(t *testing.T) {
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, store, gate.Runners{})), slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	t.Cleanup(func() { _ = stop() })
-	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store)
+	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, testAppID, worker, store)
 
 	if code := postSigned(t, h, secret, "d1", prBody(t, "synchronize", 1, "sha1")); code != http.StatusAccepted {
 		t.Fatalf("first synchronize = %d, want 202", code)
@@ -240,7 +243,7 @@ func TestWebhookPendingJobRunsAfterRestartAndDuplicateStaysNoOp(t *testing.T) {
 	store1 := openStore(t, path)
 	gh1 := newBlockingGitHub("")
 	worker1 := jobqueue.NewWorker(store1, httpapi.HandleJob(gate.NewService(gh1, store1, gate.Runners{})), logger, 8)
-	h1 := httpapi.NewHandler(logger, secret, worker1, store1)
+	h1 := httpapi.NewHandler(logger, secret, testAppID, worker1, store1)
 	if code := postSigned(t, h1, secret, "d1", prBody(t, "opened", 1, "sha1")); code != http.StatusAccepted {
 		t.Fatalf("POST = %d, want 202", code)
 	}
@@ -260,7 +263,7 @@ func TestWebhookPendingJobRunsAfterRestartAndDuplicateStaysNoOp(t *testing.T) {
 	}
 
 	// The same delivery redelivered after restart is still a no-op.
-	h2 := httpapi.NewHandler(logger, secret, worker2, store2)
+	h2 := httpapi.NewHandler(logger, secret, testAppID, worker2, store2)
 	if code := postSigned(t, h2, secret, "d1", prBody(t, "opened", 1, "sha1")); code != http.StatusAccepted {
 		t.Fatalf("duplicate POST = %d, want 202", code)
 	}
@@ -311,7 +314,7 @@ func TestEnqueueDeadlineJobsIsIdempotent(t *testing.T) {
 	jobs := &countingEnqueuer{next: worker}
 
 	for _, now := range []time.Time{deadline.Add(-time.Second), deadline.Add(time.Second), deadline.Add(2 * time.Second)} {
-		if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, jobs, now); err != nil {
+		if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, jobs, slog.New(slog.DiscardHandler), now); err != nil {
 			t.Fatalf("EnqueueDeadlineJobs(%v) = %v", now, err)
 		}
 	}
@@ -365,7 +368,7 @@ func TestDeadlineJobFailedConcludeIsRetriedByLaterSweep(t *testing.T) {
 	})
 
 	now := deadline.Add(time.Second)
-	if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, worker, now); err != nil {
+	if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, worker, slog.New(slog.DiscardHandler), now); err != nil {
 		t.Fatalf("EnqueueDeadlineJobs() = %v", err)
 	}
 	waitFor(t, "the first conclude attempt", func() bool {
@@ -386,7 +389,7 @@ func TestDeadlineJobFailedConcludeIsRetriedByLaterSweep(t *testing.T) {
 		if i > 100 {
 			t.Fatal("timed out waiting for the retried conclude write")
 		}
-		if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, worker, now.Add(time.Duration(i)*time.Minute)); err != nil {
+		if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, worker, slog.New(slog.DiscardHandler), now.Add(time.Duration(i)*time.Minute)); err != nil {
 			t.Fatalf("EnqueueDeadlineJobs() = %v", err)
 		}
 	}
@@ -401,5 +404,62 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 			t.Fatalf("timed out waiting for %s", what)
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+type fakeOverdueSource []gate.OverdueRun
+
+func (f fakeOverdueSource) OverdueRuns(context.Context, time.Time) ([]gate.OverdueRun, error) {
+	return f, nil
+}
+
+func TestEnqueueDeadlineJobsBacksOffExponentiallyAndStopsAfterADay(t *testing.T) {
+	t.Parallel()
+
+	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	src := fakeOverdueSource{{PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}, Nonce: "n1", Deadline: deadline}}
+	jobs := newFakeEnqueuer()
+	jobs.result = true
+
+	var retriedAt []int
+	seen := map[string]bool{}
+	for minute := range 24*60 + 10 {
+		before := len(jobs.jobs)
+		now := deadline.Add(time.Duration(minute)*time.Minute + time.Second)
+		if err := httpapi.EnqueueDeadlineJobs(t.Context(), src, jobs, slog.New(slog.DiscardHandler), now); err != nil {
+			t.Fatalf("EnqueueDeadlineJobs(+%dm) = %v", minute, err)
+		}
+		if minute > 24*60 && len(jobs.jobs) != before {
+			t.Errorf("job enqueued %dm past the deadline, want none after 24h", minute)
+		}
+		for _, job := range jobs.jobs[before:] {
+			if !seen[job.DeliveryID] {
+				seen[job.DeliveryID] = true
+				retriedAt = append(retriedAt, minute)
+			}
+		}
+	}
+
+	want := []int{0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1264}
+	if diff := cmp.Diff(want, retriedAt); diff != "" {
+		t.Errorf("minutes overdue at which a new job is enqueued (-want +got):\n%s", diff)
+	}
+}
+
+func TestEnqueueDeadlineJobsLogsGivingUpOnce(t *testing.T) {
+	t.Parallel()
+
+	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	src := fakeOverdueSource{{PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}, Nonce: "n1", Deadline: deadline}}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+	for now := deadline.Add(24*time.Hour - time.Minute + 10*time.Second); now.Before(deadline.Add(24*time.Hour + 3*time.Minute)); now = now.Add(30 * time.Second) {
+		if err := httpapi.EnqueueDeadlineJobs(t.Context(), src, newFakeEnqueuer(), logger, now); err != nil {
+			t.Fatalf("EnqueueDeadlineJobs(%v) = %v", now, err)
+		}
+	}
+	if got := strings.Count(logs.String(), "giving up on overdue run"); got != 1 {
+		t.Errorf("give-up warnings = %d, want 1 across sweeps every 30s:\n%s", got, logs.String())
 	}
 }

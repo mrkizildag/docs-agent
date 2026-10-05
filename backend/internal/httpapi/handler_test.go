@@ -23,6 +23,8 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 )
 
+const testAppID = 123
+
 const (
 	pullRequestJobKind = "pull_request"
 	workflowRunJobKind = "workflow_run"
@@ -30,7 +32,12 @@ const (
 
 type fakeRunLookup struct {
 	numbers map[int64]int
+	heads   map[string][]int
 	err     error
+}
+
+func (f fakeRunLookup) PRsForHead(_ context.Context, _, _, headSHA string) ([]int, error) {
+	return f.heads[headSHA], f.err
 }
 
 func (f fakeRunLookup) PRForRun(_ context.Context, _, _ string, runID int64) (int, bool, error) {
@@ -63,7 +70,7 @@ func TestHealthz(t *testing.T) {
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, []byte("secret"), newFakeEnqueuer(), fakeRunLookup{}).ServeHTTP(rec, req)
+	httpapi.NewHandler(logger, []byte("secret"), testAppID, newFakeEnqueuer(), fakeRunLookup{}).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
 		t.Errorf("GET /healthz = %d %q, want 200 \"ok\"", rec.Code, rec.Body.String())
@@ -140,7 +147,7 @@ func TestWebhook(t *testing.T) {
 			}
 			rec := httptest.NewRecorder()
 
-			httpapi.NewHandler(logger, secret, enqueuer, fakeRunLookup{}).ServeHTTP(rec, req)
+			httpapi.NewHandler(logger, secret, testAppID, enqueuer, fakeRunLookup{}).ServeHTTP(rec, req)
 
 			if rec.Code != tc.wantStatus {
 				t.Errorf("POST /webhook = %d, want %d", rec.Code, tc.wantStatus)
@@ -163,7 +170,7 @@ func TestWebhookBodyTooLarge(t *testing.T) {
 	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, secret, newFakeEnqueuer(), fakeRunLookup{}).ServeHTTP(rec, req)
+	httpapi.NewHandler(logger, secret, testAppID, newFakeEnqueuer(), fakeRunLookup{}).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("POST /webhook with oversized body = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
@@ -197,6 +204,12 @@ func pullRequestPayload(t *testing.T, action string) []byte {
 func postWebhook(t *testing.T, secret []byte, jobs httpapi.Enqueuer, event string, deliveryID string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 
+	return postWebhookWithLookup(t, secret, jobs, fakeRunLookup{}, event, deliveryID, body)
+}
+
+func postWebhookWithLookup(t *testing.T, secret []byte, jobs httpapi.Enqueuer, runs httpapi.RunLookup, event string, deliveryID string, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+
 	logger := slog.New(slog.DiscardHandler)
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-GitHub-Event", event)
@@ -206,7 +219,7 @@ func postWebhook(t *testing.T, secret []byte, jobs httpapi.Enqueuer, event strin
 	}
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, secret, jobs, fakeRunLookup{}).ServeHTTP(rec, req)
+	httpapi.NewHandler(logger, secret, testAppID, jobs, runs).ServeHTTP(rec, req)
 	return rec
 }
 
@@ -492,7 +505,7 @@ func postWorkflowRun(t *testing.T, runs httpapi.RunLookup, jobs httpapi.Enqueuer
 	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, jobs, runs).ServeHTTP(rec, req)
+	httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, testAppID, jobs, runs).ServeHTTP(rec, req)
 	return rec
 }
 
@@ -546,13 +559,19 @@ func TestWebhookWorkflowRun(t *testing.T) {
 func checkRunBody(t *testing.T, action, name string, prNumbers ...int) []byte {
 	t.Helper()
 
+	return checkRunBodyAt(t, action, name, "head1", prNumbers...)
+}
+
+func checkRunBodyAt(t *testing.T, action, name, headSHA string, prNumbers ...int) []byte {
+	t.Helper()
+
 	prs := []map[string]any{}
 	for _, n := range prNumbers {
 		prs = append(prs, map[string]any{"number": n})
 	}
 	body, err := json.Marshal(map[string]any{
 		"action":       action,
-		"check_run":    map[string]any{"name": name, "pull_requests": prs},
+		"check_run":    map[string]any{"name": name, "head_sha": headSHA, "pull_requests": prs},
 		"repository":   map[string]any{"name": "widgets", "owner": map[string]any{"login": "acme"}},
 		"installation": map[string]any{"id": 42},
 	})
@@ -580,8 +599,8 @@ func TestWebhookCheckRun(t *testing.T) {
 		}
 		for i, number := range []int{7, 8} {
 			job := jobs.jobs[i]
-			if job.Kind != pullRequestJobKind || !job.Supersedes || job.Key != fmt.Sprintf("acme/widgets#%d", number) {
-				t.Errorf("job %d = %+v, want a superseding pull_request job for PR %d", i, job, number)
+			if job.Kind != pullRequestJobKind || job.Supersedes || job.Key != fmt.Sprintf("acme/widgets#%d", number) {
+				t.Errorf("job %d = %+v, want a non-superseding pull_request job for PR %d", i, job, number)
 			}
 			var payload struct{ Rerun gate.RerunRequest }
 			if err := json.Unmarshal(job.Payload, &payload); err != nil {
@@ -616,6 +635,32 @@ func TestWebhookCheckRun(t *testing.T) {
 		})
 	}
 
+	t.Run("empty pull_requests falls back to the stored pull requests at the head", func(t *testing.T) {
+		t.Parallel()
+
+		jobs := newFakeEnqueuer()
+		runs := fakeRunLookup{heads: map[string][]int{"fork-head": {7, 8}}}
+		rec := postWebhookWithLookup(t, secret, jobs, runs, "check_run", "d1", checkRunBodyAt(t, "rerequested", "pollux-agent", "fork-head"))
+		if rec.Code != http.StatusAccepted || len(jobs.jobs) != 2 {
+			t.Fatalf("status = %d, jobs = %d, want %d and 2", rec.Code, len(jobs.jobs), http.StatusAccepted)
+		}
+		for i, number := range []int{7, 8} {
+			if want := fmt.Sprintf("acme/widgets#%d", number); jobs.jobs[i].Key != want {
+				t.Errorf("job %d key = %q, want %q", i, jobs.jobs[i].Key, want)
+			}
+		}
+	})
+
+	t.Run("head lookup error", func(t *testing.T) {
+		t.Parallel()
+
+		jobs := newFakeEnqueuer()
+		rec := postWebhookWithLookup(t, secret, jobs, fakeRunLookup{err: errors.New("boom")}, "check_run", "d1", checkRunBody(t, "rerequested", "pollux-agent"))
+		if rec.Code != http.StatusInternalServerError || len(jobs.jobs) != 0 {
+			t.Errorf("status = %d, jobs = %d, want %d and none", rec.Code, len(jobs.jobs), http.StatusInternalServerError)
+		}
+	})
+
 	t.Run("missing delivery id", func(t *testing.T) {
 		t.Parallel()
 
@@ -625,4 +670,30 @@ func TestWebhookCheckRun(t *testing.T) {
 			t.Errorf("status = %d, jobs = %d, want %d and none", rec.Code, len(jobs.jobs), http.StatusBadRequest)
 		}
 	})
+}
+
+func TestWebhookIssueCommentRequiresThisApp(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("test-secret")
+	const before, after = "<!-- pollux-agent:summary -->\n- [ ] Re-run analysis", "<!-- pollux-agent:summary -->\n- [x] Re-run analysis"
+	for _, tc := range []struct {
+		name     string
+		appID    int64
+		wantJobs int
+	}{
+		{"this app", testAppID, 1},
+		{"another app", testAppID + 1, 0},
+		{"no app", 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			jobs := newFakeEnqueuer()
+			rec := postWebhook(t, secret, jobs, "issue_comment", "d1", issueCommentBody(t, 5, tc.appID, before, after))
+			if rec.Code != http.StatusAccepted || len(jobs.jobs) != tc.wantJobs {
+				t.Errorf("status = %d, jobs = %d, want %d and %d", rec.Code, len(jobs.jobs), http.StatusAccepted, tc.wantJobs)
+			}
+		})
+	}
 }
