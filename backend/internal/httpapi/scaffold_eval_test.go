@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -256,5 +257,93 @@ func TestEvalScaffoldLinkFailureIsHealedByNextEvent(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Errorf("check run %d of PR 1 was never linked to the scaffold PR after its first link update failed", first.id)
+	}
+}
+
+// alwaysErroringModel fails every call.
+type alwaysErroringModel struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (m *alwaysErroringModel) Complete(context.Context, llm.Request) (llm.Response, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls++
+	return llm.Response{}, errors.New("provider: 529 overloaded")
+}
+
+func (m *alwaysErroringModel) count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.calls
+}
+
+// Criterion 8 (modified): three failed attempts, each retried by the next PR
+// event; after the third, the next PR's check says the scaffold could not be
+// written and no further attempt runs the model.
+func TestEvalScaffoldGivesUpAfterThreeFailedAttempts(t *testing.T) {
+	tip := evalRepo(t)
+	store := openEvalStore(t)
+	gh := newScaffoldGitHub(tip)
+	model := &alwaysErroringModel{}
+	env := startEvalEnv(t, store, gh, model)
+	drain := func() []scaffoldCheckRun {
+		var out []scaffoldCheckRun
+		for {
+			select {
+			case u := <-gh.updated:
+				out = append(out, u)
+			default:
+				return out
+			}
+		}
+	}
+
+	for i := 1; i <= 3; i++ {
+		postSigned(t, env.handler, env.secret, "d"+strconv.Itoa(i), e2ePullRequestBody(t, i, tip))
+		c := waitCall(t, gh.created)
+		if c.run.Title != "No docs/ folder" || c.run.Conclusion != gate.ConclusionNeutral {
+			t.Errorf("PR %d check run = %+v, want neutral \"No docs/ folder\"", i, c.run)
+		}
+		evalWaitFor(t, "failed attempt", func() bool {
+			s, err := store.LoadScaffold(t.Context(), "acme", "widgets")
+			return err == nil && s.Failures == i
+		})
+		evalWaitFor(t, "waiters told", func() bool { return len(gh.updated) > 0 })
+		time.Sleep(50 * time.Millisecond)
+		ups := drain()
+		want := "tries again"
+		if i == 3 {
+			want = "after 3 attempts"
+		}
+		for _, u := range ups {
+			if u.run.Title != "No docs/ folder" || !strings.Contains(u.run.Summary, want) {
+				t.Errorf("after failure %d, waiter update = %+v, want title \"No docs/ folder\" mentioning %q", i, u.run, want)
+			}
+		}
+	}
+	s, err := store.LoadScaffold(t.Context(), "acme", "widgets")
+	if err != nil || s.Phase != gate.ScaffoldGaveUp {
+		t.Fatalf("state after 3 failures = %+v, %v, want gave_up", s, err)
+	}
+	callsAtGiveUp := model.count()
+
+	postSigned(t, env.handler, env.secret, "d4", e2ePullRequestBody(t, 4, tip))
+	c := waitCall(t, gh.created)
+	if c.run.Title != "No docs/ folder" || !strings.Contains(c.run.Summary, "could not write") {
+		t.Errorf("PR 4 check run = %+v, want it to say the scaffold could not be written", c.run)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if err := env.stop(); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if model.count() != callsAtGiveUp {
+		t.Errorf("model calls = %d after giving up, want %d (no further attempt)", model.count(), callsAtGiveUp)
+	}
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
+	if len(gh.prs) != 0 || len(gh.commits) != 0 {
+		t.Errorf("pull requests = %d, commits = %d, want 0 and 0", len(gh.prs), len(gh.commits))
 	}
 }
