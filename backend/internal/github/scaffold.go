@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/google/go-github/v92/github"
@@ -112,20 +113,25 @@ func (c *Client) CreatePullRequest(ctx context.Context, installationID int64, ow
 	return gate.ScaffoldPR{Number: created.GetNumber(), URL: created.GetHTMLURL()}, nil
 }
 
-// FindPullRequest returns the pull request, open or not, opened from branch of
-// owner/repo itself.
+// FindPullRequest returns the pull request opened from branch of owner/repo
+// itself, preferring an open one over closed ones. ByBot is set when its author
+// is a bot.
 func (c *Client) FindPullRequest(ctx context.Context, installationID int64, owner, repo, branch string) (gate.ScaffoldPR, bool, error) {
 	client, err := c.installationClient(installationID)
 	if err != nil {
 		return gate.ScaffoldPR{}, false, fmt.Errorf("find pull request from %s in %s/%s: %w", branch, owner, repo, err)
 	}
 
-	list, _, err := client.PullRequests.List(ctx, owner, repo, &github.PullRequestListOptions{State: "all", Head: owner + ":" + branch, ListOptions: github.ListOptions{PerPage: 1}})
+	list, _, err := client.PullRequests.List(ctx, owner, repo, &github.PullRequestListOptions{State: "all", Head: owner + ":" + branch, ListOptions: github.ListOptions{PerPage: 100}})
 	if err != nil {
 		return gate.ScaffoldPR{}, false, fmt.Errorf("find pull request from %s in %s/%s: %w", branch, owner, repo, err)
 	}
 	if len(list) == 0 {
 		return gate.ScaffoldPR{}, false, nil
 	}
-	return gate.ScaffoldPR{Number: list[0].GetNumber(), URL: list[0].GetHTMLURL()}, true, nil
+	found := list[0]
+	if i := slices.IndexFunc(list, func(pr *github.PullRequest) bool { return pr.GetState() == "open" }); i >= 0 {
+		found = list[i]
+	}
+	return gate.ScaffoldPR{Number: found.GetNumber(), URL: found.GetHTMLURL(), ByBot: found.GetUser().GetType() == "Bot"}, true, nil
 }

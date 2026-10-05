@@ -155,7 +155,8 @@ func TestFindPullRequest(t *testing.T) {
 		if q := r.URL.Query(); q.Get("head") != "o:b" || q.Get("state") != "all" {
 			t.Errorf("query = %v, want head=o:b state=all", q)
 		}
-		writeJSON(t, w, http.StatusOK, `[{"number":6,"html_url":"https://github.com/o/found/pull/6"}]`)
+		writeJSON(t, w, http.StatusOK, `[{"number":6,"state":"closed","html_url":"https://github.com/o/found/pull/6","user":{"type":"User"}},`+
+			`{"number":7,"state":"open","html_url":"https://github.com/o/found/pull/7","user":{"type":"Bot"}}]`)
 	})
 	mux.HandleFunc("GET /repos/o/none/pulls", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(t, w, http.StatusOK, `[]`)
@@ -163,7 +164,7 @@ func TestFindPullRequest(t *testing.T) {
 	client := newTestClient(t, mux)
 
 	got, ok, err := client.FindPullRequest(t.Context(), 1, "o", "found", "b")
-	if want := (gate.ScaffoldPR{Number: 6, URL: "https://github.com/o/found/pull/6"}); err != nil || !ok || got != want {
+	if want := (gate.ScaffoldPR{Number: 7, URL: "https://github.com/o/found/pull/7", ByBot: true}); err != nil || !ok || got != want {
 		t.Errorf("FindPullRequest(found) = %+v, %v, %v; want %+v, true, nil", got, ok, err, want)
 	}
 	if _, ok, err := client.FindPullRequest(t.Context(), 1, "o", "none", "b"); err != nil || ok {

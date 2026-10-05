@@ -47,6 +47,8 @@ type scaffoldGitHub struct {
 	creates  int
 	commits  []scaffoldCommit
 	prs      []gate.NewPullRequest
+	resets   int
+	existing *gate.ScaffoldPR // the pull request FindPullRequest reports, if any
 }
 
 type scaffoldCheckRun struct {
@@ -108,6 +110,7 @@ func (f *scaffoldGitHub) CreateBranch(_ context.Context, _ int64, _, _, branch, 
 func (f *scaffoldGitHub) ResetBranch(_ context.Context, _ int64, _, _, branch, sha string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.resets++
 	f.branches[branch] = sha
 	return nil
 }
@@ -141,7 +144,12 @@ func (f *scaffoldGitHub) CreatePullRequest(_ context.Context, _ int64, _, _ stri
 }
 
 func (f *scaffoldGitHub) FindPullRequest(context.Context, int64, string, string, string) (gate.ScaffoldPR, bool, error) {
-	return gate.ScaffoldPR{}, false, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.existing == nil {
+		return gate.ScaffoldPR{}, false, nil
+	}
+	return *f.existing, true, nil
 }
 
 // scaffoldModel lists the repo, submits docs the index of which lacks its links,
@@ -281,6 +289,62 @@ func TestWebhookToScaffoldPullRequest(t *testing.T) {
 	}
 	if rejected := lastToolResult(model.requests[2]); !rejected.IsError || !strings.Contains(rejected.Content, "link") {
 		t.Errorf("rejected submit_docs result = %+v, want an error about the index links", rejected)
+	}
+}
+
+func TestWebhookAdoptsTheBotsScaffoldPullRequestAfterStateLoss(t *testing.T) {
+	repoDir, tip := newGitRepo(t, map[string]string{
+		"Makefile":        "test:\n\tgo test ./...\n",
+		"cmd/app/main.go": "package main\n\nfunc main() {}\n",
+	})
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "url."+repoDir+".insteadOf")
+	t.Setenv("GIT_CONFIG_VALUE_0", "https://github.com/acme/widgets.git")
+
+	secret := []byte("test-secret")
+	store, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "pollux.db"))
+	if err != nil {
+		t.Fatalf("sqlite.Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	gh := newScaffoldGitHub(tip)
+	gh.branches["pollux-agent/docs-scaffold"] = "bot-commit"
+	gh.existing = &gate.ScaffoldPR{Number: 7, URL: "https://github.com/acme/widgets/pull/7", ByBot: true}
+	model := &scaffoldModel{}
+	noToken := func(context.Context, int64, string) (string, error) { return "", nil }
+	gateSvc := gate.NewService(gh, gh, store, gate.Runners{Server: llmrunner.New(model, noToken, "triage", "draft")}, gh, httpapi.NewScaffoldQueue(store))
+	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), slog.New(slog.DiscardHandler), 8)
+	stopWorker := runWorker(worker)
+	var stopOnce sync.Once
+	var stopErr error
+	stop := func() error {
+		stopOnce.Do(func() { stopErr = stopWorker() })
+		return stopErr
+	}
+	t.Cleanup(func() { _ = stop() })
+	handler := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store)
+
+	if code := postSigned(t, handler, secret, "d1", e2ePullRequestBody(t, 1, tip)); code != http.StatusAccepted {
+		t.Fatalf("POST /webhook = %d, want %d", code, http.StatusAccepted)
+	}
+	waitCall(t, gh.created)
+	linked := waitCall(t, gh.updated)
+	if !strings.Contains(linked.run.Summary, "https://github.com/acme/widgets/pull/7") {
+		t.Errorf("updated check run = %+v, want it linking pull request 7", linked)
+	}
+	if err := stop(); err != nil {
+		t.Fatalf("worker.Run() error = %v", err)
+	}
+
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
+	if gh.resets != 0 || len(gh.prs) != 0 || len(gh.commits) != 0 {
+		t.Errorf("resets = %d, new pull requests = %d, commits = %d, want none", gh.resets, len(gh.prs), len(gh.commits))
 	}
 }
 

@@ -218,6 +218,7 @@ type scaffoldGitHub struct {
 	branches map[string]string
 	resets   []string // "branch@sha" of every ResetBranch
 	prs      []gate.NewPullRequest
+	existing *gate.ScaffoldPR // the pull request FindPullRequest reports, if any
 }
 
 func (g *scaffoldGitHub) DefaultBranch(context.Context, int64, string, string) (string, string, error) {
@@ -248,7 +249,10 @@ func (g *scaffoldGitHub) CreatePullRequest(_ context.Context, _ int64, _, _ stri
 }
 
 func (g *scaffoldGitHub) FindPullRequest(context.Context, int64, string, string, string) (gate.ScaffoldPR, bool, error) {
-	return gate.ScaffoldPR{}, false, nil
+	if g.existing == nil {
+		return gate.ScaffoldPR{}, false, nil
+	}
+	return *g.existing, true, nil
 }
 
 // scaffoldRunner is an Actions runner whose scaffold start and collect are scripted.
@@ -585,6 +589,50 @@ func TestHandleScaffold_ResetsAForeignBranch(t *testing.T) {
 	}
 	if len(sgh.prs) != 1 || store.state.Phase != gate.ScaffoldOpened {
 		t.Errorf("pull requests = %v, state = %+v, want one pull request and an Opened scaffold", sgh.prs, store.state)
+	}
+}
+
+func TestHandleScaffold_ForeignBranchWithAPullRequest(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		existing  gate.ScaffoldPR
+		wantErr   bool
+		wantPhase gate.ScaffoldPhase
+	}{
+		{name: "a bot's pull request is adopted", existing: gate.ScaffoldPR{Number: 7, URL: "https://gh/pull/7", ByBot: true}, wantPhase: gate.ScaffoldOpened},
+		{name: "a human's pull request fails the attempt", existing: gate.ScaffoldPR{Number: 8, URL: "https://gh/pull/8"}, wantErr: true, wantPhase: gate.ScaffoldWritten},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			files := review.Scaffold{Index: "i", Architecture: "a", Setup: "s"}
+			written := gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldWritten, Attempt: 1, BaseSHA: "tip", Files: &files}
+			sgh := &scaffoldGitHub{branches: map[string]string{"pollux-agent/docs-scaffold": "stale"}, existing: &tc.existing}
+			comments := &fakeCommentGitHub{}
+			store := &scaffoldStore{fakeStore: &fakeStore{}, state: written}
+			svc := gate.NewService(&fakeGitHub{noDocs: true}, comments, store, gate.Runners{Server: &fakeRunner{}}, sgh, &fakeScaffoldQueue{})
+
+			err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"})
+
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("HandleScaffold() = %v, want error %v", err, tc.wantErr)
+			}
+			if len(sgh.resets) != 0 || len(comments.commits) != 0 || len(sgh.prs) != 0 {
+				t.Errorf("resets = %v, commits = %v, pull requests = %v, want none", sgh.resets, comments.commits, sgh.prs)
+			}
+			if store.state.Phase != tc.wantPhase {
+				t.Errorf("phase = %q, want %q", store.state.Phase, tc.wantPhase)
+			}
+			if !tc.wantErr && (store.state.PRNumber != tc.existing.Number || store.state.PRURL != tc.existing.URL) {
+				t.Errorf("state = %+v, want the adopted pull request %+v", store.state, tc.existing)
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), "not opened by pollux") {
+				t.Errorf("error = %v, want it to say the pull request was not opened by pollux", err)
+			}
+		})
 	}
 }
 
