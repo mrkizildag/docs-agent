@@ -12,7 +12,7 @@ pollux is a GitHub App. GitHub sends pull request events to the backend; the bac
 
 ## Parts
 
-- **Backend** (`backend/`, Go): receives GitHub webhooks, talks to the GitHub and LLM APIs, owns the check run. `POST /webhook` verifies GitHub's signature. For a `pull_request` event (opened, synchronize, reopened), or a `workflow_run` completed event for a run the backend dispatched, it stores the delivery and a durable job in one SQLite transaction, deduplicated by GitHub's delivery ID; other events are acknowledged without being stored. A periodic sweep enqueues a deadline job for each awaited Actions run past its deadline (see [Job queue](features/job-queue.md)). Accepted deliveries return 202. A worker processes jobs off that queue: it runs at most one job per PR at a time but PRs in parallel, a newer push supersedes the older job for the same PR, cancelling it if it is already running, and jobs left unfinished by a restart resume afterward. The `pull_request` job picks an analysis runner for the repo and reports its result as the `pollux-agent` check run on the PR head commit.
+- **Backend** (`backend/`, Go): receives GitHub webhooks, talks to the GitHub and LLM APIs, owns the check run. `POST /webhook` verifies GitHub's signature. For a `pull_request` event (opened, synchronize, reopened), a `workflow_run` completed event for a run the backend dispatched, or a human `issue_comment` or `pull_request_review_comment` event, it stores the delivery and a durable job in one SQLite transaction, deduplicated by GitHub's delivery ID; other events are acknowledged without being stored. A periodic sweep enqueues a deadline job for each awaited Actions run past its deadline (see [Job queue](features/job-queue.md)). Accepted deliveries return 202. A worker processes jobs off that queue: it runs at most one job per PR at a time but PRs in parallel, a newer push supersedes the older job for the same PR, cancelling it if it is already running, and jobs left unfinished by a restart resume afterward. The `pull_request` job picks an analysis runner for the repo and reports its result as the `pollux-agent` check run on the PR head commit.
 - **Frontend** (phase 2, TypeScript + shadcn/ui): org and repo settings, configurable docs structures.
 - **Doc targets**: phase 1 writes to the repo's own `docs/` folder. Notion comes in phase 3.
 
@@ -30,7 +30,7 @@ Docs model: `internal/docs` reads the `docs/` tree of a checkout into docs (fron
 2. The backend lists the PR's changed files; the analysis runner maps them to docs through each doc's `covers` globs on its own checkout of the head commit (see [0002](decisions/0002-docs-structure.md)).
 3. The LLM compares the diff with those docs and returns "no impact" or proposed edits.
 4. The backend sets the `pollux-agent` check: `success` for no impact, `action_required` otherwise, and posts one review comment per proposal plus a summary comment (see [Proposal output](features/proposal-output.md)).
-5. A developer applies, edits, or waives the proposal; the check turns green and the PR can merge.
+5. A developer applies, edits, or waives the proposal; the check turns green and the PR can merge. Apply and Skip arrive as comment events, run as `comment` jobs, and commit to the PR branch (see [Apply and Skip](features/apply-skip.md)).
 
 ## Phases
 

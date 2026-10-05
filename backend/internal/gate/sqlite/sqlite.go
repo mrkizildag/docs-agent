@@ -104,6 +104,20 @@ func migrations() []string {
 			PRIMARY KEY (owner, repo, number, position),
 			FOREIGN KEY (owner, repo, number) REFERENCES pull_requests(owner, repo, number) ON DELETE CASCADE
 		)`,
+		`ALTER TABLE pull_requests ADD COLUMN head_ref TEXT NOT NULL DEFAULT '';
+		ALTER TABLE pull_requests ADD COLUMN proposals_sha TEXT NOT NULL DEFAULT '';
+		ALTER TABLE pull_requests ADD COLUMN fork INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE pull_requests ADD COLUMN pending_skip_user TEXT NOT NULL DEFAULT '';
+		ALTER TABLE pull_requests ADD COLUMN pending_skip_scope TEXT NOT NULL DEFAULT '';
+		ALTER TABLE pull_requests ADD COLUMN skip_user TEXT NOT NULL DEFAULT '';
+		ALTER TABLE pull_requests ADD COLUMN skip_scope TEXT NOT NULL DEFAULT '';
+		ALTER TABLE pull_requests ADD COLUMN skip_reason TEXT NOT NULL DEFAULT '';
+		ALTER TABLE pull_requests ADD COLUMN skip_head_sha TEXT NOT NULL DEFAULT '';
+		ALTER TABLE pr_proposals ADD COLUMN content TEXT NOT NULL DEFAULT '';
+		ALTER TABLE pr_proposals ADD COLUMN original TEXT NOT NULL DEFAULT '';
+		ALTER TABLE pr_proposals ADD COLUMN index_entry TEXT NOT NULL DEFAULT '';
+		ALTER TABLE pr_proposals ADD COLUMN applied_sha TEXT NOT NULL DEFAULT '';
+		ALTER TABLE pr_proposals ADD COLUMN reply_id INTEGER NOT NULL DEFAULT 0`,
 	}
 }
 

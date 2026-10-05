@@ -19,6 +19,9 @@ func prJobKey(owner, repo string, number int) string {
 // payload. webhookHandler encodes jobs with this kind; HandleJob decodes them.
 const pullRequestJobKind = "pull_request"
 
+// commentJobKind identifies durable jobs carrying a gate.CommentEvent payload.
+const commentJobKind = "comment"
+
 // workflowRunJobKind identifies durable jobs carrying a gate.RunCompleted payload.
 const workflowRunJobKind = "workflow_run"
 
@@ -57,6 +60,7 @@ func EnqueueDeadlineJobs(ctx context.Context, src OverdueSource, jobs Enqueuer, 
 // PullRequestHandler reports the pollux-agent check run for a pull request.
 type PullRequestHandler interface {
 	HandlePullRequest(ctx context.Context, pr gate.PullRequest) error
+	HandleComment(ctx context.Context, ev gate.CommentEvent) error
 	HandleRunCompleted(ctx context.Context, rc gate.RunCompleted) error
 	HandleDeadline(ctx context.Context, ref gate.PRRef, nonce string, now time.Time) error
 }
@@ -72,6 +76,15 @@ func HandleJob(prs PullRequestHandler) jobqueue.Handler {
 			}
 			if err := prs.HandlePullRequest(ctx, pr); err != nil {
 				return fmt.Errorf("handle pull request job %d: %w", job.ID, err)
+			}
+			return nil
+		case commentJobKind:
+			var ev gate.CommentEvent
+			if err := json.Unmarshal(job.Payload, &ev); err != nil {
+				return fmt.Errorf("decode job %d payload (kind %s): %w", job.ID, job.Kind, err)
+			}
+			if err := prs.HandleComment(ctx, ev); err != nil {
+				return fmt.Errorf("handle comment job %d: %w", job.ID, err)
 			}
 			return nil
 		case workflowRunJobKind:

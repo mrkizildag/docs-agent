@@ -111,11 +111,17 @@ func TestSavePR_RoundTripRunAndProposalsAndPRForRun(t *testing.T) {
 		Number:           7,
 		HeadSHA:          "sha1",
 		CheckRunID:       555,
+		HeadRef:          "feature",
+		ProposalsSHA:     "sha1",
 		Run:              &gate.AwaitingRun{RunID: 99, Nonce: "n1", Deadline: time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)},
 		SummaryCommentID: 99,
 		Proposals: []gate.ProposalState{
 			{ID: "aaa", DocPath: "docs/a.md", Section: "Usage", CommentID: 11, CommentURL: "https://x/11", State: gate.ProposalOpen},
 			{ID: "bbb", DocPath: "docs/new.md", CommentID: 12, CommentURL: "https://x/12", State: gate.ProposalOutdated},
+			{
+				ID: "ccc", DocPath: "docs/c.md", Section: "C", CommentID: 13, CommentURL: "https://x/13", State: gate.ProposalApplied,
+				Content: "## C\nnew\n", Original: "## C\nold\n", IndexEntry: "- [C](c.md)", AppliedSHA: "abc123", ReplyID: 77,
+			},
 		},
 	}
 	if err := store.SavePR(ctx, state); err != nil {
@@ -159,6 +165,60 @@ func TestSavePR_RoundTripRunAndProposalsAndPRForRun(t *testing.T) {
 	}
 	if diff := cmp.Diff(state, got); diff != "" {
 		t.Errorf("LoadPR() after replace mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestSavePR_RoundTripForkAndSkips(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		edit func(*gate.PRState)
+	}{
+		{"none", func(*gate.PRState) {}},
+		{"fork", func(s *gate.PRState) { s.Fork = true }},
+		{"pending skip", func(s *gate.PRState) { s.PendingSkip = &gate.SkipAsk{User: "alice", Scope: gate.SkipPR} }},
+		{"skip", func(s *gate.PRState) {
+			s.Skip = &gate.Skip{User: "bob", Scope: gate.SkipCommit, Reason: "typo only", HeadSHA: "sha1"}
+		}},
+		{"all", func(s *gate.PRState) {
+			s.Fork = true
+			s.PendingSkip = &gate.SkipAsk{User: "alice", Scope: gate.SkipCommit}
+			s.Skip = &gate.Skip{User: "bob", Scope: gate.SkipPR, Reason: "generated", HeadSHA: "sha2"}
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			store, _ := open(t)
+			ctx := t.Context()
+			state := gate.PRState{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1"}
+			tc.edit(&state)
+
+			if err := store.SavePR(ctx, state); err != nil {
+				t.Fatalf("SavePR() = %v, want nil error", err)
+			}
+			got, err := store.LoadPR(ctx, "acme", "widgets", 7)
+			if err != nil {
+				t.Fatalf("LoadPR() = %v, want nil error", err)
+			}
+			if diff := cmp.Diff(state, got); diff != "" {
+				t.Errorf("LoadPR() mismatch (-want +got):\n%s", diff)
+			}
+
+			cleared := gate.PRState{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1"}
+			if err := store.SavePR(ctx, cleared); err != nil {
+				t.Fatalf("SavePR(cleared) = %v, want nil error", err)
+			}
+			got, err = store.LoadPR(ctx, "acme", "widgets", 7)
+			if err != nil {
+				t.Fatalf("LoadPR() after clear = %v, want nil error", err)
+			}
+			if diff := cmp.Diff(cleared, got); diff != "" {
+				t.Errorf("LoadPR() after clear mismatch (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 

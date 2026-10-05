@@ -26,6 +26,8 @@ type PullRequest struct {
 	Number         int
 	BaseSHA        string
 	HeadSHA        string
+	HeadRef        string // branch name of the head
+	Fork           bool   // head lives in another repository, so Apply cannot push to it
 }
 
 // Conclusion is a GitHub check run conclusion.
@@ -122,10 +124,39 @@ type PRState struct {
 	Number         int
 	HeadSHA        string // head commit the gate last reported a check run for; "" if never
 	CheckRunID     int64  // check run reported for HeadSHA; 0 if none
+	HeadRef        string // branch Apply commits to
+	ProposalsSHA   string // head the proposals were last computed at; "" if never
+	Fork           bool   // head lives in another repository; Apply is not offered
 	Run            *AwaitingRun
+
+	PendingSkip *SkipAsk // skip waiting for its reason; nil if none
+	Skip        *Skip    // active skip; nil if none
 
 	SummaryCommentID int64 // 0 until the summary comment is created
 	Proposals        []ProposalState
+}
+
+// SkipScope is how long a skip passes the check.
+type SkipScope string
+
+const (
+	SkipCommit SkipScope = "commit" // the head the skip was made at only
+	SkipPR     SkipScope = "pr"     // every later push to the pull request
+)
+
+// SkipAsk is a skip the bot asked User for a reason for; User's next comment
+// on the pull request becomes the reason.
+type SkipAsk struct {
+	User  string
+	Scope SkipScope
+}
+
+// Skip waives the docs check. HeadSHA is the head it was made at.
+type Skip struct {
+	User    string
+	Scope   SkipScope
+	Reason  string
+	HeadSHA string
 }
 
 // AwaitingRun is the external analysis run whose result will conclude the
@@ -165,6 +196,7 @@ type ProposalStatus string
 const (
 	ProposalOpen     ProposalStatus = "open"
 	ProposalOutdated ProposalStatus = "outdated"
+	ProposalApplied  ProposalStatus = "applied"
 )
 
 // ProposalState is one proposal's review comment as the gate remembers it.
@@ -175,6 +207,12 @@ type ProposalState struct {
 	CommentID  int64 // 0 until the review comment is created
 	CommentURL string
 	State      ProposalStatus
+
+	Content    string // the section as proposed, heading included
+	Original   string // the section text Content replaces; "" for a new doc
+	IndexEntry string
+	AppliedSHA string // commit that applied it; "" unless Applied
+	ReplyID    int64  // reply posted under the comment for AppliedSHA; 0 if none
 }
 
 // ProposalID is the stable identity of a proposal across re-runs: a short hash
@@ -195,18 +233,31 @@ type Store interface {
 }
 
 // OnPush is the state transition for a new head commit: pure, no I/O. It
-// drops any awaited run, so that run's result is ignored; the proposals and
-// the summary comment carry over.
+// drops any awaited run, so that run's result is ignored; the proposals, the
+// summary comment and PR-scope skips carry over. A commit-scope skip carries
+// over only for the head it was made at, and a commit-scope pending ask never.
 func OnPush(prev PRState, pr PullRequest) PRState {
-	return PRState{
+	next := PRState{
 		InstallationID:   pr.InstallationID,
 		Owner:            pr.Owner,
 		Repo:             pr.Repo,
 		Number:           pr.Number,
 		HeadSHA:          pr.HeadSHA,
+		HeadRef:          pr.HeadRef,
+		Fork:             pr.Fork,
+		ProposalsSHA:     prev.ProposalsSHA,
 		SummaryCommentID: prev.SummaryCommentID,
 		Proposals:        slices.Clone(prev.Proposals),
 	}
+	if sk := prev.Skip; sk != nil && (sk.Scope == SkipPR || sk.HeadSHA == pr.HeadSHA) {
+		kept := *sk
+		next.Skip = &kept
+	}
+	if ask := prev.PendingSkip; ask != nil && (ask.Scope == SkipPR || prev.HeadSHA == pr.HeadSHA) {
+		kept := *ask
+		next.PendingSkip = &kept
+	}
+	return next
 }
 
 // Superseded returns the neutral check run that closes the check run of an
@@ -282,8 +333,13 @@ func truncate(s string, max int) string {
 
 // conclude is the state transition for an analysis that ended: pure, no I/O.
 // It clears the awaited run and returns the completed check run to report;
-// runner-supplied text is capped to what GitHub accepts.
+// runner-supplied text is capped to what GitHub accepts. An active skip
+// replaces the outcome with its success.
 func conclude(state PRState, outcome Outcome) (PRState, CheckRun) {
+	if skipActive(state) {
+		state.Run = nil
+		return state, skipRun(state)
+	}
 	state, run := concludeUncapped(state, outcome)
 	run.Summary = truncate(run.Summary, maxSummaryBytes)
 	return state, run
@@ -300,8 +356,13 @@ func concludeUncapped(state PRState, outcome Outcome) (PRState, CheckRun) {
 			run.Conclusion, run.Title, run.Summary = ConclusionSuccess, "No doc impact", v.Reason
 			return state, run
 		case review.Proposals:
+			pending := unapplied(state, v)
+			if len(v) > 0 && len(pending) == 0 {
+				run.Conclusion, run.Title, run.Summary = ConclusionSuccess, "Docs up to date", "Every proposed doc change is already applied."
+				return state, run
+			}
 			if len(v) > 0 {
-				run.Conclusion, run.Title, run.Summary = ConclusionActionRequired, "Docs need updating", proposalsSummary(v)
+				run.Conclusion, run.Title, run.Summary = ConclusionActionRequired, "Docs need updating", proposalsSummary(pending)
 				return state, run
 			}
 			return state, neutral(run, "Analysis failed", "runner returned an empty proposal list; no impact must be NoImpact")
@@ -313,6 +374,23 @@ func concludeUncapped(state PRState, outcome Outcome) (PRState, CheckRun) {
 	default:
 		return state, neutral(run, "Analysis failed", "analysis ended without an outcome")
 	}
+}
+
+// unapplied is v without the proposals state already holds as applied with the
+// same content; Reconcile neither reopens nor reposts those.
+func unapplied(state PRState, v review.Proposals) review.Proposals {
+	var out review.Proposals
+	for _, p := range v {
+		id := ProposalID(p.DocPath, p.Section)
+		if !slices.ContainsFunc(state.Proposals, func(ps ProposalState) bool { return ps.ID == id && appliedAs(ps, p) }) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func appliedAs(ps ProposalState, p review.Proposal) bool {
+	return ps.State == ProposalApplied && ps.Content == withHeading(p).Content
 }
 
 func neutral(run CheckRun, title, summary string) CheckRun {
@@ -334,14 +412,16 @@ type CommentWrite struct {
 }
 
 // Reconcile is the state transition for a finished run: pure, no I/O. It
-// returns prev with only Proposals and SummaryCommentID changed, and the
+// returns prev with only Proposals, ProposalsSHA and SummaryCommentID changed, and the
 // comment writes that realize it. existing is the PR's current comments: our
 // own comments carrying our markers are reused when state lacks their IDs, and
 // an outdated proposal keeps its current body. Created comments' IDs and URLs
-// belong in the returned state at the writes' Index.
+// belong in the returned state at the writes' Index. An applied proposal
+// stays applied, and gets no write, while the verdict repeats its Content.
 func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []review.ChangedFile, existing []Comment) (PRState, []CommentWrite) {
 	next := prev
 	next.Proposals = slices.Clone(prev.Proposals)
+	next.ProposalsSHA = pr.HeadSHA
 	proposals, _ := verdict.(review.Proposals)
 
 	index := make(map[string]int, len(next.Proposals))
@@ -364,14 +444,19 @@ func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []r
 			next.Proposals = append(next.Proposals, ProposalState{ID: id})
 		}
 		ps := &next.Proposals[i]
+		if appliedAs(*ps, p) {
+			continue
+		}
+		p = withHeading(p)
 		ps.DocPath, ps.Section, ps.State = p.DocPath, p.Section, ProposalOpen
+		ps.Content, ps.Original, ps.IndexEntry = p.Content, p.Original, p.IndexEntry
+		ps.AppliedSHA, ps.ReplyID = "", 0
 		adoptMarked(ps, existing)
 
-		p = withHeading(p)
-		rc := proposalComment(pr.HeadSHA, id, p, changed)
+		rc := proposalComment(pr.HeadSHA, id, p, changed, pr.Fork)
 		if c, ok := findComment(existing, CommentKindReview, ps.CommentID); ok {
 			if !sameAnchor(c, rc) {
-				rc.Body = renderCheckbox(id, p)
+				rc.Body = renderCheckbox(id, p, pr.Fork)
 			}
 			writes = append(writes, CommentWrite{Index: i, ID: ps.CommentID, Body: rc.Body})
 		} else {
@@ -382,7 +467,7 @@ func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []r
 
 	for i := range next.Proposals {
 		ps := &next.Proposals[i]
-		if current[ps.ID] || ps.State == ProposalOutdated {
+		if current[ps.ID] || ps.State == ProposalOutdated || ps.State == ProposalApplied {
 			continue
 		}
 		adoptMarked(ps, existing)
@@ -483,9 +568,10 @@ type Runners struct {
 
 // Service decides and reports the pollux-agent check run for a pull request.
 type Service struct {
-	gh      GitHub
-	store   Store
-	runners Runners
+	gh       GitHub
+	store    Store
+	runners  Runners
+	comments CommentGitHub
 	// collectBackoff is the wait before the first Collect retry; it doubles.
 	collectBackoff time.Duration
 }
@@ -511,11 +597,34 @@ func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
 	if err != nil {
 		return fmt.Errorf("handle pull request %s/%s#%d: load state: %w", pr.Owner, pr.Repo, pr.Number, err)
 	}
+	if err := s.analyze(ctx, state, pr); err != nil {
+		return err
+	}
 
+	// Posted after the new state is saved, so a retried job finds no pending skip.
+	if ask := state.PendingSkip; ask != nil && ask.Scope == SkipCommit && state.HeadSHA != pr.HeadSHA && OnPush(state, pr).PendingSkip == nil {
+		short := state.HeadSHA
+		if len(short) > 7 {
+			short = short[:7]
+		}
+		body := fmt.Sprintf("@%s, a new push arrived before your reason, so the skip for `%s` was cancelled. Tick **Skip this commit** again to skip the new head.", ask.User, short)
+		if _, err := s.gh.CreateIssueComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number, body); err != nil {
+			return fmt.Errorf("handle pull request %s/%s#%d: post skip cancellation: %w", pr.Owner, pr.Repo, pr.Number, err)
+		}
+	}
+	return nil
+}
+
+func (s *Service) analyze(ctx context.Context, state PRState, pr PullRequest) error {
+	var err error
 	if old, ok := Superseded(state, pr); ok {
 		if err := s.gh.UpdateCheckRun(ctx, state.InstallationID, state.Owner, state.Repo, state.CheckRunID, old); err != nil {
 			return fmt.Errorf("handle pull request %s/%s#%d: supersede check run %d: %w", pr.Owner, pr.Repo, pr.Number, state.CheckRunID, err)
 		}
+	}
+
+	if next := OnPush(state, pr); next.Skip != nil && next.Skip.Scope == SkipPR {
+		return s.concludeSkipped(ctx, next, pr)
 	}
 
 	var hasWorkflow bool
@@ -557,7 +666,8 @@ func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
 	case review.Result:
 		var run CheckRun
 		next, run = conclude(next, resultOutcome(res))
-		if _, err = s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, run); err == nil && reconciles(res.Verdict) {
+		next.CheckRunID, err = s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, run)
+		if err == nil && reconciles(res.Verdict) {
 			next, err = s.postComments(ctx, next, pr, res.Verdict, changed)
 		}
 	default:
@@ -571,6 +681,21 @@ func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
 		return fmt.Errorf("handle pull request %s/%s#%d: save state: %w", pr.Owner, pr.Repo, pr.Number, err)
 	}
 
+	return nil
+}
+
+// concludeSkipped reports the active PR skip as the check run for the new head
+// without starting any analysis.
+func (s *Service) concludeSkipped(ctx context.Context, next PRState, pr PullRequest) error {
+	op := fmt.Sprintf("handle pull request %s/%s#%d", pr.Owner, pr.Repo, pr.Number)
+	id, err := s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, skipRun(next))
+	if err != nil {
+		return fmt.Errorf("%s: create check run: %w", op, err)
+	}
+	next.CheckRunID = id
+	if err := s.store.SavePR(ctx, next); err != nil {
+		return fmt.Errorf("%s: save state: %w", op, err)
+	}
 	return nil
 }
 
@@ -647,7 +772,7 @@ func (s *Service) HandleRunCompleted(ctx context.Context, rc RunCompleted) error
 	_, run := conclude(state, outcome)
 	var changed []review.ChangedFile
 	reconcile := outcome.Result != nil && reconciles(outcome.Result.Verdict)
-	pr := PullRequest{InstallationID: state.InstallationID, Owner: state.Owner, Repo: state.Repo, Number: state.Number, HeadSHA: state.HeadSHA}
+	pr := PullRequest{InstallationID: state.InstallationID, Owner: state.Owner, Repo: state.Repo, Number: state.Number, HeadSHA: state.HeadSHA, HeadRef: state.HeadRef}
 	if reconcile {
 		changed, err = s.gh.ListChangedFiles(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number)
 		if err != nil {
@@ -754,6 +879,16 @@ func (s *Service) postComments(ctx context.Context, prev PRState, pr PullRequest
 		if err := s.store.SavePR(ctx, next); err != nil {
 			return PRState{}, fmt.Errorf("save state before creating comments: %w", err)
 		}
+	}
+	// GitHub orders comments by creation time, so a new summary is created
+	// before the review comments to sit above them, then edited with their links.
+	if i := slices.IndexFunc(writes, func(w CommentWrite) bool { return w.Summary && w.ID == 0 }); i >= 0 && len(writes) > 1 {
+		first := writes[i]
+		writes = append(slices.Delete(slices.Clone(writes), i, i+1), CommentWrite{Summary: true})
+		if err := s.writeSummary(ctx, pr, &next, first); err != nil {
+			return PRState{}, err
+		}
+		writes[len(writes)-1].ID = next.SummaryCommentID
 	}
 	for _, w := range writes {
 		switch {

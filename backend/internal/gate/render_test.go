@@ -60,9 +60,9 @@ func TestProposalCommentBodies(t *testing.T) {
 		t.Errorf("suggestion body = %q, want reason, suggestion block, no checkbox", sg.Body)
 	}
 
-	summary := gh.comments[len(gh.comments)-1].Body
+	summary := gh.comments[0].Body
 	for i, want := range []string{"| `docs/a.md` | Usage |", "| `docs/b.md` | (new doc) |", "| `docs/s.md` | Run |"} {
-		row := want + " [view](" + gh.comments[i].URL + ") | open |"
+		row := want + " [view](" + gh.comments[i+1].URL + ") | open |"
 		if !strings.Contains(summary, row) {
 			t.Errorf("summary missing row %q:\n%s", row, summary)
 		}

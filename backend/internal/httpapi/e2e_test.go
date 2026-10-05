@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"archive/zip"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -19,6 +20,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	gocmp "github.com/google/go-cmp/cmp"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
@@ -84,17 +87,36 @@ func (f *e2eGitHub) UpdateCheckRun(context.Context, int64, string, string, int64
 func e2ePullRequestBody(t *testing.T, number int, sha string) []byte {
 	t.Helper()
 
+	return e2ePullRequestFrom(t, number, sha, pushOpts{})
+}
+
+// pushOpts varies a pull_request delivery; zero values mean a push by user dev
+// from a branch of the base repository.
+type pushOpts struct {
+	headRepo   string
+	sender     string
+	senderType string
+}
+
+func e2ePullRequestFrom(t *testing.T, number int, sha string, o pushOpts) []byte {
+	t.Helper()
+
+	o.headRepo = cmp.Or(o.headRepo, "acme/widgets")
+	o.sender = cmp.Or(o.sender, "dev")
+	o.senderType = cmp.Or(o.senderType, "User")
 	payload := map[string]any{
 		"action": "opened",
 		"number": number,
 		"pull_request": map[string]any{
-			"head": map[string]any{"sha": sha},
+			"head": map[string]any{"sha": sha, "ref": "feature", "repo": map[string]any{"full_name": o.headRepo}},
 		},
 		"repository": map[string]any{
-			"name":  "widgets",
-			"owner": map[string]any{"login": "acme"},
+			"name":      "widgets",
+			"full_name": "acme/widgets",
+			"owner":     map[string]any{"login": "acme"},
 		},
 		"installation": map[string]any{"id": 42},
+		"sender":       map[string]any{"login": o.sender, "type": o.senderType},
 	}
 
 	body, err := json.Marshal(payload)
@@ -451,6 +473,7 @@ type commentGitHub struct {
 	checkRuns chan gate.CheckRun
 	review    chan gate.ReviewComment
 	issue     chan string
+	edited    chan string
 	created   int64
 }
 
@@ -483,6 +506,14 @@ func (f *commentGitHub) CreateIssueComment(_ context.Context, _ int64, _, _ stri
 	return gate.Comment{ID: 900}, nil
 }
 
+func (f *commentGitHub) EditIssueComment(_ context.Context, _ int64, _, _ string, id int64, body string) error {
+	if id != 900 {
+		return fmt.Errorf("edit issue comment %d: not found", id)
+	}
+	f.edited <- body
+	return nil
+}
+
 type proposalRunner struct{ proposals review.Proposals }
 
 func (r proposalRunner) Start(context.Context, review.Request) (review.Started, error) {
@@ -503,7 +534,7 @@ func TestWebhookToProposalCommentsEndToEnd(t *testing.T) {
 		}
 	})
 
-	gh := &commentGitHub{checkRuns: make(chan gate.CheckRun, 2), review: make(chan gate.ReviewComment, 4), issue: make(chan string, 2)}
+	gh := &commentGitHub{checkRuns: make(chan gate.CheckRun, 2), review: make(chan gate.ReviewComment, 4), issue: make(chan string, 2), edited: make(chan string, 2)}
 	runner := proposalRunner{proposals: review.Proposals{
 		{DocPath: "docs/a.md", Section: "Usage", Anchor: review.Anchor{File: "a.go", Line: 4}, Reason: "flag renamed", Original: "## Usage\nold\n", Lines: review.LineRange{Start: 3, End: 4}, Content: "## Usage\nnew\n"},
 		{DocPath: "docs/b.md", Anchor: review.Anchor{File: "b.go", Line: 9}, Reason: "new feature", Content: "# B\n", IndexEntry: "- [B](b.md)"},
@@ -548,6 +579,14 @@ func TestWebhookToProposalCommentsEndToEnd(t *testing.T) {
 	case summary = <-gh.issue:
 	case <-timeout:
 		t.Fatal("timed out waiting for summary comment")
+	}
+	if strings.Contains(summary, "discussion_r") {
+		t.Errorf("created summary should not link comments yet:\n%s", summary)
+	}
+	select {
+	case summary = <-gh.edited:
+	case <-timeout:
+		t.Fatal("timed out waiting for summary edit with comment links")
 	}
 	var run gate.CheckRun
 	select {
@@ -599,13 +638,79 @@ type statefulGitHub struct {
 	comments []gate.Comment
 	creates  int
 	edits    int
+
+	files           map[string]string
+	permissionCalls int
+	commits         []commitCall
+	replies         []replyCall
+	runs            []gate.CheckRun
+
+	nextReaction int64
+	reactions    map[reactionKey]map[int64]gate.Reaction
+}
+
+type reactionKey struct {
+	kind gate.CommentKind
+	id   int64
+}
+
+// reactionsOn returns the reactions currently on the comment.
+func (f *statefulGitHub) reactionsOn(kind gate.CommentKind, id int64) []gate.Reaction {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var got []gate.Reaction
+	for _, r := range f.reactions[reactionKey{kind, id}] {
+		got = append(got, r)
+	}
+	return got
+}
+
+type commitCall struct {
+	Branch, Parent, Message string
+	Files                   []gate.FileChange
+}
+
+type replyCall struct {
+	InReplyTo int64
+	Body      string
+}
+
+func (f *statefulGitHub) Permission(_ context.Context, _ int64, _, _, user string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.permissionCalls++
+	return user == "dev", nil
+}
+
+func (f *statefulGitHub) FileAtRef(_ context.Context, _ int64, _, _, path, _ string) ([]byte, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	content, ok := f.files[path]
+	return []byte(content), ok, nil
+}
+
+func (f *statefulGitHub) CommitFiles(_ context.Context, _ int64, _, _, branch, parentSHA string, files []gate.FileChange, message string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commits = append(f.commits, commitCall{Branch: branch, Parent: parentSHA, Files: files, Message: message})
+	return "commit1234567890", nil
+}
+
+func (f *statefulGitHub) ReplyToReviewComment(_ context.Context, _ int64, _, _ string, _ int, inReplyTo int64, body string) (gate.Comment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.replies = append(f.replies, replyCall{InReplyTo: inReplyTo, Body: body})
+	return gate.Comment{ID: 500 + int64(len(f.replies)), Kind: gate.CommentKindReview}, nil
 }
 
 func (f *statefulGitHub) WorkflowExists(context.Context, int64, string, string) (bool, error) {
 	return false, nil
 }
 
-func (f *statefulGitHub) UpdateCheckRun(context.Context, int64, string, string, int64, gate.CheckRun) error {
+func (f *statefulGitHub) UpdateCheckRun(_ context.Context, _ int64, _, _ string, _ int64, run gate.CheckRun) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runs = append(f.runs, run)
 	return nil
 }
 
@@ -614,6 +719,9 @@ func (f *statefulGitHub) ListChangedFiles(context.Context, int64, string, string
 }
 
 func (f *statefulGitHub) CreateCheckRun(_ context.Context, _ int64, _, _ string, run gate.CheckRun) (int64, error) {
+	f.mu.Lock()
+	f.runs = append(f.runs, run)
+	f.mu.Unlock()
 	f.checkRuns <- run
 	return 1, nil
 }
@@ -693,6 +801,7 @@ type pushHarness struct {
 	handler http.Handler
 	secret  []byte
 	deliver int
+	queued  chan review.Verdict
 }
 
 func newPushHarness(t *testing.T, verdicts ...review.Verdict) *pushHarness {
@@ -712,8 +821,8 @@ func newPushHarness(t *testing.T, verdicts ...review.Verdict) *pushHarness {
 	for _, v := range verdicts {
 		queued <- v
 	}
-	gh := &statefulGitHub{checkRuns: make(chan gate.CheckRun, len(verdicts))}
-	gateSvc := gate.NewService(gh, store, gate.Runners{Server: scriptedRunner{verdicts: queued}})
+	gh := &statefulGitHub{checkRuns: make(chan gate.CheckRun, len(verdicts)+8), files: map[string]string{}}
+	gateSvc := gate.NewService(gh, store, gate.Runners{Server: scriptedRunner{verdicts: queued}}).WithComments(gh)
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
@@ -728,7 +837,7 @@ func newPushHarness(t *testing.T, verdicts ...review.Verdict) *pushHarness {
 	})
 
 	secret := []byte("test-secret")
-	return &pushHarness{t: t, gh: gh, store: store, handler: httpapi.NewHandler(logger, secret, worker, store), secret: secret}
+	return &pushHarness{t: t, gh: gh, store: store, handler: httpapi.NewHandler(logger, secret, worker, store), secret: secret, queued: queued}
 }
 
 // push delivers a synchronize webhook for sha and returns the check run and the
@@ -736,8 +845,14 @@ func newPushHarness(t *testing.T, verdicts ...review.Verdict) *pushHarness {
 func (h *pushHarness) push(sha string) (gate.CheckRun, gate.PRState) {
 	h.t.Helper()
 
+	return h.pushWith(sha, pushOpts{})
+}
+
+func (h *pushHarness) pushWith(sha string, o pushOpts) (gate.CheckRun, gate.PRState) {
+	h.t.Helper()
+
 	h.deliver++
-	body := bytes.Replace(e2ePullRequestBody(h.t, 1, sha), []byte(`"opened"`), []byte(`"synchronize"`), 1)
+	body := bytes.Replace(e2ePullRequestFrom(h.t, 1, sha, o), []byte(`"opened"`), []byte(`"synchronize"`), 1)
 	req := httptest.NewRequestWithContext(h.t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-GitHub-Event", "pull_request")
 	req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("d%d", h.deliver))
@@ -786,6 +901,109 @@ func (h *pushHarness) commentWith(marker string) gate.Comment {
 	return gate.Comment{}
 }
 
+// tick delivers a pull_request_review_comment edited webhook in which sender
+// ticks the checkbox of comment id.
+func (h *pushHarness) tick(deliveryID, sender string, id int64, unticked string) {
+	h.t.Helper()
+
+	body, err := json.Marshal(map[string]any{
+		"action":       "edited",
+		"changes":      map[string]any{"body": map[string]any{"from": unticked}},
+		"comment":      map[string]any{"id": id, "body": strings.Replace(unticked, "- [ ]", "- [x]", 1)},
+		"pull_request": map[string]any{"number": 1},
+		"repository":   map[string]any{"name": "widgets", "owner": map[string]any{"login": "acme"}},
+		"installation": map[string]any{"id": 42},
+		"sender":       map[string]any{"login": sender, "type": "User"},
+	})
+	if err != nil {
+		h.t.Fatalf("marshal comment payload: %v", err)
+	}
+	req := httptest.NewRequestWithContext(h.t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", "pull_request_review_comment")
+	req.Header.Set("X-GitHub-Delivery", deliveryID)
+	req.Header.Set("X-Hub-Signature-256", sign(h.secret, body))
+	rec := httptest.NewRecorder()
+	h.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		h.t.Fatalf("POST /webhook for %s = %d, want %d", deliveryID, rec.Code, http.StatusAccepted)
+	}
+}
+
+func (h *pushHarness) waitFor(what string, done func() bool) {
+	h.t.Helper()
+
+	deadline := time.After(5 * time.Second)
+	for !done() {
+		select {
+		case <-deadline:
+			h.t.Fatalf("timed out waiting for %s", what)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestWebhookApplyCommitsOnceEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	h := newPushHarness(t, twoProposals())
+	h.gh.files["docs/a.md"] = "# A\n\n## Usage\nold\n\n## Other\nx\n"
+	_, state := h.push("sha1")
+	idA := gate.ProposalID("docs/a.md", "Usage")
+	commentA := h.commentWith("<!-- pollux-agent:proposal:" + idA + " -->")
+
+	h.tick("t1", "dev", commentA.ID, commentA.Body)
+	h.waitFor("applied proposal with reply", func() bool {
+		st, err := h.store.LoadPR(t.Context(), "acme", "widgets", 1)
+		if err != nil {
+			t.Fatalf("LoadPR() error = %v", err)
+		}
+		return len(st.Proposals) > 0 && st.Proposals[0].ReplyID != 0
+	})
+	h.waitFor("proposal comment reacted done", func() bool {
+		return gocmp.Equal(h.gh.reactionsOn(gate.CommentKindReview, commentA.ID), []gate.Reaction{gate.ReactionDone})
+	})
+
+	h.gh.mu.Lock()
+	wantCommit := []commitCall{{
+		Branch: "feature", Parent: "sha1", Message: "docs: apply pollux-agent proposal for docs/a.md § Usage",
+		Files: []gate.FileChange{{Path: "docs/a.md", Content: "# A\n\n## Usage\nnew\n\n## Other\nx\n"}},
+	}}
+	wantReply := []replyCall{{InReplyTo: commentA.ID, Body: "✅ Applied in commit1"}}
+	if diff := gocmp.Diff(wantCommit, h.gh.commits); diff != "" {
+		t.Errorf("commits (-want +got):\n%s", diff)
+	}
+	if diff := gocmp.Diff(wantReply, h.gh.replies); diff != "" {
+		t.Errorf("replies (-want +got):\n%s", diff)
+	}
+	h.gh.mu.Unlock()
+
+	got, err := h.store.LoadPR(t.Context(), "acme", "widgets", 1)
+	if err != nil {
+		t.Fatalf("LoadPR() error = %v", err)
+	}
+	if p := got.Proposals[0]; p.State != gate.ProposalApplied || p.AppliedSHA != "commit1234567890" || p.ReplyID != 501 {
+		t.Errorf("proposal = %+v, want applied at commit1234567890 with reply 501", p)
+	}
+	if other := state.Proposals[1].State; got.Proposals[1].State != other {
+		t.Errorf("other proposal state = %s, want unchanged %s", got.Proposals[1].State, other)
+	}
+
+	// Jobs on the PR run in order, so the third call to Permission starts after
+	// the redelivered job has finished.
+	h.tick("t2", "dev", commentA.ID, commentA.Body)
+	h.tick("t3", "dev", commentA.ID, commentA.Body)
+	h.waitFor("third comment job", func() bool {
+		h.gh.mu.Lock()
+		defer h.gh.mu.Unlock()
+		return h.gh.permissionCalls >= 3
+	})
+	h.gh.mu.Lock()
+	defer h.gh.mu.Unlock()
+	if len(h.gh.commits) != 1 || len(h.gh.replies) != 1 {
+		t.Errorf("after redelivery: %d commits, %d replies, want 1, 1", len(h.gh.commits), len(h.gh.replies))
+	}
+}
+
 func TestWebhookReconcilesProposalCommentsAcrossPushes(t *testing.T) {
 	t.Parallel()
 
@@ -808,8 +1026,8 @@ func TestWebhookReconcilesProposalCommentsAcrossPushes(t *testing.T) {
 		if creates != 3 || len(comments) != 3 {
 			t.Errorf("after second push creates = %d, comments = %d, want 3 and 3", creates, len(comments))
 		}
-		if edits != 3 {
-			t.Errorf("edits = %d, want 3 (two review comments and the summary)", edits)
+		if edits != 4 {
+			t.Errorf("edits = %d, want 4 (two review comments and the summary, which is also edited once to add links on its first run)", edits)
 		}
 		if run.Conclusion != gate.ConclusionActionRequired {
 			t.Errorf("conclusion = %q, want %q", run.Conclusion, gate.ConclusionActionRequired)
@@ -890,11 +1108,387 @@ func TestWebhookReconcilesProposalCommentsAcrossPushes(t *testing.T) {
 		if creates != 3 || len(comments) != 3 {
 			t.Errorf("creates = %d, comments = %d, want 3 and 3", creates, len(comments))
 		}
-		if edits != 3 {
-			t.Errorf("edits = %d, want 3", edits)
+		if edits != 4 {
+			t.Errorf("edits = %d, want 4", edits)
 		}
 		if state.SummaryCommentID == 0 || state.Proposals[0].CommentID == 0 || state.Proposals[1].CommentID == 0 {
 			t.Errorf("saved state did not re-adopt comment IDs: %+v", state)
 		}
 	})
+}
+
+func (f *statefulGitHub) BranchCommit(context.Context, int64, string, string, string) (gate.Commit, error) {
+	return gate.Commit{}, nil
+}
+
+const (
+	e2eSummaryMarker = "<!-- pollux-agent:summary -->"
+	e2eAppliedSHA    = "commit1234567890"
+)
+
+func (h *pushHarness) post(event string, payload map[string]any) {
+	h.t.Helper()
+
+	payload["installation"] = map[string]any{"id": 42}
+	payload["repository"] = map[string]any{"name": "widgets", "owner": map[string]any{"login": "acme"}}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		h.t.Fatalf("marshal %s payload: %v", event, err)
+	}
+	h.deliver++
+	req := httptest.NewRequestWithContext(h.t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
+	req.Header.Set("X-GitHub-Event", event)
+	req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("x%d", h.deliver))
+	req.Header.Set("X-Hub-Signature-256", sign(h.secret, body))
+	rec := httptest.NewRecorder()
+	h.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		h.t.Fatalf("POST /webhook %s = %d, want %d", event, rec.Code, http.StatusAccepted)
+	}
+}
+
+// issueComment delivers an issue_comment webhook; from is the previous body of an edit.
+func (h *pushHarness) issueComment(action, sender, senderType string, id int64, body, from string) {
+	h.t.Helper()
+
+	payload := map[string]any{
+		"action":  action,
+		"comment": map[string]any{"id": id, "body": body},
+		"issue":   map[string]any{"number": 1, "pull_request": map[string]any{}},
+		"sender":  map[string]any{"login": sender, "type": senderType},
+	}
+	if from != "" {
+		payload["changes"] = map[string]any{"body": map[string]any{"from": from}}
+	}
+	h.post("issue_comment", payload)
+}
+
+func (h *pushHarness) command(sender, text string) {
+	h.t.Helper()
+
+	h.issueComment("created", sender, "User", 100, text, "")
+}
+
+// tickSummary delivers the edit in which sender ticks label on the summary comment.
+func (h *pushHarness) tickSummary(sender, senderType, label string) {
+	h.t.Helper()
+
+	summary := h.commentWith(e2eSummaryMarker)
+	h.issueComment("edited", sender, senderType, summary.ID, strings.Replace(summary.Body, "- [ ] "+label, "- [x] "+label, 1), summary.Body)
+}
+
+func (h *pushHarness) waitState(what string, done func(gate.PRState) bool) gate.PRState {
+	h.t.Helper()
+
+	var state gate.PRState
+	h.waitFor(what, func() bool {
+		var err error
+		if state, err = h.store.LoadPR(h.t.Context(), "acme", "widgets", 1); err != nil {
+			h.t.Fatalf("LoadPR() error = %v", err)
+		}
+		return done(state)
+	})
+	return state
+}
+
+func (h *pushHarness) lastRun() gate.CheckRun {
+	h.gh.mu.Lock()
+	defer h.gh.mu.Unlock()
+	return h.gh.runs[len(h.gh.runs)-1]
+}
+
+// drainRuns discards the check runs the channel holds, which push would otherwise take for its own.
+func (h *pushHarness) drainRuns() {
+	for {
+		select {
+		case <-h.gh.checkRuns:
+		default:
+			return
+		}
+	}
+}
+
+func (h *pushHarness) allReplied(state gate.PRState) bool {
+	for _, p := range state.Proposals {
+		if p.State == gate.ProposalApplied && p.ReplyID == 0 {
+			return false
+		}
+	}
+	return slices.ContainsFunc(state.Proposals, func(p gate.ProposalState) bool { return p.State == gate.ProposalApplied })
+}
+
+func newApplyHarness(t *testing.T, extra ...review.Verdict) *pushHarness {
+	t.Helper()
+
+	h := newPushHarness(t, append([]review.Verdict{twoProposals()}, extra...)...)
+	h.gh.files["docs/a.md"] = "# A\n\n## Usage\nold\n\n## Other\nx\n"
+	h.push("sha1")
+	return h
+}
+
+// requireAppliedAll checks that one commit applied both proposals and every
+// surface shows it.
+func (h *pushHarness) requireAppliedAll() {
+	h.t.Helper()
+
+	state := h.waitState("both proposals applied with replies", h.allReplied)
+	h.gh.mu.Lock()
+	wantCommits := []commitCall{{
+		Branch: "feature", Parent: "sha1", Message: "docs: apply 2 pollux-agent proposals",
+		Files: []gate.FileChange{
+			{Path: "docs/a.md", Content: "# A\n\n## Usage\nnew\n\n## Other\nx\n"},
+			{Path: "docs/b.md", Content: "# B\n"},
+			{Path: "docs/README.md", Content: "- [B](b.md)\n"},
+		},
+	}}
+	wantReplies := []replyCall{{InReplyTo: 2, Body: "✅ Applied in commit1"}, {InReplyTo: 3, Body: "✅ Applied in commit1"}}
+	if diff := gocmp.Diff(wantCommits, h.gh.commits); diff != "" {
+		h.t.Errorf("commits (-want +got):\n%s", diff)
+	}
+	if diff := gocmp.Diff(wantReplies, h.gh.replies); diff != "" {
+		h.t.Errorf("replies (-want +got):\n%s", diff)
+	}
+	h.gh.mu.Unlock()
+
+	for _, p := range state.Proposals {
+		if p.State != gate.ProposalApplied || p.AppliedSHA != e2eAppliedSHA {
+			h.t.Errorf("proposal %s = %s at %q, want applied at %s", p.ID, p.State, p.AppliedSHA, e2eAppliedSHA)
+		}
+		if body := h.commentWith(proposalMarker(p.ID)).Body; !strings.Contains(body, "- [x] Apply this change") {
+			h.t.Errorf("proposal comment not ticked:\n%s", body)
+		}
+	}
+	summary := h.commentWith(e2eSummaryMarker).Body
+	if strings.Count(summary, "applied (commit1)") != 2 || !strings.Contains(summary, "✅ All proposals applied.") || strings.Contains(summary, "Apply all") {
+		h.t.Errorf("summary should show both proposals applied and the all-applied status line:\n%s", summary)
+	}
+}
+
+func proposalMarker(id string) string { return "<!-- pollux-agent:proposal:" + id + " -->" }
+
+func TestWebhookApplyAllEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	t.Run("summary tick", func(t *testing.T) {
+		t.Parallel()
+		h := newApplyHarness(t)
+		h.tickSummary("dev", "User", "Apply all")
+		h.requireAppliedAll()
+	})
+
+	t.Run("command", func(t *testing.T) {
+		t.Parallel()
+		h := newApplyHarness(t)
+		h.command("dev", "/pollux-agent apply")
+		h.requireAppliedAll()
+	})
+}
+
+func TestWebhookBotCommitIsAnalyzedOnceEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	h := newApplyHarness(t, review.NoImpact{Reason: "docs already match"})
+	h.tickSummary("dev", "User", "Apply all")
+	h.requireAppliedAll()
+
+	run, state := h.pushWith(e2eAppliedSHA, pushOpts{sender: "pollux-agent[bot]", senderType: "Bot"})
+
+	if run.Conclusion != gate.ConclusionSuccess || run.HeadSHA != e2eAppliedSHA {
+		t.Errorf("check run for the bot's commit = %s on %s, want success on %s", run.Conclusion, run.HeadSHA, e2eAppliedSHA)
+	}
+	if len(h.queued) != 0 {
+		t.Errorf("%d scripted verdicts left, want the bot's push analyzed once", len(h.queued))
+	}
+	for _, p := range state.Proposals {
+		if p.State != gate.ProposalApplied {
+			t.Errorf("proposal %s = %s after the bot's push, want applied", p.ID, p.State)
+		}
+	}
+}
+
+func TestWebhookSkipCommitEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	h := newPushHarness(t, twoProposals(), twoProposals())
+	h.push("sha1")
+
+	h.tickSummary("dev", "User", "Skip this commit")
+	state := h.waitState("pending skip", func(s gate.PRState) bool { return s.PendingSkip != nil })
+	if want := (gate.SkipAsk{User: "dev", Scope: gate.SkipCommit}); *state.PendingSkip != want {
+		t.Errorf("pending skip = %+v, want %+v", *state.PendingSkip, want)
+	}
+	comments, _, _ := h.gh.snapshot()
+	if ask := comments[len(comments)-1].Body; !strings.Contains(ask, "@dev") || !strings.Contains(ask, "reason") {
+		t.Errorf("bot's question = %q, want it to ask @dev for a reason", ask)
+	}
+	if got := h.lastRun(); got.Conclusion == gate.ConclusionSuccess {
+		t.Fatalf("check run succeeded before the reason arrived: %+v", got)
+	}
+
+	h.command("dev", "docs are generated for this one")
+	state = h.waitState("skip recorded", func(s gate.PRState) bool { return s.Skip != nil })
+	if want := (gate.Skip{User: "dev", Scope: gate.SkipCommit, Reason: "docs are generated for this one", HeadSHA: "sha1"}); *state.Skip != want || state.PendingSkip != nil {
+		t.Errorf("skip = %+v, pending = %+v, want %+v and no pending ask", *state.Skip, state.PendingSkip, want)
+	}
+	run := h.lastRun()
+	if run.Conclusion != gate.ConclusionSuccess || run.HeadSHA != "sha1" ||
+		!strings.Contains(run.Title, "dev") || !strings.Contains(run.Summary, "commit") || !strings.Contains(run.Summary, "docs are generated for this one") {
+		t.Errorf("skip check run = %+v, want success naming dev, commit scope and the reason", run)
+	}
+	if summary := h.commentWith(e2eSummaryMarker).Body; !strings.Contains(summary, "Skipped by @dev for this commit: docs are generated for this one") {
+		t.Errorf("summary does not show the skip:\n%s", summary)
+	}
+
+	h.drainRuns()
+	next, _ := h.push("sha2")
+	if next.Conclusion != gate.ConclusionActionRequired || next.HeadSHA != "sha2" {
+		t.Errorf("check run for the next push = %s on %s, want action_required on sha2", next.Conclusion, next.HeadSHA)
+	}
+}
+
+func TestWebhookSkipPREndToEnd(t *testing.T) {
+	t.Parallel()
+
+	h := newPushHarness(t, twoProposals(), twoProposals())
+	h.push("sha1")
+
+	h.command("dev", "/pollux-agent skip-pr vendored docs")
+	h.waitState("skip recorded", func(s gate.PRState) bool { return s.Skip != nil })
+	run := h.lastRun()
+	if run.Conclusion != gate.ConclusionSuccess || !strings.Contains(run.Summary, "vendored docs") || !strings.Contains(run.Summary, "PR") {
+		t.Errorf("skip-pr check run = %+v, want success naming the PR scope and the reason", run)
+	}
+
+	h.drainRuns()
+	next, state := h.push("sha2")
+	if next.Conclusion != gate.ConclusionSuccess || next.HeadSHA != "sha2" || !strings.Contains(next.Summary, "vendored docs") {
+		t.Errorf("check run for the later push = %+v, want the skip's success on sha2", next)
+	}
+	if len(h.queued) != 1 {
+		t.Errorf("%d scripted verdicts left, want 1: the later push must not call the runner", len(h.queued))
+	}
+	if state.Skip == nil || state.Skip.Scope != gate.SkipPR {
+		t.Errorf("skip after the later push = %+v, want it carried over", state.Skip)
+	}
+}
+
+func TestWebhookWithoutWriteAccessEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	h := newApplyHarness(t)
+	_, creates, _ := h.gh.snapshot()
+
+	h.command("stranger", "/pollux-agent apply")
+	h.waitFor("reply", func() bool {
+		_, n, _ := h.gh.snapshot()
+		return n > creates
+	})
+
+	comments, n, _ := h.gh.snapshot()
+	if n != creates+1 {
+		t.Errorf("comments created = %d, want exactly one reply", n-creates)
+	}
+	if reply := comments[len(comments)-1].Body; !strings.Contains(reply, "@stranger") || !strings.Contains(reply, "write access") {
+		t.Errorf("reply = %q, want it to tell @stranger about write access", reply)
+	}
+	h.gh.mu.Lock()
+	defer h.gh.mu.Unlock()
+	if len(h.gh.commits) != 0 || len(h.gh.replies) != 0 {
+		t.Errorf("%d commits and %d thread replies, want none", len(h.gh.commits), len(h.gh.replies))
+	}
+}
+
+func TestWebhookForkPullRequestEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	h := newPushHarness(t, twoProposals())
+	h.gh.files["docs/a.md"] = "# A\n\n## Usage\nold\n\n## Other\nx\n"
+	_, state := h.pushWith("sha1", pushOpts{headRepo: "forker/widgets"})
+
+	for _, p := range state.Proposals {
+		body := h.commentWith(proposalMarker(p.ID)).Body
+		if strings.Contains(body, "- [ ] Apply this change") || !strings.Contains(body, "Apply is not available") {
+			t.Errorf("fork proposal comment should explain instead of offering Apply:\n%s", body)
+		}
+	}
+	if summary := h.commentWith(e2eSummaryMarker).Body; !strings.Contains(summary, "Apply all is not available") || strings.Contains(summary, "- [ ] Apply all") {
+		t.Errorf("fork summary should say why Apply all is missing:\n%s", summary)
+	}
+
+	_, creates, _ := h.gh.snapshot()
+	h.command("dev", "/pollux-agent apply")
+	h.waitFor("reply", func() bool {
+		_, n, _ := h.gh.snapshot()
+		return n > creates
+	})
+	comments, _, _ := h.gh.snapshot()
+	if reply := comments[len(comments)-1].Body; !strings.Contains(reply, "@dev") || !strings.Contains(reply, "fork") {
+		t.Errorf("reply = %q, want it to tell @dev about the fork", reply)
+	}
+	h.gh.mu.Lock()
+	defer h.gh.mu.Unlock()
+	if len(h.gh.commits) != 0 {
+		t.Errorf("commits = %+v, want none on a fork", h.gh.commits)
+	}
+}
+
+func TestWebhookIgnoredEditsEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	h := newApplyHarness(t, review.NoImpact{Reason: "barrier"})
+	summary := h.commentWith(e2eSummaryMarker)
+	commentA := h.commentWith(proposalMarker(gate.ProposalID("docs/a.md", "Usage")))
+
+	h.tickSummary("pollux-agent[bot]", "Bot", "Apply all")
+	h.issueComment("edited", "dev", "User", summary.ID, summary.Body, strings.Replace(summary.Body, "- [ ] Apply all", "- [x] Apply all", 1))
+	h.post("pull_request_review_comment", map[string]any{
+		"action":       "edited",
+		"changes":      map[string]any{"body": map[string]any{"from": commentA.Body}},
+		"comment":      map[string]any{"id": commentA.ID, "body": strings.Replace(commentA.Body, "- [ ]", "- [x]", 1)},
+		"pull_request": map[string]any{"number": 1},
+		"sender":       map[string]any{"login": "pollux-agent[bot]", "type": "Bot"},
+	})
+
+	// Jobs on a PR run in order, so a finished push means the edits above were handled.
+	h.pushWith("sha2", pushOpts{})
+	state := h.waitState("barrier push saved", func(s gate.PRState) bool { return s.HeadSHA == "sha2" })
+
+	h.gh.mu.Lock()
+	defer h.gh.mu.Unlock()
+	if h.gh.permissionCalls != 0 || len(h.gh.commits) != 0 || len(h.gh.replies) != 0 {
+		t.Errorf("permission checks = %d, commits = %d, replies = %d, want none from ignored edits",
+			h.gh.permissionCalls, len(h.gh.commits), len(h.gh.replies))
+	}
+	for _, p := range state.Proposals {
+		if p.State == gate.ProposalApplied {
+			t.Errorf("proposal %s applied by an ignored edit", p.ID)
+		}
+	}
+}
+
+func (f *statefulGitHub) React(_ context.Context, _ int64, _, _ string, kind gate.CommentKind, id int64, reaction gate.Reaction) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := reactionKey{kind, id}
+	for rid, r := range f.reactions[key] {
+		if r == reaction {
+			return rid, nil
+		}
+	}
+	if f.reactions == nil {
+		f.reactions = map[reactionKey]map[int64]gate.Reaction{}
+	}
+	if f.reactions[key] == nil {
+		f.reactions[key] = map[int64]gate.Reaction{}
+	}
+	f.nextReaction++
+	f.reactions[key][f.nextReaction] = reaction
+	return f.nextReaction, nil
+}
+
+func (f *statefulGitHub) Unreact(_ context.Context, _ int64, _, _ string, kind gate.CommentKind, id, reactionID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.reactions[reactionKey{kind, id}], reactionID)
+	return nil
 }

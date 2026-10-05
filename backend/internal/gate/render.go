@@ -16,7 +16,7 @@ func proposalMarker(id string) string {
 // proposalComment is the review comment for p: a suggestion on the doc's own
 // lines when they lie within one head-side hunk of the PR diff, else the
 // checkbox variant on the anchor line.
-func proposalComment(headSHA, id string, p review.Proposal, changed []review.ChangedFile) ReviewComment {
+func proposalComment(headSHA, id string, p review.Proposal, changed []review.ChangedFile, fork bool) ReviewComment {
 	if suggestable(p, changed) {
 		rc := ReviewComment{CommitSHA: headSHA, Path: p.DocPath, Line: p.Lines.End, Body: renderSuggestion(id, p)}
 		if p.Lines.Start != p.Lines.End {
@@ -24,7 +24,7 @@ func proposalComment(headSHA, id string, p review.Proposal, changed []review.Cha
 		}
 		return rc
 	}
-	return ReviewComment{CommitSHA: headSHA, Path: p.Anchor.File, Line: p.Anchor.Line, Body: renderCheckbox(id, p)}
+	return ReviewComment{CommitSHA: headSHA, Path: p.Anchor.File, Line: p.Anchor.Line, Body: renderCheckbox(id, p, fork)}
 }
 
 func suggestable(p review.Proposal, changed []review.ChangedFile) bool {
@@ -69,7 +69,7 @@ func renderOutdated(id, headSHA, old string) string {
 
 // renderCheckbox is the checkbox-variant review comment body: the edit as a
 // diff of the section's old lines against the proposed ones.
-func renderCheckbox(id string, p review.Proposal) string {
+func renderCheckbox(id string, p review.Proposal, fork bool) string {
 	var diff strings.Builder
 	if p.Original != "" {
 		writePrefixed(&diff, "-", p.Original)
@@ -88,8 +88,26 @@ func renderCheckbox(id string, p review.Proposal) string {
 	if p.IndexEntry != "" {
 		fmt.Fprintf(&b, "\nIndex entry: `%s`\n", p.IndexEntry)
 	}
-	b.WriteString("\n- [ ] Apply this change\n")
+	if fork {
+		b.WriteString("\nApply is not available: this pull request comes from a fork the bot cannot push to.\n")
+	} else {
+		b.WriteString("\n- [ ] " + applyLabel + "\n")
+	}
 	return b.String()
+}
+
+// tickApply flips the unticked Apply checkbox in body; ok is false when body
+// has no such line.
+func tickApply(body string) (string, bool) {
+	const unticked, ticked = "- [ ] " + applyLabel, "- [x] " + applyLabel
+	lines := strings.Split(body, "\n")
+	for i, l := range lines {
+		if l == unticked {
+			lines[i] = ticked
+			return strings.Join(lines, "\n"), true
+		}
+	}
+	return body, false
 }
 
 func proposalTarget(p review.Proposal) string {
@@ -120,17 +138,73 @@ func fenceFor(body string) string {
 	return strings.Repeat("`", max(3, longest+1))
 }
 
-// renderSummary is the summary comment body: one row per proposal in state.
+// renderSummary is the summary comment body: one row per proposal in state,
+// then the PR-wide checkboxes redrawn from state.
 func renderSummary(state PRState) string {
 	var b strings.Builder
 	b.WriteString(summaryMarker)
 	b.WriteString("\n\n| Doc | Section | Comment | State |\n| --- | --- | --- | --- |\n")
+	applied, open := 0, 0
 	for _, p := range state.Proposals {
 		section := "(new doc)"
 		if p.Section != "" {
 			section = strings.ReplaceAll(p.Section, "|", `\|`)
 		}
-		fmt.Fprintf(&b, "| `%s` | %s | [view](%s) | %s |\n", strings.ReplaceAll(p.DocPath, "|", `\|`), section, p.CommentURL, p.State)
+		status := string(p.State)
+		switch p.State {
+		case ProposalApplied:
+			applied++
+			status = fmt.Sprintf("applied (%s)", p.AppliedSHA[:min(7, len(p.AppliedSHA))])
+		case ProposalOpen:
+			open++
+		case ProposalOutdated:
+		}
+		link := "-"
+		if p.CommentURL != "" {
+			link = fmt.Sprintf("[view](%s)", p.CommentURL)
+		}
+		fmt.Fprintf(&b, "| `%s` | %s | %s | %s |\n", strings.ReplaceAll(p.DocPath, "|", `\|`), section, link, status)
 	}
+
+	b.WriteString("\n")
+	if state.Fork {
+		b.WriteString("Apply all is not available: this pull request comes from a fork the bot cannot push to.\n")
+	} else {
+		if applied > 0 && open == 0 {
+			b.WriteString("✅ All proposals applied.\n")
+		} else {
+			b.WriteString(checkboxLine(false, applyAllLabel))
+		}
+	}
+	active := state.Skip
+	if active != nil && active.Scope == SkipCommit && active.HeadSHA != state.HeadSHA {
+		active = nil
+	}
+	pending := state.PendingSkip
+	b.WriteString(checkboxLine(scopeIs(SkipCommit, pending, active), skipCommitLabel))
+	b.WriteString(checkboxLine(scopeIs(SkipPR, pending, active), skipPRLabel))
+
+	if active != nil {
+		scope := "this PR"
+		if active.Scope == SkipCommit {
+			scope = "this commit"
+		}
+		fmt.Fprintf(&b, "\nSkipped by @%s for %s: %s\n", active.User, scope, active.Reason)
+	}
+	if state.PendingSkip != nil {
+		fmt.Fprintf(&b, "\nWaiting for @%s to reply with a reason.\n", state.PendingSkip.User)
+	}
+	fmt.Fprintf(&b, "\nCommands: `%[1]s %[2]s`, `%[1]s %[3]s <reason>`, `%[1]s %[4]s <reason>`.\n", commandPrefix, applyCommand, skipCommand, skipPRCommand)
 	return b.String()
+}
+
+func checkboxLine(ticked bool, label string) string {
+	if ticked {
+		return "- [x] " + label + "\n"
+	}
+	return "- [ ] " + label + "\n"
+}
+
+func scopeIs(scope SkipScope, pending *SkipAsk, active *Skip) bool {
+	return pending != nil && pending.Scope == scope || active != nil && active.Scope == scope
 }

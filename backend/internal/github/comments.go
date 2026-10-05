@@ -123,3 +123,17 @@ func (c *Client) EditIssueComment(ctx context.Context, installationID int64, own
 	}
 	return nil
 }
+
+// ReplyToReviewComment posts body as a reply in the thread of review comment inReplyTo.
+func (c *Client) ReplyToReviewComment(ctx context.Context, installationID int64, owner, repo string, number int, inReplyTo int64, body string) (gate.Comment, error) {
+	client, err := c.installationClient(installationID)
+	if err != nil {
+		return gate.Comment{}, fmt.Errorf("reply to review comment %s/%s#%d %d: %w", owner, repo, number, inReplyTo, err)
+	}
+
+	created, _, err := client.PullRequests.CreateCommentInReplyTo(ctx, owner, repo, number, body, inReplyTo)
+	if err != nil {
+		return gate.Comment{}, fmt.Errorf("reply to review comment %s/%s#%d %d: %w", owner, repo, number, inReplyTo, err)
+	}
+	return gate.Comment{ID: created.GetID(), Kind: gate.CommentKindReview, URL: created.GetHTMLURL(), Body: created.GetBody()}, nil
+}

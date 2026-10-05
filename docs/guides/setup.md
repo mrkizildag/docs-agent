@@ -17,7 +17,7 @@ Requires Go (version in `backend/go.mod`) and golangci-lint v2. To run it in pro
 |--------------|--------------------------------------------------------|
 | `make run`   | Start the backend on `:8080` (needs the env vars below); check `GET /healthz`. |
 | `make test`  | `go test -race ./...`                                  |
-| `make lint`  | golangci-lint, including formatting and import rules.  |
+| `make lint`  | golangci-lint, including formatting and import rules. Its cache is per worktree, in `.cache/`. |
 | `make fmt`   | Apply gofmt and goimports.                             |
 | `make generate` | Regenerate `action/proposal.schema.json` and `action/result.schema.json` from the `internal/review` types; a test fails when either is stale. |
 | `make check` | lint, test, and govulncheck; what CI runs.             |

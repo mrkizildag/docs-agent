@@ -9,7 +9,7 @@ covers:
 
 # Proposal output
 
-When a runner returns proposals, the gate reports them three ways on the PR: the `pollux-agent` check run (`action_required`, listing doc paths and reasons), one review comment per proposal on the head commit, and one summary comment on the PR. A "no impact" result sets the check to `success` with the reason and posts no comments. Acting on a proposal is not built yet: the "Apply this change" checkbox is rendered unticked and does nothing until #14 (Apply, Apply all, Skip, permissions, forks).
+When a runner returns proposals, the gate reports them three ways on the PR: the `pollux-agent` check run (`action_required`, listing doc paths and reasons), one review comment per proposal on the head commit, and one summary comment on the PR. A "no impact" result sets the check to `success` with the reason and posts no comments. The checkboxes act on the proposals; see [Apply and Skip](apply-skip.md). The summary also carries the PR-wide "Apply all", "Skip this commit", and "Skip this PR" checkboxes, drawn from stored state on every redraw (the bot never draws "Apply all" ticked: once a proposal is applied and none is open, the line becomes "✅ All proposals applied."), each proposal's applied state, and, on a fork PR, a notice that Apply is unavailable (proposal comments then have no Apply checkbox).
 
 ## Where the section text comes from
 
@@ -24,15 +24,16 @@ A proposal's content replaces the whole section, heading line included, because 
 
 ## Identity and re-runs
 
-A proposal's identity is its doc path plus its normalized section heading (leading `#` and whitespace stripped; path alone for a new doc), hashed to a short ID. The gate remembers each proposal's ID, comment ID and URL, and state (`open` or `outdated`), plus the summary comment ID, per PR.
+A proposal's identity is its doc path plus its normalized section heading (leading `#` and whitespace stripped; path alone for a new doc), hashed to a short ID. The gate remembers each proposal's ID, comment ID and URL, and state (`open`, `outdated`, or `applied`), plus the summary comment ID, per PR.
 
 On each run, after the check run is created, the gate reconciles the new proposals against what it remembers:
 
 - **Same proposal again:** its comment is edited in place. The PR's comment count does not change across pushes.
 - **New proposal:** a new review comment.
 - **Proposal gone:** its comment and summary row are marked `outdated`; the old body stays readable under an "Outdated" notice. The gate never deletes a comment: that would erase the thread's replies and history, and a proposal that returns would have to start over. A proposal that returns after being outdated reopens its old comment.
+- **Applied proposal:** stays applied; a re-run neither reopens nor outdates it.
 - **No impact:** every earlier proposal is marked outdated and the check is `success`.
-- **Summary:** one issue comment listing every proposal with doc path, section, a link to its comment, and state. It is edited in place, and only created when there is something to list or one already exists.
+- **Summary:** one issue comment listing every proposal with doc path, section, a link to its comment, and state. It is edited in place, and only created when there is something to list or one already exists. On the first run it is created before the proposal comments, so it sits above them in the timeline (GitHub orders comments by creation time and cannot move them), then edited once to add their links.
 
 A comment keeps its location and variant across edits. GitHub cannot move a review comment, and replacing it would churn the thread. A suggestion block on the wrong lines would overwrite them when applied, so on edit the suggestion body is used only if the existing comment already sits on that doc at the same lines; otherwise the body is the checkbox variant. If a user deletes a proposal's comment, an open proposal gets a fresh comment, and an outdated one is skipped rather than resurrected.
 

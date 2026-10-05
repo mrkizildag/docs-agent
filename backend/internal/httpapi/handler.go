@@ -71,8 +71,40 @@ type pullRequestEvent struct {
 			SHA string `json:"sha"`
 		} `json:"base"`
 		Head struct {
-			SHA string `json:"sha"`
+			SHA  string `json:"sha"`
+			Ref  string `json:"ref"`
+			Repo *struct {
+				FullName string `json:"full_name"`
+			} `json:"repo"`
 		} `json:"head"`
+	} `json:"pull_request"`
+	Repository struct {
+		Name     string `json:"name"`
+		FullName string `json:"full_name"`
+		Owner    struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	} `json:"repository"`
+	Installation struct {
+		ID int64 `json:"id"`
+	} `json:"installation"`
+}
+
+// reviewCommentEvent is the subset of GitHub's pull_request_review_comment
+// webhook payload the handler needs.
+type reviewCommentEvent struct {
+	Action  string `json:"action"`
+	Changes struct {
+		Body struct {
+			From string `json:"from"`
+		} `json:"body"`
+	} `json:"changes"`
+	Comment struct {
+		ID   int64  `json:"id"`
+		Body string `json:"body"`
+	} `json:"comment"`
+	PullRequest struct {
+		Number int `json:"number"`
 	} `json:"pull_request"`
 	Repository struct {
 		Name  string `json:"name"`
@@ -83,6 +115,42 @@ type pullRequestEvent struct {
 	Installation struct {
 		ID int64 `json:"id"`
 	} `json:"installation"`
+	Sender struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	} `json:"sender"`
+}
+
+// issueCommentEvent is the subset of GitHub's issue_comment webhook payload the
+// handler needs.
+type issueCommentEvent struct {
+	Action  string `json:"action"`
+	Changes struct {
+		Body struct {
+			From string `json:"from"`
+		} `json:"body"`
+	} `json:"changes"`
+	Comment struct {
+		ID   int64  `json:"id"`
+		Body string `json:"body"`
+	} `json:"comment"`
+	Issue struct {
+		Number      int       `json:"number"`
+		PullRequest *struct{} `json:"pull_request"`
+	} `json:"issue"`
+	Repository struct {
+		Name  string `json:"name"`
+		Owner struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	} `json:"repository"`
+	Installation struct {
+		ID int64 `json:"id"`
+	} `json:"installation"`
+	Sender struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	} `json:"sender"`
 }
 
 func webhookHandler(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer, runs RunLookup) http.HandlerFunc {
@@ -117,6 +185,10 @@ func webhookHandler(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer, ru
 		switch event {
 		case "pull_request":
 			handlePullRequestEvent(logger, jobs, w, r, deliveryID, body)
+		case "pull_request_review_comment":
+			handleReviewCommentEvent(logger, jobs, w, r, deliveryID, body)
+		case "issue_comment":
+			handleIssueCommentEvent(logger, jobs, w, r, deliveryID, body)
 		case "workflow_run":
 			handleWorkflowRunEvent(logger, jobs, runs, w, r, deliveryID, body)
 		default:
@@ -160,6 +232,8 @@ func handlePullRequestEvent(logger *slog.Logger, jobs Enqueuer, w http.ResponseW
 		Number:         payload.Number,
 		BaseSHA:        payload.PullRequest.Base.SHA,
 		HeadSHA:        payload.PullRequest.Head.SHA,
+		HeadRef:        payload.PullRequest.Head.Ref,
+		Fork:           payload.PullRequest.Head.Repo == nil || payload.PullRequest.Head.Repo.FullName != payload.Repository.FullName,
 	}
 
 	jobPayload, err := json.Marshal(pr)
@@ -188,6 +262,155 @@ func handlePullRequestEvent(logger *slog.Logger, jobs Enqueuer, w http.ResponseW
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func handleReviewCommentEvent(logger *slog.Logger, jobs Enqueuer, w http.ResponseWriter, r *http.Request, deliveryID string, body []byte) {
+	var payload reviewCommentEvent
+	if err := json.Unmarshal(body, &payload); err != nil {
+		logger.Warn("decode pull_request_review_comment payload", "delivery_id", deliveryID, "err", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if payload.Action != "edited" || payload.Sender.Type == "Bot" {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	ticked, ok := tickedLine(payload.Changes.Body.From, payload.Comment.Body)
+	if !ok {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	if payload.Comment.ID == 0 || payload.PullRequest.Number == 0 || payload.Sender.Login == "" ||
+		payload.Repository.Owner.Login == "" || payload.Repository.Name == "" || payload.Installation.ID == 0 || deliveryID == "" {
+		logger.Warn("pull_request_review_comment payload missing fields", "delivery_id", deliveryID)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	ev := gate.CommentEvent{
+		InstallationID: payload.Installation.ID,
+		Owner:          payload.Repository.Owner.Login,
+		Repo:           payload.Repository.Name,
+		Number:         payload.PullRequest.Number,
+		Sender:         payload.Sender.Login,
+		CommentID:      payload.Comment.ID,
+		Kind:           gate.CommentKindReview,
+		Ticked:         ticked,
+		Body:           payload.Comment.Body,
+	}
+	jobPayload, err := json.Marshal(ev)
+	if err != nil {
+		logger.Error("encode comment job payload", "delivery_id", deliveryID, "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	enqueued, err := jobs.Enqueue(r.Context(), jobqueue.NewJob{
+		DeliveryID: deliveryID,
+		Key:        prJobKey(ev.Owner, ev.Repo, ev.Number),
+		Kind:       commentJobKind,
+		Payload:    jobPayload,
+	})
+	if err != nil {
+		logger.Error("enqueue comment job", "delivery_id", deliveryID, "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if !enqueued {
+		logger.Info("duplicate webhook delivery", "delivery_id", deliveryID)
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func handleIssueCommentEvent(logger *slog.Logger, jobs Enqueuer, w http.ResponseWriter, r *http.Request, deliveryID string, body []byte) {
+	var payload issueCommentEvent
+	if err := json.Unmarshal(body, &payload); err != nil {
+		logger.Warn("decode issue_comment payload", "delivery_id", deliveryID, "err", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if (payload.Action != "created" && payload.Action != "edited") ||
+		payload.Issue.PullRequest == nil || payload.Sender.Type == "Bot" {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	var ticked string
+	if payload.Action == "edited" {
+		var ok bool
+		if ticked, ok = tickedLine(payload.Changes.Body.From, payload.Comment.Body); !ok {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+	} else if payload.Comment.Body == "" {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	if payload.Comment.ID == 0 || payload.Issue.Number == 0 || payload.Sender.Login == "" ||
+		payload.Repository.Owner.Login == "" || payload.Repository.Name == "" || payload.Installation.ID == 0 || deliveryID == "" {
+		logger.Warn("issue_comment payload missing fields", "delivery_id", deliveryID)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	ev := gate.CommentEvent{
+		InstallationID: payload.Installation.ID,
+		Owner:          payload.Repository.Owner.Login,
+		Repo:           payload.Repository.Name,
+		Number:         payload.Issue.Number,
+		Sender:         payload.Sender.Login,
+		CommentID:      payload.Comment.ID,
+		Kind:           gate.CommentKindIssue,
+		Ticked:         ticked,
+		Body:           payload.Comment.Body,
+	}
+	jobPayload, err := json.Marshal(ev)
+	if err != nil {
+		logger.Error("encode comment job payload", "delivery_id", deliveryID, "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	enqueued, err := jobs.Enqueue(r.Context(), jobqueue.NewJob{
+		DeliveryID: deliveryID,
+		Key:        prJobKey(ev.Owner, ev.Repo, ev.Number),
+		Kind:       commentJobKind,
+		Payload:    jobPayload,
+	})
+	if err != nil {
+		logger.Error("enqueue comment job", "delivery_id", deliveryID, "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if !enqueued {
+		logger.Info("duplicate webhook delivery", "delivery_id", deliveryID)
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// tickedLine returns the line that went from "- [ ]" to "- [x]" when from became
+// now, and false unless that is the only change.
+func tickedLine(from, now string) (string, bool) {
+	before, after := strings.Split(from, "\n"), strings.Split(now, "\n")
+	if len(before) != len(after) {
+		return "", false
+	}
+	var ticked string
+	for i := range before {
+		if before[i] == after[i] {
+			continue
+		}
+		if ticked != "" || strings.Replace(before[i], "- [ ]", "- [x]", 1) != after[i] {
+			return "", false
+		}
+		ticked = after[i]
+	}
+	return ticked, ticked != ""
 }
 
 func handleWorkflowRunEvent(logger *slog.Logger, jobs Enqueuer, runs RunLookup, w http.ResponseWriter, r *http.Request, deliveryID string, body []byte) {

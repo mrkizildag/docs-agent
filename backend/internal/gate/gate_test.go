@@ -34,7 +34,9 @@ type fakeGitHub struct {
 	createReview, editReview int
 	createIssue, editIssue   int
 	createIssueErr           error
-	failReviewCreate         int // the nth CreateReviewComment call fails once; 0 means never
+	ops                      []string // create/edit calls in order, as "create-issue" etc.
+	failReviewCreate         int      // the nth CreateReviewComment call fails once; 0 means never
+	onCreateIssue            func()
 }
 
 func (f *fakeGitHub) addComment(kind gate.CommentKind, body string) gate.Comment {
@@ -90,6 +92,7 @@ func (f *fakeGitHub) ListComments(context.Context, int64, string, string, int) (
 
 func (f *fakeGitHub) CreateReviewComment(_ context.Context, _ int64, _, _ string, _ int, c gate.ReviewComment) (gate.Comment, error) {
 	f.createReview++
+	f.ops = append(f.ops, "create-review")
 	if f.createReview == f.failReviewCreate {
 		return gate.Comment{}, errors.New("create review comment failed")
 	}
@@ -105,6 +108,10 @@ func (f *fakeGitHub) EditReviewComment(_ context.Context, _ int64, _, _ string, 
 
 func (f *fakeGitHub) CreateIssueComment(_ context.Context, _ int64, _, _ string, _ int, body string) (gate.Comment, error) {
 	f.createIssue++
+	f.ops = append(f.ops, "create-issue")
+	if f.onCreateIssue != nil {
+		f.onCreateIssue()
+	}
 	if f.createIssueErr != nil {
 		return gate.Comment{}, f.createIssueErr
 	}
@@ -113,6 +120,7 @@ func (f *fakeGitHub) CreateIssueComment(_ context.Context, _ int64, _, _ string,
 
 func (f *fakeGitHub) EditIssueComment(_ context.Context, _ int64, _, _ string, id int64, body string) error {
 	f.editIssue++
+	f.ops = append(f.ops, "edit-issue")
 	f.edit(id, body)
 	return nil
 }
@@ -631,7 +639,7 @@ func TestHandleRunCompleted(t *testing.T) {
 			saved := awaitingState()
 			saved.Run = nil
 			got := store.saveCalls[len(store.saveCalls)-1]
-			got.Proposals, got.SummaryCommentID = nil, 0
+			got.Proposals, got.SummaryCommentID, got.ProposalsSHA = nil, 0, ""
 			if diff := cmp.Diff(saved, got); diff != "" {
 				t.Errorf("final SavePR call (-want +got):\n%s", diff)
 			}
@@ -1237,6 +1245,26 @@ func proposalService(t *testing.T, gh *fakeGitHub, store *fakeStore, verdict rev
 	}
 }
 
+func TestHandlePullRequestFirstRunCreatesSummaryFirst(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{}
+	proposalService(t, gh, &fakeStore{}, review.Proposals{proposal("docs/a.md", "A"), proposal("docs/b.md", "B")})
+
+	want := []string{"create-issue", "create-review", "create-review", "edit-issue"}
+	if diff := cmp.Diff(want, gh.ops); diff != "" {
+		t.Errorf("write order (-want +got):\n%s", diff)
+	}
+	if gh.comments[0].Kind != gate.CommentKindIssue {
+		t.Fatalf("first comment kind = %s, want the summary", gh.comments[0].Kind)
+	}
+	for _, c := range gh.comments[1:] {
+		if !strings.Contains(gh.comments[0].Body, "[view]("+c.URL+")") {
+			t.Errorf("summary missing link %s:\n%s", c.URL, gh.comments[0].Body)
+		}
+	}
+}
+
 func TestHandlePullRequestRerunEditsInPlace(t *testing.T) {
 	t.Parallel()
 
@@ -1245,22 +1273,22 @@ func TestHandlePullRequestRerunEditsInPlace(t *testing.T) {
 	both := review.Proposals{proposal("docs/a.md", "A"), proposal("docs/b.md", "B")}
 
 	proposalService(t, gh, store, both)
-	if gh.createReview != 2 || gh.createIssue != 1 || gh.editReview+gh.editIssue != 0 {
-		t.Fatalf("first run: create review/issue = %d/%d, edits = %d/%d, want 2/1, 0/0", gh.createReview, gh.createIssue, gh.editReview, gh.editIssue)
+	if gh.createReview != 2 || gh.createIssue != 1 || gh.editReview != 0 || gh.editIssue != 1 {
+		t.Fatalf("first run: create review/issue = %d/%d, edits = %d/%d, want 2/1, 0/1", gh.createReview, gh.createIssue, gh.editReview, gh.editIssue)
 	}
 
 	proposalService(t, gh, store, both)
-	if gh.createReview != 2 || gh.createIssue != 1 || gh.editReview != 2 || gh.editIssue != 1 || len(gh.comments) != 3 {
-		t.Errorf("same re-run: creates %d/%d edits %d/%d comments %d, want 2/1 2/1 3", gh.createReview, gh.createIssue, gh.editReview, gh.editIssue, len(gh.comments))
+	if gh.createReview != 2 || gh.createIssue != 1 || gh.editReview != 2 || gh.editIssue != 2 || len(gh.comments) != 3 {
+		t.Errorf("same re-run: creates %d/%d edits %d/%d comments %d, want 2/1 2/2 3", gh.createReview, gh.createIssue, gh.editReview, gh.editIssue, len(gh.comments))
 	}
 
 	proposalService(t, gh, store, review.Proposals{both[0]})
-	if len(gh.comments) != 3 || !strings.Contains(gh.comments[1].Body, "Outdated") || !strings.Contains(gh.comments[2].Body, "outdated") {
+	if len(gh.comments) != 3 || !strings.Contains(gh.comments[2].Body, "Outdated") || !strings.Contains(gh.comments[0].Body, "outdated") {
 		t.Errorf("partial re-run comments = %+v, want comment 2 and summary outdated, none added", gh.comments)
 	}
 
 	proposalService(t, gh, store, review.NoImpact{Reason: "x"})
-	if len(gh.comments) != 3 || strings.Contains(gh.comments[2].Body, "| open") {
+	if len(gh.comments) != 3 || strings.Contains(gh.comments[0].Body, "| open") {
 		t.Errorf("no-impact re-run comments = %+v, want all outdated, none added", gh.comments)
 	}
 	if gh.listCalls != 4 {
@@ -1300,17 +1328,16 @@ func TestHandlePullRequestRecoversUnrecordedComments(t *testing.T) {
 func TestHandlePullRequestOutdatesCommentsPostedByACrashedRun(t *testing.T) {
 	t.Parallel()
 
-	gh := &fakeGitHub{createIssueErr: errors.New("boom")}
+	gh := &fakeGitHub{failReviewCreate: 2}
 	store := &fakeStore{}
-	runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
+	runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A"), proposal("docs/b.md", "B")}}}
 	svc := gate.NewService(gh, store, gate.Runners{Server: runner})
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err == nil {
-		t.Fatal("HandlePullRequest() = nil, want the summary create error")
+		t.Fatal("HandlePullRequest() = nil, want the review create error")
 	}
 
-	gh.createIssueErr = nil
 	proposalService(t, gh, store, review.NoImpact{Reason: "x"})
-	if len(gh.comments) != 1 || !strings.Contains(gh.comments[0].Body, "Outdated") {
+	if len(gh.comments) != 2 || !strings.Contains(gh.comments[1].Body, "Outdated") {
 		t.Errorf("comments after no-impact run = %+v, want the crashed run's comment marked outdated", gh.comments)
 	}
 }
@@ -1479,5 +1506,267 @@ func TestReconcileRestoresOmittedHeading(t *testing.T) {
 	_, writes = gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
 	if body := writes[0].Review.Body; strings.Contains(body, "+## Behavior\n") || !strings.Contains(body, "+## Behaviour\n") {
 		t.Errorf("renamed heading: review comment body = %q, want the model's heading kept and no second heading", body)
+	}
+}
+
+func TestOnPushSkips(t *testing.T) {
+	t.Parallel()
+
+	commit := &gate.Skip{User: "dev", Scope: gate.SkipCommit, Reason: "r", HeadSHA: "old111"}
+	pr := &gate.Skip{User: "dev", Scope: gate.SkipPR, Reason: "r", HeadSHA: "old111"}
+	tests := []struct {
+		name        string
+		prev        gate.PRState
+		wantSkip    *gate.Skip
+		wantPending *gate.SkipAsk
+	}{
+		{name: "commit skip cleared", prev: gate.PRState{Skip: commit, PendingSkip: &gate.SkipAsk{User: "dev", Scope: gate.SkipCommit}}},
+		{name: "PR skip kept", prev: gate.PRState{Skip: pr, PendingSkip: &gate.SkipAsk{User: "dev", Scope: gate.SkipPR}}, wantSkip: pr, wantPending: &gate.SkipAsk{User: "dev", Scope: gate.SkipPR}},
+		{name: "pending commit ask kept for the same head", prev: gate.PRState{HeadSHA: "abc123", PendingSkip: &gate.SkipAsk{User: "dev", Scope: gate.SkipCommit}}, wantPending: &gate.SkipAsk{User: "dev", Scope: gate.SkipCommit}},
+		{name: "commit skip kept for the same head", prev: gate.PRState{Skip: &gate.Skip{User: "dev", Scope: gate.SkipCommit, Reason: "r", HeadSHA: "abc123"}}, wantSkip: &gate.Skip{User: "dev", Scope: gate.SkipCommit, Reason: "r", HeadSHA: "abc123"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := gate.OnPush(tt.prev, testPR())
+			if diff := cmp.Diff(tt.wantSkip, got.Skip); diff != "" {
+				t.Errorf("Skip (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tt.wantPending, got.PendingSkip); diff != "" {
+				t.Errorf("PendingSkip (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestOnPushCopiesFork(t *testing.T) {
+	t.Parallel()
+
+	pr := testPR()
+	pr.Fork = true
+	if got := gate.OnPush(gate.PRState{}, pr); !got.Fork {
+		t.Error("OnPush().Fork = false, want true")
+	}
+}
+
+func TestHandlePullRequestPRSkipSkipsAnalysis(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{workflowExists: true, checkRunID: 888}
+	runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "x"}}}
+	store := &fakeStore{stored: gate.PRState{
+		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "old111",
+		Skip: &gate.Skip{User: "dev", Scope: gate.SkipPR, Reason: "generated", HeadSHA: "old111"},
+	}}
+	svc := gate.NewService(gh, store, gate.Runners{Actions: runner, Server: runner})
+
+	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
+		t.Fatalf("HandlePullRequest() = %v, want nil", err)
+	}
+
+	if len(runner.calls) != 0 || gh.changedCalls != 0 {
+		t.Errorf("runner starts = %d, changed-file lists = %d, want no analysis", len(runner.calls), gh.changedCalls)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("created check runs = %d, want 1", len(gh.calls))
+	}
+	if run := gh.calls[0].run; run.HeadSHA != "abc123" || run.Conclusion != gate.ConclusionSuccess || !strings.Contains(run.Summary, "generated") {
+		t.Errorf("check run = %+v, want success on abc123 naming the reason", run)
+	}
+	if got := store.saved; got == nil || got.HeadSHA != "abc123" || got.CheckRunID != 888 || got.Skip == nil || got.Run != nil {
+		t.Errorf("saved state = %+v, want head abc123, check run 888, the PR skip kept and no awaited run", got)
+	}
+}
+
+func TestHandleRunCompletedAfterSkip(t *testing.T) {
+	t.Parallel()
+
+	skipped, _ := gate.OnSkip(awaitingState(), gate.Skip{User: "dev", Scope: gate.SkipCommit, Reason: "typo"})
+
+	t.Run("late run is ignored", func(t *testing.T) {
+		t.Parallel()
+
+		gh := &fakeGitHub{}
+		runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{{DocPath: "docs/a.md", Reason: "x"}}}}
+		svc := gate.NewService(gh, &fakeStore{stored: skipped}, gate.Runners{Actions: runner})
+
+		if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
+			t.Fatalf("HandleRunCompleted() = %v, want nil", err)
+		}
+		if len(gh.updates) != 0 || len(runner.collected) != 0 {
+			t.Errorf("updates = %d, collects = %d, want the late run ignored", len(gh.updates), len(runner.collected))
+		}
+	})
+
+	t.Run("active skip beats the analysis result", func(t *testing.T) {
+		t.Parallel()
+
+		state := awaitingState()
+		state.Skip = skipped.Skip
+		gh := &fakeGitHub{}
+		runner := &fakeRunner{result: review.Result{Verdict: review.NoImpact{Reason: "x"}}}
+		store := &fakeStore{stored: state}
+		svc := gate.NewService(gh, store, gate.Runners{Actions: runner})
+
+		if err := svc.HandleRunCompleted(t.Context(), completedRun("failure")); err != nil {
+			t.Fatalf("HandleRunCompleted() = %v, want nil", err)
+		}
+		if len(gh.updates) != 1 || gh.updates[0].run.Conclusion != gate.ConclusionSuccess || !strings.Contains(gh.updates[0].run.Summary, "typo") {
+			t.Errorf("updates = %+v, want the skip's success", gh.updates)
+		}
+		if store.saved == nil || store.saved.Run != nil {
+			t.Errorf("saved state = %+v, want no awaited run", store.saved)
+		}
+	})
+}
+
+func TestHandleDeadlineAfterSkip(t *testing.T) {
+	t.Parallel()
+
+	state := awaitingState()
+	state.Run.Deadline = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	state.Skip = &gate.Skip{User: "dev", Scope: gate.SkipPR, Reason: "typo", HeadSHA: "abc123"}
+	gh := &fakeGitHub{}
+	svc := gate.NewService(gh, &fakeStore{stored: state}, gate.Runners{})
+
+	err := svc.HandleDeadline(t.Context(), gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}, "n1", state.Run.Deadline.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("HandleDeadline() = %v, want nil", err)
+	}
+	if len(gh.updates) != 1 || gh.updates[0].run.Conclusion != gate.ConclusionSuccess {
+		t.Errorf("updates = %+v, want the skip's success rather than neutral", gh.updates)
+	}
+}
+
+func TestHandlePullRequestRerunSkipsAppliedProposals(t *testing.T) {
+	t.Parallel()
+
+	a, b := proposal("docs/a.md", "A"), proposal("docs/b.md", "B")
+	applied := func(p review.Proposal, content string) gate.ProposalState {
+		return gate.ProposalState{
+			ID: gate.ProposalID(p.DocPath, p.Section), DocPath: p.DocPath, Section: p.Section,
+			State: gate.ProposalApplied, Content: content, Original: p.Original,
+		}
+	}
+	changed := a
+	changed.Content = "## A\nrewritten\n"
+
+	tests := []struct {
+		name        string
+		stored      []gate.ProposalState
+		verdict     review.Proposals
+		wantConc    gate.Conclusion
+		wantTitle   string
+		wantSummary []string
+		notSummary  []string
+	}{
+		{
+			name:      "all applied",
+			stored:    []gate.ProposalState{applied(a, a.Content), applied(b, b.Content)},
+			verdict:   review.Proposals{a, b},
+			wantConc:  gate.ConclusionSuccess,
+			wantTitle: "Docs up to date",
+		},
+		{
+			name:        "one applied one new",
+			stored:      []gate.ProposalState{applied(a, a.Content)},
+			verdict:     review.Proposals{a, b},
+			wantConc:    gate.ConclusionActionRequired,
+			wantTitle:   "Docs need updating",
+			wantSummary: []string{"docs/b.md"},
+			notSummary:  []string{"docs/a.md"},
+		},
+		{
+			name:        "applied but content changed",
+			stored:      []gate.ProposalState{applied(a, a.Content)},
+			verdict:     review.Proposals{changed},
+			wantConc:    gate.ConclusionActionRequired,
+			wantTitle:   "Docs need updating",
+			wantSummary: []string{"docs/a.md"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			gh := &fakeGitHub{}
+			store := &fakeStore{stored: gate.PRState{
+				Owner: "acme", Repo: "widgets", Number: 7, Proposals: tt.stored,
+			}}
+			proposalService(t, gh, store, tt.verdict)
+
+			run := gh.calls[len(gh.calls)-1].run
+			if run.Conclusion != tt.wantConc || run.Title != tt.wantTitle {
+				t.Errorf("check = %s %q, want %s %q", run.Conclusion, run.Title, tt.wantConc, tt.wantTitle)
+			}
+			for _, s := range tt.wantSummary {
+				if !strings.Contains(run.Summary, s) {
+					t.Errorf("summary = %q, want it to mention %q", run.Summary, s)
+				}
+			}
+			for _, s := range tt.notSummary {
+				if strings.Contains(run.Summary, s) {
+					t.Errorf("summary = %q, want it not to mention %q", run.Summary, s)
+				}
+			}
+		})
+	}
+}
+
+func TestHandlePullRequestSkipCancellationNote(t *testing.T) {
+	t.Parallel()
+
+	commitAsk := &gate.SkipAsk{User: "dev", Scope: gate.SkipCommit}
+	prAsk := &gate.SkipAsk{User: "dev", Scope: gate.SkipPR}
+	tests := []struct {
+		name        string
+		ask         *gate.SkipAsk
+		head        string
+		wantNotes   int
+		wantPending *gate.SkipAsk
+	}{
+		{name: "new head cancels commit ask", ask: commitAsk, head: "def4567890", wantNotes: 1},
+		{name: "same head redelivery keeps the ask", ask: commitAsk, head: "abc1234567", wantPending: commitAsk},
+		{name: "PR ask kept", ask: prAsk, head: "def4567890", wantPending: prAsk},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := &fakeStore{stored: gate.PRState{
+				InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7,
+				HeadSHA: "abc1234567", PendingSkip: tt.ask,
+			}}
+			gh := &fakeGitHub{}
+			var savesAtNote int
+			gh.onCreateIssue = func() { savesAtNote = len(store.saveCalls) }
+			svc := gate.NewService(gh, store, gate.Runners{})
+
+			pr := testPR()
+			pr.HeadSHA = tt.head
+			for range 2 {
+				if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
+					t.Fatalf("HandlePullRequest() = %v", err)
+				}
+				store.stored = *store.saved
+			}
+
+			if len(gh.comments) != tt.wantNotes {
+				t.Fatalf("comments = %d, want %d", len(gh.comments), tt.wantNotes)
+			}
+			if tt.wantNotes == 1 {
+				want := "@dev, a new push arrived before your reason, so the skip for `abc1234` was cancelled. Tick **Skip this commit** again to skip the new head."
+				if gh.comments[0].Body != want {
+					t.Errorf("note = %q, want %q", gh.comments[0].Body, want)
+				}
+				if savesAtNote == 0 {
+					t.Error("note posted before SavePR")
+				}
+			}
+			if diff := cmp.Diff(tt.wantPending, store.saved.PendingSkip); diff != "" {
+				t.Errorf("PendingSkip (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
