@@ -72,6 +72,7 @@ linters:
         - stdlib
         - anon
         - github.com/mrkizildag/pollux-agent/backend/internal/review.Started
+        - github.com/mrkizildag/pollux-agent/backend/internal/review.ScaffoldStarted
         - github.com/mrkizildag/pollux-agent/backend/internal/review.Verdict
   exclusions:
     rules:

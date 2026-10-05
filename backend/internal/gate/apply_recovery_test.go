@@ -40,7 +40,7 @@ func TestHandleCommentRetryAfterTheCommitLanded(t *testing.T) {
 	api := apiWithComments()
 	api.pullRequest = gate.PullRequest{HeadSHA: "botbot1234", Open: true}
 	comments := &fakeCommentGitHub{canWrite: true, files: baseFiles(), byAdd: map[string]gate.Commit{"botbot1234": botCommit()}}
-	svc := gate.NewService(api, comments, store, gate.Runners{})
+	svc := gate.NewService(api, comments, store, gate.Runners{}, nil, nil)
 
 	if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)
@@ -66,7 +66,7 @@ func TestHandlePullRequestAdoptsTheCommitEvenWhenTheBranchMovedOn(t *testing.T) 
 		branch: gate.Commit{SHA: "laterlater", Parents: []string{"botbot1234"}, Message: "wip"},
 		byAdd:  map[string]gate.Commit{"botbot1234": botCommit()},
 	}
-	svc := gate.NewService(gh, comments, store, gate.Runners{Server: &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}})
+	svc := gate.NewService(gh, comments, store, gate.Runners{Server: &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}}, nil, nil)
 	pr := gate.PullRequest{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 3, BaseSHA: "base1", HeadSHA: "botbot1234", HeadRef: "feature"}
 
 	if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
@@ -86,7 +86,7 @@ func TestHandleRerunAdoptsThePendingApply(t *testing.T) {
 	gh := &fakeGitHub{pullRequest: gate.PullRequest{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 3, BaseSHA: "base1", HeadSHA: "botbot1234", HeadRef: "feature", Open: true}}
 	gh.addComment(gate.CommentKindReview, "proposal\n- [ ] Apply this change\n")
 	comments := &fakeCommentGitHub{byAdd: map[string]gate.Commit{"botbot1234": botCommit()}}
-	svc := gate.NewService(gh, comments, store, gate.Runners{Server: &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}})
+	svc := gate.NewService(gh, comments, store, gate.Runners{Server: &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}}, nil, nil)
 
 	if err := svc.HandleRerun(t.Context(), gate.RerunRequest{InstallationID: 1, PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 3}}); err != nil {
 		t.Fatalf("HandleRerun() = %v, want nil", err)
@@ -104,7 +104,7 @@ func TestHandleRerunOnANewHeadCancelsAPendingSkipOnce(t *testing.T) {
 	state.PendingSkip = &gate.SkipAsk{User: "dev", Scope: gate.SkipPR}
 	gh := newHeadGitHub()
 	store := &fakeStore{stored: state, live: true}
-	svc := gate.NewService(gh, &fakeCommentGitHub{}, store, gate.Runners{Server: &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}})
+	svc := gate.NewService(gh, &fakeCommentGitHub{}, store, gate.Runners{Server: &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}}, nil, nil)
 	req := gate.RerunRequest{InstallationID: 42, PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}}
 
 	for range 2 {
@@ -128,7 +128,7 @@ func TestHandleCommentRefusesARejectedCommit(t *testing.T) {
 
 	store := &fakeStore{stored: openState(), live: true}
 	comments := &fakeCommentGitHub{canWrite: true, files: baseFiles(), commitErr: fmt.Errorf("%w: protected branch", gate.ErrCommitRejected)}
-	svc := gate.NewService(apiWithComments(), comments, store, gate.Runners{})
+	svc := gate.NewService(apiWithComments(), comments, store, gate.Runners{}, nil, nil)
 	ev := reviewTick(1)
 
 	if err := svc.HandleComment(t.Context(), ev); err != nil {
@@ -150,7 +150,7 @@ func TestHandleCommentRefusesARejectedCommitWithItsReason(t *testing.T) {
 
 	store := &fakeStore{stored: openState(), live: true}
 	comments := &fakeCommentGitHub{canWrite: true, files: baseFiles(), commitErr: &gate.CommitRejectedError{Reason: "the branch is protected"}}
-	svc := gate.NewService(apiWithComments(), comments, store, gate.Runners{})
+	svc := gate.NewService(apiWithComments(), comments, store, gate.Runners{}, nil, nil)
 
 	if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)
@@ -170,7 +170,7 @@ func TestHandleCommentRetryDoesNotClaimTargetsTheAdoptedCommitMissed(t *testing.
 	api := apiWithComments()
 	api.pullRequest = gate.PullRequest{HeadSHA: "botbot1234", Open: true}
 	comments := &fakeCommentGitHub{canWrite: true, files: baseFiles(), byAdd: map[string]gate.Commit{"botbot1234": botCommit()}}
-	svc := gate.NewService(api, comments, store, gate.Runners{})
+	svc := gate.NewService(api, comments, store, gate.Runners{}, nil, nil)
 	ev := reviewTick(2)
 
 	if err := svc.HandleComment(t.Context(), ev); err != nil {
@@ -194,7 +194,7 @@ func TestHandlePullRequestAdoptsACommitUnderAUserPush(t *testing.T) {
 		"user1":      {SHA: "user1", Parents: []string{"botbot1234"}, Message: "wip"},
 		"botbot1234": botCommit(),
 	}}
-	svc := gate.NewService(gh, comments, store, gate.Runners{Server: &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}})
+	svc := gate.NewService(gh, comments, store, gate.Runners{Server: &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}}, nil, nil)
 	pr := gate.PullRequest{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 3, BaseSHA: "base1", HeadSHA: "user1", HeadRef: "feature"}
 
 	if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
@@ -212,7 +212,7 @@ func TestHandlePullRequestAnalyzesTheNewHeadWhenAdoptedCommentsFail(t *testing.T
 	gh := &fakeGitHub{}
 	gh.addComment(gate.CommentKindReview, "proposal\n- [ ] Apply this change\n")
 	comments := &fakeCommentGitHub{replyErr: errors.New("502"), byAdd: map[string]gate.Commit{"botbot1234": botCommit()}}
-	svc := gate.NewService(gh, comments, store, gate.Runners{Server: &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}})
+	svc := gate.NewService(gh, comments, store, gate.Runners{Server: &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}}, nil, nil)
 	pr := gate.PullRequest{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 3, BaseSHA: "base1", HeadSHA: "botbot1234", HeadRef: "feature"}
 
 	if err := svc.HandlePullRequest(t.Context(), pr); err == nil {
@@ -252,7 +252,7 @@ func TestHandleRerunSupersededStillPostsTheSkipCancellationNote(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(t.Context())
 	defer cancel(nil)
 	runner := &fakeRunner{err: errors.New("interrupted"), onStart: func() { cancel(errors.New("superseded")) }}
-	svc := gate.NewService(ctxGitHub{gh}, &fakeCommentGitHub{}, ctxStore{&fakeStore{stored: state, live: true}}, gate.Runners{Server: runner})
+	svc := gate.NewService(ctxGitHub{gh}, &fakeCommentGitHub{}, ctxStore{&fakeStore{stored: state, live: true}}, gate.Runners{Server: runner}, nil, nil)
 
 	_ = svc.HandleRerun(ctx, gate.RerunRequest{InstallationID: 42, PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}})
 
@@ -293,7 +293,7 @@ func TestHandleCommentApplyAllWithAppliedProposalsIsNotNothingLeft(t *testing.T)
 			tc.state(&state)
 			api := apiWithComments()
 			comments := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
-			svc := gate.NewService(api, comments, &fakeStore{stored: state, live: true}, gate.Runners{})
+			svc := gate.NewService(api, comments, &fakeStore{stored: state, live: true}, gate.Runners{}, nil, nil)
 			ev := summaryTick("Apply all")
 
 			if err := svc.HandleComment(t.Context(), ev); err != nil {
@@ -316,7 +316,7 @@ func TestHandleCommentSupersededRerunDropsTheSeenReaction(t *testing.T) {
 	defer cancel(nil)
 	runner := &fakeRunner{err: errors.New("interrupted"), onStart: func() { cancel(errors.New("superseded")) }}
 	comments := &fakeCommentGitHub{canWrite: true}
-	svc := gate.NewService(newHeadGitHub(), comments, &fakeStore{stored: failedSummaryState()}, gate.Runners{Server: runner})
+	svc := gate.NewService(newHeadGitHub(), comments, &fakeStore{stored: failedSummaryState()}, gate.Runners{Server: runner}, nil, nil)
 	ev := rerunEvent()
 
 	if err := svc.HandleComment(ctx, ev); err != nil {
@@ -333,7 +333,7 @@ func TestHandleCommentReappliedProposalGetsANewReply(t *testing.T) {
 	store := &fakeStore{stored: openState(), live: true}
 	api := apiWithComments()
 	comments := &fakeCommentGitHub{canWrite: true, files: baseFiles(), api: api}
-	svc := gate.NewService(api, comments, store, gate.Runners{})
+	svc := gate.NewService(api, comments, store, gate.Runners{}, nil, nil)
 
 	if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)
@@ -359,7 +359,7 @@ func TestHandleCommentStaleApplyUnderAPRSkip(t *testing.T) {
 	state.ProposalsSHA = "older"
 	state.Skip = &gate.Skip{User: "dev", Scope: gate.SkipPR, Reason: "generated", HeadSHA: "older"}
 	comments := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
-	svc := gate.NewService(apiWithComments(), comments, &fakeStore{stored: state, live: true}, gate.Runners{})
+	svc := gate.NewService(apiWithComments(), comments, &fakeStore{stored: state, live: true}, gate.Runners{}, nil, nil)
 
 	if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)

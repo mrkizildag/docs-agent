@@ -212,11 +212,25 @@ func (s *Store) PRsForHead(ctx context.Context, owner, repo, headSHA string) ([]
 	return numbers, nil
 }
 
-// OverdueRuns returns the awaited runs whose deadline is before now. Deadlines
-// are compared as times, not as text, because RFC3339Nano does not sort.
+// OverdueRuns returns the awaited runs, of pull requests and of scaffolds,
+// whose deadline is before now. Deadlines are compared as times, not as text,
+// because RFC3339Nano does not sort.
 func (s *Store) OverdueRuns(ctx context.Context, now time.Time) ([]gate.OverdueRun, error) {
-	rows, err := s.db.QueryContext(ctx,
+	prs, err := s.overdue(ctx, now, false,
 		`SELECT owner, repo, number, run_nonce, run_deadline FROM pull_requests WHERE run_nonce != ''`)
+	if err != nil {
+		return nil, err
+	}
+	scaffolds, err := s.overdue(ctx, now, true,
+		`SELECT owner, repo, 0, run_nonce, run_deadline FROM repo_scaffolds WHERE phase = 'awaiting' AND run_nonce != ''`)
+	if err != nil {
+		return nil, err
+	}
+	return append(prs, scaffolds...), nil
+}
+
+func (s *Store) overdue(ctx context.Context, now time.Time, scaffold bool, query string) ([]gate.OverdueRun, error) {
+	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("list awaited runs: %w", err)
 	}
@@ -224,7 +238,7 @@ func (s *Store) OverdueRuns(ctx context.Context, now time.Time) ([]gate.OverdueR
 
 	var overdue []gate.OverdueRun
 	for rows.Next() {
-		var run gate.OverdueRun
+		run := gate.OverdueRun{Scaffold: scaffold}
 		var deadline string
 		if err := rows.Scan(&run.Owner, &run.Repo, &run.Number, &run.Nonce, &deadline); err != nil {
 			return nil, fmt.Errorf("scan awaited run: %w", err)

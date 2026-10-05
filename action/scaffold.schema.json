@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "index": {
+      "type": "string",
+      "description": "Full markdown of docs/README.md, frontmatter included."
+    },
+    "architecture": {
+      "type": "string",
+      "description": "Full markdown of docs/architecture.md, frontmatter included."
+    },
+    "setup": {
+      "type": "string",
+      "description": "Full markdown of docs/guides/setup.md, frontmatter included."
+    }
+  },
+  "required": [
+    "index",
+    "architecture",
+    "setup"
+  ],
+  "additionalProperties": false
+}

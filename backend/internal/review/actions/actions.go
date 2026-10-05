@@ -74,7 +74,10 @@ type Runner struct {
 	timeout time.Duration
 }
 
-var _ review.AsyncRunner = (*Runner)(nil)
+var (
+	_ review.AsyncRunner     = (*Runner)(nil)
+	_ review.AsyncScaffolder = (*Runner)(nil)
+)
 
 // New returns a Runner that dispatches through api and gives each run timeout
 // to complete.
@@ -99,6 +102,57 @@ func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started,
 	}
 
 	return review.Pending{RunID: runID, Nonce: nonce, Deadline: time.Now().Add(r.timeout)}, nil
+}
+
+// StartScaffold dispatches the workflow with pr_number 0 at req.BaseSHA and
+// returns review.Pending.
+func (r *Runner) StartScaffold(ctx context.Context, req review.ScaffoldRequest) (review.ScaffoldStarted, error) {
+	nonce, err := newNonce()
+	if err != nil {
+		return nil, fmt.Errorf("start actions scaffold %s/%s: %w", req.Owner, req.Repo, err)
+	}
+
+	runID, err := r.api.Dispatch(ctx, req.InstallationID, req.Owner, req.Repo, DispatchInputs{
+		HeadSHA:  req.BaseSHA,
+		PRNumber: 0,
+		Nonce:    nonce,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("start actions scaffold %s/%s: dispatch: %w", req.Owner, req.Repo, err)
+	}
+
+	return review.Pending{RunID: runID, Nonce: nonce, Deadline: time.Now().Add(r.timeout)}, nil
+}
+
+// CollectScaffold decodes the completed run's result artifact. It returns
+// *review.InvalidResultError when the artifact is for another commit or
+// dispatch, reports an error, or holds docs that fail docs.CheckScaffold.
+func (r *Runner) CollectScaffold(ctx context.Context, c review.Completion) (review.Scaffold, error) {
+	raw, err := r.api.ResultArtifact(ctx, c.InstallationID, c.Owner, c.Repo, c.RunID)
+	if err != nil {
+		return review.Scaffold{}, fmt.Errorf("collect actions scaffold run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
+	}
+
+	var art scaffoldArtifact
+	if err := json.Unmarshal(raw, &art); err != nil {
+		return review.Scaffold{}, &review.InvalidResultError{Cause: fmt.Errorf("decode result artifact: %w", err)}
+	}
+
+	out, err := art.output(c)
+	if err != nil {
+		return review.Scaffold{}, &review.InvalidResultError{Cause: err}
+	}
+	if err := docs.CheckScaffold(out.Index, out.Architecture, out.Setup); err != nil {
+		return review.Scaffold{}, &review.InvalidResultError{Cause: errors.New(capText(err.Error()))}
+	}
+
+	return review.Scaffold{
+		Runner:       runnerName,
+		Model:        art.Claude.model(),
+		Index:        out.Index,
+		Architecture: out.Architecture,
+		Setup:        out.Setup,
+	}, nil
 }
 
 // Collect decodes the completed run's result artifact. It returns
@@ -183,19 +237,43 @@ func (r *Runner) fillOriginals(ctx context.Context, c review.Completion, proposa
 }
 
 func (a Artifact) output(c review.Completion) (*review.StructuredOutput, error) {
-	if a.HeadSHA != c.HeadSHA {
-		return nil, fmt.Errorf("artifact head_sha %q, want %q", a.HeadSHA, c.HeadSHA)
-	}
-	if a.Nonce != c.Nonce {
-		return nil, errors.New("artifact nonce does not match the dispatch")
-	}
-	if a.Claude.IsError {
-		return nil, a.Claude.failure()
-	}
-	if a.Claude.StructuredOutput == nil {
-		return nil, errors.New("claude output has no structured_output")
+	if err := a.check(c, a.Claude.StructuredOutput == nil); err != nil {
+		return nil, err
 	}
 	return a.Claude.StructuredOutput, nil
+}
+
+// scaffoldArtifact is Artifact whose structured_output holds the scaffold docs.
+type scaffoldArtifact struct {
+	HeadSHA string `json:"head_sha"`
+	Nonce   string `json:"nonce"`
+	Claude  struct {
+		ClaudeOutput
+		StructuredOutput *review.ScaffoldDocs `json:"structured_output"`
+	} `json:"claude"`
+}
+
+func (a scaffoldArtifact) output(c review.Completion) (*review.ScaffoldDocs, error) {
+	if err := (Artifact{HeadSHA: a.HeadSHA, Nonce: a.Nonce, Claude: a.Claude.ClaudeOutput}).check(c, a.Claude.StructuredOutput == nil); err != nil {
+		return nil, err
+	}
+	return a.Claude.StructuredOutput, nil
+}
+
+func (a Artifact) check(c review.Completion, noOutput bool) error {
+	if a.HeadSHA != c.HeadSHA {
+		return fmt.Errorf("artifact head_sha %q, want %q", a.HeadSHA, c.HeadSHA)
+	}
+	if a.Nonce != c.Nonce {
+		return errors.New("artifact nonce does not match the dispatch")
+	}
+	if a.Claude.IsError {
+		return a.Claude.failure()
+	}
+	if noOutput {
+		return errors.New("claude output has no structured_output")
+	}
+	return nil
 }
 
 // failure describes an errored run from structured fields only; the free-form

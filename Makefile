@@ -6,7 +6,7 @@ export GOLANGCI_LINT_CACHE ?= $(CURDIR)/.cache/golangci-lint
 check: lint test vuln
 
 generate:
-	cd backend && go run ./cmd/genschema ../action/proposal.schema.json ../action/result.schema.json
+	cd backend && go run ./cmd/genschema ../action/proposal.schema.json ../action/result.schema.json ../action/scaffold.schema.json
 
 fmt:
 	cd backend && golangci-lint fmt ./...

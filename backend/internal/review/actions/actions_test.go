@@ -301,3 +301,86 @@ func TestCollectFillsOriginalAndLines(t *testing.T) {
 		t.Errorf("file reads (-want +got):\n%s", diff)
 	}
 }
+
+const scaffoldFrontmatter = "---\ntitle: T\nsummary: S\ncovers: []\n---\n"
+
+func validScaffoldOutput() map[string]any {
+	return map[string]any{
+		"index":        scaffoldFrontmatter + "[a](architecture.md) [s](guides/setup.md)\n",
+		"architecture": scaffoldFrontmatter,
+		"setup":        scaffoldFrontmatter,
+	}
+}
+
+func TestStartScaffold(t *testing.T) {
+	t.Parallel()
+
+	api := &fakeAPI{runID: 42}
+	runner := actions.New(api, 10*time.Minute)
+
+	started, err := runner.StartScaffold(t.Context(), review.ScaffoldRequest{InstallationID: 1, Owner: "o", Repo: "r", BaseSHA: "base"})
+	if err != nil {
+		t.Fatalf("StartScaffold() = %v, want nil", err)
+	}
+	pending, ok := started.(review.Pending)
+	if !ok {
+		t.Fatalf("StartScaffold() = %T, want review.Pending", started)
+	}
+	if pending.RunID != 42 || pending.Nonce == "" || !pending.Deadline.After(time.Now()) {
+		t.Errorf("Pending = %+v, want run 42, a nonce and a future deadline", pending)
+	}
+	want := actions.DispatchInputs{HeadSHA: "base", PRNumber: 0, Nonce: pending.Nonce}
+	if diff := cmp.Diff(want, api.dispatched); diff != "" {
+		t.Errorf("dispatch inputs (-want +got):\n%s", diff)
+	}
+}
+
+func TestCollectScaffold(t *testing.T) {
+	t.Parallel()
+
+	completion := review.Completion{Owner: "o", Repo: "r", HeadSHA: "base", RunID: 42, Nonce: "n1"}
+	badIndex := validScaffoldOutput()
+	badIndex["index"] = scaffoldFrontmatter
+
+	tests := []struct {
+		name        string
+		art         []byte
+		wantInvalid string
+	}{
+		{name: "valid", art: artifact(t, "base", "n1", map[string]any{"structured_output": validScaffoldOutput(), "modelUsage": map[string]any{"m1": map[string]any{}}})},
+		{name: "mismatched nonce", art: artifact(t, "base", "other", map[string]any{"structured_output": validScaffoldOutput()}), wantInvalid: "nonce"},
+		{name: "mismatched head", art: artifact(t, "other", "n1", map[string]any{"structured_output": validScaffoldOutput()}), wantInvalid: "head_sha"},
+		{name: "invalid docs", art: artifact(t, "base", "n1", map[string]any{"structured_output": badIndex}), wantInvalid: "docs/README.md"},
+		{name: "is_error", art: artifact(t, "base", "n1", map[string]any{"is_error": true, "structured_output": validScaffoldOutput()}), wantInvalid: "claude code failed"},
+		{name: "missing output", art: artifact(t, "base", "n1", map[string]any{}), wantInvalid: "no structured_output"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			runner := actions.New(&fakeAPI{artifact: tc.art}, time.Minute)
+			got, err := runner.CollectScaffold(t.Context(), completion)
+			if tc.wantInvalid == "" {
+				if err != nil {
+					t.Fatalf("CollectScaffold() = %v, want nil", err)
+				}
+				want := review.Scaffold{
+					Runner:       "actions",
+					Model:        "m1",
+					Index:        scaffoldFrontmatter + "[a](architecture.md) [s](guides/setup.md)\n",
+					Architecture: scaffoldFrontmatter,
+					Setup:        scaffoldFrontmatter,
+				}
+				if diff := cmp.Diff(want, got); diff != "" {
+					t.Errorf("Scaffold (-want +got):\n%s", diff)
+				}
+				return
+			}
+
+			var invalid *review.InvalidResultError
+			if !errors.As(err, &invalid) || !strings.Contains(err.Error(), tc.wantInvalid) {
+				t.Fatalf("CollectScaffold() = %v, want *InvalidResultError containing %q", err, tc.wantInvalid)
+			}
+		})
+	}
+}

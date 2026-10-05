@@ -31,6 +31,13 @@ const (
 	maxCandidateDocs = 10
 )
 
+// Caps on one scaffold run, which reads the whole repo rather than one diff.
+const (
+	scaffoldStepCap     = 40
+	scaffoldTokenBudget = 600_000
+	scaffoldTimeout     = 8 * time.Minute
+)
+
 // Runner implements review.Runner by triaging candidate docs with a small
 // model and drafting proposals with an agent loop.
 type Runner struct {
@@ -45,7 +52,10 @@ type Runner struct {
 	budget  int
 }
 
-var _ review.Runner = (*Runner)(nil)
+var (
+	_ review.Runner     = (*Runner)(nil)
+	_ review.Scaffolder = (*Runner)(nil)
+)
 
 // New returns a Runner that triages with triageModel, drafts with model, both
 // served by m, and authenticates clones with a token from token.
@@ -71,13 +81,17 @@ func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started,
 
 	res, err := r.analyze(ctx, req)
 	if err != nil {
-		err = fmt.Errorf("start analysis %s/%s#%d: %w", req.Owner, req.Repo, req.Number, err)
-		if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, agent.ErrDeadline) {
-			err = fmt.Errorf("%w: %w", agent.ErrDeadline, err)
-		}
-		return nil, &review.FailedError{Cause: classify(err), Err: err}
+		return nil, failed(fmt.Errorf("start analysis %s/%s#%d: %w", req.Owner, req.Repo, req.Number, err))
 	}
 	return res, nil
+}
+
+// failed classifies err into the *review.FailedError a runner returns.
+func failed(err error) *review.FailedError {
+	if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, agent.ErrDeadline) {
+		err = fmt.Errorf("%w: %w", agent.ErrDeadline, err)
+	}
+	return &review.FailedError{Cause: classify(err), Err: err}
 }
 
 func classify(err error) review.FailureCause {

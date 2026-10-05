@@ -130,7 +130,7 @@ func renderedSummary(t *testing.T, state gate.PRState) string {
 	for range summaryID {
 		gh.addComment(gate.CommentKindIssue, "stale")
 	}
-	svc := gate.NewService(gh, &fakeCommentGitHub{}, &fakeStore{stored: state}, gate.Runners{})
+	svc := gate.NewService(gh, &fakeCommentGitHub{}, &fakeStore{stored: state}, gate.Runners{}, nil, nil)
 	if err := svc.HandleComment(t.Context(), summaryTick("Apply all")); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)
 	}

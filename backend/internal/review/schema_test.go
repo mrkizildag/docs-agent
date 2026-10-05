@@ -19,6 +19,7 @@ func TestSchemasUpToDate(t *testing.T) {
 	}{
 		{"proposal", review.ProposalSchema, "../../../action/proposal.schema.json"},
 		{"result", review.ResultSchema, "../../../action/result.schema.json"},
+		{"scaffold", review.ScaffoldSchema, "../../../action/scaffold.schema.json"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

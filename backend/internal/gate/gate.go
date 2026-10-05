@@ -70,6 +70,8 @@ type GitHub interface {
 	// WorkflowExists reports whether the repo's default branch has the
 	// pollux-agent Actions workflow.
 	WorkflowExists(ctx context.Context, installationID int64, owner, repo string) (bool, error)
+	// DocsExist reports whether the repo has a docs/ folder at ref.
+	DocsExist(ctx context.Context, installationID int64, owner, repo, ref string) (bool, error)
 	// ListChangedFiles returns the files in the pull request's diff with their head-side hunk ranges.
 	ListChangedFiles(ctx context.Context, installationID int64, owner, repo string, number int) ([]review.ChangedFile, error)
 	// ListComments returns the pull request's review comments and issue comments.
@@ -215,7 +217,8 @@ type RerunRequest struct {
 
 // OverdueRun is an awaited run whose deadline has passed, as found by a sweep.
 type OverdueRun struct {
-	PRRef
+	PRRef         // Number is 0 for a scaffold
+	Scaffold bool // the run writes the repo's scaffold
 	Nonce    string
 	Deadline time.Time
 }
@@ -260,6 +263,18 @@ type Store interface {
 	SavePR(ctx context.Context, state PRState) error
 	// PRForRun returns the pull request an external run was dispatched for.
 	PRForRun(ctx context.Context, owner, repo string, runID int64) (number int, ok bool, err error)
+	// LoadScaffold returns the Idle zero-Attempt state (identity fields filled from the args) for a repo never saved.
+	LoadScaffold(ctx context.Context, owner, repo string) (ScaffoldState, error)
+	SaveScaffold(ctx context.Context, state ScaffoldState) error
+	// ScaffoldForRun reports whether the repo's scaffold awaits the external run runID.
+	ScaffoldForRun(ctx context.Context, owner, repo string, runID int64) (bool, error)
+	// RequestScaffold atomically creates the repo's Idle scaffold state if it has
+	// none and records waiter, returning the state as it stands. Existing state is untouched.
+	RequestScaffold(ctx context.Context, installationID int64, owner, repo string, waiter ScaffoldWaiter) (ScaffoldState, error)
+	// UnlinkedScaffoldWaiters returns the repo's recorded check runs not yet marked linked, oldest first.
+	UnlinkedScaffoldWaiters(ctx context.Context, owner, repo string) ([]ScaffoldWaiter, error)
+	// MarkScaffoldWaiterLinked records that the check run no longer waits for the scaffold.
+	MarkScaffoldWaiterLinked(ctx context.Context, owner, repo string, checkRunID int64) error
 }
 
 // OnPush is the state transition for a new head commit: pure, no I/O. It
@@ -675,25 +690,42 @@ func sameAnchor(existing Comment, rc ReviewComment) bool {
 // Runners are the analysis runners a repo may use. A nil Runner means that
 // runner is unavailable.
 type Runners struct {
-	Actions review.AsyncRunner
-	Server  review.Runner
+	Actions ActionsRunner
+	Server  ServerRunner
+}
+
+// ActionsRunner is the runner that works in the repo's Actions workflow: it
+// reviews PRs and writes scaffolds, both completing through a webhook.
+type ActionsRunner interface {
+	review.AsyncRunner
+	review.AsyncScaffolder
+}
+
+// ServerRunner is the runner that works on the server: it reviews PRs and
+// writes scaffolds in one call.
+type ServerRunner interface {
+	review.Runner
+	review.Scaffolder
 }
 
 // Service decides and reports the pollux-agent check run for a pull request.
 type Service struct {
-	gh       GitHub
-	store    Store
-	runners  Runners
-	comments CommentGitHub
+	gh            GitHub
+	store         Store
+	runners       Runners
+	comments      CommentGitHub
+	scaffoldGH    ScaffoldGitHub
+	scaffoldQueue ScaffoldQueue
 	// collectBackoff is the wait before the first Collect retry; it doubles.
 	collectBackoff time.Duration
 }
 
 // NewService returns a Service that reports check runs through gh, acts on
-// comments through comments, persists state through store, and selects among
-// runners for analysis.
-func NewService(gh GitHub, comments CommentGitHub, store Store, runners Runners) *Service {
-	return &Service{gh: gh, comments: comments, store: store, runners: runners, collectBackoff: time.Second}
+// comments through comments, persists state through store, selects among
+// runners for analysis, and writes scaffolds through scaffoldGH, scheduling
+// their jobs on scaffoldQueue.
+func NewService(gh GitHub, comments CommentGitHub, store Store, runners Runners, scaffoldGH ScaffoldGitHub, scaffoldQueue ScaffoldQueue) *Service {
+	return &Service{gh: gh, comments: comments, store: store, runners: runners, scaffoldGH: scaffoldGH, scaffoldQueue: scaffoldQueue, collectBackoff: time.Second}
 }
 
 // WithCollectBackoff sets the wait before the first Collect retry (doubling
@@ -802,16 +834,28 @@ func (s *Service) analyze(ctx context.Context, state PRState, pr PullRequest) er
 		return s.concludeSkipped(ctx, next, pr)
 	}
 
+	docsExist, err := s.gh.DocsExist(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.HeadSHA)
+	if err != nil {
+		return fmt.Errorf("look for docs/ at %s: %w", shortSHA(pr.HeadSHA), err)
+	}
+
 	var hasWorkflow bool
 	if s.runners.Actions != nil || s.runners.Server != nil {
-		var err error
 		hasWorkflow, err = s.gh.WorkflowExists(ctx, pr.InstallationID, pr.Owner, pr.Repo)
 		if err != nil {
 			return fmt.Errorf("find workflow: %w", err)
 		}
 	}
+	selected := selectRunner(hasWorkflow, s.runners)
 
-	switch selectRunner(hasWorkflow, s.runners) {
+	if !docsExist {
+		if selected == runnerNone {
+			return s.concludeNoDocs(ctx, state, pr)
+		}
+		return s.requestScaffold(ctx, state, pr)
+	}
+
+	switch selected {
 	case runnerActions:
 		return s.startRun(ctx, state, pr, s.runners.Actions)
 	case runnerServer:

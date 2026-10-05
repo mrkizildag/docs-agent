@@ -25,6 +25,7 @@ type fakeGitHub struct {
 	updateErr      error
 	workflowExists bool
 	workflowErr    error
+	noDocs         bool
 	changed        []review.ChangedFile
 	changedErr     error
 	changedCalls   int
@@ -93,6 +94,10 @@ func (f *fakeGitHub) GetPullRequest(_ context.Context, installationID int64, own
 
 func (f *fakeGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (bool, error) {
 	return f.workflowExists, f.workflowErr
+}
+
+func (f *fakeGitHub) DocsExist(context.Context, int64, string, string, string) (bool, error) {
+	return !f.noDocs, nil
 }
 
 func (f *fakeGitHub) ListChangedFiles(_ context.Context, _ int64, _, _ string, _ int) ([]review.ChangedFile, error) {
@@ -177,6 +182,14 @@ func (f *fakeRunner) Start(_ context.Context, req review.Request) (review.Starte
 	return f.started, f.err
 }
 
+func (f *fakeRunner) StartScaffold(context.Context, review.ScaffoldRequest) (review.ScaffoldStarted, error) {
+	return nil, errors.New("fakeRunner does not scaffold")
+}
+
+func (f *fakeRunner) CollectScaffold(context.Context, review.Completion) (review.Scaffold, error) {
+	return review.Scaffold{}, errors.New("fakeRunner does not scaffold")
+}
+
 type fakeStore struct {
 	loadCalls   []loadPRCall
 	saveCalls   []gate.PRState
@@ -210,6 +223,28 @@ func (f *fakeStore) LoadPR(_ context.Context, owner, repo string, number int) (g
 
 func (f *fakeStore) PRForRun(context.Context, string, string, int64) (int, bool, error) {
 	return 0, false, nil
+}
+
+func (f *fakeStore) LoadScaffold(_ context.Context, owner, repo string) (gate.ScaffoldState, error) {
+	return gate.ScaffoldState{Owner: owner, Repo: repo, Phase: gate.ScaffoldIdle}, nil
+}
+
+func (f *fakeStore) SaveScaffold(context.Context, gate.ScaffoldState) error { return nil }
+
+func (f *fakeStore) ScaffoldForRun(context.Context, string, string, int64) (bool, error) {
+	return false, nil
+}
+
+func (f *fakeStore) RequestScaffold(_ context.Context, installationID int64, owner, repo string, _ gate.ScaffoldWaiter) (gate.ScaffoldState, error) {
+	return gate.ScaffoldState{Owner: owner, Repo: repo, InstallationID: installationID, Phase: gate.ScaffoldIdle}, nil
+}
+
+func (f *fakeStore) UnlinkedScaffoldWaiters(context.Context, string, string) ([]gate.ScaffoldWaiter, error) {
+	return nil, nil
+}
+
+func (f *fakeStore) MarkScaffoldWaiterLinked(context.Context, string, string, int64) error {
+	return nil
 }
 
 func (f *fakeStore) SavePR(ctx context.Context, state gate.PRState) error {
@@ -276,7 +311,7 @@ func TestHandlePullRequestRunnerSelection(t *testing.T) {
 				runners.Server = tc.server
 			}
 
-			svc := gate.NewService(gh, nil, &fakeStore{}, runners)
+			svc := gate.NewService(gh, nil, &fakeStore{}, runners, nil, nil)
 			pr := testPR()
 			if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
 				t.Fatalf("HandlePullRequest(%+v) = %v, want nil", pr, err)
@@ -315,7 +350,7 @@ func TestHandlePullRequestNoImpact(t *testing.T) {
 
 	gh := &fakeGitHub{workflowExists: false}
 	runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "docs already cover this"}}}
-	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: runner})
+	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: runner}, nil, nil)
 
 	pr := testPR()
 	if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
@@ -344,7 +379,7 @@ func TestHandlePullRequestProposals(t *testing.T) {
 		{DocPath: "docs/b.md", Reason: "config added"},
 	}
 	runner := &fakeRunner{started: review.Result{Verdict: proposals}}
-	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: runner})
+	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: runner}, nil, nil)
 
 	pr := testPR()
 	if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
@@ -367,7 +402,7 @@ func TestHandlePullRequestWorkflowExistsError(t *testing.T) {
 
 	wantErr := errors.New("boom")
 	gh := &fakeGitHub{workflowErr: wantErr}
-	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: &fakeRunner{}})
+	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: &fakeRunner{}}, nil, nil)
 
 	err := svc.HandlePullRequest(t.Context(), testPR())
 	if !errors.Is(err, wantErr) {
@@ -381,7 +416,7 @@ func TestHandlePullRequestPassesChangedFiles(t *testing.T) {
 	changed := []review.ChangedFile{{Path: "a.go", Hunks: []review.LineRange{{Start: 3, End: 9}}, Patch: "@@ -1 +3,7 @@"}}
 	gh := &fakeGitHub{changed: changed}
 	runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
-	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: runner})
+	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: runner}, nil, nil)
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
 		t.Fatalf("HandlePullRequest() = %v, want nil", err)
@@ -400,7 +435,7 @@ func TestHandlePullRequestListChangedFilesError(t *testing.T) {
 	wantErr := errors.New("boom")
 	gh := &fakeGitHub{changedErr: wantErr}
 	runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
-	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: runner})
+	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: runner}, nil, nil)
 
 	err := svc.HandlePullRequest(t.Context(), testPR())
 	if !errors.Is(err, wantErr) {
@@ -418,7 +453,7 @@ func TestHandlePullRequestNoRunnersSkipsWorkflowLookup(t *testing.T) {
 	t.Parallel()
 
 	gh := &fakeGitHub{workflowErr: errors.New("boom")}
-	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{})
+	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{}, nil, nil)
 
 	pr := testPR()
 	if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
@@ -437,7 +472,7 @@ func TestHandlePullRequestEmptyProposals(t *testing.T) {
 
 	gh := &fakeGitHub{}
 	runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{}}}
-	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: runner})
+	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: runner}, nil, nil)
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
 		t.Fatalf("HandlePullRequest() = %v, want nil", err)
@@ -453,7 +488,7 @@ func TestHandlePullRequestRunnerStartError(t *testing.T) {
 	wantErr := errors.New("boom")
 	gh := &fakeGitHub{}
 	runner := &fakeRunner{err: wantErr}
-	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: runner})
+	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: runner}, nil, nil)
 
 	err := svc.HandlePullRequest(t.Context(), testPR())
 	if !errors.Is(err, wantErr) {
@@ -467,7 +502,7 @@ func TestHandlePullRequestCreateCheckRunError(t *testing.T) {
 	wantErr := errors.New("boom")
 	gh := &fakeGitHub{err: wantErr}
 	store := &fakeStore{}
-	svc := gate.NewService(gh, nil, store, gate.Runners{})
+	svc := gate.NewService(gh, nil, store, gate.Runners{}, nil, nil)
 
 	err := svc.HandlePullRequest(t.Context(), testPR())
 	if !errors.Is(err, wantErr) {
@@ -507,7 +542,7 @@ func TestHandlePullRequestSavesState(t *testing.T) {
 
 	gh := &fakeGitHub{}
 	store := &fakeStore{}
-	svc := gate.NewService(gh, nil, store, gate.Runners{})
+	svc := gate.NewService(gh, nil, store, gate.Runners{}, nil, nil)
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
 		t.Fatalf("HandlePullRequest() = %v, want nil", err)
@@ -528,7 +563,7 @@ func TestHandlePullRequestLoadError(t *testing.T) {
 
 	wantErr := errors.New("boom")
 	gh := &fakeGitHub{}
-	svc := gate.NewService(gh, nil, &fakeStore{loadErr: wantErr}, gate.Runners{})
+	svc := gate.NewService(gh, nil, &fakeStore{loadErr: wantErr}, gate.Runners{}, nil, nil)
 
 	err := svc.HandlePullRequest(t.Context(), testPR())
 	if !errors.Is(err, wantErr) {
@@ -543,7 +578,7 @@ func TestHandlePullRequestSaveError(t *testing.T) {
 	t.Parallel()
 
 	wantErr := errors.New("boom")
-	svc := gate.NewService(&fakeGitHub{}, nil, &fakeStore{saveErr: wantErr}, gate.Runners{})
+	svc := gate.NewService(&fakeGitHub{}, nil, &fakeStore{saveErr: wantErr}, gate.Runners{}, nil, nil)
 
 	err := svc.HandlePullRequest(t.Context(), testPR())
 	if !errors.Is(err, wantErr) {
@@ -558,7 +593,7 @@ func TestHandlePullRequestActionsStartsRun(t *testing.T) {
 	gh := &fakeGitHub{workflowExists: true, checkRunID: 555}
 	runner := &fakeRunner{started: review.Pending{RunID: 99, Nonce: "n1", Deadline: deadline}}
 	store := &fakeStore{}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner})
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil)
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
 		t.Fatalf("HandlePullRequest() = %v, want nil", err)
@@ -649,7 +684,7 @@ func TestHandleRunCompleted(t *testing.T) {
 
 			gh := &fakeGitHub{}
 			store := &fakeStore{stored: awaitingState()}
-			svc := gate.NewService(gh, nil, store, gate.Runners{Actions: tc.runner})
+			svc := gate.NewService(gh, nil, store, gate.Runners{Actions: tc.runner}, nil, nil)
 
 			if err := svc.HandleRunCompleted(t.Context(), completedRun(tc.conclusion)); (err != nil) != tc.wantErr {
 				t.Fatalf("HandleRunCompleted() = %v, want error = %v", err, tc.wantErr)
@@ -709,7 +744,7 @@ func TestHandleRunCompletedFailedRunCause(t *testing.T) {
 			t.Parallel()
 
 			gh := &fakeGitHub{}
-			svc := gate.NewService(gh, nil, &fakeStore{stored: awaitingState()}, gate.Runners{Actions: tc.runner})
+			svc := gate.NewService(gh, nil, &fakeStore{stored: awaitingState()}, gate.Runners{Actions: tc.runner}, nil, nil)
 
 			if err := svc.HandleRunCompleted(t.Context(), completedRun("failure")); err == nil {
 				t.Fatal("HandleRunCompleted() = nil, want the collect detail for the job log")
@@ -727,7 +762,7 @@ func TestHandlePullRequestSupersedesAwaitedRun(t *testing.T) {
 	gh := &fakeGitHub{workflowExists: true, checkRunID: 556}
 	runner := &fakeRunner{started: review.Pending{RunID: 100, Nonce: "n2"}}
 	store := &fakeStore{stored: awaitingState()}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner})
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil)
 
 	pr := testPR()
 	pr.HeadSHA = "def4567890"
@@ -762,7 +797,7 @@ func TestHandlePullRequestSupersedesAwaitedRunOnSameHead(t *testing.T) {
 
 	gh := &fakeGitHub{workflowExists: true, checkRunID: 556}
 	runner := &fakeRunner{started: review.Pending{RunID: 100, Nonce: "n2"}}
-	svc := gate.NewService(gh, nil, &fakeStore{stored: awaitingState()}, gate.Runners{Actions: runner})
+	svc := gate.NewService(gh, nil, &fakeStore{stored: awaitingState()}, gate.Runners{Actions: runner}, nil, nil)
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
 		t.Fatalf("HandlePullRequest() = %v, want nil", err)
@@ -782,7 +817,7 @@ func TestHandlePullRequestSupersedeUpdateError(t *testing.T) {
 
 	wantErr := errors.New("boom")
 	gh := &fakeGitHub{updateErr: wantErr}
-	svc := gate.NewService(gh, nil, &fakeStore{stored: awaitingState()}, gate.Runners{})
+	svc := gate.NewService(gh, nil, &fakeStore{stored: awaitingState()}, gate.Runners{}, nil, nil)
 
 	pr := testPR()
 	pr.HeadSHA = "def4567"
@@ -825,7 +860,7 @@ func TestHandleDeadline(t *testing.T) {
 
 			gh := &fakeGitHub{}
 			store := &fakeStore{stored: tc.state}
-			svc := gate.NewService(gh, nil, store, gate.Runners{})
+			svc := gate.NewService(gh, nil, store, gate.Runners{}, nil, nil)
 
 			if err := svc.HandleDeadline(t.Context(), ref, tc.nonce, tc.now); err != nil {
 				t.Fatalf("HandleDeadline() = %v, want nil", err)
@@ -869,7 +904,7 @@ func TestHandleRunCompletedIgnoresUnmatchedRun(t *testing.T) {
 			gh := &fakeGitHub{}
 			runner := &fakeRunner{}
 			store := &fakeStore{stored: tc.state}
-			svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner})
+			svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil)
 
 			if err := svc.HandleRunCompleted(t.Context(), tc.rc); err != nil {
 				t.Fatalf("HandleRunCompleted() = %v, want nil", err)
@@ -888,7 +923,7 @@ func TestHandleRunCompletedTransientCollectError(t *testing.T) {
 	gh := &fakeGitHub{}
 	store := &fakeStore{stored: awaitingState()}
 	runner := &fakeRunner{collectErr: wantErr}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}).WithCollectBackoff(0)
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil).WithCollectBackoff(0)
 
 	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); !errors.Is(err, wantErr) {
 		t.Fatalf("HandleRunCompleted() = %v, want %v", err, wantErr)
@@ -911,7 +946,7 @@ func TestHandleRunCompletedCollectRecovers(t *testing.T) {
 	gh := &fakeGitHub{}
 	store := &fakeStore{stored: awaitingState()}
 	runner := &fakeRunner{collectErr: errors.New("502"), failFirst: 2, result: review.Result{Verdict: review.NoImpact{Reason: "fine"}}}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}).WithCollectBackoff(0)
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil).WithCollectBackoff(0)
 
 	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
 		t.Fatalf("HandleRunCompleted() = %v, want nil", err)
@@ -928,7 +963,7 @@ func TestHandlePullRequestActionsCreatesCheckBeforeDispatch(t *testing.T) {
 	gh := &fakeGitHub{workflowExists: true, checkRunID: 555}
 	runner := &fakeRunner{err: wantErr}
 	store := &fakeStore{}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner})
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil)
 
 	err := svc.HandlePullRequest(t.Context(), testPR())
 	if !errors.Is(err, wantErr) {
@@ -953,7 +988,7 @@ func TestHandlePullRequestActionsSurvivesCancelAfterDispatch(t *testing.T) {
 	gh := &fakeGitHub{workflowExists: true, checkRunID: 555}
 	runner := &fakeRunner{started: review.Pending{RunID: 99, Nonce: "n1"}, onStart: cancel}
 	store := &fakeStore{}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner})
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil)
 
 	if err := svc.HandlePullRequest(ctx, testPR()); err != nil {
 		t.Fatalf("HandlePullRequest() = %v, want nil", err)
@@ -987,7 +1022,7 @@ func TestHandleRunCompletedCapsText(t *testing.T) {
 
 			gh := &fakeGitHub{}
 			store := &fakeStore{stored: awaitingState()}
-			svc := gate.NewService(gh, nil, store, gate.Runners{Actions: tt.runner})
+			svc := gate.NewService(gh, nil, store, gate.Runners{Actions: tt.runner}, nil, nil)
 
 			if err := svc.HandleRunCompleted(t.Context(), completedRun(tt.conclude)); err != nil {
 				t.Fatalf("HandleRunCompleted() = %v, want nil", err)
@@ -1279,7 +1314,7 @@ func TestReconcileEditKeepsVariantSafe(t *testing.T) {
 func proposalService(t *testing.T, gh *fakeGitHub, store *fakeStore, verdict review.Verdict) {
 	t.Helper()
 	runner := &fakeRunner{started: review.Result{Verdict: verdict}}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner})
+	svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner}, nil, nil)
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
 		t.Fatalf("HandlePullRequest() = %v, want nil", err)
 	}
@@ -1371,7 +1406,7 @@ func TestHandlePullRequestOutdatesCommentsPostedByACrashedRun(t *testing.T) {
 	gh := &fakeGitHub{editIssueErr: errors.New("boom")}
 	store := &fakeStore{}
 	runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner}).WithCollectBackoff(0)
+	svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner}, nil, nil).WithCollectBackoff(0)
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err == nil {
 		t.Fatal("HandlePullRequest() = nil, want the summary edit error")
 	}
@@ -1389,7 +1424,7 @@ func TestHandleRunCompletedPostsComments(t *testing.T) {
 	gh := &fakeGitHub{changed: []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 20}}}}}
 	runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
 	store := &fakeStore{stored: awaitingState()}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}).WithCollectBackoff(0)
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil).WithCollectBackoff(0)
 
 	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
 		t.Fatalf("HandleRunCompleted() = %v, want nil", err)
@@ -1418,7 +1453,7 @@ func TestHandleRunCompletedRetriesFailedPosts(t *testing.T) {
 	state := awaitingState()
 	state.CheckRunID = 5
 	store := &fakeStore{stored: state}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}).WithCollectBackoff(0)
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil).WithCollectBackoff(0)
 
 	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
 		t.Fatalf("HandleRunCompleted() = %v, want nil after the inline retry", err)
@@ -1450,7 +1485,7 @@ func TestHandleRunCompletedGivesUpOnPersistentPostFailure(t *testing.T) {
 	state := awaitingState()
 	state.CheckRunID = 5
 	store := &fakeStore{stored: state}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}).WithCollectBackoff(0)
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil).WithCollectBackoff(0)
 
 	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err == nil {
 		t.Fatal("HandleRunCompleted() = nil, want the summary failure after the retries")
@@ -1517,7 +1552,7 @@ func TestHandleRunCompletedChangedFilesError(t *testing.T) {
 	gh := &fakeGitHub{changedErr: wantErr}
 	runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
 	store := &fakeStore{stored: awaitingState()}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner})
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil)
 
 	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); !errors.Is(err, wantErr) {
 		t.Fatalf("HandleRunCompleted() = %v, want wrapping %v", err, wantErr)
@@ -1536,7 +1571,7 @@ func TestHandleRunCompletedFailureKeepsProposals(t *testing.T) {
 	state.Proposals = []gate.ProposalState{{ID: id, DocPath: "docs/a.md", Section: "A", CommentID: 1, State: gate.ProposalOpen}}
 	gh := &fakeGitHub{}
 	store := &fakeStore{stored: state}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: &fakeRunner{}})
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: &fakeRunner{}}, nil, nil)
 
 	if err := svc.HandleRunCompleted(t.Context(), completedRun("failure")); err != nil {
 		t.Fatalf("HandleRunCompleted() = %v, want nil", err)
@@ -1643,7 +1678,7 @@ func TestHandlePullRequestPRSkipSkipsAnalysis(t *testing.T) {
 		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "old111",
 		Skip: &gate.Skip{User: "dev", Scope: gate.SkipPR, Reason: "generated", HeadSHA: "old111"},
 	}}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner, Server: runner})
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner, Server: runner}, nil, nil)
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
 		t.Fatalf("HandlePullRequest() = %v, want nil", err)
@@ -1673,7 +1708,7 @@ func TestHandleRunCompletedAfterSkip(t *testing.T) {
 
 		gh := &fakeGitHub{}
 		runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{{DocPath: "docs/a.md", Reason: "x"}}}}
-		svc := gate.NewService(gh, nil, &fakeStore{stored: skipped}, gate.Runners{Actions: runner})
+		svc := gate.NewService(gh, nil, &fakeStore{stored: skipped}, gate.Runners{Actions: runner}, nil, nil)
 
 		if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
 			t.Fatalf("HandleRunCompleted() = %v, want nil", err)
@@ -1691,7 +1726,7 @@ func TestHandleRunCompletedAfterSkip(t *testing.T) {
 		gh := &fakeGitHub{}
 		runner := &fakeRunner{result: review.Result{Verdict: review.NoImpact{Reason: "x"}}}
 		store := &fakeStore{stored: state}
-		svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner})
+		svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil)
 
 		if err := svc.HandleRunCompleted(t.Context(), completedRun("failure")); err != nil {
 			t.Fatalf("HandleRunCompleted() = %v, want nil", err)
@@ -1712,7 +1747,7 @@ func TestHandleDeadlineAfterSkip(t *testing.T) {
 	state.Run.Deadline = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	state.Skip = &gate.Skip{User: "dev", Scope: gate.SkipPR, Reason: "typo", HeadSHA: "abc123"}
 	gh := &fakeGitHub{}
-	svc := gate.NewService(gh, nil, &fakeStore{stored: state}, gate.Runners{})
+	svc := gate.NewService(gh, nil, &fakeStore{stored: state}, gate.Runners{}, nil, nil)
 
 	err := svc.HandleDeadline(t.Context(), gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}, "n1", state.Run.Deadline.Add(time.Hour))
 	if err != nil {
@@ -1827,7 +1862,7 @@ func TestHandlePullRequestSkipCancellationNote(t *testing.T) {
 			gh := &fakeGitHub{}
 			var savesAtNote int
 			gh.onCreateIssue = func() { savesAtNote = len(store.saveCalls) }
-			svc := gate.NewService(gh, nil, store, gate.Runners{})
+			svc := gate.NewService(gh, nil, store, gate.Runners{}, nil, nil)
 
 			pr := testPR()
 			pr.HeadSHA = tt.head
@@ -1866,7 +1901,7 @@ func TestHandlePullRequestSkipCancellationNoteSurvivesFailedAnalysis(t *testing.
 	}}
 	gh := &fakeGitHub{checkRunID: 5}
 	failure := &review.FailedError{Cause: review.CauseLimit, Err: errors.New("limit")}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Server: &fakeRunner{err: failure}})
+	svc := gate.NewService(gh, nil, store, gate.Runners{Server: &fakeRunner{err: failure}}, nil, nil)
 	pr := testPR()
 	pr.HeadSHA = "def4567890"
 
@@ -1893,7 +1928,7 @@ func TestHandlePullRequestServerStartErrorEndsNeutral(t *testing.T) {
 	failure := &review.FailedError{Cause: review.CauseLimit, Err: errors.New("model said: leak-me")}
 	gh := &fakeGitHub{checkRunID: 555}
 	store := &fakeStore{}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Server: &fakeRunner{err: failure}})
+	svc := gate.NewService(gh, nil, store, gate.Runners{Server: &fakeRunner{err: failure}}, nil, nil)
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); !errors.Is(err, failure) {
 		t.Fatalf("HandlePullRequest() = %v, want wrapping %v", err, failure)
@@ -1938,7 +1973,7 @@ func TestHandleRerun(t *testing.T) {
 
 			gh := &fakeGitHub{pullRequest: gate.PullRequest{BaseSHA: "base1", HeadSHA: "new222", Open: true}}
 			runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
-			svc := gate.NewService(gh, nil, &fakeStore{stored: stored}, gate.Runners{Server: runner})
+			svc := gate.NewService(gh, nil, &fakeStore{stored: stored}, gate.Runners{Server: runner}, nil, nil)
 
 			if err := svc.HandleRerun(t.Context(), gate.RerunRequest{InstallationID: 42, PRRef: ref, SummaryCommentID: tc.comment}); err != nil {
 				t.Fatalf("HandleRerun() = %v, want nil", err)
@@ -1986,7 +2021,7 @@ func TestHandleRerunSkips(t *testing.T) {
 			gh := &fakeGitHub{pullRequest: tc.pr}
 			runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
 			store := &fakeStore{stored: tc.stored}
-			svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner})
+			svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner}, nil, nil)
 
 			if err := svc.HandleRerun(t.Context(), gate.RerunRequest{InstallationID: 42, PRRef: ref}); err != nil {
 				t.Fatalf("HandleRerun() = %v, want nil", err)
@@ -2004,7 +2039,7 @@ func TestHandleRerunSupersedesOverdueAnalysisOfSameHead(t *testing.T) {
 	stored := gate.PRState{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "new222", CheckRunID: 5, Run: &gate.AwaitingRun{Nonce: "n", Deadline: time.Now().Add(-time.Minute)}}
 	gh := &fakeGitHub{pullRequest: gate.PullRequest{HeadSHA: "new222", Open: true}}
 	runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
-	svc := gate.NewService(gh, nil, &fakeStore{stored: stored}, gate.Runners{Server: runner})
+	svc := gate.NewService(gh, nil, &fakeStore{stored: stored}, gate.Runners{Server: runner}, nil, nil)
 
 	if err := svc.HandleRerun(t.Context(), gate.RerunRequest{InstallationID: 42, PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}}); err != nil {
 		t.Fatalf("HandleRerun() = %v, want nil", err)
@@ -2023,7 +2058,7 @@ func TestHandlePullRequestServerRunnerRetriesFailedPosts(t *testing.T) {
 	gh := &fakeGitHub{failReviewCreate: 1, changed: []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 20}}}}}
 	runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
 	store := &fakeStore{}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner}).WithCollectBackoff(0)
+	svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner}, nil, nil).WithCollectBackoff(0)
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
 		t.Fatalf("HandlePullRequest() = %v, want nil after the inline retry", err)
@@ -2047,7 +2082,7 @@ func TestHandleRerunSupersedesAnalysisOfOlderHead(t *testing.T) {
 	stored := gate.PRState{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "old111", CheckRunID: 5, Run: &gate.AwaitingRun{Nonce: "n"}}
 	gh := &fakeGitHub{pullRequest: gate.PullRequest{HeadSHA: "new222", Open: true}}
 	runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
-	svc := gate.NewService(gh, nil, &fakeStore{stored: stored}, gate.Runners{Server: runner})
+	svc := gate.NewService(gh, nil, &fakeStore{stored: stored}, gate.Runners{Server: runner}, nil, nil)
 
 	if err := svc.HandleRerun(t.Context(), gate.RerunRequest{InstallationID: 42, PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}}); err != nil {
 		t.Fatalf("HandleRerun() = %v, want nil", err)
@@ -2103,7 +2138,7 @@ func TestHandlePullRequestSizeLimit(t *testing.T) {
 				if kind == "actions" {
 					runners = gate.Runners{Actions: runner}
 				}
-				svc := gate.NewService(gh, nil, &fakeStore{}, runners)
+				svc := gate.NewService(gh, nil, &fakeStore{}, runners, nil, nil)
 
 				err := svc.HandlePullRequest(t.Context(), testPR())
 				if tc.want == "" {
@@ -2183,7 +2218,7 @@ func TestPostCommentsFailureRearmsRunForDeadlineSweep(t *testing.T) {
 		store.saveCalls = nil
 
 		runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
-		svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner}).WithCollectBackoff(0)
+		svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner}, nil, nil).WithCollectBackoff(0)
 		if err := svc.HandlePullRequest(t.Context(), testPR()); !errors.Is(err, editErr) {
 			t.Fatalf("HandlePullRequest() = %v, want wrapping %v", err, editErr)
 		}
@@ -2195,7 +2230,7 @@ func TestPostCommentsFailureRearmsRunForDeadlineSweep(t *testing.T) {
 		gh := &fakeGitHub{changed: []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 20}}, Patch: "@@"}}}
 		runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
 		store := &fakeStore{stored: awaitingState()}
-		svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}).WithCollectBackoff(0)
+		svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil).WithCollectBackoff(0)
 		if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
 			t.Fatalf("HandleRunCompleted() = %v, want nil", err)
 		}
@@ -2216,7 +2251,7 @@ func TestPostCommentsTransientFailureEndsConcluded(t *testing.T) {
 	gh.createIssueFailures = 1
 	runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
 	store := &fakeStore{stored: awaitingState()}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}).WithCollectBackoff(0)
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil).WithCollectBackoff(0)
 	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
 		t.Fatalf("HandleRunCompleted() = %v, want nil after the retry", err)
 	}
@@ -2245,7 +2280,7 @@ func TestHandleDeadlineWritesFailureSummary(t *testing.T) {
 			state.Run = &gate.AwaitingRun{RunID: tc.runID, Nonce: "n1", Deadline: deadline}
 			gh := &fakeGitHub{}
 			store := &fakeStore{stored: state}
-			svc := gate.NewService(gh, nil, store, gate.Runners{})
+			svc := gate.NewService(gh, nil, store, gate.Runners{}, nil, nil)
 
 			ref := gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}
 			if err := svc.HandleDeadline(t.Context(), ref, "n1", deadline.Add(time.Second)); err != nil {
@@ -2280,7 +2315,7 @@ func TestHandlePullRequestConcludesAfterALongAnalysis(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				gh := &fakeGitHub{checkRunID: 7}
 				tc.runner.onStart = func() { time.Sleep(2 * time.Minute) }
-				svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: tc.runner})
+				svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: tc.runner}, nil, nil)
 
 				_ = svc.HandlePullRequest(t.Context(), testPR())
 

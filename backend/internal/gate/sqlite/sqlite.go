@@ -120,6 +120,32 @@ func migrations() []string {
 		ALTER TABLE pr_proposals ADD COLUMN reply_id INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE pull_requests ADD COLUMN failure_cause TEXT NOT NULL DEFAULT '';
 		ALTER TABLE pull_requests ADD COLUMN pending_apply TEXT NOT NULL DEFAULT ''`,
+		`CREATE TABLE repo_scaffolds (
+			owner TEXT NOT NULL,
+			repo TEXT NOT NULL,
+			installation_id INTEGER NOT NULL,
+			phase TEXT NOT NULL,
+			attempt INTEGER NOT NULL DEFAULT 0,
+			base_sha TEXT NOT NULL DEFAULT '',
+			lease_until TEXT NOT NULL DEFAULT '',
+			files TEXT NOT NULL DEFAULT '',
+			branch TEXT NOT NULL DEFAULT '',
+			pr_number INTEGER NOT NULL DEFAULT 0,
+			pr_url TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (owner, repo)
+		);
+		CREATE TABLE scaffold_waiters (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			owner TEXT NOT NULL,
+			repo TEXT NOT NULL,
+			check_run_id INTEGER NOT NULL,
+			pr_number INTEGER NOT NULL,
+			UNIQUE (owner, repo, check_run_id)
+		)`,
+		`ALTER TABLE repo_scaffolds ADD COLUMN run_id INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE repo_scaffolds ADD COLUMN run_nonce TEXT NOT NULL DEFAULT '';
+		ALTER TABLE repo_scaffolds ADD COLUMN run_deadline TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE scaffold_waiters ADD COLUMN linked INTEGER NOT NULL DEFAULT 0`,
 	}
 }
 
