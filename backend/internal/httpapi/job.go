@@ -24,11 +24,12 @@ const pullRequestJobKind = "pull_request"
 const commentJobKind = "comment"
 
 // pullRequestJobPayload is a gate.PullRequest to analyze, or when Rerun is set,
-// a request to re-analyze the PR's current head (the embedded PullRequest is
-// then zero).
+// a request to re-analyze the PR's current head, or when Comment is set, a
+// summary Re-run tick to act on (the embedded PullRequest is then zero).
 type pullRequestJobPayload struct {
 	gate.PullRequest
-	Rerun *gate.RerunRequest `json:",omitempty"`
+	Rerun   *gate.RerunRequest `json:",omitempty"`
+	Comment *gate.CommentEvent `json:",omitempty"`
 }
 
 // workflowRunJobKind identifies durable jobs carrying a gate.RunCompleted payload.
@@ -112,6 +113,12 @@ func HandleJob(prs PullRequestHandler) jobqueue.Handler {
 			var payload pullRequestJobPayload
 			if err := json.Unmarshal(job.Payload, &payload); err != nil {
 				return fmt.Errorf("decode job %d payload (kind %s): %w", job.ID, job.Kind, err)
+			}
+			if payload.Comment != nil {
+				if err := prs.HandleComment(ctx, *payload.Comment); err != nil {
+					return fmt.Errorf("handle rerun comment job %d: %w", job.ID, err)
+				}
+				return nil
 			}
 			if payload.Rerun != nil {
 				if err := prs.HandleRerun(ctx, *payload.Rerun); err != nil {

@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
 
@@ -113,5 +114,29 @@ func TestWebhookCommandReactionsEndToEnd(t *testing.T) {
 				return gocmp.Equal(h.gh.reactionsOn(gate.CommentKindIssue, 100), []gate.Reaction{tc.want})
 			})
 		})
+	}
+}
+
+func TestWebhookRerequestAfterSkipPRRunsNoAnalysisEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	h := newPushHarness(t, twoProposals(), twoProposals())
+	h.push("sha1")
+	h.command("dev", "/pollux-agent skip-pr vendored docs")
+	h.waitState("skip recorded", func(s gate.PRState) bool { return s.Skip != nil })
+	h.drainRuns()
+
+	h.deliverEvent("check_run", checkRunRerequestedBody(t))
+
+	select {
+	case run := <-h.gh.checkRuns:
+		if run.Conclusion != gate.ConclusionSuccess || !strings.Contains(run.Summary, "vendored docs") {
+			t.Errorf("re-requested check run = %+v, want the PR skip's success", run)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the re-requested check run")
+	}
+	if len(h.queued) != 1 {
+		t.Errorf("%d scripted verdicts left, want 1: a re-run under a PR skip must not call the runner", len(h.queued))
 	}
 }

@@ -3,6 +3,7 @@ package gate_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -11,21 +12,6 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
-
-type memStore struct{ state gate.PRState }
-
-func (m *memStore) LoadPR(context.Context, string, string, int) (gate.PRState, error) {
-	return m.state, nil
-}
-
-func (m *memStore) SavePR(_ context.Context, s gate.PRState) error {
-	m.state = s
-	return nil
-}
-
-func (m *memStore) PRForRun(context.Context, string, string, int64) (int, bool, error) {
-	return 0, false, nil
-}
 
 type reply struct {
 	to   int64
@@ -37,6 +23,9 @@ type fakeCommentGitHub struct {
 	files     map[string]string
 	commitErr error
 	branch    gate.Commit
+	byAdd     map[string]gate.Commit // CommitAt by sha; the branch tip is found too
+	sha       string                 // the commit CommitFiles makes; "abcdef1234567" when empty
+	api       *fakeGitHub            // when set, replies are also added to its comments
 
 	permissionCalls int
 	commits         [][]gate.FileChange
@@ -45,6 +34,8 @@ type fakeCommentGitHub struct {
 
 	nextReaction int64
 	reactions    map[reactionKey]map[int64]gate.Reaction
+	reactionLog  []gate.Reaction // every reaction added, in order
+	reactedAs    int64           // installation of the last React call
 }
 
 type reactionKey struct {
@@ -77,6 +68,9 @@ func (f *fakeCommentGitHub) CommitFiles(_ context.Context, _ int64, _, _, _, _ s
 	}
 	f.commits = append(f.commits, files)
 	f.messages = append(f.messages, message)
+	if f.sha != "" {
+		return f.sha, nil
+	}
 	return "abcdef1234567", nil
 }
 
@@ -86,6 +80,9 @@ func (f *fakeCommentGitHub) BranchCommit(context.Context, int64, string, string,
 
 func (f *fakeCommentGitHub) ReplyToReviewComment(_ context.Context, _ int64, _, _ string, _ int, to int64, body string) (gate.Comment, error) {
 	f.replies = append(f.replies, reply{to: to, body: body})
+	if f.api != nil {
+		return f.api.addComment(gate.CommentKindReview, body), nil
+	}
 	return gate.Comment{ID: int64(900 + len(f.replies))}, nil
 }
 
@@ -118,7 +115,7 @@ func threeState() gate.PRState {
 }
 
 func apiWithComments() *fakeGitHub {
-	api := &fakeGitHub{}
+	api := &fakeGitHub{pullRequest: gate.PullRequest{HeadSHA: "head1", Open: true}}
 	for range 3 {
 		api.addComment(gate.CommentKindReview, "proposal\n- [ ] Apply this change\n")
 	}
@@ -287,9 +284,17 @@ func TestReconcileStoresEdit(t *testing.T) {
 func TestHandleComment(t *testing.T) {
 	t.Parallel()
 
-	adoptable := gate.Commit{SHA: "botbot1234", Parents: []string{"head1"}, Message: singleMsg}
-	wrongMessage := gate.Commit{SHA: "botbot1234", Parents: []string{"head1"}, Message: "someone else's"}
-	wrongParent := gate.Commit{SHA: "botbot1234", Parents: []string{"other"}, Message: singleMsg}
+	adoptable := gate.Commit{SHA: "botbot1234", Parents: []string{"head1"}, Message: singleMsg, Mine: true}
+	wrongMessage := gate.Commit{SHA: "botbot1234", Parents: []string{"head1"}, Message: "someone else's", Mine: true}
+	wrongParent := gate.Commit{SHA: "botbot1234", Parents: []string{"other"}, Message: singleMsg, Mine: true}
+	notMine := gate.Commit{SHA: "botbot1234", Parents: []string{"head1"}, Message: singleMsg}
+	indexSplice := func(s *gate.PRState) {
+		s.Proposals = []gate.ProposalState{
+			s.Proposals[2],
+			{ID: "p4", DocPath: "docs/README.md", Section: "Index", CommentID: 2, State: gate.ProposalOpen,
+				Original: "## Index\n\n- [A](a.md)\n- [B](b.md)\n\n", Content: "## Index\n\n- [A](a.md)\n- [B](b.md)\n- [X](x.md)\n\n"},
+		}
+	}
 	appliedReplyMissing := func(s *gate.PRState) {
 		s.Proposals[0].State, s.Proposals[0].AppliedSHA = gate.ProposalApplied, "abcdef1234567"
 		s.Proposals[1].State, s.Proposals[1].AppliedSHA, s.Proposals[1].ReplyID = gate.ProposalApplied, "abcdef1234567", 7
@@ -300,6 +305,7 @@ func TestHandleComment(t *testing.T) {
 		event       gate.CommentEvent
 		state       func(*gate.PRState)
 		gh          func(*fakeCommentGitHub)
+		api         func(*fakeGitHub)
 		wantErr     bool
 		wantMessage string
 		wantFiles   map[string]string
@@ -337,7 +343,42 @@ func TestHandleComment(t *testing.T) {
 			wantReact: gate.ReactionDone,
 		},
 		{name: "fork", event: reviewTick(1), state: func(s *gate.PRState) { s.Fork = true }, wantSay: "fork", wantReact: gate.ReactionRefused},
-		{name: "stale head", event: reviewTick(1), state: func(s *gate.PRState) { s.ProposalsSHA = "older" }, wantSay: "re-analyzed", wantReact: gate.ReactionRefused},
+		{name: "stale head while a newer push is analyzed", event: reviewTick(1), state: func(s *gate.PRState) {
+			s.ProposalsSHA, s.Run = "older", &gate.AwaitingRun{RunID: 1, Nonce: "n"}
+		}, wantSay: "re-analyzed", wantReact: gate.ReactionRefused},
+		{name: "stale head with nothing running", event: reviewTick(1), state: func(s *gate.PRState) { s.ProposalsSHA = "older" }, wantSay: "no analysis is running", wantReact: gate.ReactionRefused},
+		{name: "stale head after a failed analysis offers a re-run", event: reviewTick(1), state: func(s *gate.PRState) {
+			s.ProposalsSHA, s.FailureCause = "older", "The analysis timed out."
+		}, wantSay: "Re-run analysis", wantReact: gate.ReactionRefused},
+		{name: "live head moved on", event: reviewTick(1), api: func(f *fakeGitHub) { f.pullRequest.HeadSHA = "head2" }, wantSay: "re-analyzed", wantReact: gate.ReactionRefused},
+		{name: "closed pull request", event: reviewTick(1), api: func(f *fakeGitHub) { f.pullRequest.Open = false }, wantSay: "closed", wantReact: gate.ReactionRefused},
+		{name: "invalid stored proposal", event: reviewTick(1), state: func(s *gate.PRState) { s.Proposals[0].Section = "Usage\nx" }, wantSay: "not valid", wantReact: gate.ReactionRefused},
+		{name: "tick on an outdated proposal is refused", event: reviewTick(1), state: func(s *gate.PRState) { s.Proposals[0].State = gate.ProposalOutdated }, wantSay: "outdated", wantReact: gate.ReactionRefused},
+		{
+			name: "new doc's index entry goes in after a splice of the index", event: summaryTick("Apply all"), state: indexSplice,
+			wantMessage: "docs: apply 2 pollux-agent proposals",
+			wantFiles: map[string]string{
+				"docs/c.md":      "# C\n",
+				"docs/README.md": "# Docs\n\n## Index\n\n- [A](a.md)\n- [B](b.md)\n- [X](x.md)\n- [C](c.md)\n\n## More\ntext\n",
+			},
+			wantApplied: []string{"p3", "p4"}, wantReplies: []int64{3, 2}, wantTicks: 2,
+			wantReact: gate.ReactionDone,
+		},
+		{
+			name: "index heading without items gets the entry right after it", event: issueComment("/pollux-agent apply"),
+			state:       func(s *gate.PRState) { s.Proposals = s.Proposals[2:] },
+			gh:          func(f *fakeCommentGitHub) { f.files["docs/README.md"] = "# Docs\n\n## Index\n\n## More\ntext\n" },
+			wantMessage: "docs: apply pollux-agent proposal for docs/c.md",
+			wantFiles:   map[string]string{"docs/c.md": "# C\n", "docs/README.md": "# Docs\n\n## Index\n- [C](c.md)\n\n## More\ntext\n"},
+			wantApplied: []string{"p3"}, wantReplies: []int64{3}, wantTicks: 1,
+			wantReact: gate.ReactionDone,
+		},
+		{
+			name: "branch moved, commit not ours", event: reviewTick(1),
+			gh:        func(f *fakeCommentGitHub) { f.commitErr, f.branch = gate.ErrBranchMoved, notMine },
+			wantSay:   "branch moved",
+			wantReact: gate.ReactionRefused,
+		},
 		{
 			name: "splice mismatch", event: reviewTick(1),
 			gh:        func(f *fakeCommentGitHub) { f.files["docs/a.md"] = "# A\n" },
@@ -393,9 +434,9 @@ func TestHandleComment(t *testing.T) {
 			wantReact: gate.ReactionRefused,
 		},
 		{
-			name: "redelivery posts only the missing replies", event: summaryTick("Apply all"), state: appliedReplyMissing,
-			wantReplies: []int64{1},
-			wantReact:   gate.ReactionDone,
+			name: "redelivery ticks the boxes and posts only the missing replies", event: summaryTick("Apply all"), state: appliedReplyMissing,
+			wantReplies: []int64{1}, wantTicks: 2,
+			wantReact: gate.ReactionDone,
 		},
 		{
 			name: "redelivery of a tick posts its missing reply", event: reviewTick(1), state: appliedReplyMissing,
@@ -417,13 +458,16 @@ func TestHandleComment(t *testing.T) {
 			if tc.state != nil {
 				tc.state(&st)
 			}
-			store := &memStore{state: st}
+			store := &fakeStore{stored: st, live: true}
 			gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
 			if tc.gh != nil {
 				tc.gh(gh)
 			}
 			api := apiWithComments()
-			svc := gate.NewService(api, store, gate.Runners{}).WithComments(gh)
+			if tc.api != nil {
+				tc.api(api)
+			}
+			svc := gate.NewService(api, gh, store, gate.Runners{})
 
 			err := svc.HandleComment(t.Context(), tc.event)
 
@@ -454,7 +498,7 @@ func TestHandleComment(t *testing.T) {
 			}
 
 			var applied []string
-			for i, p := range store.state.Proposals {
+			for i, p := range store.stored.Proposals {
 				if p.State == gate.ProposalApplied && st.Proposals[i].State == gate.ProposalOpen {
 					applied = append(applied, p.ID)
 				}
@@ -487,7 +531,7 @@ func TestHandleComment(t *testing.T) {
 				t.Errorf("user-facing replies = %q, want one containing %q", says, tc.wantSay)
 			}
 			for _, id := range tc.wantReplies {
-				for _, p := range store.state.Proposals {
+				for _, p := range store.stored.Proposals {
 					if p.CommentID == id && p.ReplyID == 0 {
 						t.Errorf("proposal %s has no ReplyID after its reply", p.ID)
 					}
@@ -497,7 +541,7 @@ func TestHandleComment(t *testing.T) {
 				t.Errorf("checkbox edits = %d, want %d", api.editReview, tc.wantTicks)
 			}
 			if tc.wantTicks > 0 {
-				for _, p := range store.state.Proposals {
+				for _, p := range store.stored.Proposals {
 					if p.State == gate.ProposalApplied && !strings.Contains(api.comments[p.CommentID-1].Body, "[x] Apply this change") {
 						t.Errorf("comment %d body = %q, want the Apply box ticked", p.CommentID, api.comments[p.CommentID-1].Body)
 					}
@@ -515,7 +559,7 @@ func TestHandleCommentSideEffects(t *testing.T) {
 
 		gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
 		api := apiWithComments()
-		svc := gate.NewService(api, &memStore{state: threeState()}, gate.Runners{}).WithComments(gh)
+		svc := gate.NewService(api, gh, &fakeStore{stored: threeState(), live: true}, gate.Runners{})
 
 		if err := svc.HandleComment(t.Context(), issueComment("thanks!")); err != nil {
 			t.Fatalf("HandleComment() error = %v", err)
@@ -528,9 +572,9 @@ func TestHandleCommentSideEffects(t *testing.T) {
 	t.Run("a redelivered tick never commits twice", func(t *testing.T) {
 		t.Parallel()
 
-		store := &memStore{state: threeState()}
+		store := &fakeStore{stored: threeState(), live: true}
 		gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
-		svc := gate.NewService(apiWithComments(), store, gate.Runners{}).WithComments(gh)
+		svc := gate.NewService(apiWithComments(), gh, store, gate.Runners{})
 
 		for range 2 {
 			if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
@@ -552,7 +596,7 @@ func TestHandleCommentRefusalUnticks(t *testing.T) {
 		gh := &fakeCommentGitHub{files: baseFiles()}
 		api := apiWithComments()
 		api.edit(1, "proposal\n- [x] Apply this change\n")
-		svc := gate.NewService(api, &memStore{state: threeState()}, gate.Runners{}).WithComments(gh)
+		svc := gate.NewService(api, gh, &fakeStore{stored: threeState(), live: true}, gate.Runners{})
 
 		if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
 			t.Fatalf("HandleComment() error = %v", err)
@@ -573,7 +617,7 @@ func TestHandleCommentRefusalUnticks(t *testing.T) {
 		gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
 		api := apiWithComments()
 		api.edit(summaryID, "- [x] Apply all")
-		svc := gate.NewService(api, &memStore{state: state}, gate.Runners{}).WithComments(gh)
+		svc := gate.NewService(api, gh, &fakeStore{stored: state, live: true}, gate.Runners{})
 
 		if err := svc.HandleComment(t.Context(), summaryTick("Apply all")); err != nil {
 			t.Fatalf("HandleComment() error = %v", err)
@@ -592,7 +636,7 @@ func TestHandleCommentRefusalUnticks(t *testing.T) {
 
 		gh := &fakeCommentGitHub{files: baseFiles()}
 		api := apiWithComments()
-		svc := gate.NewService(api, &memStore{state: threeState()}, gate.Runners{}).WithComments(gh)
+		svc := gate.NewService(api, gh, &fakeStore{stored: threeState(), live: true}, gate.Runners{})
 
 		if err := svc.HandleComment(t.Context(), issueComment("/pollux-agent apply")); err != nil {
 			t.Fatalf("HandleComment() error = %v", err)
@@ -603,7 +647,12 @@ func TestHandleCommentRefusalUnticks(t *testing.T) {
 	})
 }
 
-func (f *fakeCommentGitHub) React(_ context.Context, _ int64, _, _ string, kind gate.CommentKind, id int64, reaction gate.Reaction) (int64, error) {
+func (f *fakeCommentGitHub) React(ctx context.Context, installationID int64, _, _ string, kind gate.CommentKind, id int64, reaction gate.Reaction) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("react: %w", err)
+	}
+	f.reactedAs = installationID
+	f.reactionLog = append(f.reactionLog, reaction)
 	key := reactionKey{kind, id}
 	if f.reactions == nil {
 		f.reactions = map[reactionKey]map[int64]gate.Reaction{}
@@ -616,7 +665,10 @@ func (f *fakeCommentGitHub) React(_ context.Context, _ int64, _, _ string, kind 
 	return f.nextReaction, nil
 }
 
-func (f *fakeCommentGitHub) Unreact(_ context.Context, _ int64, _, _ string, kind gate.CommentKind, id, reactionID int64) error {
+func (f *fakeCommentGitHub) Unreact(ctx context.Context, _ int64, _, _ string, kind gate.CommentKind, id, reactionID int64) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("unreact: %w", err)
+	}
 	delete(f.reactions[reactionKey{kind, id}], reactionID)
 	return nil
 }
@@ -625,7 +677,7 @@ func TestHandleCommentIgnoredReactsToNothing(t *testing.T) {
 	t.Parallel()
 
 	gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
-	svc := gate.NewService(apiWithComments(), &memStore{state: threeState()}, gate.Runners{}).WithComments(gh)
+	svc := gate.NewService(apiWithComments(), gh, &fakeStore{stored: threeState(), live: true}, gate.Runners{})
 
 	if err := svc.HandleComment(t.Context(), issueComment("looks good")); err != nil {
 		t.Fatalf("HandleComment() error = %v", err)
@@ -633,4 +685,14 @@ func TestHandleCommentIgnoredReactsToNothing(t *testing.T) {
 	if gh.nextReaction != 0 {
 		t.Errorf("reactions added = %d, want 0", gh.nextReaction)
 	}
+}
+
+func (f *fakeCommentGitHub) CommitAt(_ context.Context, _ int64, _, _, sha string) (gate.Commit, error) {
+	if c, ok := f.byAdd[sha]; ok {
+		return c, nil
+	}
+	if f.branch.SHA == sha {
+		return f.branch, nil
+	}
+	return gate.Commit{}, nil
 }

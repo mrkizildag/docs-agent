@@ -4,7 +4,7 @@
     "doc_path": {
       "type": "string",
       "description": "Repo-relative path, under docs/, of the doc this proposal changes or creates.",
-      "pattern": "^docs/"
+      "pattern": "^docs/.*\\.mdx?$"
     },
     "section": {
       "type": "string",

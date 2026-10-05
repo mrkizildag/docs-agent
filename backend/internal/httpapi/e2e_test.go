@@ -45,6 +45,39 @@ type e2eGitHub struct {
 	calls chan e2eCheckRunCall
 }
 
+// unusedCommentGitHub is the CommentGitHub of tests that never act on comments.
+type unusedCommentGitHub struct{}
+
+var errUnusedComments = errors.New("comment access is not used by this test")
+
+func (unusedCommentGitHub) Permission(context.Context, int64, string, string, string) (bool, error) {
+	return false, errUnusedComments
+}
+
+func (unusedCommentGitHub) FileAtRef(context.Context, int64, string, string, string, string) ([]byte, bool, error) {
+	return nil, false, errUnusedComments
+}
+
+func (unusedCommentGitHub) CommitFiles(context.Context, int64, string, string, string, string, []gate.FileChange, string) (string, error) {
+	return "", errUnusedComments
+}
+
+func (unusedCommentGitHub) BranchCommit(context.Context, int64, string, string, string) (gate.Commit, error) {
+	return gate.Commit{}, errUnusedComments
+}
+
+func (unusedCommentGitHub) React(context.Context, int64, string, string, gate.CommentKind, int64, gate.Reaction) (int64, error) {
+	return 0, errUnusedComments
+}
+
+func (unusedCommentGitHub) Unreact(context.Context, int64, string, string, gate.CommentKind, int64, int64) error {
+	return errUnusedComments
+}
+
+func (unusedCommentGitHub) ReplyToReviewComment(context.Context, int64, string, string, int, int64, string) (gate.Comment, error) {
+	return gate.Comment{}, errUnusedComments
+}
+
 // noComments is the comment and pull request lookup surface of a fake that
 // never posts comments or re-runs.
 type noComments struct{}
@@ -161,7 +194,7 @@ func TestWebhookToCheckRunEndToEnd(t *testing.T) {
 	})
 
 	gh := &e2eGitHub{calls: make(chan e2eCheckRunCall, 10)}
-	gateSvc := gate.NewService(gh, store, gate.Runners{})
+	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{})
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
@@ -404,7 +437,7 @@ func TestActionsRunnerEndToEnd(t *testing.T) {
 		t.Fatalf("NewClient() error = %v", err)
 	}
 
-	gateSvc := gate.NewService(client, store, gate.Runners{Actions: actions.New(client, 10*time.Minute)})
+	gateSvc := gate.NewService(client, unusedCommentGitHub{}, store, gate.Runners{Actions: actions.New(client, 10*time.Minute)})
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(baseStore, httpapi.HandleJob(gateSvc), logger, 8)
 
@@ -555,7 +588,7 @@ func TestWebhookToProposalCommentsEndToEnd(t *testing.T) {
 		{DocPath: "docs/a.md", Section: "Usage", Anchor: review.Anchor{File: "a.go", Line: 4}, Reason: "flag renamed", Original: "## Usage\nold\n", Lines: review.LineRange{Start: 3, End: 4}, Content: "## Usage\nnew\n"},
 		{DocPath: "docs/b.md", Anchor: review.Anchor{File: "b.go", Line: 9}, Reason: "new feature", Content: "# B\n", IndexEntry: "- [B](b.md)"},
 	}}
-	gateSvc := gate.NewService(gh, store, gate.Runners{Server: runner})
+	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{Server: runner})
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
@@ -896,7 +929,7 @@ func newPushHarness(t *testing.T, outcomes ...any) *pushHarness {
 		queued <- o
 	}
 	gh := &statefulGitHub{checkRuns: make(chan gate.CheckRun, len(outcomes)+8), files: map[string]string{}}
-	gateSvc := gate.NewService(gh, store, gate.Runners{Actions: scriptedRunner{outcomes: queued}, Server: scriptedRunner{outcomes: queued}}).WithComments(gh)
+	gateSvc := gate.NewService(gh, gh, store, gate.Runners{Actions: scriptedRunner{outcomes: queued}, Server: scriptedRunner{outcomes: queued}})
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
@@ -1080,7 +1113,7 @@ func TestWebhookApplyCommitsOnceEndToEnd(t *testing.T) {
 		Branch: "feature", Parent: "sha1", Message: "docs: apply pollux-agent proposal for docs/a.md § Usage",
 		Files: []gate.FileChange{{Path: "docs/a.md", Content: "# A\n\n## Usage\nnew\n\n## Other\nx\n"}},
 	}}
-	wantReply := []replyCall{{InReplyTo: commentA.ID, Body: "✅ Applied in commit1"}}
+	wantReply := []replyCall{{InReplyTo: commentA.ID, Body: appliedReply("commit1234567890", idA)}}
 	if diff := gocmp.Diff(wantCommit, h.gh.commits); diff != "" {
 		t.Errorf("commits (-want +got):\n%s", diff)
 	}
@@ -1359,7 +1392,10 @@ func (h *pushHarness) requireAppliedAll() {
 			{Path: "docs/README.md", Content: "- [B](b.md)\n"},
 		},
 	}}
-	wantReplies := []replyCall{{InReplyTo: 2, Body: "✅ Applied in commit1"}, {InReplyTo: 3, Body: "✅ Applied in commit1"}}
+	wantReplies := []replyCall{
+		{InReplyTo: 2, Body: appliedReply("commit1234567890", gate.ProposalID("docs/a.md", "Usage"))},
+		{InReplyTo: 3, Body: appliedReply("commit1234567890", gate.ProposalID("docs/b.md", ""))},
+	}
 	if diff := gocmp.Diff(wantCommits, h.gh.commits); diff != "" {
 		h.t.Errorf("commits (-want +got):\n%s", diff)
 	}
@@ -1383,6 +1419,10 @@ func (h *pushHarness) requireAppliedAll() {
 }
 
 func proposalMarker(id string) string { return "<!-- pollux-agent:proposal:" + id + " -->" }
+
+func appliedReply(sha, id string) string {
+	return "✅ Applied in " + sha[:7] + "\n\n<!-- pollux-agent:applied:" + id + ":" + sha + " -->"
+}
 
 func TestWebhookApplyAllEndToEnd(t *testing.T) {
 	t.Parallel()
@@ -1899,4 +1939,38 @@ func TestPushSupersedesQueuedRerun(t *testing.T) {
 	if last := h.gh.concluded[len(h.gh.concluded)-1]; last.id != state.CheckRunID || last.run.Conclusion != gate.ConclusionSuccess {
 		t.Errorf("last concluded = %+v, want the newest check run %d concluded", last, state.CheckRunID)
 	}
+}
+
+func TestPushSupersedesQueuedRerunTick(t *testing.T) {
+	t.Parallel()
+
+	failure := &review.FailedError{Cause: review.CauseProvider, Err: errors.New("provider down")}
+	held := heldRun{started: make(chan struct{}), release: make(chan struct{})}
+	h := newPushHarness(t, failure, held, review.NoImpact{Reason: "docs already match"})
+
+	h.push("sha1")
+	h.send("sha2")
+	select {
+	case <-held.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the second analysis to start")
+	}
+	h.tickSummary("dev", "User", "Re-run analysis")
+	h.send("sha3")
+
+	state := h.waitState("the newest head to finish", func(s gate.PRState) bool { return s.HeadSHA == "sha3" && s.Run == nil && s.CheckRunID > 1 })
+	if state.FailureCause != "" {
+		t.Errorf("FailureCause = %q, want the newest head analyzed successfully", state.FailureCause)
+	}
+	if n := len(h.queued); n != 0 {
+		t.Errorf("unconsumed analysis outcomes = %d, want 0 (the Re-run tick must not have run an analysis)", n)
+	}
+}
+
+func (unusedCommentGitHub) CommitAt(context.Context, int64, string, string, string) (gate.Commit, error) {
+	return gate.Commit{}, nil
+}
+
+func (f *statefulGitHub) CommitAt(context.Context, int64, string, string, string) (gate.Commit, error) {
+	return gate.Commit{}, nil
 }

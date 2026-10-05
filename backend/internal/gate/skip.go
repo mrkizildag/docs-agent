@@ -3,6 +3,7 @@ package gate
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 // skipActive reports whether a skip covers the head state reports on.
@@ -39,20 +40,40 @@ func OnSkip(s PRState, sk Skip) (PRState, CheckRun) {
 	return s, skipRun(s)
 }
 
+// maxReasonRunes caps a skip reason, which is echoed in the summary and the check run.
+const maxReasonRunes = 500
+
+// cleanReason makes a user-written skip reason safe to echo: one line, capped,
+// with @mentions and checkbox markup broken so it can notify nobody and cannot
+// pass for a box in the summary.
+func cleanReason(reason string) string {
+	reason = strings.Join(strings.Fields(reason), " ")
+	reason = strings.ReplaceAll(reason, "@", "@\u200b")
+	reason = strings.ReplaceAll(reason, "- [", "-\u200b [")
+	if r := []rune(reason); len(r) > maxReasonRunes {
+		reason = strings.TrimSpace(string(r[:maxReasonRunes-1])) + "…"
+	}
+	return reason
+}
+
 // handleSkip acts on a skip intent from a sender already allowed to write.
 func (s *Service) handleSkip(ctx context.Context, state PRState, in Intent, sender, op string) (Reaction, error) {
+	ctx, cancel := writeContext(ctx)
+	defer cancel()
 	var err error
 	switch in.Kind {
 	case IntentSkipAsk:
 		ask := SkipAsk{User: sender, Scope: in.Scope}
-		if (state.PendingSkip == nil || *state.PendingSkip != ask) && (!skipActive(state) || state.Skip.Scope != ask.Scope) {
+		if (state.PendingSkip != nil && *state.PendingSkip == ask) || (skipActive(state) && state.Skip.Scope == ask.Scope) {
+			err = s.redrawSummary(ctx, state, op)
+		} else {
 			err = s.askSkipReason(ctx, state, ask, op)
 		}
 	case IntentSkip:
-		err = s.skip(ctx, state, Skip{User: sender, Scope: in.Scope, Reason: in.Reason}, op)
+		err = s.skip(ctx, state, Skip{User: sender, Scope: in.Scope, Reason: cleanReason(in.Reason)}, op)
 	case IntentSkipReason:
 		if state.PendingSkip != nil {
-			err = s.skip(ctx, state, Skip{User: state.PendingSkip.User, Scope: state.PendingSkip.Scope, Reason: in.Reason}, op)
+			err = s.skip(ctx, state, Skip{User: state.PendingSkip.User, Scope: state.PendingSkip.Scope, Reason: cleanReason(in.Reason)}, op)
 		}
 	case IntentNone, IntentApply, IntentApplyAll, IntentRerun:
 	}
@@ -68,12 +89,14 @@ func (s *Service) askSkipReason(ctx context.Context, state PRState, ask SkipAsk,
 		return fmt.Errorf("%s: ask for skip reason: %w", op, err)
 	}
 	state.PendingSkip = &ask
-	return s.redrawAndSave(ctx, state, op)
+	return s.saveAndRedraw(ctx, state, op)
 }
 
+// skip concludes the check run as skipped. A skip already in state only redraws
+// the summary, which finishes a run that failed after saving.
 func (s *Service) skip(ctx context.Context, state PRState, sk Skip, op string) error {
 	if state.Skip != nil && *state.Skip == (Skip{User: sk.User, Scope: sk.Scope, Reason: sk.Reason, HeadSHA: state.HeadSHA}) {
-		return nil
+		return s.redrawSummary(ctx, state, op)
 	}
 	state, run := OnSkip(state, sk)
 	if state.CheckRunID == 0 {
@@ -85,19 +108,14 @@ func (s *Service) skip(ctx context.Context, state PRState, sk Skip, op string) e
 	} else if err := s.gh.UpdateCheckRun(ctx, state.InstallationID, state.Owner, state.Repo, state.CheckRunID, run); err != nil {
 		return fmt.Errorf("%s: update check run %d: %w", op, state.CheckRunID, err)
 	}
-	return s.redrawAndSave(ctx, state, op)
+	return s.saveAndRedraw(ctx, state, op)
 }
 
-// redrawAndSave redraws the summary before saving, so a retry after a failed
-// redraw still sees the change as new.
-func (s *Service) redrawAndSave(ctx context.Context, state PRState, op string) error {
-	if state.SummaryCommentID != 0 {
-		if err := s.gh.EditIssueComment(ctx, state.InstallationID, state.Owner, state.Repo, state.SummaryCommentID, renderSummary(state)); err != nil {
-			return fmt.Errorf("%s: edit summary comment: %w", op, err)
-		}
-	}
+// saveAndRedraw saves state before redrawing the summary, so a failed redraw
+// never leaves a concluded check run with unsaved state; a retry redraws again.
+func (s *Service) saveAndRedraw(ctx context.Context, state PRState, op string) error {
 	if err := s.store.SavePR(ctx, state); err != nil {
 		return fmt.Errorf("%s: save state: %w", op, err)
 	}
-	return nil
+	return s.redrawSummary(ctx, state, op)
 }

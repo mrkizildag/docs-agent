@@ -6,12 +6,23 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"unicode"
+
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
+)
+
+const (
+	indexPath    = "docs/README.md"
+	indexHeading = "## Index"
 )
 
 // ErrBranchMoved is returned by CommentGitHub.CommitFiles when the branch no
 // longer points at the parent commit.
 var ErrBranchMoved = errors.New("gate: branch moved")
+
+// ErrCommitRejected is returned by CommentGitHub.CommitFiles when GitHub or the
+// target tree refuses the commit for a reason the user must fix (a protected
+// branch, a symlink or submodule at a proposal's path); nothing was committed.
+var ErrCommitRejected = errors.New("gate: commit rejected")
 
 // FileChange is a whole-file replacement in a commit.
 type FileChange struct {
@@ -24,19 +35,10 @@ type Commit struct {
 	SHA     string
 	Message string
 	Parents []string
+	Mine    bool // authored by this App's bot
 }
 
-// Reaction is a GitHub reaction's content.
-type Reaction string
-
-const (
-	ReactionSeen    Reaction = "eyes"     // the bot picked the action up
-	ReactionDone    Reaction = "rocket"   // the action completed
-	ReactionRefused Reaction = "confused" // the action was refused; a reply says why
-)
-
-// CommentGitHub is what acting on a comment needs from GitHub. It is wired with
-// Service.WithComments.
+// CommentGitHub is what acting on a comment needs from GitHub.
 type CommentGitHub interface {
 	// Permission reports whether user may write to the repository.
 	Permission(ctx context.Context, installationID int64, owner, repo, user string) (canWrite bool, err error)
@@ -47,6 +49,8 @@ type CommentGitHub interface {
 	CommitFiles(ctx context.Context, installationID int64, owner, repo, branch, parentSHA string, files []FileChange, message string) (sha string, err error)
 	// BranchCommit returns the commit branch points at.
 	BranchCommit(ctx context.Context, installationID int64, owner, repo, branch string) (Commit, error)
+	// CommitAt returns the commit sha.
+	CommitAt(ctx context.Context, installationID int64, owner, repo, sha string) (Commit, error)
 	// React adds reaction to comment id of kind and returns the reaction's ID;
 	// adding one that already exists returns the existing ID.
 	React(ctx context.Context, installationID int64, owner, repo string, kind CommentKind, id int64, reaction Reaction) (int64, error)
@@ -54,135 +58,6 @@ type CommentGitHub interface {
 	Unreact(ctx context.Context, installationID int64, owner, repo string, kind CommentKind, id, reactionID int64) error
 	// ReplyToReviewComment posts a reply in the thread of review comment inReplyTo.
 	ReplyToReviewComment(ctx context.Context, installationID int64, owner, repo string, number int, inReplyTo int64, body string) (Comment, error)
-}
-
-// CommentEvent is an edited or new comment on a pull request, decoded by the
-// transport. Ticked is the checkbox line that went from unchecked to checked in
-// this edit, else "".
-type CommentEvent struct {
-	InstallationID int64
-	Owner          string
-	Repo           string
-	Number         int
-	Sender         string
-	CommentID      int64
-	Kind           CommentKind
-	Ticked         string
-	Body           string
-}
-
-// IntentKind is what a comment asks the gate to do.
-type IntentKind int
-
-const (
-	IntentNone       IntentKind = iota
-	IntentApply                 // ProposalID
-	IntentApplyAll              // summary tick or "/pollux-agent apply"
-	IntentSkipAsk               // Scope; a skip tick, or a skip command without a reason
-	IntentSkip                  // Scope and Reason; a skip command with a reason
-	IntentSkipReason            // Reason; the pending asker's next comment
-	IntentRerun                 // summary tick of the Re-run box
-)
-
-// Intent is the action a comment asks for.
-type Intent struct {
-	Kind       IntentKind
-	ProposalID string
-	Scope      SkipScope
-	Reason     string
-}
-
-const (
-	applyLabel      = "Apply this change"
-	applyAllLabel   = "Apply all"
-	skipCommitLabel = "Skip this commit"
-	skipPRLabel     = "Skip this PR"
-
-	commandPrefix = "/pollux-agent"
-	applyCommand  = "apply"
-	skipCommand   = "skip"
-	skipPRCommand = "skip-pr"
-
-	indexPath    = "docs/README.md"
-	indexHeading = "## Index"
-)
-
-// ParseIntent decodes what ev asks for given the PR's state: pure, no I/O.
-func ParseIntent(ev CommentEvent, s PRState) Intent {
-	if ticked := strings.TrimSpace(ev.Ticked); ticked != "" {
-		return parseTick(ev, ticked, s)
-	}
-	body := strings.TrimSpace(ev.Body)
-	if body == "" {
-		return Intent{}
-	}
-	firstLine, _, _ := strings.Cut(body, "\n")
-	if strings.HasPrefix(strings.TrimSpace(firstLine), commandPrefix+" ") {
-		if ev.Kind != CommentKindIssue {
-			return Intent{}
-		}
-		return parseCommand(strings.TrimSpace(body[len(commandPrefix):]))
-	}
-	if s.PendingSkip != nil && strings.EqualFold(ev.Sender, s.PendingSkip.User) {
-		return Intent{Kind: IntentSkipReason, Reason: body}
-	}
-	return Intent{}
-}
-
-func parseTick(ev CommentEvent, ticked string, s PRState) Intent {
-	switch ev.Kind {
-	case CommentKindReview:
-		if ticked != "- [x] "+applyLabel {
-			return Intent{}
-		}
-		for _, p := range s.Proposals {
-			if p.CommentID != 0 && p.CommentID == ev.CommentID {
-				return Intent{Kind: IntentApply, ProposalID: p.ID}
-			}
-		}
-	case CommentKindIssue:
-		if s.SummaryCommentID == 0 || ev.CommentID != s.SummaryCommentID {
-			return Intent{}
-		}
-		switch ticked {
-		case "- [x] " + applyAllLabel:
-			return Intent{Kind: IntentApplyAll}
-		case "- [x] " + skipCommitLabel:
-			return Intent{Kind: IntentSkipAsk, Scope: SkipCommit}
-		case "- [x] " + skipPRLabel:
-			return Intent{Kind: IntentSkipAsk, Scope: SkipPR}
-		case "- [x] " + rerunLabel:
-			return Intent{Kind: IntentRerun}
-		}
-	default:
-	}
-	return Intent{}
-}
-
-// parseCommand decodes the text after the command prefix: a command word and,
-// for the skip commands, the reason that follows it.
-func parseCommand(rest string) Intent {
-	word, reason := rest, ""
-	if i := strings.IndexFunc(rest, unicode.IsSpace); i >= 0 {
-		word, reason = rest[:i], strings.TrimSpace(rest[i:])
-	}
-	switch word {
-	case applyCommand:
-		return Intent{Kind: IntentApplyAll}
-	case skipCommand:
-		return skipIntent(SkipCommit, reason)
-	case skipPRCommand:
-		return skipIntent(SkipPR, reason)
-	default:
-		return Intent{}
-	}
-}
-
-func skipIntent(scope SkipScope, reason string) Intent {
-	if reason == "" {
-		return Intent{Kind: IntentSkipAsk, Scope: scope}
-	}
-	return Intent{Kind: IntentSkip, Scope: scope, Reason: reason}
 }
 
 // OnApply is the state transition for a commit that applied the open proposals
@@ -209,17 +84,24 @@ func splice(file, original, content string) (string, error) {
 }
 
 // addIndexEntry inserts entry after the last list item of the "## Index"
-// section of readme, or appends it when there is none.
+// section of readme, right after the heading when that section has no items,
+// or appends it when there is no such section.
 func addIndexEntry(readme, entry string) string {
 	lines := strings.Split(readme, "\n")
-	inIndex, last := false, -1
+	inIndex, heading, last := false, -1, -1
 	for i, l := range lines {
 		switch {
 		case strings.HasPrefix(l, "## "):
 			inIndex = strings.TrimSpace(l) == indexHeading
+			if inIndex && heading < 0 {
+				heading = i
+			}
 		case inIndex && strings.HasPrefix(l, "- "):
 			last = i
 		}
+	}
+	if last < 0 && heading >= 0 {
+		last = heading
 	}
 	if last < 0 {
 		if readme != "" && !strings.HasSuffix(readme, "\n") {
@@ -230,89 +112,12 @@ func addIndexEntry(readme, entry string) string {
 	return strings.Join(slices.Concat(lines[:last+1], []string{entry}, lines[last+1:]), "\n")
 }
 
-// WithComments sets the GitHub access HandleComment needs and returns s.
-func (s *Service) WithComments(c CommentGitHub) *Service {
-	s.comments = c
-	return s
-}
-
-// HandleComment acts on a comment: it applies proposals, hands a skip to
-// handleSkip, or re-runs the analysis, when the sender may write. Comments that ask for nothing cost no
-// GitHub call. A redelivery of an applied proposal only posts the replies still
-// missing.
-func (s *Service) HandleComment(ctx context.Context, ev CommentEvent) error {
-	op := fmt.Sprintf("handle comment %d of %s/%s#%d", ev.CommentID, ev.Owner, ev.Repo, ev.Number)
-	if s.comments == nil {
-		return fmt.Errorf("%s: no comment GitHub configured", op)
-	}
-	state, err := s.store.LoadPR(ctx, ev.Owner, ev.Repo, ev.Number)
-	if err != nil {
-		return fmt.Errorf("%s: load state: %w", op, err)
-	}
-	intent := ParseIntent(ev, state)
-	if intent.Kind == IntentNone {
-		return nil
-	}
-
-	seen, err := s.comments.React(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, ReactionSeen)
-	if err != nil {
-		return fmt.Errorf("%s: react %s: %w", op, ReactionSeen, err)
-	}
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
-	defer cancel()
-	final, err := s.act(ctx, writeCtx, state, ev, intent, op)
-	if err != nil {
-		return err
-	}
-	return s.settle(writeCtx, state, ev, seen, final, op)
-}
-
-// act runs intent for ev and reports how it ended: ReactionDone when the
-// action completed, ReactionRefused when a reply told the sender why not.
-func (s *Service) act(ctx, writeCtx context.Context, state PRState, ev CommentEvent, in Intent, op string) (Reaction, error) {
-	canWrite, err := s.comments.Permission(ctx, state.InstallationID, state.Owner, state.Repo, ev.Sender)
-	if err != nil {
-		return "", fmt.Errorf("%s: %w", op, err)
-	}
-	if !canWrite {
-		return s.say(writeCtx, state, ev, "you need write access to this repository to do that.", op)
-	}
-
-	switch in.Kind {
-	case IntentApply, IntentApplyAll:
-		return s.handleApply(ctx, writeCtx, state, ev, in, op)
-	case IntentNone:
-		return ReactionDone, nil
-	case IntentSkipAsk, IntentSkip, IntentSkipReason:
-		return s.handleSkip(writeCtx, state, in, ev.Sender, op)
-	case IntentRerun:
-		rerun := RerunRequest{InstallationID: ev.InstallationID, PRRef: PRRef{Owner: ev.Owner, Repo: ev.Repo, Number: ev.Number}, SummaryCommentID: ev.CommentID}
-		if err := s.HandleRerun(ctx, rerun); err != nil {
-			return "", fmt.Errorf("%s: %w", op, err)
-		}
-		return ReactionDone, nil
-	default:
-		return "", fmt.Errorf("%s: unknown intent %d", op, in.Kind)
-	}
-}
-
-// settle swaps the 👀 on ev's comment for final, after the action's own writes.
-func (s *Service) settle(ctx context.Context, state PRState, ev CommentEvent, seen int64, final Reaction, op string) error {
-	if err := s.comments.Unreact(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, seen); err != nil {
-		return fmt.Errorf("%s: remove %s reaction: %w", op, ReactionSeen, err)
-	}
-	if _, err := s.comments.React(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, final); err != nil {
-		return fmt.Errorf("%s: react %s: %w", op, final, err)
-	}
-	return nil
-}
-
 // handleApply commits the open proposals the intent targets as one commit.
-// ctx bounds the reads and the commit; writeCtx the state and comment writes
-// that must survive a cancelled job.
-func (s *Service) handleApply(ctx, writeCtx context.Context, state PRState, ev CommentEvent, in Intent, op string) (Reaction, error) {
+// ctx bounds the reads and the commit; each group of writes after them gets its
+// own write budget.
+func (s *Service) handleApply(ctx context.Context, state PRState, ev CommentEvent, in Intent, op string) (Reaction, error) {
 	if state.Fork {
-		return s.say(writeCtx, state, ev, "Apply is not available on a fork the bot cannot push to.", op)
+		return s.say(ctx, state, ev, "Apply is not available on a fork the bot cannot push to.", op)
 	}
 	var targets []int
 	for i, p := range state.Proposals {
@@ -321,72 +126,181 @@ func (s *Service) handleApply(ctx, writeCtx context.Context, state PRState, ev C
 		}
 	}
 	if len(targets) == 0 {
-		posted, err := s.replyApplied(writeCtx, state, in.ProposalID, op)
+		return s.replayApplied(ctx, state, ev, in, op)
+	}
+
+	live, err := s.gh.GetPullRequest(ctx, state.InstallationID, state.Owner, state.Repo, state.Number)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", op, err)
+	}
+	if pa := state.PendingApply; pa != nil {
+		c, err := s.comments.CommitAt(ctx, state.InstallationID, state.Owner, state.Repo, live.HeadSHA)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("%s: read commit %s: %w", op, shortSHA(live.HeadSHA), err)
 		}
-		if posted == 0 && in.Kind == IntentApplyAll {
-			if _, err := s.say(writeCtx, state, ev, "✅ Nothing left to apply.", op); err != nil {
+		if isPendingApply(c, *pa) {
+			var tick []string
+			if in.Kind == IntentApplyAll {
+				tick = pa.IDs
+			}
+			if _, err := s.finishAdopted(ctx, state, c.SHA, tick, op); err != nil {
 				return "", err
 			}
+			return ReactionDone, nil
 		}
-		return ReactionDone, nil
 	}
-	if state.HeadSHA != state.ProposalsSHA {
-		return s.say(writeCtx, state, ev, "a newer push is being re-analyzed; nothing was committed. Apply again once the proposals refresh.", op)
+	if !live.Open {
+		return s.say(ctx, state, ev, "this pull request is closed; nothing was committed.", op)
+	}
+	if state.HeadSHA != state.ProposalsSHA || live.HeadSHA != state.ProposalsSHA {
+		return s.say(ctx, state, ev, staleText(state, live), op)
+	}
+	for _, i := range targets {
+		p := state.Proposals[i]
+		target := review.Proposal{DocPath: p.DocPath, Section: p.Section, IndexEntry: p.IndexEntry}
+		if err := target.ValidateTarget(); err != nil {
+			return s.say(ctx, state, ev, "a stored proposal is not valid ("+strings.ReplaceAll(err.Error(), "\n", "; ")+"); nothing was committed.", op)
+		}
 	}
 
 	files, err := s.applyFiles(ctx, state, targets)
 	if errors.Is(err, errDocMismatch) {
-		return s.say(writeCtx, state, ev, "a proposal no longer matches the doc ("+err.Error()+"); nothing was committed.", op)
+		return s.say(ctx, state, ev, "a proposal no longer matches the doc ("+err.Error()+"); nothing was committed.", op)
 	}
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", op, err)
 	}
 	message := applyMessage(state, targets)
-
-	sha, err := s.comments.CommitFiles(ctx, state.InstallationID, state.Owner, state.Repo, state.HeadRef, state.HeadSHA, files, message)
-	if errors.Is(err, ErrBranchMoved) {
-		var adopted bool
-		if sha, adopted, err = s.adoptCommit(ctx, state, message); err != nil {
-			return "", fmt.Errorf("%s: %w", op, err)
-		}
-		if !adopted {
-			return s.say(writeCtx, state, ev, "the branch moved while applying; nothing was committed. A re-analysis follows.", op)
-		}
-	} else if err != nil {
-		return "", fmt.Errorf("%s: %w", op, err)
-	}
-
 	ids := make([]string, len(targets))
 	for n, i := range targets {
 		ids[n] = state.Proposals[i].ID
 	}
-	state = OnApply(state, ids, sha)
-	if err := s.store.SavePR(writeCtx, state); err != nil {
-		return "", fmt.Errorf("%s: save state after commit %s: %w", op, shortSHA(sha), err)
+
+	// Saved before the commit so a push of that commit, which can be handled
+	// before this one is retried, still finds the proposals it applied.
+	state.PendingApply = &PendingApply{IDs: ids, Message: message, Parent: state.HeadSHA}
+	if err := s.store.SavePR(ctx, state); err != nil {
+		return "", fmt.Errorf("%s: save pending apply: %w", op, err)
 	}
-	if in.Kind == IntentApplyAll {
-		if err := s.tickApplied(writeCtx, state, ids, op); err != nil {
+	sha, err := s.comments.CommitFiles(ctx, state.InstallationID, state.Owner, state.Repo, state.HeadRef, state.HeadSHA, files, message)
+	if errors.Is(err, ErrBranchMoved) {
+		var adopted bool
+		if sha, adopted, err = s.adoptCommit(ctx, state, state.PendingApply); err != nil {
+			return "", fmt.Errorf("%s: %w", op, err)
+		}
+		if !adopted {
+			state.PendingApply = nil
+			if err := s.saveWrite(ctx, state, "clear pending apply", op); err != nil {
+				return "", err
+			}
+			return s.say(ctx, state, ev, "the branch moved while applying; nothing was committed. A re-analysis follows.", op)
+		}
+	} else if errors.Is(err, ErrCommitRejected) {
+		state.PendingApply = nil
+		if err := s.saveWrite(ctx, state, "clear pending apply", op); err != nil {
 			return "", err
 		}
+		return s.say(ctx, state, ev, "GitHub rejected the commit (a protected branch, or a symlink or submodule at a doc path); nothing was committed.", op)
+	} else if err != nil {
+		return "", fmt.Errorf("%s: %w", op, err)
 	}
-	if state.SummaryCommentID != 0 {
-		if err := s.gh.EditIssueComment(writeCtx, state.InstallationID, state.Owner, state.Repo, state.SummaryCommentID, renderSummary(state)); err != nil {
-			return "", fmt.Errorf("%s: edit summary comment: %w", op, err)
-		}
+
+	state = OnApply(state, ids, sha)
+	state.PendingApply = nil
+	if err := s.saveWrite(ctx, state, "save after commit "+shortSHA(sha), op); err != nil {
+		return "", err
 	}
-	if _, err := s.replyApplied(writeCtx, state, "", op); err != nil {
+	var tick []string
+	if in.Kind == IntentApplyAll {
+		tick = ids
+	}
+	writeCtx, cancel := writeContext(ctx)
+	defer cancel()
+	if _, err := s.finishApply(writeCtx, state, tick, "", op); err != nil {
 		return "", err
 	}
 	return ReactionDone, nil
+}
+
+// saveWrite saves state under its own write budget.
+func (s *Service) saveWrite(ctx context.Context, state PRState, what, op string) error {
+	ctx, cancel := writeContext(ctx)
+	defer cancel()
+	if err := s.store.SavePR(ctx, state); err != nil {
+		return fmt.Errorf("%s: %s: %w", op, what, err)
+	}
+	return nil
+}
+
+// staleText says why the proposals cannot be applied at the live head.
+func staleText(state PRState, live PullRequest) string {
+	switch {
+	case state.Skip != nil && state.Skip.Scope == SkipPR:
+		return "This PR is skipped, so its proposals are not refreshed; nothing was committed."
+	case state.FailureCause != "":
+		return "the last analysis failed, so the proposals are out of date; nothing was committed. Tick **" + rerunLabel + "** in the summary, then apply again."
+	case state.Run == nil && live.HeadSHA == state.HeadSHA:
+		return "the proposals are out of date and no analysis is running; nothing was committed. Push a commit to refresh them, then apply again."
+	default:
+		return "a newer push is being re-analyzed; nothing was committed. Apply again once the proposals refresh."
+	}
+}
+
+// replayApplied handles an Apply that targets no open proposal: a redelivery
+// finishes what the first run left undone, and an outdated proposal is refused.
+func (s *Service) replayApplied(ctx context.Context, state PRState, ev CommentEvent, in Intent, op string) (Reaction, error) {
+	var applied []string
+	for _, p := range state.Proposals {
+		if in.Kind == IntentApply && p.ID == in.ProposalID && p.State == ProposalOutdated {
+			return s.say(ctx, state, ev, "this proposal is outdated; nothing was committed.", op)
+		}
+		if p.State == ProposalApplied && p.AppliedSHA != "" && (in.Kind == IntentApplyAll || p.ID == in.ProposalID) {
+			applied = append(applied, p.ID)
+		}
+	}
+
+	writeCtx, cancel := writeContext(ctx)
+	defer cancel()
+	var tick []string
+	if in.Kind == IntentApplyAll {
+		tick = applied
+	}
+	if len(applied) > 0 {
+		if _, err := s.finishApply(writeCtx, state, tick, in.ProposalID, op); err != nil {
+			return "", err
+		}
+	}
+	if len(applied) == 0 && in.Kind == IntentApplyAll {
+		if _, err := s.say(ctx, state, ev, "✅ Nothing left to apply.", op); err != nil {
+			return "", err
+		}
+	}
+	return ReactionDone, nil
+}
+
+// finishApply brings the comments up to date with state's applied proposals:
+// it ticks the Apply boxes of tick, redraws the summary, and posts the replies
+// still missing (just proposal only, when it is not ""). It returns how many
+// replies it posted or adopted.
+func (s *Service) finishApply(ctx context.Context, state PRState, tick []string, only, op string) (int, error) {
+	if len(tick) > 0 {
+		if err := s.tickApplied(ctx, state, tick, op); err != nil {
+			return 0, err
+		}
+	}
+	if err := s.redrawSummary(ctx, state, op); err != nil {
+		return 0, err
+	}
+	return s.replyApplied(ctx, state, only, op)
 }
 
 // errDocMismatch marks a proposal that cannot be applied to the doc at head.
 var errDocMismatch = errors.New("doc mismatch")
 
 // applyFiles builds the file changes for the proposals at targets, reading
-// each doc once at the head. It returns errDocMismatch for user-facing failures.
+// each doc once at the head. Section splices all run first; index entries for
+// new docs go in last so they cannot break a splice of the index itself. It
+// returns errDocMismatch for user-facing failures.
 func (s *Service) applyFiles(ctx context.Context, state PRState, targets []int) ([]FileChange, error) {
 	docs := map[string]string{}
 	var changed []string
@@ -410,6 +324,7 @@ func (s *Service) applyFiles(ctx context.Context, state PRState, targets []int) 
 		}
 	}
 
+	var indexEntries []string
 	for _, i := range targets {
 		p := state.Proposals[i]
 		if p.Section != "" {
@@ -435,14 +350,19 @@ func (s *Service) applyFiles(ctx context.Context, state PRState, targets []int) 
 			return nil, fmt.Errorf("%w: %s already exists at %s", errDocMismatch, p.DocPath, shortSHA(state.HeadSHA))
 		}
 		set(p.DocPath, p.Content)
-		if p.IndexEntry == "" {
-			continue
+		if p.IndexEntry != "" {
+			indexEntries = append(indexEntries, p.IndexEntry)
 		}
+	}
+	if len(indexEntries) > 0 {
 		readme, _, err := load(indexPath)
 		if err != nil {
 			return nil, err
 		}
-		set(indexPath, addIndexEntry(readme, p.IndexEntry))
+		for _, entry := range indexEntries {
+			readme = addIndexEntry(readme, entry)
+		}
+		set(indexPath, readme)
 	}
 
 	files := make([]FileChange, len(changed))
@@ -464,18 +384,58 @@ func applyMessage(state PRState, targets []int) string {
 	return message
 }
 
+// isPendingApply reports whether c is the commit pa was about to create: ours,
+// the child of pa's parent, with pa's message.
+func isPendingApply(c Commit, pa PendingApply) bool {
+	return c.Mine && c.Message == pa.Message && slices.Equal(c.Parents, []string{pa.Parent})
+}
+
 // adoptCommit recovers from a commit that landed before its state was saved:
-// the branch tip is ours when it is the head's child with the message we would
-// have written.
-func (s *Service) adoptCommit(ctx context.Context, state PRState, message string) (sha string, adopted bool, err error) {
+// the branch tip is ours when it is the pending apply's commit.
+func (s *Service) adoptCommit(ctx context.Context, state PRState, pa *PendingApply) (sha string, adopted bool, err error) {
 	c, err := s.comments.BranchCommit(ctx, state.InstallationID, state.Owner, state.Repo, state.HeadRef)
 	if err != nil {
 		return "", false, fmt.Errorf("read branch %s: %w", state.HeadRef, err)
 	}
-	if !slices.Equal(c.Parents, []string{state.HeadSHA}) || c.Message != message {
+	if !isPendingApply(c, *pa) {
 		return "", false, nil
 	}
 	return c.SHA, true, nil
+}
+
+// adoptPendingApply marks as applied the proposals of an Apply whose commit
+// landed but whose state was never saved, when the push of pr is that commit;
+// without it the push would outdate them. Any other push drops the pending apply.
+func (s *Service) adoptPendingApply(ctx context.Context, state PRState, pr PullRequest) (PRState, error) {
+	pa := state.PendingApply
+	if pa == nil || state.HeadRef == "" || pr.HeadSHA == state.HeadSHA {
+		return state, nil
+	}
+	op := fmt.Sprintf("adopt pending apply of %s/%s#%d", pr.Owner, pr.Repo, pr.Number)
+	c, err := s.comments.CommitAt(ctx, state.InstallationID, state.Owner, state.Repo, pr.HeadSHA)
+	if err != nil {
+		return PRState{}, fmt.Errorf("%s: read commit %s: %w", op, shortSHA(pr.HeadSHA), err)
+	}
+	if !isPendingApply(c, *pa) {
+		return state, nil
+	}
+	return s.finishAdopted(ctx, state, c.SHA, pa.IDs, op)
+}
+
+// finishAdopted records that the pending apply's commit sha landed, then
+// brings the comments up to date.
+func (s *Service) finishAdopted(ctx context.Context, state PRState, sha string, tick []string, op string) (PRState, error) {
+	state = OnApply(state, state.PendingApply.IDs, sha)
+	state.PendingApply = nil
+	if err := s.saveWrite(ctx, state, "save adopted commit "+shortSHA(sha), op); err != nil {
+		return PRState{}, err
+	}
+	writeCtx, cancel := writeContext(ctx)
+	defer cancel()
+	if _, err := s.finishApply(writeCtx, state, tick, "", op); err != nil {
+		return PRState{}, err
+	}
+	return state, nil
 }
 
 // tickApplied flips the Apply checkbox of the applied proposals ids that have one.
@@ -492,7 +452,7 @@ func (s *Service) tickApplied(ctx context.Context, state PRState, ids []string, 
 		if !ok {
 			continue
 		}
-		body, ok := tickApply(c.Body)
+		body, ok := setCheckbox(c.Body, applyLabel, true)
 		if !ok {
 			continue
 		}
@@ -503,78 +463,55 @@ func (s *Service) tickApplied(ctx context.Context, state PRState, ids []string, 
 	return nil
 }
 
+// appliedMarker names the proposal and the commit, so a proposal reopened and
+// applied again gets a reply for its new commit.
+func appliedMarker(id, sha string) string {
+	return "<!-- pollux-agent:applied:" + id + ":" + sha + " -->"
+}
+
 // replyApplied posts the "Applied" reply still missing under each applied
 // proposal's comment (just proposal only, when it is not ""), saving after each.
+// A reply a crashed run posted before saving its ID is adopted by its marker.
+// It returns how many replies it posted or adopted.
 func (s *Service) replyApplied(ctx context.Context, state PRState, only, op string) (posted int, err error) {
+	var existing []Comment
+	listed := false
 	for i, p := range state.Proposals {
 		if p.State != ProposalApplied || p.ReplyID != 0 || p.AppliedSHA == "" || p.CommentID == 0 || (only != "" && p.ID != only) {
 			continue
 		}
-		c, err := s.comments.ReplyToReviewComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, p.CommentID, "✅ Applied in "+shortSHA(p.AppliedSHA))
-		if err != nil {
-			return posted, fmt.Errorf("%s: %w", op, err)
+		if !listed {
+			if existing, err = s.gh.ListComments(ctx, state.InstallationID, state.Owner, state.Repo, state.Number); err != nil {
+				return posted, fmt.Errorf("%s: list comments: %w", op, err)
+			}
+			listed = true
 		}
-		state.Proposals[i].ReplyID = c.ID
+		replyID := int64(0)
+		if c, ok := findReply(existing, appliedMarker(p.ID, p.AppliedSHA)); ok {
+			replyID = c.ID
+		} else {
+			body := "✅ Applied in " + shortSHA(p.AppliedSHA) + "\n\n" + appliedMarker(p.ID, p.AppliedSHA)
+			c, err := s.comments.ReplyToReviewComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, p.CommentID, body)
+			if err != nil {
+				return posted, fmt.Errorf("%s: %w", op, err)
+			}
+			replyID = c.ID
+		}
+		state.Proposals[i].ReplyID = replyID
 		if err := s.store.SavePR(ctx, state); err != nil {
-			return posted, fmt.Errorf("%s: save reply %d: %w", op, c.ID, err)
+			return posted, fmt.Errorf("%s: save reply %d: %w", op, replyID, err)
 		}
 		posted++
 	}
 	return posted, nil
 }
 
-// say answers ev: in the review thread for a review comment, else as an issue
-// comment addressed to the sender. A refused tick is then unticked so it can be
-// ticked again. It returns ReactionRefused for the caller to settle.
-func (s *Service) say(ctx context.Context, state PRState, ev CommentEvent, text, op string) (Reaction, error) {
-	if ev.Kind == CommentKindReview {
-		if _, err := s.comments.ReplyToReviewComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, ev.CommentID, "@"+ev.Sender+" "+text); err != nil {
-			return "", fmt.Errorf("%s: reply: %w", op, err)
-		}
-	} else if _, err := s.gh.CreateIssueComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, "@"+ev.Sender+" "+text); err != nil {
-		return "", fmt.Errorf("%s: reply: %w", op, err)
-	}
-	if strings.TrimSpace(ev.Ticked) != "" {
-		if err := s.untick(ctx, state, ev, op); err != nil {
-			return "", err
+// findReply returns our review comment whose body carries marker.
+func findReply(existing []Comment, marker string) (Comment, bool) {
+	for _, c := range existing {
+		if c.Mine && c.Kind == CommentKindReview && strings.Contains(c.Body, marker) {
+			return c, true
 		}
 	}
-	return ReactionRefused, nil
+	return Comment{}, false
 }
-
-// untick restores the box ev ticked: the summary is redrawn from state, a
-// review comment loses the tick on that one line.
-func (s *Service) untick(ctx context.Context, state PRState, ev CommentEvent, op string) error {
-	if ev.Kind == CommentKindIssue {
-		if state.SummaryCommentID == 0 || ev.CommentID != state.SummaryCommentID {
-			return nil
-		}
-		if err := s.gh.EditIssueComment(ctx, state.InstallationID, state.Owner, state.Repo, state.SummaryCommentID, renderSummary(state)); err != nil {
-			return fmt.Errorf("%s: untick summary comment: %w", op, err)
-		}
-		return nil
-	}
-	existing, err := s.gh.ListComments(ctx, state.InstallationID, state.Owner, state.Repo, state.Number)
-	if err != nil {
-		return fmt.Errorf("%s: list comments: %w", op, err)
-	}
-	c, ok := findComment(existing, CommentKindReview, ev.CommentID)
-	if !ok {
-		return nil
-	}
-	want := strings.TrimSpace(ev.Ticked)
-	lines := strings.Split(c.Body, "\n")
-	for i, l := range lines {
-		if strings.TrimSpace(l) != want {
-			continue
-		}
-		lines[i] = strings.Replace(l, "- [x]", "- [ ]", 1)
-		if err := s.gh.EditReviewComment(ctx, state.InstallationID, state.Owner, state.Repo, ev.CommentID, strings.Join(lines, "\n")); err != nil {
-			return fmt.Errorf("%s: untick comment %d: %w", op, ev.CommentID, err)
-		}
-		return nil
-	}
-	return nil
-}
-
-func shortSHA(sha string) string { return sha[:min(7, len(sha))] }

@@ -327,19 +327,7 @@ func handleReviewCommentEvent(logger *slog.Logger, jobs Enqueuer, w http.Respons
 		Ticked:         ticked,
 		Body:           payload.Comment.Body,
 	}
-	jobPayload, err := json.Marshal(ev)
-	if err != nil {
-		logger.Error("encode comment job payload", "delivery_id", deliveryID, "err", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	enqueued, err := jobs.Enqueue(r.Context(), jobqueue.NewJob{
-		DeliveryID: deliveryID,
-		Key:        prJobKey(ev.Owner, ev.Repo, ev.Number),
-		Kind:       commentJobKind,
-		Payload:    jobPayload,
-	})
+	enqueued, err := enqueueComment(r.Context(), jobs, deliveryID, ev)
 	if err != nil {
 		logger.Error("enqueue comment job", "delivery_id", deliveryID, "err", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -395,19 +383,7 @@ func handleIssueCommentEvent(logger *slog.Logger, jobs Enqueuer, w http.Response
 		Ticked:         ticked,
 		Body:           payload.Comment.Body,
 	}
-	jobPayload, err := json.Marshal(ev)
-	if err != nil {
-		logger.Error("encode comment job payload", "delivery_id", deliveryID, "err", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	enqueued, err := jobs.Enqueue(r.Context(), jobqueue.NewJob{
-		DeliveryID: deliveryID,
-		Key:        prJobKey(ev.Owner, ev.Repo, ev.Number),
-		Kind:       commentJobKind,
-		Payload:    jobPayload,
-	})
+	enqueued, err := enqueueComment(r.Context(), jobs, deliveryID, ev)
 	if err != nil {
 		logger.Error("enqueue comment job", "delivery_id", deliveryID, "err", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -438,6 +414,33 @@ func tickedLine(from, now string) (string, bool) {
 		ticked = after[i]
 	}
 	return ticked, ticked != ""
+}
+
+// enqueueComment enqueues the job for a comment event. A Re-run tick runs as a
+// pull request job that a push supersedes, queued behind a running analysis
+// like enqueueRerun; any other comment is a comment job. It reports whether the
+// delivery was new.
+func enqueueComment(ctx context.Context, jobs Enqueuer, deliveryID string, ev gate.CommentEvent) (bool, error) {
+	kind, supersedes := commentJobKind, false
+	var payload any = ev
+	if ev.Ticked != "" && gate.IsRerunTick(ev.Ticked) {
+		kind, payload = pullRequestJobKind, pullRequestJobPayload{Comment: &ev}
+	}
+	jobPayload, err := json.Marshal(payload)
+	if err != nil {
+		return false, fmt.Errorf("encode comment job payload: %w", err)
+	}
+	enqueued, err := jobs.Enqueue(ctx, jobqueue.NewJob{
+		DeliveryID: deliveryID,
+		Key:        prJobKey(ev.Owner, ev.Repo, ev.Number),
+		Kind:       kind,
+		Payload:    jobPayload,
+		Supersedes: supersedes,
+	})
+	if err != nil {
+		return false, fmt.Errorf("enqueue comment job for %s/%s#%d: %w", ev.Owner, ev.Repo, ev.Number, err)
+	}
+	return enqueued, nil
 }
 
 // enqueueRerun enqueues a re-run job for req's pull request. It queues behind a

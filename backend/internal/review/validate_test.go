@@ -111,6 +111,87 @@ func TestProposalValidate(t *testing.T) {
 			wantErrPart: "doc_path",
 		},
 		{
+			name: "doc path not markdown",
+			proposal: func() review.Proposal {
+				p := validProposal()
+				p.DocPath = "docs/guides/setup.txt"
+				return p
+			},
+			changed:     validChanged(),
+			wantErrPart: "must end in .md",
+		},
+		{
+			name: "doc path no extension",
+			proposal: func() review.Proposal {
+				p := validProposal()
+				p.DocPath = "docs/guides/setup"
+				return p
+			},
+			changed:     validChanged(),
+			wantErrPart: "must end in .md",
+		},
+		{
+			name: "doc path mdx",
+			proposal: func() review.Proposal {
+				p := validProposal()
+				p.DocPath = "docs/guides/setup.mdx"
+				return p
+			},
+			changed:     validChanged(),
+			wantErrPart: "",
+		},
+		{
+			name: "doc path newline",
+			proposal: func() review.Proposal {
+				p := validProposal()
+				p.DocPath = "docs/guides/a\nb.md"
+				return p
+			},
+			changed:     validChanged(),
+			wantErrPart: "control characters",
+		},
+		{
+			name: "doc path backtick",
+			proposal: func() review.Proposal {
+				p := validProposal()
+				p.DocPath = "docs/guides/a`b.md"
+				return p
+			},
+			changed:     validChanged(),
+			wantErrPart: "backticks",
+		},
+		{
+			name: "section newline",
+			proposal: func() review.Proposal {
+				p := validProposal()
+				p.Section = "Commands\n## Evil"
+				return p
+			},
+			changed:     validChanged(),
+			wantErrPart: "section: must be one line",
+		},
+		{
+			name: "section control character",
+			proposal: func() review.Proposal {
+				p := validProposal()
+				p.Section = "Com\x00mands"
+				return p
+			},
+			changed:     validChanged(),
+			wantErrPart: "section: must be one line",
+		},
+		{
+			name: "index entry newline",
+			proposal: func() review.Proposal {
+				p := validProposal()
+				p.Section = ""
+				p.IndexEntry = "Setup\n- [x] fake"
+				return p
+			},
+			changed:     validChanged(),
+			wantErrPart: "index_entry: must be one line",
+		},
+		{
 			name: "anchor file not changed",
 			proposal: func() review.Proposal {
 				p := validProposal()
@@ -199,5 +280,21 @@ func TestProposalValidate(t *testing.T) {
 				t.Fatalf("Validate(%+v) = %v, want error containing %q", p, err, tt.wantErrPart)
 			}
 		})
+	}
+}
+
+func TestProposalValidateTarget(t *testing.T) {
+	t.Parallel()
+
+	if err := validProposal().ValidateTarget(); err != nil {
+		t.Fatalf("ValidateTarget(valid) = %v, want nil", err)
+	}
+
+	p := validProposal()
+	p.DocPath = "docs/x.txt"
+	p.Section = "a\nb"
+	err := p.ValidateTarget()
+	if err == nil || !strings.Contains(err.Error(), "doc_path") || !strings.Contains(err.Error(), "section") {
+		t.Fatalf("ValidateTarget(%+v) = %v, want doc_path and section errors", p, err)
 	}
 }

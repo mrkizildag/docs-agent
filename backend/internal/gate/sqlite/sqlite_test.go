@@ -178,6 +178,9 @@ func TestSavePR_RoundTripForkAndSkips(t *testing.T) {
 		{"none", func(*gate.PRState) {}},
 		{"fork", func(s *gate.PRState) { s.Fork = true }},
 		{"failure cause", func(s *gate.PRState) { s.FailureCause = "The analysis timed out." }},
+		{"pending apply", func(s *gate.PRState) {
+			s.PendingApply = &gate.PendingApply{IDs: []string{"p1", "p2"}, Message: "docs: apply 2 pollux-agent proposals", Parent: "sha0"}
+		}},
 		{"pending skip", func(s *gate.PRState) { s.PendingSkip = &gate.SkipAsk{User: "alice", Scope: gate.SkipPR} }},
 		{"skip", func(s *gate.PRState) {
 			s.Skip = &gate.Skip{User: "bob", Scope: gate.SkipCommit, Reason: "typo only", HeadSHA: "sha1"}

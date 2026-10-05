@@ -1,38 +1,16 @@
 package gate_test
 
 import (
-	"context"
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
-
-type skipCommentGitHub struct{ canWrite bool }
-
-func (f skipCommentGitHub) Permission(context.Context, int64, string, string, string) (bool, error) {
-	return f.canWrite, nil
-}
-
-func (skipCommentGitHub) FileAtRef(context.Context, int64, string, string, string, string) ([]byte, bool, error) {
-	return nil, false, nil
-}
-
-func (skipCommentGitHub) CommitFiles(context.Context, int64, string, string, string, string, []gate.FileChange, string) (string, error) {
-	return "", nil
-}
-
-func (skipCommentGitHub) BranchCommit(context.Context, int64, string, string, string) (gate.Commit, error) {
-	return gate.Commit{}, nil
-}
-
-func (skipCommentGitHub) ReplyToReviewComment(context.Context, int64, string, string, int, int64, string) (gate.Comment, error) {
-	return gate.Comment{}, nil
-}
 
 func skipBase() gate.PRState {
 	return gate.PRState{
@@ -45,7 +23,7 @@ func skipBase() gate.PRState {
 func skipService(state gate.PRState) (*gate.Service, *fakeGitHub, *fakeStore) {
 	gh := &fakeGitHub{}
 	store := &fakeStore{stored: state}
-	svc := gate.NewService(gh, store, gate.Runners{}).WithComments(skipCommentGitHub{canWrite: true})
+	svc := gate.NewService(gh, &fakeCommentGitHub{canWrite: true}, store, gate.Runners{})
 	return svc, gh, store
 }
 
@@ -231,7 +209,7 @@ func TestHandleCommentSkipUpdatesCheckRunFromPush(t *testing.T) {
 	gh := &fakeGitHub{checkRunID: 321}
 	store := &fakeStore{}
 	runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
-	svc := gate.NewService(gh, store, gate.Runners{Server: runner}).WithComments(skipCommentGitHub{canWrite: true})
+	svc := gate.NewService(gh, &fakeCommentGitHub{canWrite: true}, store, gate.Runners{Server: runner})
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
 		t.Fatalf("HandlePullRequest() = %v, want nil", err)
@@ -252,14 +230,6 @@ func TestHandleCommentSkipUpdatesCheckRunFromPush(t *testing.T) {
 	}
 }
 
-func (skipCommentGitHub) React(context.Context, int64, string, string, gate.CommentKind, int64, gate.Reaction) (int64, error) {
-	return 0, nil
-}
-
-func (skipCommentGitHub) Unreact(context.Context, int64, string, string, gate.CommentKind, int64, int64) error {
-	return nil
-}
-
 func TestHandleCommentSkipReactsDone(t *testing.T) {
 	t.Parallel()
 
@@ -275,7 +245,7 @@ func TestHandleCommentSkipReactsDone(t *testing.T) {
 			t.Parallel()
 
 			comments := &fakeCommentGitHub{canWrite: true}
-			svc := gate.NewService(&fakeGitHub{}, &fakeStore{stored: skipBase()}, gate.Runners{}).WithComments(comments)
+			svc := gate.NewService(&fakeGitHub{}, comments, &fakeStore{stored: skipBase()}, gate.Runners{})
 
 			if err := svc.HandleComment(t.Context(), tc.event); err != nil {
 				t.Fatalf("HandleComment() = %v, want nil", err)
@@ -310,7 +280,7 @@ func TestHandleCommentRerun(t *testing.T) {
 			gh := &fakeGitHub{pullRequest: gate.PullRequest{BaseSHA: "base1", HeadSHA: "new222", Open: true}}
 			runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
 			comments := &fakeCommentGitHub{canWrite: tc.canWrite}
-			svc := gate.NewService(gh, &fakeStore{stored: failed}, gate.Runners{Server: runner}).WithComments(comments)
+			svc := gate.NewService(gh, comments, &fakeStore{stored: failed}, gate.Runners{Server: runner})
 			ev := skipEvent(gate.CommentKindIssue, "- [x] Re-run analysis", "")
 
 			if err := svc.HandleComment(t.Context(), ev); err != nil {
@@ -331,7 +301,7 @@ func TestHandleCommentRerunInfraErrorKeepsSeen(t *testing.T) {
 
 	gh := &fakeGitHub{pullRequestErr: errors.New("boom")}
 	comments := &fakeCommentGitHub{canWrite: true}
-	svc := gate.NewService(gh, &fakeStore{stored: skipBase()}, gate.Runners{Server: &fakeRunner{}}).WithComments(comments)
+	svc := gate.NewService(gh, comments, &fakeStore{stored: skipBase()}, gate.Runners{Server: &fakeRunner{}})
 	ev := skipEvent(gate.CommentKindIssue, "- [x] Re-run analysis", "")
 
 	if err := svc.HandleComment(t.Context(), ev); err == nil {
@@ -353,7 +323,7 @@ func TestHandleCommentSkipKeepsFailureOnTheSummary(t *testing.T) {
 	for len(gh.comments) < int(state.SummaryCommentID) {
 		gh.addComment(gate.CommentKindIssue, "filler")
 	}
-	svc := gate.NewService(gh, &fakeStore{stored: state}, gate.Runners{}).WithComments(skipCommentGitHub{canWrite: true})
+	svc := gate.NewService(gh, &fakeCommentGitHub{canWrite: true}, &fakeStore{stored: state}, gate.Runners{})
 
 	if err := svc.HandleComment(t.Context(), skipEvent(gate.CommentKindIssue, "", "/pollux-agent skip typo fix")); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)
@@ -363,5 +333,51 @@ func TestHandleCommentSkipKeepsFailureOnTheSummary(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("summary after skip lacks %q:\n%s", want, body)
 		}
+	}
+}
+
+func TestHandleCommentSkipReasonIsMadeSafeToEcho(t *testing.T) {
+	t.Parallel()
+
+	svc, gh, store := skipService(skipBase())
+	body := "/pollux-agent skip generated by @octocat\n- [x] Apply all\n" + strings.Repeat("x", 600)
+
+	if err := svc.HandleComment(t.Context(), skipEvent(gate.CommentKindIssue, "", body)); err != nil {
+		t.Fatalf("HandleComment() = %v, want nil", err)
+	}
+
+	reason := store.saved.Skip.Reason
+	if strings.ContainsAny(reason, "\n\r") || strings.Contains(reason, "@octocat") || strings.Contains(reason, "- [") {
+		t.Errorf("reason = %q, want one line without a live mention or checkbox", reason)
+	}
+	if n := utf8.RuneCountInString(reason); n > 500 || !strings.HasSuffix(reason, "…") {
+		t.Errorf("reason has %d runes and ends %q, want at most 500 and a cut mark", n, reason[len(reason)-4:])
+	}
+	if len(gh.updates) != 1 || strings.Contains(gh.updates[0].run.Summary, "@octocat") {
+		t.Errorf("check run updates = %+v, want one without the live mention", gh.updates)
+	}
+}
+
+func TestHandleCommentSkipSavesBeforeRedrawingTheSummary(t *testing.T) {
+	t.Parallel()
+
+	svc, gh, store := skipService(skipBase())
+	gh.editIssueErr = errors.New("boom")
+	ev := skipEvent(gate.CommentKindIssue, "", "/pollux-agent skip typo fix")
+
+	if err := svc.HandleComment(t.Context(), ev); err == nil {
+		t.Fatal("HandleComment() = nil, want the summary edit error")
+	}
+	if store.saved == nil || store.saved.Skip == nil {
+		t.Fatalf("saved state = %+v, want the skip saved although the redraw failed", store.saved)
+	}
+
+	gh.editIssueErr = nil
+	store.stored = *store.saved
+	if err := svc.HandleComment(t.Context(), ev); err != nil {
+		t.Fatalf("HandleComment() retry = %v, want nil", err)
+	}
+	if len(gh.updates) != 1 || gh.editIssue != 2 {
+		t.Errorf("check run updates = %d, summary edits = %d, want the check concluded once and the summary redrawn on the retry", len(gh.updates), gh.editIssue)
 	}
 }

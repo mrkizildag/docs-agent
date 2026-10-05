@@ -476,6 +476,29 @@ func TestHandleJob(t *testing.T) {
 		}
 	})
 
+	t.Run("dispatches rerun ticks as comments", func(t *testing.T) {
+		t.Parallel()
+
+		ev := gate.CommentEvent{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, Sender: "dev", CommentID: 5, Kind: gate.CommentKindIssue, Ticked: "- [x] Re-run analysis"}
+		evPayload, err := json.Marshal(map[string]any{"Comment": ev})
+		if err != nil {
+			t.Fatalf("marshal rerun comment job: %v", err)
+		}
+		handler := &fakePullRequestHandler{}
+		job := jobqueue.Job{ID: 6, Key: "acme/widgets#7", Kind: pullRequestJobKind, Payload: evPayload}
+
+		if err := httpapi.HandleJob(handler)(t.Context(), job); err != nil {
+			t.Fatalf("HandleJob() error = %v", err)
+		}
+
+		if diff := cmp.Diff([]gate.CommentEvent{ev}, handler.comments); diff != "" {
+			t.Errorf("HandleComment calls (-want +got):\n%s", diff)
+		}
+		if len(handler.calls) != 0 {
+			t.Errorf("HandlePullRequest calls = %v, want none", handler.calls)
+		}
+	})
+
 	t.Run("unknown kind errors", func(t *testing.T) {
 		t.Parallel()
 
@@ -748,6 +771,37 @@ func TestWebhookIssueComment(t *testing.T) {
 				t.Errorf("job payload (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestWebhookIssueCommentRerunTickIsPullRequestJob(t *testing.T) {
+	t.Parallel()
+
+	unticked := "intro\n\n- [ ] Re-run analysis\n"
+	ticked := "intro\n\n- [x] Re-run analysis\n"
+	enqueuer := newFakeEnqueuer()
+	rec := postWebhook(t, []byte("test-secret"), enqueuer, "issue_comment", "delivery-id", issueCommentPayload(t, "edited", "User", true, unticked, ticked))
+
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("POST /webhook = %d, want %d", rec.Code, http.StatusAccepted)
+	}
+	if len(enqueuer.jobs) != 1 {
+		t.Fatalf("Enqueue calls = %d, want 1", len(enqueuer.jobs))
+	}
+	job := enqueuer.jobs[0]
+	if job.Key != "acme/widgets#7" || job.Kind != pullRequestJobKind || job.Supersedes || job.DeliveryID != "delivery-id" {
+		t.Errorf("NewJob = %+v, want Key=acme/widgets#7 Kind=%s Supersedes=false DeliveryID=delivery-id", job, pullRequestJobKind)
+	}
+	var payload struct{ Comment *gate.CommentEvent }
+	if err := json.Unmarshal(job.Payload, &payload); err != nil {
+		t.Fatalf("decode job payload: %v", err)
+	}
+	want := &gate.CommentEvent{
+		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, Sender: "dev", CommentID: 5,
+		Kind: gate.CommentKindIssue, Ticked: "- [x] Re-run analysis", Body: ticked,
+	}
+	if diff := cmp.Diff(want, payload.Comment); diff != "" {
+		t.Errorf("job payload Comment (-want +got):\n%s", diff)
 	}
 }
 

@@ -2,7 +2,7 @@
 
 A GitHub App that keeps project docs up to date. On every pull request it reads the diff, finds the docs that describe the changed code, and proposes updates. A required `pollux-agent` check blocks the merge until the docs are updated or the change is skipped.
 
-**Status:** phase 1 (in-repo docs and the merge check) is nearly done. Analysis, proposals, Apply, and Skip work end to end. Still open: failure handling with Re-run, and a starter `docs/` folder for repos that have none.
+**Status:** phase 1 (in-repo docs and the merge check) is nearly done. Analysis, proposals, Apply, Skip, and failure handling with Re-run work end to end. Still open: a starter `docs/` folder for repos that have none.
 
 ## How it works
 

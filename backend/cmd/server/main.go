@@ -63,7 +63,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("build analysis runners: %w", err)
 	}
-	gateSvc := gate.NewService(ghClient, store, runners).WithComments(ghClient)
+	gateSvc := gate.NewService(ghClient, ghClient, store, runners)
 
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, maxParallelJobs)
 	workerCtx, cancelWorker := context.WithCancel(context.WithoutCancel(ctx))

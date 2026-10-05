@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -19,14 +20,15 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 	var deadline string
 	row := s.db.QueryRowContext(ctx,
 		`SELECT installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, summary_comment_id, head_ref, proposals_sha,
-			fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha, failure_cause
+			fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha, failure_cause, pending_apply
 		FROM pull_requests WHERE owner = ? AND repo = ? AND number = ?`,
 		owner, repo, number)
 
 	var pending gate.SkipAsk
 	var skip gate.Skip
+	var pendingApply string
 	if err := row.Scan(&state.InstallationID, &state.HeadSHA, &state.CheckRunID, &run.RunID, &run.Nonce, &deadline, &state.SummaryCommentID, &state.HeadRef, &state.ProposalsSHA,
-		&state.Fork, &pending.User, &pending.Scope, &skip.User, &skip.Scope, &skip.Reason, &skip.HeadSHA, &state.FailureCause); err != nil {
+		&state.Fork, &pending.User, &pending.Scope, &skip.User, &skip.Scope, &skip.Reason, &skip.HeadSHA, &state.FailureCause, &pendingApply); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return state, nil
 		}
@@ -38,6 +40,13 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 	}
 	if skip.User != "" {
 		state.Skip = &skip
+	}
+
+	if pendingApply != "" {
+		state.PendingApply = &gate.PendingApply{}
+		if err := json.Unmarshal([]byte(pendingApply), state.PendingApply); err != nil {
+			return gate.PRState{}, fmt.Errorf("load pr %s/%s#%d: parse pending apply: %w", owner, repo, number, err)
+		}
 	}
 
 	if run.Nonce != "" {
@@ -91,6 +100,14 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 		skip = *state.Skip
 	}
 
+	var pendingApply []byte
+	if state.PendingApply != nil {
+		var err error
+		if pendingApply, err = json.Marshal(state.PendingApply); err != nil {
+			return fmt.Errorf("save pr %s/%s#%d: encode pending apply: %w", state.Owner, state.Repo, state.Number, err)
+		}
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("save pr %s/%s#%d: begin: %w", state.Owner, state.Repo, state.Number, err)
@@ -99,8 +116,8 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO pull_requests (owner, repo, number, installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, summary_comment_id, head_ref, proposals_sha,
-			fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha, failure_cause)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha, failure_cause, pending_apply)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (owner, repo, number) DO UPDATE SET
 			installation_id = excluded.installation_id,
 			head_sha = excluded.head_sha,
@@ -118,10 +135,11 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 			skip_scope = excluded.skip_scope,
 			skip_reason = excluded.skip_reason,
 			skip_head_sha = excluded.skip_head_sha,
-			failure_cause = excluded.failure_cause`,
+			failure_cause = excluded.failure_cause,
+			pending_apply = excluded.pending_apply`,
 		state.Owner, state.Repo, state.Number, state.InstallationID, state.HeadSHA,
 		state.CheckRunID, run.RunID, run.Nonce, deadline, state.SummaryCommentID, state.HeadRef, state.ProposalsSHA,
-		state.Fork, pending.User, pending.Scope, skip.User, skip.Scope, skip.Reason, skip.HeadSHA, state.FailureCause)
+		state.Fork, pending.User, pending.Scope, skip.User, skip.Scope, skip.Reason, skip.HeadSHA, state.FailureCause, string(pendingApply))
 	if err != nil {
 		return fmt.Errorf("save pr %s/%s#%d: %w", state.Owner, state.Repo, state.Number, err)
 	}

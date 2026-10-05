@@ -134,12 +134,21 @@ type PRState struct {
 	Fork           bool   // head lives in another repository; Apply is not offered
 	Run            *AwaitingRun
 
-	PendingSkip *SkipAsk // skip waiting for its reason; nil if none
-	Skip        *Skip    // active skip; nil if none
+	PendingSkip  *SkipAsk      // skip waiting for its reason; nil if none
+	Skip         *Skip         // active skip; nil if none
+	PendingApply *PendingApply // Apply commit being created; nil if none
 
 	SummaryCommentID int64  // 0 until the summary comment is created
 	FailureCause     string // why the last analysis failed, shown in the summary; "" when it did not
 	Proposals        []ProposalState
+}
+
+// PendingApply is an Apply commit that may exist on GitHub before its proposals
+// are saved as applied: the proposals, the message and the parent it was built on.
+type PendingApply struct {
+	IDs     []string
+	Message string
+	Parent  string
 }
 
 // SkipScope is how long a skip passes the check.
@@ -256,7 +265,8 @@ type Store interface {
 // OnPush is the state transition for a new head commit: pure, no I/O. It
 // drops any awaited run, so that run's result is ignored; the proposals, the
 // summary comment and PR-scope skips carry over. A commit-scope skip carries
-// over only for the head it was made at, and a commit-scope pending ask never.
+// over only for the head it was made at, and a pending skip ask, of either
+// scope, only while the head stays the same. The pending apply is dropped.
 func OnPush(prev PRState, pr PullRequest) PRState {
 	next := PRState{
 		InstallationID:   pr.InstallationID,
@@ -270,15 +280,27 @@ func OnPush(prev PRState, pr PullRequest) PRState {
 		SummaryCommentID: prev.SummaryCommentID,
 		Proposals:        slices.Clone(prev.Proposals),
 	}
-	if sk := prev.Skip; sk != nil && (sk.Scope == SkipPR || sk.HeadSHA == pr.HeadSHA) {
-		kept := *sk
+	if prev.Skip != nil {
+		kept := *prev.Skip
 		next.Skip = &kept
+		if !skipActive(next) {
+			next.Skip = nil
+		}
 	}
-	if ask := prev.PendingSkip; ask != nil && (ask.Scope == SkipPR || prev.HeadSHA == pr.HeadSHA) {
+	if ask := prev.PendingSkip; ask != nil && pendingSkipCancelled(prev, pr) == nil {
 		kept := *ask
 		next.PendingSkip = &kept
 	}
 	return next
+}
+
+// pendingSkipCancelled returns the pending skip ask that a push to pr cancels,
+// or nil: any ask is cancelled by a new head, kept on the same one.
+func pendingSkipCancelled(prev PRState, pr PullRequest) *SkipAsk {
+	if prev.PendingSkip == nil || prev.HeadSHA == pr.HeadSHA {
+		return nil
+	}
+	return prev.PendingSkip
 }
 
 // Superseded returns the neutral check run that closes the check run of an
@@ -290,7 +312,7 @@ func Superseded(state PRState, pr PullRequest) (run CheckRun, ok bool) {
 	}
 	by := "a re-run"
 	if pr.HeadSHA != state.HeadSHA {
-		by = pr.HeadSHA[:min(7, len(pr.HeadSHA))]
+		by = shortSHA(pr.HeadSHA)
 	}
 	run = CheckRun{Name: CheckName, HeadSHA: state.HeadSHA, Status: StatusCompleted}
 	return neutral(run, "Superseded", "Superseded by "+by), true
@@ -390,6 +412,9 @@ func truncate(s string, max int) string {
 	}
 	return s[:cut] + truncatedMark
 }
+
+// shortSHA is the 7-character abbreviation of sha.
+func shortSHA(sha string) string { return sha[:min(7, len(sha))] }
 
 // conclude is the state transition for an analysis that ended: pure, no I/O.
 // It clears the awaited run and returns the completed check run to report;
@@ -664,10 +689,11 @@ type Service struct {
 	collectBackoff time.Duration
 }
 
-// NewService returns a Service that reports check runs through gh, persists
-// state through store, and selects among runners for analysis.
-func NewService(gh GitHub, store Store, runners Runners) *Service {
-	return &Service{gh: gh, store: store, runners: runners, collectBackoff: time.Second}
+// NewService returns a Service that reports check runs through gh, acts on
+// comments through comments, persists state through store, and selects among
+// runners for analysis.
+func NewService(gh GitHub, comments CommentGitHub, store Store, runners Runners) *Service {
+	return &Service{gh: gh, comments: comments, store: store, runners: runners, collectBackoff: time.Second}
 }
 
 // WithCollectBackoff sets the wait before the first Collect retry (doubling
@@ -679,28 +705,51 @@ func (s *Service) WithCollectBackoff(d time.Duration) *Service {
 
 // HandlePullRequest selects an analysis runner for pr, runs it, and reports
 // the result as the pollux-agent check run. A runner that finishes later leaves
-// the check run in progress until HandleRunCompleted concludes it.
+// the check run in progress until HandleRunCompleted concludes it. A push of the
+// commit a crashed Apply made keeps that Apply's proposals applied.
 func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
+	op := fmt.Sprintf("handle pull request %s/%s#%d", pr.Owner, pr.Repo, pr.Number)
 	state, err := s.store.LoadPR(ctx, pr.Owner, pr.Repo, pr.Number)
 	if err != nil {
-		return fmt.Errorf("handle pull request %s/%s#%d: load state: %w", pr.Owner, pr.Repo, pr.Number, err)
+		return fmt.Errorf("%s: load state: %w", op, err)
 	}
-	if err := s.analyze(ctx, state, pr); err != nil {
-		return fmt.Errorf("handle pull request %s/%s#%d: %w", pr.Owner, pr.Repo, pr.Number, err)
-	}
-
-	// Posted after the new state is saved, so a retried job finds no pending skip.
-	if ask := state.PendingSkip; ask != nil && ask.Scope == SkipCommit && state.HeadSHA != pr.HeadSHA && OnPush(state, pr).PendingSkip == nil {
-		short := state.HeadSHA
-		if len(short) > 7 {
-			short = short[:7]
-		}
-		body := fmt.Sprintf("@%s, a new push arrived before your reason, so the skip for `%s` was cancelled. Tick **Skip this commit** again to skip the new head.", ask.User, short)
-		if _, err := s.gh.CreateIssueComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number, body); err != nil {
-			return fmt.Errorf("handle pull request %s/%s#%d: post skip cancellation: %w", pr.Owner, pr.Repo, pr.Number, err)
-		}
+	if err := s.analyzeHead(ctx, state, pr); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
 	}
 	return nil
+}
+
+// analyzeHead analyzes pr's head against the stored state, as a push or a
+// re-run does: the push of a crashed Apply's commit keeps its proposals
+// applied, and a pending skip ask the new head cancels gets a note.
+func (s *Service) analyzeHead(ctx context.Context, loaded PRState, pr PullRequest) error {
+	state, err := s.adoptPendingApply(ctx, loaded, pr)
+	if err != nil {
+		return err
+	}
+	analyzeErr := s.analyze(ctx, state, pr)
+
+	// The ask is cancelled once the new head is saved, so a retried job finds no
+	// pending skip and the note is posted once; an analysis that failed before
+	// saving leaves the ask for the retry.
+	if ask := pendingSkipCancelled(loaded, pr); ask != nil && (analyzeErr == nil || s.headSaved(ctx, pr)) {
+		label := skipCommitLabel
+		if ask.Scope == SkipPR {
+			label = skipPRLabel
+		}
+		body := fmt.Sprintf("@%s, a new push arrived before your reason, so the skip for `%s` was cancelled. Tick **%s** again to skip the new head.", ask.User, shortSHA(loaded.HeadSHA), label)
+		if _, err := s.gh.CreateIssueComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number, body); err != nil {
+			return errors.Join(analyzeErr, fmt.Errorf("post skip cancellation: %w", err))
+		}
+	}
+	return analyzeErr
+}
+
+// headSaved reports whether the stored state is already at pr's head; a failed
+// load counts as not saved.
+func (s *Service) headSaved(ctx context.Context, pr PullRequest) bool {
+	latest, err := s.store.LoadPR(ctx, pr.Owner, pr.Repo, pr.Number)
+	return err == nil && latest.HeadSHA == pr.HeadSHA
 }
 
 // HandleRerun starts a fresh analysis of the pull request's current head, as a
@@ -723,7 +772,7 @@ func (s *Service) HandleRerun(ctx context.Context, r RerunRequest) error {
 	if !pr.Open || (state.Run != nil && state.HeadSHA == pr.HeadSHA && !Overdue(state, time.Now())) {
 		return nil
 	}
-	if err := s.analyze(ctx, state, pr); err != nil {
+	if err := s.analyzeHead(ctx, state, pr); err != nil {
 		return fmt.Errorf("handle rerun of %s/%s#%d: %w", ref.Owner, ref.Repo, ref.Number, err)
 	}
 	return nil
@@ -855,8 +904,8 @@ func (s *Service) startRun(ctx context.Context, state PRState, pr PullRequest, r
 }
 
 // failRun concludes the check run neutral for cause, reports it in the summary
-// comment, and saves the concluded state. It returns cause joined with any
-// error from those steps.
+// comment, and saves the concluded state. It returns cause, as a
+// *reportedFailure when those steps succeeded, else joined with their error.
 func (s *Service) failRun(ctx context.Context, state PRState, pr PullRequest, cause error) error {
 	outcome := failedOutcome(failureCause(cause))
 	var large *tooLargeError
@@ -866,8 +915,14 @@ func (s *Service) failRun(ctx context.Context, state PRState, pr PullRequest, ca
 	if err := s.concludeFailed(ctx, state, pr, outcome); err != nil {
 		return errors.Join(cause, err)
 	}
-	return cause
+	return &reportedFailure{cause}
 }
+
+// reportedFailure is an analysis failure that the check run and the summary
+// already report, so a caller that only wants the analysis to have run is done.
+type reportedFailure struct{ error }
+
+func (r *reportedFailure) Unwrap() error { return r.error }
 
 // concludeFailed concludes the check run neutral for a failed outcome, writes
 // the summary comment with its cause, and saves the concluded state. If the

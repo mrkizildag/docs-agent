@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/google/go-github/v92/github"
+
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 )
 
@@ -42,21 +44,14 @@ func (c *Client) Unreact(ctx context.Context, installationID int64, owner, repo 
 		return fmt.Errorf("unreact %s/%s %s comment %d: %w", owner, repo, kind, id, err)
 	}
 
-	var resp *http.Response
 	switch kind {
 	case gate.CommentKindReview:
-		r, err := client.Reactions.DeletePullRequestCommentReaction(ctx, owner, repo, id, reactionID)
-		if r != nil {
-			resp = r.Response
-		}
+		resp, err := client.Reactions.DeletePullRequestCommentReaction(ctx, owner, repo, id, reactionID)
 		if err != nil && !isNotFound(resp) {
 			return fmt.Errorf("unreact %s/%s review comment %d: %w", owner, repo, id, err)
 		}
 	case gate.CommentKindIssue:
-		r, err := client.Reactions.DeleteIssueCommentReaction(ctx, owner, repo, id, reactionID)
-		if r != nil {
-			resp = r.Response
-		}
+		resp, err := client.Reactions.DeleteIssueCommentReaction(ctx, owner, repo, id, reactionID)
 		if err != nil && !isNotFound(resp) {
 			return fmt.Errorf("unreact %s/%s issue comment %d: %w", owner, repo, id, err)
 		}
@@ -66,6 +61,6 @@ func (c *Client) Unreact(ctx context.Context, installationID int64, owner, repo 
 	return nil
 }
 
-func isNotFound(resp *http.Response) bool {
-	return resp != nil && resp.StatusCode == http.StatusNotFound
+func isNotFound(resp *github.Response) bool {
+	return resp != nil && resp.Response != nil && resp.StatusCode == http.StatusNotFound
 }
