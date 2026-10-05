@@ -19,14 +19,14 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 	var deadline string
 	row := s.db.QueryRowContext(ctx,
 		`SELECT installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, summary_comment_id, head_ref, proposals_sha,
-			fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha
+			fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha, failure_cause
 		FROM pull_requests WHERE owner = ? AND repo = ? AND number = ?`,
 		owner, repo, number)
 
 	var pending gate.SkipAsk
 	var skip gate.Skip
 	if err := row.Scan(&state.InstallationID, &state.HeadSHA, &state.CheckRunID, &run.RunID, &run.Nonce, &deadline, &state.SummaryCommentID, &state.HeadRef, &state.ProposalsSHA,
-		&state.Fork, &pending.User, &pending.Scope, &skip.User, &skip.Scope, &skip.Reason, &skip.HeadSHA); err != nil {
+		&state.Fork, &pending.User, &pending.Scope, &skip.User, &skip.Scope, &skip.Reason, &skip.HeadSHA, &state.FailureCause); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return state, nil
 		}
@@ -40,7 +40,7 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 		state.Skip = &skip
 	}
 
-	if run.RunID != 0 {
+	if run.Nonce != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, deadline)
 		if err != nil {
 			return gate.PRState{}, fmt.Errorf("load pr %s/%s#%d: parse run deadline %q: %w", owner, repo, number, deadline, err)
@@ -99,8 +99,8 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO pull_requests (owner, repo, number, installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, summary_comment_id, head_ref, proposals_sha,
-			fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha, failure_cause)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (owner, repo, number) DO UPDATE SET
 			installation_id = excluded.installation_id,
 			head_sha = excluded.head_sha,
@@ -117,10 +117,11 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 			skip_user = excluded.skip_user,
 			skip_scope = excluded.skip_scope,
 			skip_reason = excluded.skip_reason,
-			skip_head_sha = excluded.skip_head_sha`,
+			skip_head_sha = excluded.skip_head_sha,
+			failure_cause = excluded.failure_cause`,
 		state.Owner, state.Repo, state.Number, state.InstallationID, state.HeadSHA,
 		state.CheckRunID, run.RunID, run.Nonce, deadline, state.SummaryCommentID, state.HeadRef, state.ProposalsSHA,
-		state.Fork, pending.User, pending.Scope, skip.User, skip.Scope, skip.Reason, skip.HeadSHA)
+		state.Fork, pending.User, pending.Scope, skip.User, skip.Scope, skip.Reason, skip.HeadSHA, state.FailureCause)
 	if err != nil {
 		return fmt.Errorf("save pr %s/%s#%d: %w", state.Owner, state.Repo, state.Number, err)
 	}
@@ -168,11 +169,36 @@ func (s *Store) PRForRun(ctx context.Context, owner, repo string, runID int64) (
 	return number, true, nil
 }
 
+// PRsForHead returns the numbers of owner/repo's stored pull requests whose
+// head is headSHA.
+func (s *Store) PRsForHead(ctx context.Context, owner, repo, headSHA string) ([]int, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT number FROM pull_requests WHERE owner = ? AND repo = ? AND head_sha = ? ORDER BY number`,
+		owner, repo, headSHA)
+	if err != nil {
+		return nil, fmt.Errorf("find prs for head %s of %s/%s: %w", headSHA, owner, repo, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var numbers []int
+	for rows.Next() {
+		var number int
+		if err := rows.Scan(&number); err != nil {
+			return nil, fmt.Errorf("scan pr for head %s of %s/%s: %w", headSHA, owner, repo, err)
+		}
+		numbers = append(numbers, number)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("find prs for head %s of %s/%s: %w", headSHA, owner, repo, err)
+	}
+	return numbers, nil
+}
+
 // OverdueRuns returns the awaited runs whose deadline is before now. Deadlines
 // are compared as times, not as text, because RFC3339Nano does not sort.
 func (s *Store) OverdueRuns(ctx context.Context, now time.Time) ([]gate.OverdueRun, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT owner, repo, number, run_nonce, run_deadline FROM pull_requests WHERE run_id != 0`)
+		`SELECT owner, repo, number, run_nonce, run_deadline FROM pull_requests WHERE run_nonce != ''`)
 	if err != nil {
 		return nil, fmt.Errorf("list awaited runs: %w", err)
 	}
@@ -190,6 +216,7 @@ func (s *Store) OverdueRuns(ctx context.Context, now time.Time) ([]gate.OverdueR
 			return nil, fmt.Errorf("parse run deadline %q of %s/%s#%d: %w", deadline, run.Owner, run.Repo, run.Number, err)
 		}
 		if now.After(parsed) {
+			run.Deadline = parsed
 			overdue = append(overdue, run)
 		}
 	}

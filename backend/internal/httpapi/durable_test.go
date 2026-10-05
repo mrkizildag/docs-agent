@@ -4,14 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
@@ -309,12 +313,153 @@ func TestEnqueueDeadlineJobsIsIdempotent(t *testing.T) {
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(&blockingGitHub{}, store, gate.Runners{})), slog.New(slog.DiscardHandler), 1)
 	jobs := &countingEnqueuer{next: worker}
 
-	for _, now := range []time.Time{deadline.Add(-time.Second), deadline.Add(time.Second), deadline.Add(time.Minute)} {
-		if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, jobs, now); err != nil {
+	for _, now := range []time.Time{deadline.Add(-time.Second), deadline.Add(time.Second), deadline.Add(2 * time.Second)} {
+		if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, jobs, slog.New(slog.DiscardHandler), now); err != nil {
 			t.Fatalf("EnqueueDeadlineJobs(%v) = %v", now, err)
 		}
 	}
 	if jobs.enqueued != 1 {
-		t.Errorf("deadline jobs enqueued = %d, want 1 across a not-yet-due sweep and two overdue sweeps", jobs.enqueued)
+		t.Errorf("deadline jobs enqueued = %d, want 1 across a not-yet-due sweep and two overdue sweeps in one minute", jobs.enqueued)
+	}
+}
+
+// failOnceConcludeGitHub rejects the first UpdateCheckRun and records the rest.
+type failOnceConcludeGitHub struct {
+	blockingGitHub
+
+	mu        sync.Mutex
+	attempts  int
+	concluded chan gate.CheckRun
+}
+
+func (f *failOnceConcludeGitHub) UpdateCheckRun(_ context.Context, _ int64, _, _ string, _ int64, run gate.CheckRun) error {
+	f.mu.Lock()
+	f.attempts++
+	first := f.attempts == 1
+	f.mu.Unlock()
+	if first {
+		return errors.New("github rejected the conclude write")
+	}
+	f.concluded <- run
+	return nil
+}
+
+func TestDeadlineJobFailedConcludeIsRetriedByLaterSweep(t *testing.T) {
+	t.Parallel()
+
+	store := openStore(t, filepath.Join(t.TempDir(), "db"))
+	t.Cleanup(func() { _ = store.Close() })
+	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	state := gate.PRState{
+		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1", CheckRunID: 5,
+		Run: &gate.AwaitingRun{RunID: 9, Nonce: "n1", Deadline: deadline},
+	}
+	if err := store.SavePR(t.Context(), state); err != nil {
+		t.Fatalf("SavePR() = %v", err)
+	}
+
+	gh := &failOnceConcludeGitHub{concluded: make(chan gate.CheckRun, 1)}
+	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, store, gate.Runners{})), slog.New(slog.DiscardHandler), 1)
+	stop := runWorker(worker)
+	t.Cleanup(func() {
+		if err := stop(); err != nil {
+			t.Errorf("worker.Run() = %v", err)
+		}
+	})
+
+	now := deadline.Add(time.Second)
+	if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, worker, slog.New(slog.DiscardHandler), now); err != nil {
+		t.Fatalf("EnqueueDeadlineJobs() = %v", err)
+	}
+	waitFor(t, "the first conclude attempt", func() bool {
+		gh.mu.Lock()
+		defer gh.mu.Unlock()
+		return gh.attempts == 1
+	})
+
+	for i := 1; ; i++ {
+		select {
+		case run := <-gh.concluded:
+			if run.Conclusion != gate.ConclusionNeutral {
+				t.Errorf("conclusion = %q, want %q", run.Conclusion, gate.ConclusionNeutral)
+			}
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+		if i > 100 {
+			t.Fatal("timed out waiting for the retried conclude write")
+		}
+		if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, worker, slog.New(slog.DiscardHandler), now.Add(time.Duration(i)*time.Minute)); err != nil {
+			t.Fatalf("EnqueueDeadlineJobs() = %v", err)
+		}
+	}
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for !cond() {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", what)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+type fakeOverdueSource []gate.OverdueRun
+
+func (f fakeOverdueSource) OverdueRuns(context.Context, time.Time) ([]gate.OverdueRun, error) {
+	return f, nil
+}
+
+func TestEnqueueDeadlineJobsBacksOffExponentiallyAndStopsAfterADay(t *testing.T) {
+	t.Parallel()
+
+	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	src := fakeOverdueSource{{PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}, Nonce: "n1", Deadline: deadline}}
+	jobs := newFakeEnqueuer()
+	jobs.result = true
+
+	var retriedAt []int
+	seen := map[string]bool{}
+	for minute := range 24*60 + 10 {
+		before := len(jobs.jobs)
+		now := deadline.Add(time.Duration(minute)*time.Minute + time.Second)
+		if err := httpapi.EnqueueDeadlineJobs(t.Context(), src, jobs, slog.New(slog.DiscardHandler), now); err != nil {
+			t.Fatalf("EnqueueDeadlineJobs(+%dm) = %v", minute, err)
+		}
+		if minute > 24*60 && len(jobs.jobs) != before {
+			t.Errorf("job enqueued %dm past the deadline, want none after 24h", minute)
+		}
+		for _, job := range jobs.jobs[before:] {
+			if !seen[job.DeliveryID] {
+				seen[job.DeliveryID] = true
+				retriedAt = append(retriedAt, minute)
+			}
+		}
+	}
+
+	want := []int{0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1264}
+	if diff := cmp.Diff(want, retriedAt); diff != "" {
+		t.Errorf("minutes overdue at which a new job is enqueued (-want +got):\n%s", diff)
+	}
+}
+
+func TestEnqueueDeadlineJobsLogsGivingUpOnce(t *testing.T) {
+	t.Parallel()
+
+	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	src := fakeOverdueSource{{PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}, Nonce: "n1", Deadline: deadline}}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+	for now := deadline.Add(24*time.Hour - time.Minute + 10*time.Second); now.Before(deadline.Add(24*time.Hour + 3*time.Minute)); now = now.Add(30 * time.Second) {
+		if err := httpapi.EnqueueDeadlineJobs(t.Context(), src, newFakeEnqueuer(), logger, now); err != nil {
+			t.Fatalf("EnqueueDeadlineJobs(%v) = %v", now, err)
+		}
+	}
+	if got := strings.Count(logs.String(), "giving up on overdue run"); got != 1 {
+		t.Errorf("give-up warnings = %d, want 1 across sweeps every 30s:\n%s", got, logs.String())
 	}
 }

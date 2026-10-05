@@ -138,26 +138,46 @@ func fenceFor(body string) string {
 	return strings.Repeat("`", max(3, longest+1))
 }
 
-// renderSummary is the summary comment body: one row per proposal in state,
-// then the PR-wide checkboxes redrawn from state.
+const rerunLabel = "Re-run analysis"
+
+// renderSummary is the summary comment body: a heading (the failure cause when
+// the last analysis failed, else the open proposal count), one row per proposal
+// in state, then the PR-wide checkboxes redrawn from state. Re-run is offered
+// for a failure only; Apply all is never drawn ticked.
 func renderSummary(state PRState) string {
 	var b strings.Builder
 	b.WriteString(summaryMarker)
-	b.WriteString("\n\n| Doc | Section | Comment | State |\n| --- | --- | --- | --- |\n")
+	b.WriteString("\n\n")
 	applied, open := 0, 0
+	for _, p := range state.Proposals {
+		switch p.State {
+		case ProposalApplied:
+			applied++
+		case ProposalOpen:
+			open++
+		case ProposalOutdated:
+		}
+	}
+	if state.FailureCause != "" {
+		b.WriteString("**Analysis failed:** " + state.FailureCause + "\n\n")
+	} else {
+		noun := "updates"
+		if open == 1 {
+			noun = "update"
+		}
+		fmt.Fprintf(&b, "**pollux-agent** proposes %d doc %s.\n\n", open, noun)
+	}
+	if len(state.Proposals) > 0 {
+		b.WriteString("| Doc | Section | Comment | State |\n| --- | --- | --- | --- |\n")
+	}
 	for _, p := range state.Proposals {
 		section := "(new doc)"
 		if p.Section != "" {
 			section = strings.ReplaceAll(p.Section, "|", `\|`)
 		}
 		status := string(p.State)
-		switch p.State {
-		case ProposalApplied:
-			applied++
+		if p.State == ProposalApplied {
 			status = fmt.Sprintf("applied (%s)", p.AppliedSHA[:min(7, len(p.AppliedSHA))])
-		case ProposalOpen:
-			open++
-		case ProposalOutdated:
 		}
 		link := "-"
 		if p.CommentURL != "" {
@@ -166,13 +186,14 @@ func renderSummary(state PRState) string {
 		fmt.Fprintf(&b, "| `%s` | %s | %s | %s |\n", strings.ReplaceAll(p.DocPath, "|", `\|`), section, link, status)
 	}
 
-	b.WriteString("\n")
-	if state.Fork {
-		b.WriteString("Apply all is not available: this pull request comes from a fork the bot cannot push to.\n")
-	} else {
-		if applied > 0 && open == 0 {
+	if len(state.Proposals) > 0 {
+		b.WriteString("\n")
+		switch {
+		case state.Fork:
+			b.WriteString("Apply all is not available: this pull request comes from a fork the bot cannot push to.\n")
+		case applied > 0 && open == 0:
 			b.WriteString("✅ All proposals applied.\n")
-		} else {
+		default:
 			b.WriteString(checkboxLine(false, applyAllLabel))
 		}
 	}
@@ -183,6 +204,9 @@ func renderSummary(state PRState) string {
 	pending := state.PendingSkip
 	b.WriteString(checkboxLine(scopeIs(SkipCommit, pending, active), skipCommitLabel))
 	b.WriteString(checkboxLine(scopeIs(SkipPR, pending, active), skipPRLabel))
+	if state.FailureCause != "" {
+		b.WriteString(checkboxLine(false, rerunLabel))
+	}
 
 	if active != nil {
 		scope := "this PR"

@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -44,8 +45,13 @@ type e2eGitHub struct {
 	calls chan e2eCheckRunCall
 }
 
-// noComments is the comment surface of a fake that never posts comments.
+// noComments is the comment and pull request lookup surface of a fake that
+// never posts comments or re-runs.
 type noComments struct{}
+
+func (noComments) GetPullRequest(_ context.Context, installationID int64, owner, repo string, number int) (gate.PullRequest, error) {
+	return gate.PullRequest{InstallationID: installationID, Owner: owner, Repo: repo, Number: number, Open: true}, nil
+}
 
 func (noComments) ListComments(context.Context, int64, string, string, int) ([]gate.Comment, error) {
 	return nil, nil
@@ -347,10 +353,16 @@ func (f *fakeActionsGitHub) handler() http.Handler {
 func e2eWorkflowRunBody(t *testing.T) []byte {
 	t.Helper()
 
+	return e2eWorkflowRunCompletedBody(t, 4242, "success")
+}
+
+func e2eWorkflowRunCompletedBody(t *testing.T, runID int64, conclusion string) []byte {
+	t.Helper()
+
 	body, err := json.Marshal(map[string]any{
 		"action": "completed",
 		"workflow_run": map[string]any{
-			"id": 4242, "path": ".github/workflows/pollux-agent.yml", "conclusion": "success",
+			"id": runID, "path": ".github/workflows/pollux-agent.yml", "conclusion": conclusion,
 		},
 		"repository":   map[string]any{"name": "widgets", "owner": map[string]any{"login": "acme"}},
 		"installation": map[string]any{"id": 42},
@@ -438,13 +450,17 @@ func TestActionsRunnerEndToEnd(t *testing.T) {
 	if created["status"] != "in_progress" || created["conclusion"] != nil || created["head_sha"] != "sha1" {
 		t.Errorf("created check run = %v, want in_progress on sha1 with no conclusion", created)
 	}
-	select {
-	case saved := <-store.saved:
-		if saved.Run == nil || saved.Run.RunID != 4242 || saved.CheckRunID != 555 {
-			t.Errorf("saved state = %+v, want awaiting run 4242 with check run 555", saved)
+	// The first save arms the check run before the dispatch; the awaited run follows it.
+	var saved gate.PRState
+	for saved.Run == nil || saved.Run.RunID == 0 {
+		select {
+		case saved = <-store.saved:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for awaited run to be saved")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for awaited run to be saved")
+	}
+	if saved.Run.RunID != 4242 || saved.CheckRunID != 555 {
+		t.Errorf("saved state = %+v, want awaiting run 4242 with check run 555", saved)
 	}
 
 	github.mu.Lock()
@@ -481,7 +497,8 @@ func (f *commentGitHub) WorkflowExists(context.Context, int64, string, string) (
 	return false, nil
 }
 
-func (f *commentGitHub) UpdateCheckRun(context.Context, int64, string, string, int64, gate.CheckRun) error {
+func (f *commentGitHub) UpdateCheckRun(_ context.Context, _ int64, _, _ string, _ int64, run gate.CheckRun) error {
+	f.checkRuns <- run
 	return nil
 }
 
@@ -489,8 +506,7 @@ func (f *commentGitHub) ListChangedFiles(context.Context, int64, string, string,
 	return nil, nil
 }
 
-func (f *commentGitHub) CreateCheckRun(_ context.Context, _ int64, _, _ string, run gate.CheckRun) (int64, error) {
-	f.checkRuns <- run
+func (f *commentGitHub) CreateCheckRun(context.Context, int64, string, string, gate.CheckRun) (int64, error) {
 	return 1, nil
 }
 
@@ -632,12 +648,16 @@ func TestWebhookToProposalCommentsEndToEnd(t *testing.T) {
 // statefulGitHub keeps the PR's comments like GitHub does: created comments are
 // listed back and edits replace bodies.
 type statefulGitHub struct {
-	checkRuns chan gate.CheckRun
+	checkRuns chan gate.CheckRun // each concluded check run, in order
 
-	mu       sync.Mutex
-	comments []gate.Comment
-	creates  int
-	edits    int
+	mu         sync.Mutex
+	head       string
+	workflow   bool
+	comments   []gate.Comment
+	creates    int
+	edits      int
+	checkRunID int64
+	concluded  []concludedCheckRun
 
 	files           map[string]string
 	permissionCalls int
@@ -703,14 +723,29 @@ func (f *statefulGitHub) ReplyToReviewComment(_ context.Context, _ int64, _, _ s
 	return gate.Comment{ID: 500 + int64(len(f.replies)), Kind: gate.CommentKindReview}, nil
 }
 
-func (f *statefulGitHub) WorkflowExists(context.Context, int64, string, string) (bool, error) {
-	return false, nil
+type concludedCheckRun struct {
+	id  int64
+	run gate.CheckRun
 }
 
-func (f *statefulGitHub) UpdateCheckRun(_ context.Context, _ int64, _, _ string, _ int64, run gate.CheckRun) error {
+func (f *statefulGitHub) GetPullRequest(_ context.Context, installationID int64, owner, repo string, number int) (gate.PullRequest, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return gate.PullRequest{InstallationID: installationID, Owner: owner, Repo: repo, Number: number, HeadSHA: f.head, HeadRef: "feature", Open: true}, nil
+}
+
+func (f *statefulGitHub) WorkflowExists(context.Context, int64, string, string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.workflow, nil
+}
+
+func (f *statefulGitHub) UpdateCheckRun(_ context.Context, _ int64, _, _ string, id int64, run gate.CheckRun) error {
+	f.mu.Lock()
 	f.runs = append(f.runs, run)
+	f.concluded = append(f.concluded, concludedCheckRun{id: id, run: run})
+	f.mu.Unlock()
+	f.checkRuns <- run
 	return nil
 }
 
@@ -721,9 +756,13 @@ func (f *statefulGitHub) ListChangedFiles(context.Context, int64, string, string
 func (f *statefulGitHub) CreateCheckRun(_ context.Context, _ int64, _, _ string, run gate.CheckRun) (int64, error) {
 	f.mu.Lock()
 	f.runs = append(f.runs, run)
+	f.checkRunID++
+	id := f.checkRunID
 	f.mu.Unlock()
-	f.checkRuns <- run
-	return 1, nil
+	if run.Status == gate.StatusCompleted {
+		f.checkRuns <- run
+	}
+	return id, nil
 }
 
 func (f *statefulGitHub) ListComments(context.Context, int64, string, string, int) ([]gate.Comment, error) {
@@ -778,11 +817,46 @@ func (f *statefulGitHub) snapshot() (comments []gate.Comment, creates, edits int
 	return slices.Clone(f.comments), f.creates, f.edits
 }
 
-// scriptedRunner returns one queued verdict per run.
-type scriptedRunner struct{ verdicts chan review.Verdict }
+// scriptedRunner plays one queued outcome per run: a review.Verdict is a
+// finished analysis, a review.Pending is an external run, an error is a failed
+// one. Collect never finds a result, which is what a failed workflow run leaves.
+type scriptedRunner struct{ outcomes chan any }
 
-func (r scriptedRunner) Start(context.Context, review.Request) (review.Started, error) {
-	return review.Result{Runner: "fake", Verdict: <-r.verdicts}, nil
+// blockedRun is an outcome that holds the analysis until its context is
+// cancelled, then fails the way an interrupted server analysis does.
+type blockedRun struct{ started chan struct{} }
+
+// heldRun is an outcome that holds the analysis until release is closed, then
+// finishes with no impact; a cancelled context fails it like blockedRun.
+type heldRun struct{ started, release chan struct{} }
+
+func (r scriptedRunner) Start(ctx context.Context, rq review.Request) (review.Started, error) {
+	switch o := (<-r.outcomes).(type) {
+	case blockedRun:
+		close(o.started)
+		<-ctx.Done()
+		return nil, &review.FailedError{Cause: review.CauseTimeout, Err: ctx.Err()}
+	case heldRun:
+		close(o.started)
+		select {
+		case <-o.release:
+			return review.Result{Runner: "fake", Verdict: review.NoImpact{Reason: "held run done"}}, nil
+		case <-ctx.Done():
+			return nil, &review.FailedError{Cause: review.CauseTimeout, Err: ctx.Err()}
+		}
+	case review.Verdict:
+		return review.Result{Runner: "fake", Verdict: o}, nil
+	case review.Pending:
+		return o, nil
+	case error:
+		return nil, o
+	default:
+		return nil, fmt.Errorf("scriptedRunner: unsupported outcome %T", o)
+	}
+}
+
+func (scriptedRunner) Collect(context.Context, review.Completion) (review.Result, error) {
+	return review.Result{}, errors.New("scriptedRunner: no result artifact")
 }
 
 func twoProposals() review.Proposals {
@@ -801,10 +875,10 @@ type pushHarness struct {
 	handler http.Handler
 	secret  []byte
 	deliver int
-	queued  chan review.Verdict
+	queued  chan any
 }
 
-func newPushHarness(t *testing.T, verdicts ...review.Verdict) *pushHarness {
+func newPushHarness(t *testing.T, outcomes ...any) *pushHarness {
 	t.Helper()
 
 	store, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "pollux.db"))
@@ -817,12 +891,12 @@ func newPushHarness(t *testing.T, verdicts ...review.Verdict) *pushHarness {
 		}
 	})
 
-	queued := make(chan review.Verdict, len(verdicts))
-	for _, v := range verdicts {
-		queued <- v
+	queued := make(chan any, len(outcomes))
+	for _, o := range outcomes {
+		queued <- o
 	}
-	gh := &statefulGitHub{checkRuns: make(chan gate.CheckRun, len(verdicts)+8), files: map[string]string{}}
-	gateSvc := gate.NewService(gh, store, gate.Runners{Server: scriptedRunner{verdicts: queued}}).WithComments(gh)
+	gh := &statefulGitHub{checkRuns: make(chan gate.CheckRun, len(outcomes)+8), files: map[string]string{}}
+	gateSvc := gate.NewService(gh, store, gate.Runners{Actions: scriptedRunner{outcomes: queued}, Server: scriptedRunner{outcomes: queued}}).WithComments(gh)
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
@@ -851,6 +925,24 @@ func (h *pushHarness) push(sha string) (gate.CheckRun, gate.PRState) {
 func (h *pushHarness) pushWith(sha string, o pushOpts) (gate.CheckRun, gate.PRState) {
 	h.t.Helper()
 
+	h.sendWith(sha, o)
+	return h.waitConcluded(sha)
+}
+
+// send delivers a synchronize webhook for sha without waiting for the run.
+func (h *pushHarness) send(sha string) {
+	h.t.Helper()
+
+	h.sendWith(sha, pushOpts{})
+}
+
+func (h *pushHarness) sendWith(sha string, o pushOpts) {
+	h.t.Helper()
+
+	h.gh.mu.Lock()
+	h.gh.head = sha
+	h.gh.mu.Unlock()
+
 	h.deliver++
 	body := bytes.Replace(e2ePullRequestFrom(h.t, 1, sha, o), []byte(`"opened"`), []byte(`"synchronize"`), 1)
 	req := httptest.NewRequestWithContext(h.t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
@@ -862,6 +954,11 @@ func (h *pushHarness) pushWith(sha string, o pushOpts) (gate.CheckRun, gate.PRSt
 	if rec.Code != http.StatusAccepted {
 		h.t.Fatalf("POST /webhook for %s = %d, want %d", sha, rec.Code, http.StatusAccepted)
 	}
+}
+
+// waitConcluded waits for the next concluded check run and the saved state of sha.
+func (h *pushHarness) waitConcluded(sha string) (gate.CheckRun, gate.PRState) {
+	h.t.Helper()
 
 	var run gate.CheckRun
 	select {
@@ -870,14 +967,14 @@ func (h *pushHarness) pushWith(sha string, o pushOpts) (gate.CheckRun, gate.PRSt
 		h.t.Fatalf("timed out waiting for check run on %s", sha)
 	}
 
-	// The check run is created before comments are written and state is saved.
+	// The check run is concluded before comments are written and state is saved.
 	deadline := time.After(5 * time.Second)
 	for {
 		state, err := h.store.LoadPR(h.t.Context(), "acme", "widgets", 1)
 		if err != nil {
 			h.t.Fatalf("LoadPR() error = %v", err)
 		}
-		if state.HeadSHA == sha {
+		if state.HeadSHA == sha && state.Run == nil && h.commentIDsSaved(state) {
 			return run, state
 		}
 		select {
@@ -886,6 +983,21 @@ func (h *pushHarness) pushWith(sha string, o pushOpts) (gate.CheckRun, gate.PRSt
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+// commentIDsSaved reports whether state already records every comment written
+// so far: gate saves the concluded state before it writes comments.
+func (h *pushHarness) commentIDsSaved(state gate.PRState) bool {
+	comments, _, _ := h.gh.snapshot()
+	if len(comments) > 0 && state.SummaryCommentID == 0 {
+		return false
+	}
+	for _, p := range state.Proposals {
+		if p.CommentID == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *pushHarness) commentWith(marker string) gate.Comment {
@@ -1135,10 +1247,16 @@ func (h *pushHarness) post(event string, payload map[string]any) {
 	if err != nil {
 		h.t.Fatalf("marshal %s payload: %v", event, err)
 	}
+	h.deliverEvent(event, body)
+}
+
+func (h *pushHarness) deliverEvent(event string, body []byte) {
+	h.t.Helper()
+
 	h.deliver++
 	req := httptest.NewRequestWithContext(h.t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-GitHub-Event", event)
-	req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("x%d", h.deliver))
+	req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("d%d", h.deliver))
 	req.Header.Set("X-Hub-Signature-256", sign(h.secret, body))
 	rec := httptest.NewRecorder()
 	h.handler.ServeHTTP(rec, req)
@@ -1217,10 +1335,10 @@ func (h *pushHarness) allReplied(state gate.PRState) bool {
 	return slices.ContainsFunc(state.Proposals, func(p gate.ProposalState) bool { return p.State == gate.ProposalApplied })
 }
 
-func newApplyHarness(t *testing.T, extra ...review.Verdict) *pushHarness {
+func newApplyHarness(t *testing.T, extra ...any) *pushHarness {
 	t.Helper()
 
-	h := newPushHarness(t, append([]review.Verdict{twoProposals()}, extra...)...)
+	h := newPushHarness(t, append([]any{twoProposals()}, extra...)...)
 	h.gh.files["docs/a.md"] = "# A\n\n## Usage\nold\n\n## Other\nx\n"
 	h.push("sha1")
 	return h
@@ -1491,4 +1609,294 @@ func (f *statefulGitHub) Unreact(_ context.Context, _ int64, _, _ string, kind g
 	defer f.mu.Unlock()
 	delete(f.reactions[reactionKey{kind, id}], reactionID)
 	return nil
+}
+
+func TestFailedAnalysisIsRerunFromSummaryCheckbox(t *testing.T) {
+	t.Parallel()
+
+	const (
+		providerText = "provider said: leak-me"
+		rerunBox     = "- [ ] Re-run analysis"
+		summaryTag   = "<!-- pollux-agent:summary -->"
+	)
+	failure := &review.FailedError{Cause: review.CauseProvider, Err: errors.New(providerText)}
+	h := newPushHarness(t, failure, review.NoImpact{Reason: "docs already match"})
+
+	run, state := h.push("sha1")
+	if run.Conclusion != gate.ConclusionNeutral || run.Title != "Analysis failed" || run.Summary != "The model provider returned an error." {
+		t.Fatalf("failed check run = %+v, want neutral \"Analysis failed\" with the fixed provider cause", run)
+	}
+	if strings.Contains(run.Summary, "leak-me") {
+		t.Errorf("check run summary leaks the provider text: %q", run.Summary)
+	}
+	summary := h.commentWith(summaryTag)
+	if !strings.Contains(summary.Body, "The model provider returned an error.") || !strings.Contains(summary.Body, rerunBox+"\n") || strings.Contains(summary.Body, "leak-me") {
+		t.Errorf("summary after failure:\n%s\nwant the fixed cause and an unticked Re-run box", summary.Body)
+	}
+	if state.SummaryCommentID != summary.ID {
+		t.Errorf("saved SummaryCommentID = %d, want %d", state.SummaryCommentID, summary.ID)
+	}
+
+	ticked := strings.Replace(summary.Body, rerunBox, "- [x] Re-run analysis", 1)
+	h.issueComment("edited", "dev", "User", summary.ID, summary.Body+"\nedited", summary.Body)
+	h.issueComment("edited", "pollux-agent[bot]", "Bot", summary.ID, ticked, summary.Body)
+	h.issueComment("edited", "dev", "User", summary.ID+1, ticked, summary.Body)
+	h.tickSummary("dev", "User", "Re-run analysis")
+
+	select {
+	case run = <-h.gh.checkRuns:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the re-run's check run")
+	}
+	if run.Conclusion != gate.ConclusionSuccess {
+		t.Errorf("re-run check conclusion = %q, want %q", run.Conclusion, gate.ConclusionSuccess)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for {
+		var err error
+		if state, err = h.store.LoadPR(t.Context(), "acme", "widgets", 1); err != nil {
+			t.Fatalf("LoadPR() error = %v", err)
+		}
+		if state.CheckRunID == 2 && state.Run == nil {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for the re-run to finish, state = %+v", state)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	comments, creates, _ := h.gh.snapshot()
+	if creates != 1 || len(comments) != 1 {
+		t.Errorf("creates = %d, comments = %d, want the one summary comment edited in place", creates, len(comments))
+	}
+	if body := h.commentWith(summaryTag).Body; strings.Contains(body, "Analysis failed") || strings.Contains(body, rerunBox) {
+		t.Errorf("summary after re-run:\n%s\nwant no failure cause and no Re-run box", body)
+	}
+
+	h.gh.mu.Lock()
+	defer h.gh.mu.Unlock()
+	if len(h.gh.concluded) != 2 || h.gh.concluded[0].id != 1 || h.gh.concluded[1].id != 2 {
+		t.Errorf("concluded check runs = %+v, want two, on check runs 1 and 2 (the extra edits start nothing)", h.gh.concluded)
+	}
+}
+
+func checkRunRerequestedBody(t *testing.T) []byte {
+	t.Helper()
+
+	return checkRunBody(t, "rerequested", "pollux-agent", 1)
+}
+
+func TestCheckRunRerequestedStartsFreshAnalysis(t *testing.T) {
+	t.Parallel()
+
+	h := newPushHarness(t, review.NoImpact{Reason: "docs already match"}, review.NoImpact{Reason: "docs already match"})
+
+	if run, _ := h.push("sha1"); run.Conclusion != gate.ConclusionSuccess {
+		t.Fatalf("first conclusion = %q, want %q", run.Conclusion, gate.ConclusionSuccess)
+	}
+
+	h.deliverEvent("check_run", checkRunRerequestedBody(t))
+
+	select {
+	case run := <-h.gh.checkRuns:
+		if run.Conclusion != gate.ConclusionSuccess {
+			t.Errorf("re-run conclusion = %q, want %q", run.Conclusion, gate.ConclusionSuccess)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the re-run's check run")
+	}
+	state := h.waitState("the re-run to finish", func(s gate.PRState) bool { return s.CheckRunID == 2 && s.Run == nil })
+	if state.HeadSHA != "sha1" {
+		t.Errorf("HeadSHA = %q, want sha1", state.HeadSHA)
+	}
+}
+
+func TestRerunAndPushTogetherEndOnNewestHead(t *testing.T) {
+	t.Parallel()
+
+	noImpact := review.NoImpact{Reason: "docs already match"}
+	h := newPushHarness(t, noImpact, noImpact, noImpact)
+	h.push("sha1")
+
+	h.gh.mu.Lock()
+	h.gh.head = "sha2"
+	h.gh.mu.Unlock()
+	h.deliverEvent("check_run", checkRunRerequestedBody(t))
+	h.deliverEvent("pull_request", bytes.Replace(e2ePullRequestBody(t, 1, "sha2"), []byte(`"opened"`), []byte(`"synchronize"`), 1))
+
+	var state gate.PRState
+	h.waitState("the newest head to finish", func(s gate.PRState) bool {
+		state = s
+		h.gh.mu.Lock()
+		defer h.gh.mu.Unlock()
+		last := h.gh.concluded[len(h.gh.concluded)-1]
+		return s.HeadSHA == "sha2" && s.Run == nil && s.CheckRunID > 1 && last.id == s.CheckRunID
+	})
+
+	h.gh.mu.Lock()
+	defer h.gh.mu.Unlock()
+	seen := map[int64]bool{}
+	for _, c := range h.gh.concluded {
+		if seen[c.id] {
+			t.Errorf("check run %d concluded twice: %+v", c.id, h.gh.concluded)
+		}
+		seen[c.id] = true
+	}
+	if last := h.gh.concluded[len(h.gh.concluded)-1]; last.id != state.CheckRunID {
+		t.Errorf("last concluded = %+v, want the newest check run %d", last, state.CheckRunID)
+	}
+}
+
+func TestActionsRerunFailingAgainEditsSummaryInPlace(t *testing.T) {
+	t.Parallel()
+
+	const (
+		rerunBox   = "- [ ] Re-run analysis"
+		summaryTag = "<!-- pollux-agent:summary -->"
+		cause      = "The pollux-agent workflow run failed."
+	)
+	pending := func(runID int64) review.Pending {
+		return review.Pending{RunID: runID, Nonce: fmt.Sprintf("n%d", runID), Deadline: time.Now().Add(time.Hour)}
+	}
+	h := newPushHarness(t, twoProposals(), pending(101), pending(102))
+	h.gh.mu.Lock()
+	h.gh.workflow = true
+	h.gh.mu.Unlock()
+
+	h.push("sha1")
+
+	failRun := func(runID int64, checkRunID int64) gate.CheckRun {
+		t.Helper()
+
+		h.waitState(fmt.Sprintf("run %d to be awaited", runID), func(s gate.PRState) bool { return s.Run != nil && s.Run.RunID == runID })
+		h.deliverEvent("workflow_run", e2eWorkflowRunCompletedBody(t, runID, "failure"))
+
+		var run gate.CheckRun
+		select {
+		case run = <-h.gh.checkRuns:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for run %d's check run", runID)
+		}
+		h.waitState(fmt.Sprintf("run %d to be concluded", runID), func(s gate.PRState) bool { return s.CheckRunID == checkRunID && s.Run == nil })
+		return run
+	}
+
+	h.deliverEvent("check_run", checkRunRerequestedBody(t))
+	failRun(101, 2)
+
+	summary := h.commentWith(summaryTag)
+	if !strings.Contains(summary.Body, cause) || !strings.Contains(summary.Body, rerunBox+"\n") {
+		t.Fatalf("summary after the first failure:\n%s\nwant the workflow-failure cause and an unticked Re-run box", summary.Body)
+	}
+
+	h.tickSummary("dev", "User", "Re-run analysis")
+	run := failRun(102, 3)
+
+	if run.Conclusion != gate.ConclusionNeutral || run.Title != "Analysis failed" || run.Summary != cause {
+		t.Errorf("re-run check run = %+v, want neutral \"Analysis failed\" with summary %q", run, cause)
+	}
+	comments, creates, _ := h.gh.snapshot()
+	if creates != 3 || len(comments) != 3 {
+		t.Errorf("creates = %d, comments = %d, want 3 and 3 (two proposals and one summary edited in place)", creates, len(comments))
+	}
+	summaries := 0
+	for _, c := range comments {
+		if strings.Contains(c.Body, summaryTag) {
+			summaries++
+		}
+	}
+	if summaries != 1 {
+		t.Errorf("summary comments = %d, want 1", summaries)
+	}
+	body := h.commentWith(summaryTag).Body
+	for _, want := range []string{cause, "`docs/a.md`", "`docs/b.md`", "| open |"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("summary after the second failure lacks %q:\n%s", want, body)
+		}
+	}
+	if !strings.Contains(body, rerunBox+"\n") {
+		t.Errorf("summary after the second failure:\n%s\nwant an unticked Re-run box", body)
+	}
+}
+
+// A push that supersedes a running server analysis closes its check run as
+// superseded; the interrupted analysis is not reported as a failure.
+func TestSupersededServerAnalysisIsNotReportedFailed(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	h := newPushHarness(t, blockedRun{started: started}, review.NoImpact{Reason: "fine"})
+
+	h.send("sha1")
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first analysis to start")
+	}
+	h.push("sha2")
+
+	h.gh.mu.Lock()
+	concluded := slices.Clone(h.gh.concluded)
+	h.gh.mu.Unlock()
+	if len(concluded) != 2 || concluded[0].id != 1 || concluded[0].run.Title != "Superseded" || concluded[1].id != 2 {
+		t.Fatalf("concluded = %+v, want check run 1 superseded, then check run 2", concluded)
+	}
+	comments, _, _ := h.gh.snapshot()
+	for _, c := range comments {
+		if strings.Contains(c.Body, "**Analysis failed:**") {
+			t.Errorf("comment reports a failure:\n%s", c.Body)
+		}
+	}
+}
+
+func TestRerunQueuesBehindRunningAnalysisOfSameHead(t *testing.T) {
+	t.Parallel()
+
+	held := heldRun{started: make(chan struct{}), release: make(chan struct{})}
+	h := newPushHarness(t, held, review.NoImpact{Reason: "docs already match"})
+
+	h.send("sha1")
+	select {
+	case <-held.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first analysis to start")
+	}
+	h.deliverEvent("check_run", checkRunRerequestedBody(t))
+	close(held.release)
+
+	state := h.waitState("the re-run to finish", func(s gate.PRState) bool { return s.CheckRunID == 2 && s.Run == nil })
+	if state.HeadSHA != "sha1" {
+		t.Errorf("HeadSHA = %q, want sha1", state.HeadSHA)
+	}
+	h.gh.mu.Lock()
+	defer h.gh.mu.Unlock()
+	if len(h.gh.concluded) != 2 || h.gh.concluded[0].id != 1 || h.gh.concluded[1].id != 2 || h.gh.concluded[1].run.Conclusion != gate.ConclusionSuccess {
+		t.Errorf("concluded = %+v, want check runs 1 then 2, both concluded", h.gh.concluded)
+	}
+}
+
+func TestPushSupersedesQueuedRerun(t *testing.T) {
+	t.Parallel()
+
+	held := heldRun{started: make(chan struct{}), release: make(chan struct{})}
+	h := newPushHarness(t, held, review.NoImpact{Reason: "docs already match"})
+
+	h.send("sha1")
+	select {
+	case <-held.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first analysis to start")
+	}
+	h.deliverEvent("check_run", checkRunRerequestedBody(t))
+	h.send("sha2")
+
+	state := h.waitState("the newest head to finish", func(s gate.PRState) bool { return s.HeadSHA == "sha2" && s.Run == nil && s.CheckRunID > 1 })
+	h.gh.mu.Lock()
+	defer h.gh.mu.Unlock()
+	if last := h.gh.concluded[len(h.gh.concluded)-1]; last.id != state.CheckRunID || last.run.Conclusion != gate.ConclusionSuccess {
+		t.Errorf("last concluded = %+v, want the newest check run %d concluded", last, state.CheckRunID)
+	}
 }

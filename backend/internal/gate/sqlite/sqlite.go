@@ -118,6 +118,7 @@ func migrations() []string {
 		ALTER TABLE pr_proposals ADD COLUMN index_entry TEXT NOT NULL DEFAULT '';
 		ALTER TABLE pr_proposals ADD COLUMN applied_sha TEXT NOT NULL DEFAULT '';
 		ALTER TABLE pr_proposals ADD COLUMN reply_id INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE pull_requests ADD COLUMN failure_cause TEXT NOT NULL DEFAULT ''`,
 	}
 }
 

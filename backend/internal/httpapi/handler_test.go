@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -30,7 +31,12 @@ const (
 
 type fakeRunLookup struct {
 	numbers map[int64]int
+	heads   map[string][]int
 	err     error
+}
+
+func (f fakeRunLookup) PRsForHead(_ context.Context, _, _, headSHA string) ([]int, error) {
+	return f.heads[headSHA], f.err
 }
 
 func (f fakeRunLookup) PRForRun(_ context.Context, _, _ string, runID int64) (int, bool, error) {
@@ -198,6 +204,12 @@ func pullRequestPayload(t *testing.T, action string) []byte {
 func postWebhook(t *testing.T, secret []byte, jobs httpapi.Enqueuer, event string, deliveryID string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 
+	return postWebhookWithLookup(t, secret, jobs, fakeRunLookup{}, event, deliveryID, body)
+}
+
+func postWebhookWithLookup(t *testing.T, secret []byte, jobs httpapi.Enqueuer, runs httpapi.RunLookup, event string, deliveryID string, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+
 	logger := slog.New(slog.DiscardHandler)
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-GitHub-Event", event)
@@ -207,7 +219,7 @@ func postWebhook(t *testing.T, secret []byte, jobs httpapi.Enqueuer, event strin
 	}
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, secret, jobs, fakeRunLookup{}).ServeHTTP(rec, req)
+	httpapi.NewHandler(logger, secret, jobs, runs).ServeHTTP(rec, req)
 	return rec
 }
 
@@ -383,6 +395,10 @@ func (f *fakePullRequestHandler) HandleDeadline(context.Context, gate.PRRef, str
 
 func (f *fakePullRequestHandler) HandleComment(_ context.Context, ev gate.CommentEvent) error {
 	f.comments = append(f.comments, ev)
+	return f.err
+}
+
+func (f *fakePullRequestHandler) HandleRerun(context.Context, gate.RerunRequest) error {
 	return f.err
 }
 
@@ -803,4 +819,120 @@ func TestWebhookPullRequestFork(t *testing.T) {
 			}
 		})
 	}
+}
+
+func checkRunBody(t *testing.T, action, name string, prNumbers ...int) []byte {
+	t.Helper()
+
+	return checkRunBodyAt(t, action, name, "head1", prNumbers...)
+}
+
+func checkRunBodyAt(t *testing.T, action, name, headSHA string, prNumbers ...int) []byte {
+	t.Helper()
+
+	prs := []map[string]any{}
+	for _, n := range prNumbers {
+		prs = append(prs, map[string]any{"number": n})
+	}
+	body, err := json.Marshal(map[string]any{
+		"action":       action,
+		"check_run":    map[string]any{"name": name, "head_sha": headSHA, "pull_requests": prs},
+		"repository":   map[string]any{"name": "widgets", "owner": map[string]any{"login": "acme"}},
+		"installation": map[string]any{"id": 42},
+	})
+	if err != nil {
+		t.Fatalf("marshal check_run payload: %v", err)
+	}
+	return body
+}
+
+func TestWebhookCheckRun(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("test-secret")
+
+	t.Run("rerequested enqueues a rerun per pull request", func(t *testing.T) {
+		t.Parallel()
+
+		jobs := newFakeEnqueuer()
+		rec := postWebhook(t, secret, jobs, "check_run", "d1", checkRunBody(t, "rerequested", "pollux-agent", 7, 8))
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusAccepted)
+		}
+		if len(jobs.jobs) != 2 {
+			t.Fatalf("jobs = %d, want 2", len(jobs.jobs))
+		}
+		for i, number := range []int{7, 8} {
+			job := jobs.jobs[i]
+			if job.Kind != pullRequestJobKind || job.Supersedes || job.Key != fmt.Sprintf("acme/widgets#%d", number) {
+				t.Errorf("job %d = %+v, want a non-superseding pull_request job for PR %d", i, job, number)
+			}
+			var payload struct{ Rerun gate.RerunRequest }
+			if err := json.Unmarshal(job.Payload, &payload); err != nil {
+				t.Fatalf("decode payload: %v", err)
+			}
+			want := gate.RerunRequest{InstallationID: 42, PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: number}}
+			if diff := cmp.Diff(want, payload.Rerun); diff != "" {
+				t.Errorf("job %d rerun (-want +got):\n%s", i, diff)
+			}
+		}
+		if jobs.jobs[0].DeliveryID == jobs.jobs[1].DeliveryID {
+			t.Errorf("delivery IDs equal (%q), want one per pull request", jobs.jobs[0].DeliveryID)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{"other check name", checkRunBody(t, "rerequested", "lint", 7)},
+		{"other action", checkRunBody(t, "completed", "pollux-agent", 7)},
+		{"empty pull_requests", checkRunBody(t, "rerequested", "pollux-agent")},
+	} {
+		t.Run(tc.name+" enqueues nothing", func(t *testing.T) {
+			t.Parallel()
+
+			jobs := newFakeEnqueuer()
+			rec := postWebhook(t, secret, jobs, "check_run", "d1", tc.body)
+			if rec.Code != http.StatusAccepted || len(jobs.jobs) != 0 {
+				t.Errorf("status = %d, jobs = %d, want %d and none", rec.Code, len(jobs.jobs), http.StatusAccepted)
+			}
+		})
+	}
+
+	t.Run("empty pull_requests falls back to the stored pull requests at the head", func(t *testing.T) {
+		t.Parallel()
+
+		jobs := newFakeEnqueuer()
+		runs := fakeRunLookup{heads: map[string][]int{"fork-head": {7, 8}}}
+		rec := postWebhookWithLookup(t, secret, jobs, runs, "check_run", "d1", checkRunBodyAt(t, "rerequested", "pollux-agent", "fork-head"))
+		if rec.Code != http.StatusAccepted || len(jobs.jobs) != 2 {
+			t.Fatalf("status = %d, jobs = %d, want %d and 2", rec.Code, len(jobs.jobs), http.StatusAccepted)
+		}
+		for i, number := range []int{7, 8} {
+			if want := fmt.Sprintf("acme/widgets#%d", number); jobs.jobs[i].Key != want {
+				t.Errorf("job %d key = %q, want %q", i, jobs.jobs[i].Key, want)
+			}
+		}
+	})
+
+	t.Run("head lookup error", func(t *testing.T) {
+		t.Parallel()
+
+		jobs := newFakeEnqueuer()
+		rec := postWebhookWithLookup(t, secret, jobs, fakeRunLookup{err: errors.New("boom")}, "check_run", "d1", checkRunBody(t, "rerequested", "pollux-agent"))
+		if rec.Code != http.StatusInternalServerError || len(jobs.jobs) != 0 {
+			t.Errorf("status = %d, jobs = %d, want %d and none", rec.Code, len(jobs.jobs), http.StatusInternalServerError)
+		}
+	})
+
+	t.Run("missing delivery id", func(t *testing.T) {
+		t.Parallel()
+
+		jobs := newFakeEnqueuer()
+		rec := postWebhook(t, secret, jobs, "check_run", "", checkRunBody(t, "rerequested", "pollux-agent", 7))
+		if rec.Code != http.StatusBadRequest || len(jobs.jobs) != 0 {
+			t.Errorf("status = %d, jobs = %d, want %d and none", rec.Code, len(jobs.jobs), http.StatusBadRequest)
+		}
+	})
 }

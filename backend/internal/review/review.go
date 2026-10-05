@@ -44,6 +44,31 @@ func (e *InvalidResultError) Error() string { return "invalid analysis result: "
 
 func (e *InvalidResultError) Unwrap() error { return e.Cause }
 
+// FailureCause says which way a runner's analysis failed; the gate maps each
+// to fixed text, so error text from a model or provider never reaches GitHub.
+type FailureCause string
+
+const (
+	CauseProvider          FailureCause = "provider"
+	CauseTimeout           FailureCause = "timeout"
+	CauseLimit             FailureCause = "limit"
+	CauseTooManyCandidates FailureCause = "too_many_candidates"
+	CauseClone             FailureCause = "clone"
+	CauseInternal          FailureCause = "internal"
+)
+
+// FailedError is an analysis that failed for a known Cause.
+type FailedError struct {
+	Cause FailureCause
+	Err   error
+}
+
+func (e *FailedError) Error() string {
+	return "analysis failed (" + string(e.Cause) + "): " + e.Err.Error()
+}
+
+func (e *FailedError) Unwrap() error { return e.Err }
+
 // Started is Pending or Result.
 type Started interface{ isStarted() }
 
@@ -119,6 +144,9 @@ type ChangedFile struct {
 	PreviousPath string // old path of a renamed or moved file; empty otherwise.
 	Hunks        []LineRange
 	Patch        string // unified diff text for Path, as GitHub returns it; empty when GitHub omits it.
+	// Changes is GitHub's count of added and deleted lines in the file. A file
+	// with Changes > 0 and no Patch had its diff omitted; binary files have 0.
+	Changes int
 }
 
 // LineRange is an inclusive range of 1-based line numbers.

@@ -53,8 +53,14 @@ func New(m llm.Model, token func(ctx context.Context, installationID int64, repo
 	return &Runner{m: m, token: token, triageModel: triageModel, model: model, timeout: analysisTimeout, budget: tokenBudget}
 }
 
-// Start implements review.Runner. Errors from a hit limit satisfy
-// errors.Is with agent.ErrStepLimit, agent.ErrTokenBudget or agent.ErrDeadline.
+var (
+	errProvider          = errors.New("model call failed or returned an unusable reply")
+	errClone             = errors.New("clone failed")
+	errTooManyCandidates = errors.New("too many candidate docs")
+)
+
+// Start implements review.Runner. Every error it returns is a
+// *review.FailedError whose Err keeps the original chain.
 func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started, error) {
 	if len(req.ChangedFiles) == 0 {
 		return r.noImpact("no changed files"), nil
@@ -69,9 +75,26 @@ func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started,
 		if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, agent.ErrDeadline) {
 			err = fmt.Errorf("%w: %w", agent.ErrDeadline, err)
 		}
-		return nil, err
+		return nil, &review.FailedError{Cause: classify(err), Err: err}
 	}
 	return res, nil
+}
+
+func classify(err error) review.FailureCause {
+	switch {
+	case errors.Is(err, agent.ErrStepLimit), errors.Is(err, agent.ErrTokenBudget):
+		return review.CauseLimit
+	case errors.Is(err, agent.ErrDeadline):
+		return review.CauseTimeout
+	case errors.Is(err, errTooManyCandidates):
+		return review.CauseTooManyCandidates
+	case errors.Is(err, errClone):
+		return review.CauseClone
+	case errors.Is(err, errProvider):
+		return review.CauseProvider
+	default:
+		return review.CauseInternal
+	}
 }
 
 func (r *Runner) noImpact(reason string) review.Result {
@@ -81,7 +104,7 @@ func (r *Runner) noImpact(reason string) review.Result {
 func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result, error) {
 	token, err := r.token(ctx, req.InstallationID, req.Repo)
 	if err != nil {
-		return review.Result{}, fmt.Errorf("get installation token: %w", err)
+		return review.Result{}, fmt.Errorf("get installation token: %w: %w", errClone, err)
 	}
 
 	remoteURL := r.remote
@@ -94,7 +117,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		defer func() { _ = os.RemoveAll(dir) }() // best-effort cleanup of a temp dir; the runner has no logger
 	}
 	if err != nil {
-		return review.Result{}, err
+		return review.Result{}, fmt.Errorf("%w: %w", errClone, err)
 	}
 
 	root, err := os.OpenRoot(dir)
@@ -119,7 +142,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		return r.noImpact("no doc covers the changed files"), nil
 	}
 	if len(candidates) > maxCandidateDocs {
-		return review.Result{}, fmt.Errorf("%d candidate docs exceed the cap of %d", len(candidates), maxCandidateDocs)
+		return review.Result{}, fmt.Errorf("%w: %d candidate docs exceed the cap of %d", errTooManyCandidates, len(candidates), maxCandidateDocs)
 	}
 
 	index := make(docIndex, len(tree.Docs))
@@ -227,12 +250,15 @@ func (r *Runner) ask(ctx context.Context, budget *agent.Budget, model, system, p
 		Messages: []llm.Message{{Role: llm.RoleUser, Text: prompt}},
 	})
 	if err != nil {
-		return "", fmt.Errorf("complete: %w", err)
+		return "", fmt.Errorf("complete: %w: %w", errProvider, err)
 	}
 	if err := budget.Charge(resp.Usage); err != nil {
 		return "", fmt.Errorf("charge token budget: %w", err)
 	}
-	return resp.Text, decodeVerdict(resp.Text, v)
+	if err := decodeVerdict(resp.Text, v); err != nil {
+		return resp.Text, fmt.Errorf("%w: %w", errProvider, err)
+	}
+	return resp.Text, nil
 }
 
 // triage runs one small-model call for docPath, returning whether the PR's
@@ -244,7 +270,7 @@ func (r *Runner) triage(ctx context.Context, index docIndex, budget *agent.Budge
 		return false, "", err
 	}
 	if v.Impacted == nil {
-		return false, "", fmt.Errorf("triage verdict has no \"impacted\" field in reply %q", oneLine(reply, 200))
+		return false, "", fmt.Errorf("%w: triage verdict has no \"impacted\" field in reply %q", errProvider, oneLine(reply, 200))
 	}
 	return *v.Impacted, v.Reason, nil
 }
@@ -272,7 +298,7 @@ func (r *Runner) verify(ctx context.Context, index docIndex, budget *agent.Budge
 		return false, "", err
 	}
 	if v.Supported == nil {
-		return false, "", fmt.Errorf("verify verdict has no \"supported\" field in reply %q", oneLine(reply, 200))
+		return false, "", fmt.Errorf("%w: verify verdict has no \"supported\" field in reply %q", errProvider, oneLine(reply, 200))
 	}
 	return *v.Supported, v.Reason, nil
 }
@@ -361,7 +387,7 @@ func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budge
 
 	raw, _, err := agent.Run(ctx, r.m, task, budget)
 	if err != nil {
-		return nil, fmt.Errorf("draft proposals: %w", err)
+		return nil, fmt.Errorf("draft proposals: %w: %w", errProvider, err)
 	}
 
 	var parsed submitProposalsArgs

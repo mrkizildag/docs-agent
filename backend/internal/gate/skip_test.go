@@ -2,6 +2,7 @@ package gate_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -246,8 +247,8 @@ func TestHandleCommentSkipUpdatesCheckRunFromPush(t *testing.T) {
 	if len(gh.calls) != 1 {
 		t.Errorf("created check runs = %d, want 1: the skip must reuse the push's check run", len(gh.calls))
 	}
-	if len(gh.updates) != 1 || gh.updates[0].id != 321 || gh.updates[0].run.Conclusion != gate.ConclusionSuccess {
-		t.Errorf("check run updates = %+v, want one success update of 321", gh.updates)
+	if len(gh.updates) != 2 || gh.updates[1].id != 321 || gh.updates[1].run.Conclusion != gate.ConclusionSuccess {
+		t.Errorf("check run updates = %+v, want the push's conclusion then a success update of 321", gh.updates)
 	}
 }
 
@@ -283,5 +284,84 @@ func TestHandleCommentSkipReactsDone(t *testing.T) {
 				t.Errorf("reactions (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestHandleCommentRerun(t *testing.T) {
+	t.Parallel()
+
+	failed := skipBase()
+	failed.Run = nil
+	failed.HeadSHA = "old111"
+	failed.FailureCause = "The analysis timed out."
+	tests := []struct {
+		name         string
+		canWrite     bool
+		wantStarts   int
+		wantReaction gate.Reaction
+	}{
+		{name: "writer", canWrite: true, wantStarts: 1, wantReaction: gate.ReactionDone},
+		{name: "no write access", wantReaction: gate.ReactionRefused},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			gh := &fakeGitHub{pullRequest: gate.PullRequest{BaseSHA: "base1", HeadSHA: "new222", Open: true}}
+			runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
+			comments := &fakeCommentGitHub{canWrite: tc.canWrite}
+			svc := gate.NewService(gh, &fakeStore{stored: failed}, gate.Runners{Server: runner}).WithComments(comments)
+			ev := skipEvent(gate.CommentKindIssue, "- [x] Re-run analysis", "")
+
+			if err := svc.HandleComment(t.Context(), ev); err != nil {
+				t.Fatalf("HandleComment() = %v, want nil", err)
+			}
+			if len(runner.calls) != tc.wantStarts {
+				t.Errorf("analyses started = %d, want %d", len(runner.calls), tc.wantStarts)
+			}
+			if diff := cmp.Diff([]gate.Reaction{tc.wantReaction}, comments.reactionsOn(ev.Kind, ev.CommentID)); diff != "" {
+				t.Errorf("reactions (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestHandleCommentRerunInfraErrorKeepsSeen(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{pullRequestErr: errors.New("boom")}
+	comments := &fakeCommentGitHub{canWrite: true}
+	svc := gate.NewService(gh, &fakeStore{stored: skipBase()}, gate.Runners{Server: &fakeRunner{}}).WithComments(comments)
+	ev := skipEvent(gate.CommentKindIssue, "- [x] Re-run analysis", "")
+
+	if err := svc.HandleComment(t.Context(), ev); err == nil {
+		t.Fatal("HandleComment() = nil, want the pull request lookup error")
+	}
+	if diff := cmp.Diff([]gate.Reaction{gate.ReactionSeen}, comments.reactionsOn(ev.Kind, ev.CommentID)); diff != "" {
+		t.Errorf("reactions (-want +got):\n%s", diff)
+	}
+}
+
+func TestHandleCommentSkipKeepsFailureOnTheSummary(t *testing.T) {
+	t.Parallel()
+
+	state := skipBase()
+	state.Run = nil
+	state.FailureCause = "The analysis timed out."
+	gh := &fakeGitHub{}
+	gh.addComment(gate.CommentKindIssue, "old summary")
+	for len(gh.comments) < int(state.SummaryCommentID) {
+		gh.addComment(gate.CommentKindIssue, "filler")
+	}
+	svc := gate.NewService(gh, &fakeStore{stored: state}, gate.Runners{}).WithComments(skipCommentGitHub{canWrite: true})
+
+	if err := svc.HandleComment(t.Context(), skipEvent(gate.CommentKindIssue, "", "/pollux-agent skip typo fix")); err != nil {
+		t.Fatalf("HandleComment() = %v, want nil", err)
+	}
+	body := gh.comments[state.SummaryCommentID-1].Body
+	for _, want := range []string{"**Analysis failed:** The analysis timed out.", "- [ ] Re-run analysis", "Skipped by @dev"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("summary after skip lacks %q:\n%s", want, body)
+		}
 	}
 }

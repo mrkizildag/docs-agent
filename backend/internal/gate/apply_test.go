@@ -158,6 +158,7 @@ func TestParseIntent(t *testing.T) {
 		{name: "apply all tick", event: summaryTick("Apply all"), want: gate.Intent{Kind: gate.IntentApplyAll}},
 		{name: "skip commit tick", event: summaryTick("Skip this commit"), want: gate.Intent{Kind: gate.IntentSkipAsk, Scope: gate.SkipCommit}},
 		{name: "skip pr tick", event: summaryTick("Skip this PR"), want: gate.Intent{Kind: gate.IntentSkipAsk, Scope: gate.SkipPR}},
+		{name: "rerun tick", event: summaryTick("Re-run analysis"), want: gate.Intent{Kind: gate.IntentRerun}},
 		{name: "unknown summary label", event: summaryTick("Something else")},
 		{name: "apply command", event: issueComment("/pollux-agent apply"), want: gate.Intent{Kind: gate.IntentApplyAll}},
 		{name: "skip with reason", event: issueComment("/pollux-agent skip typo only"), want: gate.Intent{Kind: gate.IntentSkip, Scope: gate.SkipCommit, Reason: "typo only"}},

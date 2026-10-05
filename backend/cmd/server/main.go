@@ -23,9 +23,8 @@ import (
 )
 
 const (
-	maxParallelJobs    = 8
-	actionsRunTimeout  = 10 * time.Minute
-	deadlineSweepEvery = 30 * time.Second
+	maxParallelJobs   = 8
+	actionsRunTimeout = 10 * time.Minute
 )
 
 func main() {
@@ -132,14 +131,14 @@ func run(ctx context.Context) error {
 
 // sweepDeadlines enqueues deadline jobs for overdue runs until ctx is done.
 func sweepDeadlines(ctx context.Context, src httpapi.OverdueSource, jobs httpapi.Enqueuer, logger *slog.Logger) {
-	ticker := time.NewTicker(deadlineSweepEvery)
+	ticker := time.NewTicker(httpapi.DeadlineSweepEvery)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			if err := httpapi.EnqueueDeadlineJobs(ctx, src, jobs, now); err != nil {
+			if err := httpapi.EnqueueDeadlineJobs(ctx, src, jobs, logger, now); err != nil {
 				logger.Error("sweep deadlines", "err", err)
 			}
 		}

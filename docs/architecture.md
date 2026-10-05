@@ -30,6 +30,7 @@ Docs model: `internal/docs` reads the `docs/` tree of a checkout into docs (fron
 2. The backend lists the PR's changed files; the analysis runner maps them to docs through each doc's `covers` globs on its own checkout of the head commit (see [0002](decisions/0002-docs-structure.md)).
 3. The LLM compares the diff with those docs and returns "no impact" or proposed edits.
 4. The backend sets the `pollux-agent` check: `success` for no impact, `action_required` otherwise, and posts one review comment per proposal plus a summary comment (see [Proposal output](features/proposal-output.md)).
+4a. If analysis fails or the PR is over the size limits, the check ends neutral with a fixed cause and the summary offers a "Re-run analysis" checkbox, handled like the other summary checkboxes (see [Apply and Skip](features/apply-skip.md)); GitHub's Re-run on the check does the same. The check never stays pending.
 5. A developer applies, edits, or waives the proposal; the check turns green and the PR can merge. Apply and Skip arrive as comment events, run as `comment` jobs, and commit to the PR branch (see [Apply and Skip](features/apply-skip.md)).
 
 ## Phases

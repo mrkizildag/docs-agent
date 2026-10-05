@@ -81,6 +81,7 @@ const (
 	IntentSkipAsk               // Scope; a skip tick, or a skip command without a reason
 	IntentSkip                  // Scope and Reason; a skip command with a reason
 	IntentSkipReason            // Reason; the pending asker's next comment
+	IntentRerun                 // summary tick of the Re-run box
 )
 
 // Intent is the action a comment asks for.
@@ -150,6 +151,8 @@ func parseTick(ev CommentEvent, ticked string, s PRState) Intent {
 			return Intent{Kind: IntentSkipAsk, Scope: SkipCommit}
 		case "- [x] " + skipPRLabel:
 			return Intent{Kind: IntentSkipAsk, Scope: SkipPR}
+		case "- [x] " + rerunLabel:
+			return Intent{Kind: IntentRerun}
 		}
 	default:
 	}
@@ -233,8 +236,8 @@ func (s *Service) WithComments(c CommentGitHub) *Service {
 	return s
 }
 
-// HandleComment acts on a comment: it applies proposals, or hands a skip to
-// handleSkip, when the sender may write. Comments that ask for nothing cost no
+// HandleComment acts on a comment: it applies proposals, hands a skip to
+// handleSkip, or re-runs the analysis, when the sender may write. Comments that ask for nothing cost no
 // GitHub call. A redelivery of an applied proposal only posts the replies still
 // missing.
 func (s *Service) HandleComment(ctx context.Context, ev CommentEvent) error {
@@ -282,6 +285,12 @@ func (s *Service) act(ctx, writeCtx context.Context, state PRState, ev CommentEv
 		return ReactionDone, nil
 	case IntentSkipAsk, IntentSkip, IntentSkipReason:
 		return s.handleSkip(writeCtx, state, in, ev.Sender, op)
+	case IntentRerun:
+		rerun := RerunRequest{InstallationID: ev.InstallationID, PRRef: PRRef{Owner: ev.Owner, Repo: ev.Repo, Number: ev.Number}, SummaryCommentID: ev.CommentID}
+		if err := s.HandleRerun(ctx, rerun); err != nil {
+			return "", fmt.Errorf("%s: %w", op, err)
+		}
+		return ReactionDone, nil
 	default:
 		return "", fmt.Errorf("%s: unknown intent %d", op, in.Kind)
 	}

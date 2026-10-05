@@ -17,6 +17,7 @@ The check stays `action_required` until every proposal is applied or the gate is
 - **Apply one:** ticking "Apply this change" on a proposal's review comment.
 - **Apply all:** ticking "Apply all" in the summary, or commenting `/pollux-agent apply`.
 - **Skip this commit / Skip this PR:** ticking the matching box in the summary, or commenting `/pollux-agent skip <reason>` or `/pollux-agent skip-pr <reason>`.
+- **Re-run analysis:** ticking "Re-run analysis" in a failure summary (see [Proposal output](proposal-output.md)). It is handled like the other summary ticks: the sender needs write access, the comment gets 👀 and then 🚀 once the re-run started or had nothing to do (the PR is closed, or its head is already being analyzed), and an infrastructure error leaves the 👀.
 
 A tick is recognized only as a single `- [ ]` to `- [x]` flip in the edit's previous body (`changes.body.from`). Unticking, editing text, or ticking several boxes at once changes nothing, so the bot redrawing its own comments cannot trigger anything. Events whose sender is a bot are dropped for the same reason. Every comment from a human on a PR is enqueued, because it may be the reason a pending skip is waiting for.
 
@@ -56,4 +57,4 @@ The gap is a crash after GitHub accepted the commit but before the gate saved it
 
 ## Summary redraws
 
-Every summary redraw renders the Apply all and Skip checkboxes from stored state, plus the applied state of each proposal and the fork notice. Apply all is ticked once every proposal is applied. A skip box is ticked while its skip is pending or active; a commit skip counts only for the head it was made at. A re-run therefore never drops them or leaves a stale tick. When a tick is refused, the bot puts the box back so it can be ticked again.
+Every summary redraw renders the Apply all and Skip checkboxes from stored state, plus the applied state of each proposal and the fork notice. Apply all is never drawn ticked: once every proposal is applied the line reads "✅ All proposals applied.". A failure summary also redraws its cause and Re-run box. A skip box is ticked while its skip is pending or active; a commit skip counts only for the head it was made at. A re-run therefore never drops them or leaves a stale tick. When a tick is refused, the bot puts the box back so it can be ticked again.

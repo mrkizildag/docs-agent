@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -24,9 +25,11 @@ type Enqueuer interface {
 	Enqueue(ctx context.Context, job jobqueue.NewJob) (bool, error)
 }
 
-// RunLookup maps an analysis workflow run to the pull request it was dispatched for.
+// RunLookup finds stored pull requests: the one an analysis workflow run was
+// dispatched for, and those at a head commit.
 type RunLookup interface {
 	PRForRun(ctx context.Context, owner, repo string, runID int64) (number int, ok bool, err error)
+	PRsForHead(ctx context.Context, owner, repo, headSHA string) ([]int, error)
 }
 
 func NewHandler(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer, runs RunLookup) *http.ServeMux {
@@ -153,6 +156,28 @@ type issueCommentEvent struct {
 	} `json:"sender"`
 }
 
+// checkRunEvent is the subset of GitHub's check_run webhook payload the handler
+// needs. PullRequests is empty when GitHub cannot associate the run with a PR.
+type checkRunEvent struct {
+	Action   string `json:"action"`
+	CheckRun struct {
+		Name         string `json:"name"`
+		HeadSHA      string `json:"head_sha"`
+		PullRequests []struct {
+			Number int `json:"number"`
+		} `json:"pull_requests"`
+	} `json:"check_run"`
+	Repository struct {
+		Name  string `json:"name"`
+		Owner struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	} `json:"repository"`
+	Installation struct {
+		ID int64 `json:"id"`
+	} `json:"installation"`
+}
+
 func webhookHandler(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer, runs RunLookup) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		deliveryID := r.Header.Get("X-GitHub-Delivery")
@@ -189,6 +214,8 @@ func webhookHandler(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer, ru
 			handleReviewCommentEvent(logger, jobs, w, r, deliveryID, body)
 		case "issue_comment":
 			handleIssueCommentEvent(logger, jobs, w, r, deliveryID, body)
+		case "check_run":
+			handleCheckRunEvent(logger, jobs, runs, w, r, deliveryID, body)
 		case "workflow_run":
 			handleWorkflowRunEvent(logger, jobs, runs, w, r, deliveryID, body)
 		default:
@@ -236,7 +263,7 @@ func handlePullRequestEvent(logger *slog.Logger, jobs Enqueuer, w http.ResponseW
 		Fork:           payload.PullRequest.Head.Repo == nil || payload.PullRequest.Head.Repo.FullName != payload.Repository.FullName,
 	}
 
-	jobPayload, err := json.Marshal(pr)
+	jobPayload, err := json.Marshal(pullRequestJobPayload{PullRequest: pr})
 	if err != nil {
 		logger.Error("encode pull_request job payload", "delivery_id", deliveryID, "err", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -411,6 +438,76 @@ func tickedLine(from, now string) (string, bool) {
 		ticked = after[i]
 	}
 	return ticked, ticked != ""
+}
+
+// enqueueRerun enqueues a re-run job for req's pull request. It queues behind a
+// running analysis instead of superseding it: HandleRerun skips a head whose
+// analysis is still armed, so cancelling that analysis would leave no analysis.
+func enqueueRerun(ctx context.Context, jobs Enqueuer, deliveryID string, req gate.RerunRequest) error {
+	jobPayload, err := json.Marshal(pullRequestJobPayload{Rerun: &req})
+	if err != nil {
+		return fmt.Errorf("encode rerun job payload: %w", err)
+	}
+	if _, err := jobs.Enqueue(ctx, jobqueue.NewJob{
+		DeliveryID: deliveryID,
+		Key:        prJobKey(req.PRRef.Owner, req.PRRef.Repo, req.PRRef.Number),
+		Kind:       pullRequestJobKind,
+		Payload:    jobPayload,
+		Supersedes: false,
+	}); err != nil {
+		return fmt.Errorf("enqueue rerun job for %s/%s#%d: %w", req.PRRef.Owner, req.PRRef.Repo, req.PRRef.Number, err)
+	}
+	return nil
+}
+
+// handleCheckRunEvent enqueues a re-run for each pull request of our check run
+// when a user clicks "Re-run" on it.
+func handleCheckRunEvent(logger *slog.Logger, jobs Enqueuer, runs RunLookup, w http.ResponseWriter, r *http.Request, deliveryID string, body []byte) {
+	var payload checkRunEvent
+	if err := json.Unmarshal(body, &payload); err != nil {
+		logger.Warn("decode check_run payload", "delivery_id", deliveryID, "err", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if payload.Action != "rerequested" || payload.CheckRun.Name != gate.CheckName {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	owner, repo := payload.Repository.Owner.Login, payload.Repository.Name
+	if owner == "" || repo == "" || payload.Installation.ID == 0 || deliveryID == "" {
+		logger.Warn("check_run payload missing fields", "delivery_id", deliveryID)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	numbers := make([]int, 0, len(payload.CheckRun.PullRequests))
+	for _, pr := range payload.CheckRun.PullRequests {
+		numbers = append(numbers, pr.Number)
+	}
+	if len(numbers) == 0 && payload.CheckRun.HeadSHA != "" {
+		var err error
+		numbers, err = runs.PRsForHead(r.Context(), owner, repo, payload.CheckRun.HeadSHA)
+		if err != nil {
+			logger.Error("look up pull requests for check run head", "delivery_id", deliveryID, "head_sha", payload.CheckRun.HeadSHA, "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	for _, number := range numbers {
+		if err := enqueueRerun(r.Context(), jobs, fmt.Sprintf("%s:%d", deliveryID, number), gate.RerunRequest{
+			InstallationID: payload.Installation.ID,
+			PRRef:          gate.PRRef{Owner: owner, Repo: repo, Number: number},
+		}); err != nil {
+			logger.Error("enqueue rerun job", "delivery_id", deliveryID, "number", number, "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	w.WriteHeader(http.StatusAccepted)
 }
 
 func handleWorkflowRunEvent(logger *slog.Logger, jobs Enqueuer, runs RunLookup, w http.ResponseWriter, r *http.Request, deliveryID string, body []byte) {

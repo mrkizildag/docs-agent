@@ -21,7 +21,7 @@ func (sc SkipScope) noun() string {
 func skipRun(s PRState) CheckRun {
 	sk := s.Skip
 	return CheckRun{
-		Name:       checkName,
+		Name:       CheckName,
 		HeadSHA:    s.HeadSHA,
 		Status:     StatusCompleted,
 		Conclusion: ConclusionSuccess,
@@ -54,7 +54,7 @@ func (s *Service) handleSkip(ctx context.Context, state PRState, in Intent, send
 		if state.PendingSkip != nil {
 			err = s.skip(ctx, state, Skip{User: state.PendingSkip.User, Scope: state.PendingSkip.Scope, Reason: in.Reason}, op)
 		}
-	case IntentNone, IntentApply, IntentApplyAll:
+	case IntentNone, IntentApply, IntentApplyAll, IntentRerun:
 	}
 	if err != nil {
 		return "", err

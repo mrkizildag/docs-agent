@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
@@ -15,12 +16,20 @@ func prJobKey(owner, repo string, number int) string {
 	return fmt.Sprintf("%s/%s#%d", owner, repo, number)
 }
 
-// pullRequestJobKind identifies durable jobs carrying a gate.PullRequest
-// payload. webhookHandler encodes jobs with this kind; HandleJob decodes them.
+// pullRequestJobKind identifies durable jobs carrying a pullRequestJobPayload.
+// webhookHandler encodes jobs with this kind; HandleJob decodes them.
 const pullRequestJobKind = "pull_request"
 
 // commentJobKind identifies durable jobs carrying a gate.CommentEvent payload.
 const commentJobKind = "comment"
+
+// pullRequestJobPayload is a gate.PullRequest to analyze, or when Rerun is set,
+// a request to re-analyze the PR's current head (the embedded PullRequest is
+// then zero).
+type pullRequestJobPayload struct {
+	gate.PullRequest
+	Rerun *gate.RerunRequest `json:",omitempty"`
+}
 
 // workflowRunJobKind identifies durable jobs carrying a gate.RunCompleted payload.
 const workflowRunJobKind = "workflow_run"
@@ -33,20 +42,49 @@ type OverdueSource interface {
 	OverdueRuns(ctx context.Context, now time.Time) ([]gate.OverdueRun, error)
 }
 
-// EnqueueDeadlineJobs enqueues one deadline job per overdue run. Jobs dedupe
-// by nonce, so sweeping again before the job finishes adds nothing.
-func EnqueueDeadlineJobs(ctx context.Context, src OverdueSource, jobs Enqueuer, now time.Time) error {
+const (
+	// deadlineRetryCap is how long past its deadline a run is still retried.
+	deadlineRetryCap = 24 * time.Hour
+	// deadlineTailEvery is the retry interval once the power-of-two buckets reach deadlineTailFrom.
+	deadlineTailEvery = 240
+	deadlineTailFrom  = 1024
+	// DeadlineSweepEvery is how often cmd/server runs EnqueueDeadlineJobs; the
+	// give-up warn window matches it so the warn logs once.
+	DeadlineSweepEvery = 30 * time.Second
+)
+
+// EnqueueDeadlineJobs enqueues deadline jobs for overdue runs. A run's jobs
+// dedupe by nonce and by the power-of-two bucket of whole minutes past its
+// deadline, so a run whose job failed is retried at about 0, 1, 2, 4, 8, ...
+// minutes overdue, then every 240 minutes from 1024. Runs more than deadlineRetryCap overdue are dropped.
+func EnqueueDeadlineJobs(ctx context.Context, src OverdueSource, jobs Enqueuer, logger *slog.Logger, now time.Time) error {
 	overdue, err := src.OverdueRuns(ctx, now)
 	if err != nil {
 		return fmt.Errorf("enqueue deadline jobs: %w", err)
 	}
 	for _, run := range overdue {
+		late := now.Sub(run.Deadline)
+		if late > deadlineRetryCap {
+			if late < deadlineRetryCap+DeadlineSweepEvery {
+				logger.Warn("giving up on overdue run", "owner", run.Owner, "repo", run.Repo, "number", run.Number, "nonce", run.Nonce)
+			}
+			continue
+		}
 		payload, err := json.Marshal(run)
 		if err != nil {
 			return fmt.Errorf("encode deadline job payload for %s/%s#%d: %w", run.Owner, run.Repo, run.Number, err)
 		}
+		minutes := int(late / time.Minute)
+		bucket := 0
+		if minutes >= deadlineTailFrom {
+			bucket = 11 + (minutes-deadlineTailFrom)/deadlineTailEvery
+		} else {
+			for m := minutes; m > 0; m >>= 1 {
+				bucket++
+			}
+		}
 		if _, err := jobs.Enqueue(ctx, jobqueue.NewJob{
-			DeliveryID: "deadline:" + run.Nonce,
+			DeliveryID: fmt.Sprintf("deadline:%s:%d", run.Nonce, bucket),
 			Key:        prJobKey(run.Owner, run.Repo, run.Number),
 			Kind:       runDeadlineJobKind,
 			Payload:    payload,
@@ -61,6 +99,7 @@ func EnqueueDeadlineJobs(ctx context.Context, src OverdueSource, jobs Enqueuer, 
 type PullRequestHandler interface {
 	HandlePullRequest(ctx context.Context, pr gate.PullRequest) error
 	HandleComment(ctx context.Context, ev gate.CommentEvent) error
+	HandleRerun(ctx context.Context, r gate.RerunRequest) error
 	HandleRunCompleted(ctx context.Context, rc gate.RunCompleted) error
 	HandleDeadline(ctx context.Context, ref gate.PRRef, nonce string, now time.Time) error
 }
@@ -70,11 +109,17 @@ func HandleJob(prs PullRequestHandler) jobqueue.Handler {
 	return func(ctx context.Context, job jobqueue.Job) error {
 		switch job.Kind {
 		case pullRequestJobKind:
-			var pr gate.PullRequest
-			if err := json.Unmarshal(job.Payload, &pr); err != nil {
+			var payload pullRequestJobPayload
+			if err := json.Unmarshal(job.Payload, &payload); err != nil {
 				return fmt.Errorf("decode job %d payload (kind %s): %w", job.ID, job.Kind, err)
 			}
-			if err := prs.HandlePullRequest(ctx, pr); err != nil {
+			if payload.Rerun != nil {
+				if err := prs.HandleRerun(ctx, *payload.Rerun); err != nil {
+					return fmt.Errorf("handle rerun job %d: %w", job.ID, err)
+				}
+				return nil
+			}
+			if err := prs.HandlePullRequest(ctx, payload.PullRequest); err != nil {
 				return fmt.Errorf("handle pull request job %d: %w", job.ID, err)
 			}
 			return nil

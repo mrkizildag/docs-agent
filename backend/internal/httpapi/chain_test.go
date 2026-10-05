@@ -40,12 +40,12 @@ func (f *chainGitHub) ListChangedFiles(context.Context, int64, string, string, i
 	}}, nil
 }
 
-func (f *chainGitHub) CreateCheckRun(_ context.Context, installationID int64, owner, repo string, run gate.CheckRun) (int64, error) {
-	f.calls <- e2eCheckRunCall{installationID: installationID, owner: owner, repo: repo, run: run}
-	return 0, nil
+func (f *chainGitHub) CreateCheckRun(context.Context, int64, string, string, gate.CheckRun) (int64, error) {
+	return 1, nil
 }
 
-func (f *chainGitHub) UpdateCheckRun(context.Context, int64, string, string, int64, gate.CheckRun) error {
+func (f *chainGitHub) UpdateCheckRun(_ context.Context, installationID int64, owner, repo string, _ int64, run gate.CheckRun) error {
+	f.calls <- e2eCheckRunCall{installationID: installationID, owner: owner, repo: repo, run: run}
 	return nil
 }
 

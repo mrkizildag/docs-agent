@@ -10,7 +10,7 @@ import (
 func TestProposalCommentBodies(t *testing.T) {
 	t.Parallel()
 
-	gh := &fakeGitHub{changed: []review.ChangedFile{{Path: "docs/s.md", Hunks: []review.LineRange{{Start: 1, End: 10}}}}}
+	gh := &fakeGitHub{changed: []review.ChangedFile{{Path: "docs/s.md", Hunks: []review.LineRange{{Start: 1, End: 10}}, Patch: "@@ -1 +1,10 @@"}}}
 	checkbox := review.Proposal{
 		DocPath: "docs/a.md", Section: "Usage", Reason: "flag renamed", Anchor: review.Anchor{File: "a.go", Line: 4},
 		Original: "## Usage\nold\n", Lines: review.LineRange{Start: 3, End: 4}, Content: "## Usage\nnew\n",
