@@ -135,6 +135,31 @@ func (s *Store) PRForRun(ctx context.Context, owner, repo string, runID int64) (
 	return number, true, nil
 }
 
+// PRsForHead returns the numbers of owner/repo's stored pull requests whose
+// head is headSHA.
+func (s *Store) PRsForHead(ctx context.Context, owner, repo, headSHA string) ([]int, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT number FROM pull_requests WHERE owner = ? AND repo = ? AND head_sha = ? ORDER BY number`,
+		owner, repo, headSHA)
+	if err != nil {
+		return nil, fmt.Errorf("find prs for head %s of %s/%s: %w", headSHA, owner, repo, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var numbers []int
+	for rows.Next() {
+		var number int
+		if err := rows.Scan(&number); err != nil {
+			return nil, fmt.Errorf("scan pr for head %s of %s/%s: %w", headSHA, owner, repo, err)
+		}
+		numbers = append(numbers, number)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("find prs for head %s of %s/%s: %w", headSHA, owner, repo, err)
+	}
+	return numbers, nil
+}
+
 // OverdueRuns returns the awaited runs whose deadline is before now. Deadlines
 // are compared as times, not as text, because RFC3339Nano does not sort.
 func (s *Store) OverdueRuns(ctx context.Context, now time.Time) ([]gate.OverdueRun, error) {
@@ -157,6 +182,7 @@ func (s *Store) OverdueRuns(ctx context.Context, now time.Time) ([]gate.OverdueR
 			return nil, fmt.Errorf("parse run deadline %q of %s/%s#%d: %w", deadline, run.Owner, run.Repo, run.Number, err)
 		}
 		if now.After(parsed) {
+			run.Deadline = parsed
 			overdue = append(overdue, run)
 		}
 	}

@@ -27,6 +27,7 @@ type PullRequest struct {
 	Number         int
 	BaseSHA        string
 	HeadSHA        string
+	Open           bool // false once the pull request is closed or merged
 }
 
 // Conclusion is a GitHub check run conclusion.
@@ -150,6 +151,11 @@ type RunCompleted struct {
 	Conclusion     string
 }
 
+// pullRequest is the pull request state describes, at the head it last reported.
+func (s PRState) pullRequest() PullRequest {
+	return PullRequest{InstallationID: s.InstallationID, Owner: s.Owner, Repo: s.Repo, Number: s.Number, HeadSHA: s.HeadSHA}
+}
+
 // PRRef identifies a pull request.
 type PRRef struct {
 	Owner  string
@@ -169,7 +175,8 @@ type RerunRequest struct {
 // OverdueRun is an awaited run whose deadline has passed, as found by a sweep.
 type OverdueRun struct {
 	PRRef
-	Nonce string
+	Nonce    string
+	Deadline time.Time
 }
 
 // ProposalStatus is whether a proposal still applies to the latest head.
@@ -312,6 +319,8 @@ const (
 	writeTimeout = 30 * time.Second
 	// collectAttempts is how many times a result download is tried.
 	collectAttempts = 3
+	// postAttempts is how many times posting a result's comments is tried.
+	postAttempts = 3
 	// analysisDeadline is how long an analysis may stay in progress before the
 	// deadline sweep concludes its check run.
 	analysisDeadline = 10 * time.Minute
@@ -518,12 +527,17 @@ func adoptMarked(ps *ProposalState, existing []Comment) {
 
 func findMarked(existing []Comment, kind CommentKind, marker string) (Comment, bool) {
 	for _, c := range existing {
-		first, _, _ := strings.Cut(c.Body, "\n")
-		if c.Mine && c.Kind == kind && strings.TrimRight(first, "\r") == marker {
+		if c.Mine && c.Kind == kind && hasMarker(c.Body, marker) {
 			return c, true
 		}
 	}
 	return Comment{}, false
+}
+
+// hasMarker reports whether marker is the first line of body.
+func hasMarker(body, marker string) bool {
+	first, _, _ := strings.Cut(body, "\n")
+	return strings.TrimRight(first, "\r") == marker
 }
 
 // findComment returns our comment id; a listed comment someone else wrote
@@ -587,7 +601,9 @@ func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
 }
 
 // HandleRerun starts a fresh analysis of the pull request's current head, as a
-// push would, unless r names a summary comment that is not the one state holds.
+// push would, unless r names a summary comment that is not the one state holds,
+// the pull request is not open, or its current head is already being analyzed
+// within its deadline.
 func (s *Service) HandleRerun(ctx context.Context, r RerunRequest) error {
 	ref := r.PRRef
 	state, err := s.store.LoadPR(ctx, ref.Owner, ref.Repo, ref.Number)
@@ -600,6 +616,9 @@ func (s *Service) HandleRerun(ctx context.Context, r RerunRequest) error {
 	pr, err := s.gh.GetPullRequest(ctx, r.InstallationID, ref.Owner, ref.Repo, ref.Number)
 	if err != nil {
 		return fmt.Errorf("handle rerun of %s/%s#%d: %w", ref.Owner, ref.Repo, ref.Number, err)
+	}
+	if !pr.Open || (state.Run != nil && state.HeadSHA == pr.HeadSHA && !Overdue(state, time.Now())) {
+		return nil
 	}
 	if err := s.analyze(ctx, state, pr); err != nil {
 		return fmt.Errorf("handle rerun of %s/%s#%d: %w", ref.Owner, ref.Repo, ref.Number, err)
@@ -696,18 +715,8 @@ func (s *Service) startRun(ctx context.Context, state PRState, pr PullRequest, r
 		case review.Pending:
 			next = OnStarted(next, res, id)
 		case review.Result:
-			var run CheckRun
-			next, run = conclude(next, resultOutcome(res))
-			if err := s.gh.UpdateCheckRun(writeCtx, pr.InstallationID, pr.Owner, pr.Repo, id, run); err != nil {
-				return fmt.Errorf("conclude check run %d: %w", id, err)
-			}
-			if reconciles(res.Verdict) {
-				if err := s.store.SavePR(writeCtx, next); err != nil {
-					return fmt.Errorf("save state: %w", err)
-				}
-				if next, err = s.postComments(writeCtx, next, pr, res.Verdict, changed); err != nil {
-					return err
-				}
+			if next, err = s.concludeResult(writeCtx, next, pr, res, changed); err != nil {
+				return err
 			}
 		default:
 			err = fmt.Errorf("unknown review.Started %T", started)
@@ -758,6 +767,56 @@ func (s *Service) concludeFailed(ctx context.Context, state PRState, pr PullRequ
 	return errors.Join(errs...)
 }
 
+// concludeResult concludes the check run for a result, then, when the verdict
+// concludes the analysis, saves state and posts its comments, retrying the posts
+// with backoff. If every post fails the run is re-armed so the deadline sweep
+// ends the check neutral. Callers save the returned state.
+func (s *Service) concludeResult(ctx context.Context, state PRState, pr PullRequest, res review.Result, changed []review.ChangedFile) (PRState, error) {
+	next, run := conclude(state, resultOutcome(res))
+	if err := s.gh.UpdateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, state.CheckRunID, run); err != nil {
+		return PRState{}, fmt.Errorf("conclude check run %d: %w", state.CheckRunID, err)
+	}
+	if !reconciles(res.Verdict) {
+		return next, nil
+	}
+	if err := s.store.SavePR(ctx, next); err != nil {
+		return PRState{}, fmt.Errorf("save state: %w", err)
+	}
+	posted, err := s.postComments(ctx, next, pr, res.Verdict, changed)
+	backoff := s.collectBackoff
+	for attempt := 1; attempt < postAttempts && err != nil; attempt++ {
+		select {
+		case <-ctx.Done():
+			return PRState{}, errors.Join(err, ctx.Err())
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		posted, err = s.postComments(ctx, next, pr, res.Verdict, changed)
+	}
+	if err != nil {
+		// A check claiming proposals that were never posted is worse than a neutral
+		// one the user can re-run, so re-arm the run for the deadline sweep.
+		if rerr := s.rearm(ctx, pr, state.Run); rerr != nil {
+			err = errors.Join(err, rerr)
+		}
+	}
+	return posted, err
+}
+
+// rearm restores run on the stored state, which keeps whatever comment IDs the
+// failed posts saved.
+func (s *Service) rearm(ctx context.Context, pr PullRequest, run *AwaitingRun) error {
+	latest, err := s.store.LoadPR(ctx, pr.Owner, pr.Repo, pr.Number)
+	if err != nil {
+		return fmt.Errorf("load state to re-arm run: %w", err)
+	}
+	latest.Run = run
+	if err := s.store.SavePR(ctx, latest); err != nil {
+		return fmt.Errorf("save re-armed state: %w", err)
+	}
+	return nil
+}
+
 // failureCause is the fixed one-line text for err; error text from a model or
 // provider never reaches GitHub.
 func failureCause(err error) string {
@@ -797,7 +856,7 @@ func (s *Service) HandleRunCompleted(ctx context.Context, rc RunCompleted) error
 		return fmt.Errorf("handle run %d of %s/%s#%d: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
 	}
 
-	pr := PullRequest{InstallationID: state.InstallationID, Owner: state.Owner, Repo: state.Repo, Number: state.Number, HeadSHA: state.HeadSHA}
+	pr := state.pullRequest()
 	if outcome.Failed != nil {
 		// err is the detail behind the fixed cause; it goes to the job log only.
 		if cerr := s.concludeFailed(ctx, state, pr, outcome); cerr != nil {
@@ -809,26 +868,16 @@ func (s *Service) HandleRunCompleted(ctx context.Context, rc RunCompleted) error
 		return nil
 	}
 
-	next, run := conclude(state, outcome)
 	var changed []review.ChangedFile
-	reconcile := outcome.Result != nil && reconciles(outcome.Result.Verdict)
-	if reconcile {
+	if reconciles(outcome.Result.Verdict) {
 		changed, err = s.gh.ListChangedFiles(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number)
 		if err != nil {
 			return fmt.Errorf("handle run %d of %s/%s#%d: list changed files: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
 		}
 	}
-	if err := s.gh.UpdateCheckRun(ctx, state.InstallationID, state.Owner, state.Repo, state.CheckRunID, run); err != nil {
+	next, err := s.concludeResult(ctx, state, pr, *outcome.Result, changed)
+	if err != nil {
 		return fmt.Errorf("handle run %d of %s/%s#%d: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
-	}
-	if reconcile {
-		if err := s.store.SavePR(ctx, next); err != nil {
-			return fmt.Errorf("handle run %d of %s/%s#%d: save state: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
-		}
-		next, err = s.postComments(ctx, next, pr, outcome.Result.Verdict, changed)
-		if err != nil {
-			return fmt.Errorf("handle run %d of %s/%s#%d: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
-		}
 	}
 	if err := s.store.SavePR(ctx, next); err != nil {
 		return fmt.Errorf("handle run %d of %s/%s#%d: save state: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
@@ -852,7 +901,7 @@ func (s *Service) HandleDeadline(ctx context.Context, ref PRRef, nonce string, n
 	if state.Run.RunID != 0 {
 		cause = "The pollux-agent workflow run did not report a result before the deadline."
 	}
-	pr := PullRequest{InstallationID: state.InstallationID, Owner: state.Owner, Repo: state.Repo, Number: state.Number, HeadSHA: state.HeadSHA}
+	pr := state.pullRequest()
 	if err := s.concludeFailed(ctx, state, pr, failedOutcome(cause)); err != nil {
 		return fmt.Errorf("handle deadline of %s/%s#%d: %w", ref.Owner, ref.Repo, ref.Number, err)
 	}

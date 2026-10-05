@@ -47,7 +47,7 @@ type e2eGitHub struct {
 type noComments struct{}
 
 func (noComments) GetPullRequest(_ context.Context, installationID int64, owner, repo string, number int) (gate.PullRequest, error) {
-	return gate.PullRequest{InstallationID: installationID, Owner: owner, Repo: repo, Number: number}, nil
+	return gate.PullRequest{InstallationID: installationID, Owner: owner, Repo: repo, Number: number, Open: true}, nil
 }
 
 func (noComments) ListComments(context.Context, int64, string, string, int) ([]gate.Comment, error) {
@@ -156,7 +156,7 @@ func TestWebhookToCheckRunEndToEnd(t *testing.T) {
 		}
 	})
 
-	handler := httpapi.NewHandler(logger, secret, worker, store)
+	handler := httpapi.NewHandler(logger, secret, testAppID, worker, store)
 
 	post := func(deliveryID string, body []byte) *httptest.ResponseRecorder {
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
@@ -396,7 +396,7 @@ func TestActionsRunnerEndToEnd(t *testing.T) {
 		}
 	})
 
-	handler := httpapi.NewHandler(logger, secret, worker, baseStore)
+	handler := httpapi.NewHandler(logger, secret, testAppID, worker, baseStore)
 	post := func(event, deliveryID string, body []byte) {
 		t.Helper()
 
@@ -544,7 +544,7 @@ func TestWebhookToProposalCommentsEndToEnd(t *testing.T) {
 	req.Header.Set("X-GitHub-Delivery", "d1")
 	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
 	rec := httptest.NewRecorder()
-	httpapi.NewHandler(logger, secret, worker, store).ServeHTTP(rec, req)
+	httpapi.NewHandler(logger, secret, testAppID, worker, store).ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("POST /webhook = %d, want %d", rec.Code, http.StatusAccepted)
 	}
@@ -629,7 +629,7 @@ type concludedCheckRun struct {
 func (f *statefulGitHub) GetPullRequest(_ context.Context, installationID int64, owner, repo string, number int) (gate.PullRequest, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return gate.PullRequest{InstallationID: installationID, Owner: owner, Repo: repo, Number: number, HeadSHA: f.head}, nil
+	return gate.PullRequest{InstallationID: installationID, Owner: owner, Repo: repo, Number: number, HeadSHA: f.head, Open: true}, nil
 }
 
 func (f *statefulGitHub) WorkflowExists(context.Context, int64, string, string) (bool, error) {
@@ -718,12 +718,24 @@ type scriptedRunner struct{ outcomes chan any }
 // cancelled, then fails the way an interrupted server analysis does.
 type blockedRun struct{ started chan struct{} }
 
+// heldRun is an outcome that holds the analysis until release is closed, then
+// finishes with no impact; a cancelled context fails it like blockedRun.
+type heldRun struct{ started, release chan struct{} }
+
 func (r scriptedRunner) Start(ctx context.Context, rq review.Request) (review.Started, error) {
 	switch o := (<-r.outcomes).(type) {
 	case blockedRun:
 		close(o.started)
 		<-ctx.Done()
 		return nil, &review.FailedError{Cause: review.CauseTimeout, Err: ctx.Err()}
+	case heldRun:
+		close(o.started)
+		select {
+		case <-o.release:
+			return review.Result{Runner: "fake", Verdict: review.NoImpact{Reason: "held run done"}}, nil
+		case <-ctx.Done():
+			return nil, &review.FailedError{Cause: review.CauseTimeout, Err: ctx.Err()}
+		}
 	case review.Verdict:
 		return review.Result{Runner: "fake", Verdict: o}, nil
 	case review.Pending:
@@ -790,7 +802,7 @@ func newPushHarness(t *testing.T, outcomes ...any) *pushHarness {
 	})
 
 	secret := []byte("test-secret")
-	return &pushHarness{t: t, gh: gh, store: store, handler: httpapi.NewHandler(logger, secret, worker, store), secret: secret}
+	return &pushHarness{t: t, gh: gh, store: store, handler: httpapi.NewHandler(logger, secret, testAppID, worker, store), secret: secret}
 }
 
 // push delivers a synchronize webhook for sha and returns the check run and the
@@ -994,15 +1006,19 @@ func TestWebhookReconcilesProposalCommentsAcrossPushes(t *testing.T) {
 }
 
 // issueCommentBody is an issue_comment webhook for comment id on PR 1, edited
-// from before to after by a user of the given type.
-func issueCommentBody(t *testing.T, id int64, userType, before, after string) []byte {
+// from before to after by the App with appID (0 for a plain user).
+func issueCommentBody(t *testing.T, id, appID int64, before, after string) []byte {
 	t.Helper()
 
+	comment := map[string]any{"id": id, "body": after}
+	if appID != 0 {
+		comment["performed_via_github_app"] = map[string]any{"id": appID}
+	}
 	body, err := json.Marshal(map[string]any{
 		"action":       "edited",
 		"changes":      map[string]any{"body": map[string]any{"from": before}},
 		"issue":        map[string]any{"number": 1, "pull_request": map[string]any{}},
-		"comment":      map[string]any{"id": id, "body": after, "user": map[string]any{"type": userType}},
+		"comment":      comment,
 		"repository":   map[string]any{"name": "widgets", "owner": map[string]any{"login": "acme"}},
 		"installation": map[string]any{"id": 42},
 	})
@@ -1054,9 +1070,10 @@ func TestFailedAnalysisIsRerunFromSummaryCheckbox(t *testing.T) {
 	}
 
 	ticked := strings.Replace(summary.Body, rerunBox, "- [x] Re-run analysis", 1)
-	h.deliverEvent("issue_comment", issueCommentBody(t, summary.ID, "User", summary.Body, summary.Body+"\nedited"))
-	h.deliverEvent("issue_comment", issueCommentBody(t, summary.ID+1, "Bot", summary.Body, ticked))
-	h.deliverEvent("issue_comment", issueCommentBody(t, summary.ID, "Bot", summary.Body, ticked))
+	h.deliverEvent("issue_comment", issueCommentBody(t, summary.ID, 0, summary.Body, summary.Body+"\nedited"))
+	h.deliverEvent("issue_comment", issueCommentBody(t, summary.ID, testAppID+1, summary.Body, ticked))
+	h.deliverEvent("issue_comment", issueCommentBody(t, summary.ID+1, testAppID, summary.Body, ticked))
+	h.deliverEvent("issue_comment", issueCommentBody(t, summary.ID, testAppID, summary.Body, ticked))
 
 	select {
 	case run = <-h.gh.checkRuns:
@@ -1087,8 +1104,8 @@ func TestFailedAnalysisIsRerunFromSummaryCheckbox(t *testing.T) {
 	if creates != 1 || len(comments) != 1 {
 		t.Errorf("creates = %d, comments = %d, want the one summary comment edited in place", creates, len(comments))
 	}
-	if body := h.commentWith(summaryTag).Body; strings.Contains(body, "Analysis failed") || !strings.HasSuffix(body, rerunBox+"\n") {
-		t.Errorf("summary after re-run:\n%s\nwant no failure cause and an unticked Re-run box", body)
+	if body := h.commentWith(summaryTag).Body; strings.Contains(body, "Analysis failed") || strings.Contains(body, rerunBox) {
+		t.Errorf("summary after re-run:\n%s\nwant no failure cause and no Re-run box", body)
 	}
 
 	h.gh.mu.Lock()
@@ -1228,7 +1245,7 @@ func TestActionsRerunFailingAgainEditsSummaryInPlace(t *testing.T) {
 	}
 
 	ticked := strings.Replace(summary.Body, rerunBox, "- [x] Re-run analysis", 1)
-	h.deliverEvent("issue_comment", issueCommentBody(t, summary.ID, "Bot", summary.Body, ticked))
+	h.deliverEvent("issue_comment", issueCommentBody(t, summary.ID, testAppID, summary.Body, ticked))
 	run := failRun(102, 3)
 
 	if run.Conclusion != gate.ConclusionNeutral || run.Title != "Analysis failed" || run.Summary != cause {
@@ -1285,5 +1302,54 @@ func TestSupersededServerAnalysisIsNotReportedFailed(t *testing.T) {
 		if strings.Contains(c.Body, "**Analysis failed:**") {
 			t.Errorf("comment reports a failure:\n%s", c.Body)
 		}
+	}
+}
+
+func TestRerunQueuesBehindRunningAnalysisOfSameHead(t *testing.T) {
+	t.Parallel()
+
+	held := heldRun{started: make(chan struct{}), release: make(chan struct{})}
+	h := newPushHarness(t, held, review.NoImpact{Reason: "docs already match"})
+
+	h.send("sha1")
+	select {
+	case <-held.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first analysis to start")
+	}
+	h.deliverEvent("check_run", checkRunRerequestedBody(t))
+	close(held.release)
+
+	state := h.waitState("the re-run to finish", func(s gate.PRState) bool { return s.CheckRunID == 2 && s.Run == nil })
+	if state.HeadSHA != "sha1" {
+		t.Errorf("HeadSHA = %q, want sha1", state.HeadSHA)
+	}
+	h.gh.mu.Lock()
+	defer h.gh.mu.Unlock()
+	if len(h.gh.concluded) != 2 || h.gh.concluded[0].id != 1 || h.gh.concluded[1].id != 2 || h.gh.concluded[1].run.Conclusion != gate.ConclusionSuccess {
+		t.Errorf("concluded = %+v, want check runs 1 then 2, both concluded", h.gh.concluded)
+	}
+}
+
+func TestPushSupersedesQueuedRerun(t *testing.T) {
+	t.Parallel()
+
+	held := heldRun{started: make(chan struct{}), release: make(chan struct{})}
+	h := newPushHarness(t, held, review.NoImpact{Reason: "docs already match"})
+
+	h.send("sha1")
+	select {
+	case <-held.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first analysis to start")
+	}
+	h.deliverEvent("check_run", checkRunRerequestedBody(t))
+	h.send("sha2")
+
+	state := h.waitState("the newest head to finish", func(s gate.PRState) bool { return s.HeadSHA == "sha2" && s.Run == nil && s.CheckRunID > 1 })
+	h.gh.mu.Lock()
+	defer h.gh.mu.Unlock()
+	if last := h.gh.concluded[len(h.gh.concluded)-1]; last.id != state.CheckRunID || last.run.Conclusion != gate.ConclusionSuccess {
+		t.Errorf("last concluded = %+v, want the newest check run %d concluded", last, state.CheckRunID)
 	}
 }

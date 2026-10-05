@@ -134,7 +134,7 @@ func TestWebhookToServerRunnerChain(t *testing.T) {
 		}
 	})
 
-	handler := httpapi.NewHandler(logger, secret, worker, store)
+	handler := httpapi.NewHandler(logger, secret, testAppID, worker, store)
 	body := e2ePullRequestBody(t, 1, headSHA)
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-GitHub-Event", "pull_request")

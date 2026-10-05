@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
@@ -38,21 +39,49 @@ type OverdueSource interface {
 	OverdueRuns(ctx context.Context, now time.Time) ([]gate.OverdueRun, error)
 }
 
-// EnqueueDeadlineJobs enqueues one deadline job per overdue run. Jobs dedupe
-// by nonce and minute: sweeping again within the minute adds nothing, and a
-// later minute's sweep retries a run whose earlier job failed.
-func EnqueueDeadlineJobs(ctx context.Context, src OverdueSource, jobs Enqueuer, now time.Time) error {
+const (
+	// deadlineRetryCap is how long past its deadline a run is still retried.
+	deadlineRetryCap = 24 * time.Hour
+	// deadlineTailEvery is the retry interval once the power-of-two buckets reach deadlineTailFrom.
+	deadlineTailEvery = 240
+	deadlineTailFrom  = 1024
+	// DeadlineSweepEvery is how often cmd/server runs EnqueueDeadlineJobs; the
+	// give-up warn window matches it so the warn logs once.
+	DeadlineSweepEvery = 30 * time.Second
+)
+
+// EnqueueDeadlineJobs enqueues deadline jobs for overdue runs. A run's jobs
+// dedupe by nonce and by the power-of-two bucket of whole minutes past its
+// deadline, so a run whose job failed is retried at about 0, 1, 2, 4, 8, ...
+// minutes overdue, then every 240 minutes from 1024. Runs more than deadlineRetryCap overdue are dropped.
+func EnqueueDeadlineJobs(ctx context.Context, src OverdueSource, jobs Enqueuer, logger *slog.Logger, now time.Time) error {
 	overdue, err := src.OverdueRuns(ctx, now)
 	if err != nil {
 		return fmt.Errorf("enqueue deadline jobs: %w", err)
 	}
 	for _, run := range overdue {
+		late := now.Sub(run.Deadline)
+		if late > deadlineRetryCap {
+			if late < deadlineRetryCap+DeadlineSweepEvery {
+				logger.Warn("giving up on overdue run", "owner", run.Owner, "repo", run.Repo, "number", run.Number, "nonce", run.Nonce)
+			}
+			continue
+		}
 		payload, err := json.Marshal(run)
 		if err != nil {
 			return fmt.Errorf("encode deadline job payload for %s/%s#%d: %w", run.Owner, run.Repo, run.Number, err)
 		}
+		minutes := int(late / time.Minute)
+		bucket := 0
+		if minutes >= deadlineTailFrom {
+			bucket = 11 + (minutes-deadlineTailFrom)/deadlineTailEvery
+		} else {
+			for m := minutes; m > 0; m >>= 1 {
+				bucket++
+			}
+		}
 		if _, err := jobs.Enqueue(ctx, jobqueue.NewJob{
-			DeliveryID: "deadline:" + run.Nonce + ":" + now.Truncate(time.Minute).UTC().Format(time.RFC3339),
+			DeliveryID: fmt.Sprintf("deadline:%s:%d", run.Nonce, bucket),
 			Key:        prJobKey(run.Owner, run.Repo, run.Number),
 			Kind:       runDeadlineJobKind,
 			Payload:    payload,

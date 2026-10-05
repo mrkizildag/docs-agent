@@ -28,7 +28,7 @@ func newFilesClient(t *testing.T, files http.HandlerFunc) *ghclient.Client {
 	mux.HandleFunc("GET /repos/o/r/pulls/7/files", files)
 	mux.HandleFunc("GET /repos/o/r/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if _, err := fmt.Fprint(w, `{"number":7,"base":{"sha":"base1"},"head":{"sha":"head1"}}`); err != nil {
+		if _, err := fmt.Fprint(w, `{"number":7,"state":"open","base":{"sha":"base1"},"head":{"sha":"head1"}}`); err != nil {
 			t.Errorf("write pull request response: %v", err)
 		}
 	})
@@ -53,7 +53,7 @@ func TestGetPullRequest(t *testing.T) {
 		t.Fatalf("GetPullRequest() = %v, want nil error", err)
 	}
 
-	want := gate.PullRequest{InstallationID: 99, Owner: "o", Repo: "r", Number: 7, BaseSHA: "base1", HeadSHA: "head1"}
+	want := gate.PullRequest{InstallationID: 99, Owner: "o", Repo: "r", Number: 7, BaseSHA: "base1", HeadSHA: "head1", Open: true}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("GetPullRequest() (-want +got):\n%s", diff)
 	}
