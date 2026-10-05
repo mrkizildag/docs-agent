@@ -29,7 +29,7 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 		return gate.PRState{}, fmt.Errorf("load pr %s/%s#%d: %w", owner, repo, number, err)
 	}
 
-	if run.RunID != 0 {
+	if run.Nonce != "" {
 		parsed, err := time.Parse(time.RFC3339Nano, deadline)
 		if err != nil {
 			return gate.PRState{}, fmt.Errorf("load pr %s/%s#%d: parse run deadline %q: %w", owner, repo, number, deadline, err)
@@ -139,7 +139,7 @@ func (s *Store) PRForRun(ctx context.Context, owner, repo string, runID int64) (
 // are compared as times, not as text, because RFC3339Nano does not sort.
 func (s *Store) OverdueRuns(ctx context.Context, now time.Time) ([]gate.OverdueRun, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT owner, repo, number, run_nonce, run_deadline FROM pull_requests WHERE run_id != 0`)
+		`SELECT owner, repo, number, run_nonce, run_deadline FROM pull_requests WHERE run_nonce != ''`)
 	if err != nil {
 		return nil, fmt.Errorf("list awaited runs: %w", err)
 	}

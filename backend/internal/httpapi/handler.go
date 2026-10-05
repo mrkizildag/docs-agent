@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -85,6 +86,58 @@ type pullRequestEvent struct {
 	} `json:"installation"`
 }
 
+// issueCommentEvent is the subset of GitHub's issue_comment webhook payload the
+// handler needs.
+type issueCommentEvent struct {
+	Action  string `json:"action"`
+	Changes struct {
+		Body struct {
+			From string `json:"from"`
+		} `json:"body"`
+	} `json:"changes"`
+	Issue struct {
+		Number      int       `json:"number"`
+		PullRequest *struct{} `json:"pull_request"`
+	} `json:"issue"`
+	Comment struct {
+		ID   int64  `json:"id"`
+		Body string `json:"body"`
+		User struct {
+			Type string `json:"type"`
+		} `json:"user"`
+	} `json:"comment"`
+	Repository struct {
+		Name  string `json:"name"`
+		Owner struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	} `json:"repository"`
+	Installation struct {
+		ID int64 `json:"id"`
+	} `json:"installation"`
+}
+
+// checkRunEvent is the subset of GitHub's check_run webhook payload the handler
+// needs. PullRequests is empty when GitHub cannot associate the run with a PR.
+type checkRunEvent struct {
+	Action   string `json:"action"`
+	CheckRun struct {
+		Name         string `json:"name"`
+		PullRequests []struct {
+			Number int `json:"number"`
+		} `json:"pull_requests"`
+	} `json:"check_run"`
+	Repository struct {
+		Name  string `json:"name"`
+		Owner struct {
+			Login string `json:"login"`
+		} `json:"owner"`
+	} `json:"repository"`
+	Installation struct {
+		ID int64 `json:"id"`
+	} `json:"installation"`
+}
+
 func webhookHandler(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer, runs RunLookup) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		deliveryID := r.Header.Get("X-GitHub-Delivery")
@@ -117,6 +170,10 @@ func webhookHandler(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer, ru
 		switch event {
 		case "pull_request":
 			handlePullRequestEvent(logger, jobs, w, r, deliveryID, body)
+		case "issue_comment":
+			handleIssueCommentEvent(logger, jobs, w, r, deliveryID, body)
+		case "check_run":
+			handleCheckRunEvent(logger, jobs, w, r, deliveryID, body)
 		case "workflow_run":
 			handleWorkflowRunEvent(logger, jobs, runs, w, r, deliveryID, body)
 		default:
@@ -162,7 +219,7 @@ func handlePullRequestEvent(logger *slog.Logger, jobs Enqueuer, w http.ResponseW
 		HeadSHA:        payload.PullRequest.Head.SHA,
 	}
 
-	jobPayload, err := json.Marshal(pr)
+	jobPayload, err := json.Marshal(pullRequestJobPayload{PullRequest: pr})
 	if err != nil {
 		logger.Error("encode pull_request job payload", "delivery_id", deliveryID, "err", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -185,6 +242,114 @@ func handlePullRequestEvent(logger *slog.Logger, jobs Enqueuer, w http.ResponseW
 	}
 	if !enqueued {
 		logger.Info("duplicate webhook delivery", "delivery_id", deliveryID)
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// handleIssueCommentEvent enqueues a re-run when a bot's summary comment on a
+// pull request is edited to tick its Re-run box. gate.Service.HandleRerun
+// checks that the comment is the PR's summary comment.
+func handleIssueCommentEvent(logger *slog.Logger, jobs Enqueuer, w http.ResponseWriter, r *http.Request, deliveryID string, body []byte) {
+	var payload issueCommentEvent
+	if err := json.Unmarshal(body, &payload); err != nil {
+		logger.Warn("decode issue_comment payload", "delivery_id", deliveryID, "err", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if payload.Action != "edited" || payload.Issue.PullRequest == nil || payload.Comment.User.Type != "Bot" ||
+		!gate.RerunTicked(payload.Changes.Body.From, payload.Comment.Body) {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	if payload.Comment.ID == 0 || payload.Issue.Number == 0 || payload.Repository.Owner.Login == "" ||
+		payload.Repository.Name == "" || payload.Installation.ID == 0 || deliveryID == "" {
+		logger.Warn("issue_comment payload missing fields", "delivery_id", deliveryID)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	owner, repo, number := payload.Repository.Owner.Login, payload.Repository.Name, payload.Issue.Number
+	jobPayload, err := json.Marshal(pullRequestJobPayload{Rerun: &gate.RerunRequest{
+		InstallationID:   payload.Installation.ID,
+		PRRef:            gate.PRRef{Owner: owner, Repo: repo, Number: number},
+		SummaryCommentID: payload.Comment.ID,
+	}})
+	if err != nil {
+		logger.Error("encode rerun job payload", "delivery_id", deliveryID, "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	enqueued, err := jobs.Enqueue(r.Context(), jobqueue.NewJob{
+		DeliveryID: deliveryID,
+		Key:        prJobKey(owner, repo, number),
+		Kind:       pullRequestJobKind,
+		Payload:    jobPayload,
+		Supersedes: true,
+	})
+	if err != nil {
+		logger.Error("enqueue rerun job", "delivery_id", deliveryID, "err", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if !enqueued {
+		logger.Info("duplicate webhook delivery", "delivery_id", deliveryID)
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// handleCheckRunEvent enqueues a re-run for each pull request of our check run
+// when a user clicks "Re-run" on it.
+func handleCheckRunEvent(logger *slog.Logger, jobs Enqueuer, w http.ResponseWriter, r *http.Request, deliveryID string, body []byte) {
+	var payload checkRunEvent
+	if err := json.Unmarshal(body, &payload); err != nil {
+		logger.Warn("decode check_run payload", "delivery_id", deliveryID, "err", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if payload.Action != "rerequested" || payload.CheckRun.Name != gate.CheckName || len(payload.CheckRun.PullRequests) == 0 {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	owner, repo := payload.Repository.Owner.Login, payload.Repository.Name
+	if owner == "" || repo == "" || payload.Installation.ID == 0 || deliveryID == "" {
+		logger.Warn("check_run payload missing fields", "delivery_id", deliveryID)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	for _, pr := range payload.CheckRun.PullRequests {
+		jobPayload, err := json.Marshal(pullRequestJobPayload{Rerun: &gate.RerunRequest{
+			InstallationID: payload.Installation.ID,
+			PRRef:          gate.PRRef{Owner: owner, Repo: repo, Number: pr.Number},
+		}})
+		if err != nil {
+			logger.Error("encode rerun job payload", "delivery_id", deliveryID, "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		enqueued, err := jobs.Enqueue(r.Context(), jobqueue.NewJob{
+			DeliveryID: fmt.Sprintf("%s:%d", deliveryID, pr.Number),
+			Key:        prJobKey(owner, repo, pr.Number),
+			Kind:       pullRequestJobKind,
+			Payload:    jobPayload,
+			Supersedes: true,
+		})
+		if err != nil {
+			logger.Error("enqueue rerun job", "delivery_id", deliveryID, "number", pr.Number, "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if !enqueued {
+			logger.Info("duplicate webhook delivery", "delivery_id", deliveryID)
+		}
 	}
 
 	w.WriteHeader(http.StatusAccepted)

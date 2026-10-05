@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	ghclient "github.com/mrkizildag/pollux-agent/backend/internal/github"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
@@ -25,6 +26,12 @@ func newFilesClient(t *testing.T, files http.HandlerFunc) *ghclient.Client {
 		}
 	})
 	mux.HandleFunc("GET /repos/o/r/pulls/7/files", files)
+	mux.HandleFunc("GET /repos/o/r/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprint(w, `{"number":7,"base":{"sha":"base1"},"head":{"sha":"head1"}}`); err != nil {
+			t.Errorf("write pull request response: %v", err)
+		}
+	})
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -36,6 +43,22 @@ func newFilesClient(t *testing.T, files http.HandlerFunc) *ghclient.Client {
 	return client
 }
 
+func TestGetPullRequest(t *testing.T) {
+	t.Parallel()
+
+	client := newFilesClient(t, func(http.ResponseWriter, *http.Request) {})
+
+	got, err := client.GetPullRequest(t.Context(), 99, "o", "r", 7)
+	if err != nil {
+		t.Fatalf("GetPullRequest() = %v, want nil error", err)
+	}
+
+	want := gate.PullRequest{InstallationID: 99, Owner: "o", Repo: "r", Number: 7, BaseSHA: "base1", HeadSHA: "head1"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("GetPullRequest() (-want +got):\n%s", diff)
+	}
+}
+
 func TestListChangedFiles(t *testing.T) {
 	t.Parallel()
 
@@ -43,12 +66,12 @@ func TestListChangedFiles(t *testing.T) {
 
 	pages := map[string]string{
 		"": fmt.Sprintf(`[
-			{"filename":"a.go","status":"modified","patch":%q},
+			{"filename":"a.go","status":"modified","changes":5,"patch":%q},
 			{"filename":"new/name.go","previous_filename":"old/name.go","status":"renamed","patch":"@@ -5,2 +5,3 @@\n x"}
 		]`, multiPatch),
 		"2": `[
 			{"filename":"removed.go","status":"removed","patch":"@@ -1,2 +0,0 @@\n-a\n-b"},
-			{"filename":"big.bin","status":"modified"}
+			{"filename":"big.bin","status":"modified","changes":12000}
 		]`,
 	}
 
@@ -72,13 +95,14 @@ func TestListChangedFiles(t *testing.T) {
 
 	want := []review.ChangedFile{
 		{
-			Path:  "a.go",
-			Hunks: []review.LineRange{{Start: 1, End: 4}, {Start: 11, End: 11}},
-			Patch: multiPatch,
+			Path:    "a.go",
+			Hunks:   []review.LineRange{{Start: 1, End: 4}, {Start: 11, End: 11}},
+			Patch:   multiPatch,
+			Changes: 5,
 		},
 		{Path: "new/name.go", PreviousPath: "old/name.go", Hunks: []review.LineRange{{Start: 5, End: 7}}, Patch: "@@ -5,2 +5,3 @@\n x"},
 		{Path: "removed.go", Patch: "@@ -1,2 +0,0 @@\n-a\n-b"},
-		{Path: "big.bin"},
+		{Path: "big.bin", Changes: 12000},
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("ListChangedFiles() (-want +got):\n%s", diff)
