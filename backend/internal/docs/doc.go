@@ -85,13 +85,16 @@ func CheckScaffoldDoc(path string, src []byte) error {
 
 // CheckScaffold reports why index, architecture and setup are not a usable
 // starting docs folder: each must pass CheckScaffoldDoc at its path, and the
-// index must link the other two relatively.
+// index must link the other two relatively. Each file must fit in MaxDocBytes.
 func CheckScaffold(index, architecture, setup string) error {
 	for _, doc := range []struct{ path, src string }{
 		{"docs/README.md", index},
 		{"docs/architecture.md", architecture},
 		{"docs/guides/setup.md", setup},
 	} {
+		if len(doc.src) > MaxDocBytes {
+			return fmt.Errorf("check scaffold doc %s: %d bytes exceed the %d byte cap", doc.path, len(doc.src), MaxDocBytes)
+		}
 		if err := CheckScaffoldDoc(doc.path, []byte(doc.src)); err != nil {
 			return err
 		}

@@ -39,9 +39,25 @@ type ScaffoldStarted interface{ isScaffoldStarted() }
 type Scaffold struct {
 	Runner       string
 	Model        string
-	Index        string // docs/README.md
-	Architecture string // docs/architecture.md
-	Setup        string // docs/guides/setup.md
+	Index        string
+	Architecture string
+	Setup        string
+}
+
+// ScaffoldFile is one file of a Scaffold at its repo-relative path.
+type ScaffoldFile struct {
+	Path    string
+	Content string
+}
+
+// Files returns the scaffold's files with their paths: the one place those
+// paths are defined for writing.
+func (s Scaffold) Files() []ScaffoldFile {
+	return []ScaffoldFile{
+		{Path: "docs/README.md", Content: s.Index},
+		{Path: "docs/architecture.md", Content: s.Architecture},
+		{Path: "docs/guides/setup.md", Content: s.Setup},
+	}
 }
 
 func (Pending) isScaffoldStarted()  {}

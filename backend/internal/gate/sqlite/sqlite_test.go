@@ -1,7 +1,9 @@
 package sqlite_test
 
 import (
+	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,6 +48,31 @@ func TestOpen_MigrationsIdempotentOnReopen(t *testing.T) {
 	}
 	if err := s2.Close(); err != nil {
 		t.Fatalf("Close() = %v, want nil error", err)
+	}
+}
+
+func TestOpen_RejectsANewerSchema(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open(%q) = %v, want nil error", path, err)
+	}
+	if _, err := db.ExecContext(t.Context(), "PRAGMA user_version = 999"); err != nil {
+		t.Fatalf("set user_version = %v, want nil error", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil error", err)
+	}
+
+	store, err := sqlite.Open(t.Context(), path)
+	if err == nil {
+		_ = store.Close()
+		t.Fatal("Open() = nil, want an error for a schema newer than the binary")
+	}
+	if !strings.Contains(err.Error(), "database schema version 999 is newer than this binary's") {
+		t.Errorf("Open() = %v, want it to name the newer schema version", err)
 	}
 }
 

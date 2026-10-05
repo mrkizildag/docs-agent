@@ -471,3 +471,19 @@ func TestEnqueueDeadlineJobsLogsGivingUpOnce(t *testing.T) {
 		t.Errorf("give-up warnings = %d, want 1 across sweeps every 30s:\n%s", got, logs.String())
 	}
 }
+
+func TestEnqueueDeadlineJobsNamesScaffoldRunsByScaffoldKey(t *testing.T) {
+	t.Parallel()
+
+	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	src := fakeOverdueSource{{PRRef: gate.PRRef{Owner: "acme", Repo: "widgets"}, Scaffold: true, Nonce: "n1", Deadline: deadline}}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+	if err := httpapi.EnqueueDeadlineJobs(t.Context(), src, newFakeEnqueuer(), logger, deadline.Add(24*time.Hour+time.Second)); err != nil {
+		t.Fatalf("EnqueueDeadlineJobs() = %v", err)
+	}
+	if got := logs.String(); !strings.Contains(got, "acme/widgets#scaffold") || strings.Contains(got, "#0") {
+		t.Errorf("give-up log = %q, want the scaffold key acme/widgets#scaffold and no #0", got)
+	}
+}

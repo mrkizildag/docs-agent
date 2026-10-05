@@ -12,7 +12,7 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
-const scaffoldColumns = `installation_id, phase, attempt, base_sha, run_id, run_nonce, run_deadline, files, branch, pr_number, pr_url`
+const scaffoldColumns = `installation_id, phase, attempt, failures, base_sha, run_id, run_nonce, run_deadline, files, commit_sha, pr_number, pr_url`
 
 // LoadScaffold returns the scaffold state saved for owner/repo, or the Idle
 // zero-attempt state (identity fields filled from the args) if there is none.
@@ -31,7 +31,7 @@ func loadScaffold(ctx context.Context, q queryRower, owner, repo string) (gate.S
 	var nonce, deadline, files string
 	err := q.QueryRowContext(ctx,
 		`SELECT `+scaffoldColumns+` FROM repo_scaffolds WHERE owner = ? AND repo = ?`, owner, repo).
-		Scan(&state.InstallationID, &state.Phase, &state.Attempt, &state.BaseSHA, &runID, &nonce, &deadline, &files, &state.Branch, &state.PRNumber, &state.PRURL)
+		Scan(&state.InstallationID, &state.Phase, &state.Attempt, &state.Failures, &state.BaseSHA, &runID, &nonce, &deadline, &files, &state.CommitSHA, &state.PRNumber, &state.PRURL)
 	if errors.Is(err, sql.ErrNoRows) {
 		return state, nil
 	}
@@ -55,7 +55,8 @@ func loadScaffold(ctx context.Context, q queryRower, owner, repo string) (gate.S
 	return state, nil
 }
 
-// SaveScaffold upserts state, keyed by owner/repo.
+// SaveScaffold upserts state, keyed by owner/repo. It never overwrites a stored
+// installation_id: RequestScaffold owns it.
 func (s *Store) SaveScaffold(ctx context.Context, state gate.ScaffoldState) error {
 	var runID int64
 	var nonce, deadline string
@@ -72,20 +73,20 @@ func (s *Store) SaveScaffold(ctx context.Context, state gate.ScaffoldState) erro
 
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO repo_scaffolds (owner, repo, `+scaffoldColumns+`)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (owner, repo) DO UPDATE SET
-			installation_id = excluded.installation_id,
 			phase = excluded.phase,
 			attempt = excluded.attempt,
+			failures = excluded.failures,
 			base_sha = excluded.base_sha,
 			run_id = excluded.run_id,
 			run_nonce = excluded.run_nonce,
 			run_deadline = excluded.run_deadline,
 			files = excluded.files,
-			branch = excluded.branch,
+			commit_sha = excluded.commit_sha,
 			pr_number = excluded.pr_number,
 			pr_url = excluded.pr_url`,
-		state.Owner, state.Repo, state.InstallationID, state.Phase, state.Attempt, state.BaseSHA, runID, nonce, deadline, string(files), state.Branch, state.PRNumber, state.PRURL)
+		state.Owner, state.Repo, state.InstallationID, state.Phase, state.Attempt, state.Failures, state.BaseSHA, runID, nonce, deadline, string(files), state.CommitSHA, state.PRNumber, state.PRURL)
 	if err != nil {
 		return fmt.Errorf("save scaffold %s/%s: %w", state.Owner, state.Repo, err)
 	}
@@ -94,7 +95,8 @@ func (s *Store) SaveScaffold(ctx context.Context, state gate.ScaffoldState) erro
 
 // RequestScaffold creates owner/repo's Idle scaffold state if it has none and
 // records waiter, in one transaction, and returns the state as it stands.
-// Existing state is never changed; a waiter already recorded is a no-op.
+// Existing state keeps its phase; only installation_id is refreshed. A waiter
+// already recorded is a no-op.
 func (s *Store) RequestScaffold(ctx context.Context, installationID int64, owner, repo string, waiter gate.ScaffoldWaiter) (gate.ScaffoldState, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -103,13 +105,13 @@ func (s *Store) RequestScaffold(ctx context.Context, installationID int64, owner
 	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO repo_scaffolds (owner, repo, installation_id, phase) VALUES (?, ?, ?, ?) ON CONFLICT (owner, repo) DO NOTHING`,
+		`INSERT INTO repo_scaffolds (owner, repo, installation_id, phase) VALUES (?, ?, ?, ?) ON CONFLICT (owner, repo) DO UPDATE SET installation_id = excluded.installation_id`,
 		owner, repo, installationID, gate.ScaffoldIdle); err != nil {
 		return gate.ScaffoldState{}, fmt.Errorf("request scaffold %s/%s: create state: %w", owner, repo, err)
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO scaffold_waiters (owner, repo, check_run_id, pr_number) VALUES (?, ?, ?, ?) ON CONFLICT (owner, repo, check_run_id) DO NOTHING`,
-		owner, repo, waiter.CheckRunID, waiter.PRNumber); err != nil {
+		`INSERT INTO scaffold_waiters (owner, repo, check_run_id) VALUES (?, ?, ?) ON CONFLICT (owner, repo, check_run_id) DO NOTHING`,
+		owner, repo, waiter.CheckRunID); err != nil {
 		return gate.ScaffoldState{}, fmt.Errorf("request scaffold %s/%s: record check run %d: %w", owner, repo, waiter.CheckRunID, err)
 	}
 	state, err := loadScaffold(ctx, tx, owner, repo)
@@ -126,7 +128,7 @@ func (s *Store) RequestScaffold(ctx context.Context, installationID int64, owner
 // yet marked linked, oldest first.
 func (s *Store) UnlinkedScaffoldWaiters(ctx context.Context, owner, repo string) ([]gate.ScaffoldWaiter, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT check_run_id, pr_number FROM scaffold_waiters WHERE owner = ? AND repo = ? AND linked = 0 ORDER BY id`, owner, repo)
+		`SELECT check_run_id FROM scaffold_waiters WHERE owner = ? AND repo = ? AND linked = 0 ORDER BY id`, owner, repo)
 	if err != nil {
 		return nil, fmt.Errorf("list scaffold waiters of %s/%s: %w", owner, repo, err)
 	}
@@ -135,7 +137,7 @@ func (s *Store) UnlinkedScaffoldWaiters(ctx context.Context, owner, repo string)
 	var waiters []gate.ScaffoldWaiter
 	for rows.Next() {
 		var w gate.ScaffoldWaiter
-		if err := rows.Scan(&w.CheckRunID, &w.PRNumber); err != nil {
+		if err := rows.Scan(&w.CheckRunID); err != nil {
 			return nil, fmt.Errorf("scan scaffold waiter of %s/%s: %w", owner, repo, err)
 		}
 		waiters = append(waiters, w)

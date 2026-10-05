@@ -37,7 +37,7 @@ func TestDocsExist(t *testing.T) {
 		wantErr bool
 	}{
 		{repo: "with", want: true},
-		{repo: "file"},
+		{repo: "file", want: true},
 		{repo: "none"},
 		{repo: "boom", wantErr: true},
 	}
@@ -168,5 +168,33 @@ func TestFindPullRequest(t *testing.T) {
 	}
 	if _, ok, err := client.FindPullRequest(t.Context(), 1, "o", "none", "b"); err != nil || ok {
 		t.Errorf("FindPullRequest(none) = _, %v, %v; want false, nil", ok, err)
+	}
+}
+
+func TestResetBranch(t *testing.T) {
+	t.Parallel()
+
+	var body map[string]any
+	mux := http.NewServeMux()
+	handleAccessToken(t, mux)
+	mux.HandleFunc("PATCH /repos/o/r/git/refs/heads/pollux-agent/docs-scaffold", func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		writeJSON(t, w, http.StatusOK, `{"ref":"refs/heads/pollux-agent/docs-scaffold"}`)
+	})
+	mux.HandleFunc("PATCH /repos/o/missing/git/refs/heads/b", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, http.StatusNotFound, `{"message":"Reference does not exist"}`)
+	})
+	client := newTestClient(t, mux)
+
+	if err := client.ResetBranch(t.Context(), 1, "o", "r", "pollux-agent/docs-scaffold", "sha1"); err != nil {
+		t.Fatalf("ResetBranch() = %v, want nil error", err)
+	}
+	if diff := cmp.Diff(map[string]any{"sha": "sha1", "force": true}, body); diff != "" {
+		t.Errorf("ResetBranch() body (-want +got):\n%s", diff)
+	}
+	if err := client.ResetBranch(t.Context(), 1, "o", "missing", "b", "sha1"); err == nil {
+		t.Error("ResetBranch(missing) = nil, want an error")
 	}
 }

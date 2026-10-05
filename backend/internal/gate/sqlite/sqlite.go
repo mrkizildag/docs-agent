@@ -126,12 +126,15 @@ func migrations() []string {
 			installation_id INTEGER NOT NULL,
 			phase TEXT NOT NULL,
 			attempt INTEGER NOT NULL DEFAULT 0,
+			failures INTEGER NOT NULL DEFAULT 0,
 			base_sha TEXT NOT NULL DEFAULT '',
-			lease_until TEXT NOT NULL DEFAULT '',
 			files TEXT NOT NULL DEFAULT '',
-			branch TEXT NOT NULL DEFAULT '',
+			commit_sha TEXT NOT NULL DEFAULT '',
 			pr_number INTEGER NOT NULL DEFAULT 0,
 			pr_url TEXT NOT NULL DEFAULT '',
+			run_id INTEGER NOT NULL DEFAULT 0,
+			run_nonce TEXT NOT NULL DEFAULT '',
+			run_deadline TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (owner, repo)
 		);
 		CREATE TABLE scaffold_waiters (
@@ -139,13 +142,9 @@ func migrations() []string {
 			owner TEXT NOT NULL,
 			repo TEXT NOT NULL,
 			check_run_id INTEGER NOT NULL,
-			pr_number INTEGER NOT NULL,
+			linked INTEGER NOT NULL DEFAULT 0,
 			UNIQUE (owner, repo, check_run_id)
 		)`,
-		`ALTER TABLE repo_scaffolds ADD COLUMN run_id INTEGER NOT NULL DEFAULT 0;
-		ALTER TABLE repo_scaffolds ADD COLUMN run_nonce TEXT NOT NULL DEFAULT '';
-		ALTER TABLE repo_scaffolds ADD COLUMN run_deadline TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE scaffold_waiters ADD COLUMN linked INTEGER NOT NULL DEFAULT 0`,
 	}
 }
 
@@ -158,6 +157,9 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	}
 
 	steps := migrations()
+	if version > len(steps) {
+		return fmt.Errorf("database schema version %d is newer than this binary's %d", version, len(steps))
+	}
 	for i := version; i < len(steps); i++ {
 		if err := applyMigration(ctx, db, i, steps[i]); err != nil {
 			return err

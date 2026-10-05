@@ -47,6 +47,20 @@ linters:
           deny:
             - pkg: github.com/mrkizildag/pollux-agent/backend/internal
               desc: internal/review imports nothing else from this module
+        docs-leaf:
+          files:
+            - "**/internal/docs/**"
+            - "!$test"
+          deny:
+            - pkg: github.com/mrkizildag/pollux-agent/backend/internal
+              desc: internal/docs imports no other internal package
+        actions-runner:
+          files:
+            - "**/internal/review/actions/**"
+            - "!$test"
+          deny:
+            - pkg: github.com/mrkizildag/pollux-agent/backend/internal/github
+              desc: the Actions runner reaches GitHub only through its own WorkflowAPI
         llm-agent-leaf:
           files:
             - "**/internal/llm/**"
@@ -71,6 +85,7 @@ linters:
         - empty
         - stdlib
         - anon
+        - generic
         - github.com/mrkizildag/pollux-agent/backend/internal/review.Started
         - github.com/mrkizildag/pollux-agent/backend/internal/review.ScaffoldStarted
         - github.com/mrkizildag/pollux-agent/backend/internal/review.Verdict

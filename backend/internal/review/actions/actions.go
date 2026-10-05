@@ -51,21 +51,21 @@ type WorkflowAPI interface {
 }
 
 // Artifact is the JSON document the workflow uploads as result.json.
-type Artifact struct {
-	HeadSHA string       `json:"head_sha"`
-	Nonce   string       `json:"nonce"`
-	Claude  ClaudeOutput `json:"claude"`
+type Artifact[T any] struct {
+	HeadSHA string          `json:"head_sha"`
+	Nonce   string          `json:"nonce"`
+	Claude  ClaudeOutput[T] `json:"claude"`
 }
 
 // ClaudeOutput is the subset of `claude -p --output-format json` stdout the
 // runner reads.
-type ClaudeOutput struct {
+type ClaudeOutput[T any] struct {
 	IsError          bool                       `json:"is_error"`
 	Subtype          string                     `json:"subtype"`
 	TerminalReason   string                     `json:"terminal_reason"`
 	APIErrorStatus   *int                       `json:"api_error_status"`
 	ModelUsage       map[string]json.RawMessage `json:"modelUsage"`
-	StructuredOutput *review.StructuredOutput   `json:"structured_output"`
+	StructuredOutput *T                         `json:"structured_output"`
 }
 
 // Runner dispatches the repo's pollux-agent workflow and collects its result.
@@ -87,38 +87,32 @@ func New(api WorkflowAPI, timeout time.Duration) *Runner {
 
 // Start dispatches the workflow for req and returns review.Pending.
 func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started, error) {
-	nonce, err := newNonce()
+	pending, err := r.dispatch(ctx, req.InstallationID, req.Owner, req.Repo, req.HeadSHA, req.Number)
 	if err != nil {
 		return nil, fmt.Errorf("start actions run %s/%s#%d: %w", req.Owner, req.Repo, req.Number, err)
 	}
-
-	runID, err := r.api.Dispatch(ctx, req.InstallationID, req.Owner, req.Repo, DispatchInputs{
-		HeadSHA:  req.HeadSHA,
-		PRNumber: req.Number,
-		Nonce:    nonce,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("start actions run %s/%s#%d: dispatch: %w", req.Owner, req.Repo, req.Number, err)
-	}
-
-	return review.Pending{RunID: runID, Nonce: nonce, Deadline: time.Now().Add(r.timeout)}, nil
+	return pending, nil
 }
 
 // StartScaffold dispatches the workflow with pr_number 0 at req.BaseSHA and
 // returns review.Pending.
 func (r *Runner) StartScaffold(ctx context.Context, req review.ScaffoldRequest) (review.ScaffoldStarted, error) {
-	nonce, err := newNonce()
+	pending, err := r.dispatch(ctx, req.InstallationID, req.Owner, req.Repo, req.BaseSHA, 0)
 	if err != nil {
 		return nil, fmt.Errorf("start actions scaffold %s/%s: %w", req.Owner, req.Repo, err)
 	}
+	return pending, nil
+}
 
-	runID, err := r.api.Dispatch(ctx, req.InstallationID, req.Owner, req.Repo, DispatchInputs{
-		HeadSHA:  req.BaseSHA,
-		PRNumber: 0,
-		Nonce:    nonce,
-	})
+func (r *Runner) dispatch(ctx context.Context, installationID int64, owner, repo, sha string, number int) (review.Pending, error) {
+	nonce, err := newNonce()
 	if err != nil {
-		return nil, fmt.Errorf("start actions scaffold %s/%s: dispatch: %w", req.Owner, req.Repo, err)
+		return review.Pending{}, err
+	}
+
+	runID, err := r.api.Dispatch(ctx, installationID, owner, repo, DispatchInputs{HeadSHA: sha, PRNumber: number, Nonce: nonce})
+	if err != nil {
+		return review.Pending{}, fmt.Errorf("dispatch: %w", err)
 	}
 
 	return review.Pending{RunID: runID, Nonce: nonce, Deadline: time.Now().Add(r.timeout)}, nil
@@ -133,7 +127,7 @@ func (r *Runner) CollectScaffold(ctx context.Context, c review.Completion) (revi
 		return review.Scaffold{}, fmt.Errorf("collect actions scaffold run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
 	}
 
-	var art scaffoldArtifact
+	var art Artifact[review.ScaffoldDocs]
 	if err := json.Unmarshal(raw, &art); err != nil {
 		return review.Scaffold{}, &review.InvalidResultError{Cause: fmt.Errorf("decode result artifact: %w", err)}
 	}
@@ -166,7 +160,7 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 		return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
 	}
 
-	var art Artifact
+	var art Artifact[review.StructuredOutput]
 	if err := json.Unmarshal(raw, &art); err != nil {
 		return review.Result{}, &review.InvalidResultError{Cause: fmt.Errorf("decode result artifact: %w", err)}
 	}
@@ -236,49 +230,27 @@ func (r *Runner) fillOriginals(ctx context.Context, c review.Completion, proposa
 	return nil
 }
 
-func (a Artifact) output(c review.Completion) (*review.StructuredOutput, error) {
-	if err := a.check(c, a.Claude.StructuredOutput == nil); err != nil {
-		return nil, err
-	}
-	return a.Claude.StructuredOutput, nil
-}
-
-// scaffoldArtifact is Artifact whose structured_output holds the scaffold docs.
-type scaffoldArtifact struct {
-	HeadSHA string `json:"head_sha"`
-	Nonce   string `json:"nonce"`
-	Claude  struct {
-		ClaudeOutput
-		StructuredOutput *review.ScaffoldDocs `json:"structured_output"`
-	} `json:"claude"`
-}
-
-func (a scaffoldArtifact) output(c review.Completion) (*review.ScaffoldDocs, error) {
-	if err := (Artifact{HeadSHA: a.HeadSHA, Nonce: a.Nonce, Claude: a.Claude.ClaudeOutput}).check(c, a.Claude.StructuredOutput == nil); err != nil {
-		return nil, err
-	}
-	return a.Claude.StructuredOutput, nil
-}
-
-func (a Artifact) check(c review.Completion, noOutput bool) error {
+// output returns the structured output of an artifact that belongs to c's
+// dispatch and reports no error.
+func (a Artifact[T]) output(c review.Completion) (*T, error) {
 	if a.HeadSHA != c.HeadSHA {
-		return fmt.Errorf("artifact head_sha %q, want %q", a.HeadSHA, c.HeadSHA)
+		return nil, fmt.Errorf("artifact head_sha %q, want %q", a.HeadSHA, c.HeadSHA)
 	}
 	if a.Nonce != c.Nonce {
-		return errors.New("artifact nonce does not match the dispatch")
+		return nil, errors.New("artifact nonce does not match the dispatch")
 	}
 	if a.Claude.IsError {
-		return a.Claude.failure()
+		return nil, a.Claude.failure()
 	}
-	if noOutput {
-		return errors.New("claude output has no structured_output")
+	if a.Claude.StructuredOutput == nil {
+		return nil, errors.New("claude output has no structured_output")
 	}
-	return nil
+	return a.Claude.StructuredOutput, nil
 }
 
 // failure describes an errored run from structured fields only; the free-form
 // result text is attacker-influenced and must not reach a public check run.
-func (o ClaudeOutput) failure() error {
+func (o ClaudeOutput[T]) failure() error {
 	status := "none"
 	if o.APIErrorStatus != nil {
 		status = strconv.Itoa(*o.APIErrorStatus)
@@ -294,7 +266,7 @@ func capText(s string) string {
 	return strings.ToValidUTF8(s[:maxCauseText], "") + "..."
 }
 
-func (o ClaudeOutput) model() string {
+func (o ClaudeOutput[T]) model() string {
 	if models := slices.Sorted(maps.Keys(o.ModelUsage)); len(models) > 0 {
 		return models[0]
 	}

@@ -105,6 +105,13 @@ func (f *scaffoldGitHub) CreateBranch(_ context.Context, _ int64, _, _, branch, 
 	return nil
 }
 
+func (f *scaffoldGitHub) ResetBranch(_ context.Context, _ int64, _, _, branch, sha string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.branches[branch] = sha
+	return nil
+}
+
 func (f *scaffoldGitHub) BranchSHA(_ context.Context, _ int64, _, _, branch string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

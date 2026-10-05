@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
+	"time"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
 	"github.com/mrkizildag/pollux-agent/backend/internal/docs"
@@ -12,12 +12,12 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
-// submitDocsArgs is the argument shape of the submit_docs finishing tool.
-type submitDocsArgs struct {
-	Index        string `json:"index"`
-	Architecture string `json:"architecture"`
-	Setup        string `json:"setup"`
-}
+// Caps on one scaffold run, which reads the whole repo rather than one diff.
+const (
+	scaffoldStepCap     = 40
+	scaffoldTokenBudget = 600_000
+	scaffoldTimeout     = 8 * time.Minute
+)
 
 // StartScaffold implements review.Scaffolder: an agent loop over a depth-1
 // clone of req.BaseSHA writes the three scaffold docs. It always returns a
@@ -35,29 +35,11 @@ func (r *Runner) StartScaffold(ctx context.Context, req review.ScaffoldRequest) 
 }
 
 func (r *Runner) scaffold(ctx context.Context, req review.ScaffoldRequest) (review.Scaffold, error) {
-	token, err := r.token(ctx, req.InstallationID, req.Repo)
+	root, cleanup, err := r.openClone(ctx, req.InstallationID, req.Owner, req.Repo, req.BaseSHA)
 	if err != nil {
-		return review.Scaffold{}, fmt.Errorf("get installation token: %w: %w", errClone, err)
+		return review.Scaffold{}, err
 	}
-
-	remoteURL := r.remote
-	if remoteURL == "" {
-		remoteURL = fmt.Sprintf("https://github.com/%s/%s.git", req.Owner, req.Repo)
-	}
-
-	dir, err := cloneHead(ctx, remoteURL, req.BaseSHA, token)
-	if dir != "" {
-		defer func() { _ = os.RemoveAll(dir) }() // best-effort cleanup of a temp dir; the runner has no logger
-	}
-	if err != nil {
-		return review.Scaffold{}, fmt.Errorf("%w: %w", errClone, err)
-	}
-
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		return review.Scaffold{}, fmt.Errorf("open clone root: %w", err)
-	}
-	defer func() { _ = root.Close() }()
+	defer cleanup()
 
 	finish, err := submitDocsTool()
 	if err != nil {
@@ -81,7 +63,7 @@ func (r *Runner) scaffold(ctx context.Context, req review.ScaffoldRequest) (revi
 		return review.Scaffold{}, fmt.Errorf("write docs: %w: %w", errProvider, err)
 	}
 
-	var submitted submitDocsArgs
+	var submitted review.ScaffoldDocs
 	if err := json.Unmarshal(raw, &submitted); err != nil {
 		return review.Scaffold{}, fmt.Errorf("decode accepted submit_docs arguments: %w", err)
 	}
@@ -90,7 +72,7 @@ func (r *Runner) scaffold(ctx context.Context, req review.ScaffoldRequest) (revi
 
 // checkSubmittedDocs is the finishing tool's Accept.
 func checkSubmittedDocs(args json.RawMessage) error {
-	var d submitDocsArgs
+	var d review.ScaffoldDocs
 	if err := json.Unmarshal(args, &d); err != nil {
 		return fmt.Errorf("decode submit_docs arguments: %w", err)
 	}
@@ -101,20 +83,9 @@ func checkSubmittedDocs(args json.RawMessage) error {
 }
 
 func submitDocsTool() (llm.Tool, error) {
-	text := func(what string) map[string]string {
-		return map[string]string{"type": "string", "description": what}
-	}
-	schema, err := json.Marshal(map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"index":        text("Full markdown of docs/README.md, frontmatter included."),
-			"architecture": text("Full markdown of docs/architecture.md, frontmatter included."),
-			"setup":        text("Full markdown of docs/guides/setup.md, frontmatter included."),
-		},
-		"required": []string{"index", "architecture", "setup"},
-	})
+	schema, err := review.ScaffoldSchema()
 	if err != nil {
-		return llm.Tool{}, fmt.Errorf("marshal submit_docs schema: %w", err)
+		return llm.Tool{}, fmt.Errorf("build submit_docs schema: %w", err)
 	}
 	return llm.Tool{
 		Name:        "submit_docs",

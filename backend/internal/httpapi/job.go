@@ -117,16 +117,21 @@ func EnqueueDeadlineJobs(ctx context.Context, src OverdueSource, jobs Enqueuer, 
 		return fmt.Errorf("enqueue deadline jobs: %w", err)
 	}
 	for _, run := range overdue {
+		key, kind, subject := prJobKey(run.Owner, run.Repo, run.Number), runDeadlineJobKind, fmt.Sprintf("%s/%s#%d", run.Owner, run.Repo, run.Number)
+		if run.Scaffold {
+			key, kind = scaffoldJobKey(gate.RepoRef{Owner: run.Owner, Repo: run.Repo}), scaffoldDeadlineJobKind
+			subject = key
+		}
 		late := now.Sub(run.Deadline)
 		if late > deadlineRetryCap {
 			if late < deadlineRetryCap+DeadlineSweepEvery {
-				logger.Warn("giving up on overdue run", "owner", run.Owner, "repo", run.Repo, "number", run.Number, "nonce", run.Nonce)
+				logger.Warn("giving up on overdue run", "run", subject, "nonce", run.Nonce)
 			}
 			continue
 		}
 		payload, err := json.Marshal(run)
 		if err != nil {
-			return fmt.Errorf("encode deadline job payload for %s/%s#%d: %w", run.Owner, run.Repo, run.Number, err)
+			return fmt.Errorf("encode deadline job payload for %s: %w", subject, err)
 		}
 		minutes := int(late / time.Minute)
 		bucket := 0
@@ -137,17 +142,13 @@ func EnqueueDeadlineJobs(ctx context.Context, src OverdueSource, jobs Enqueuer, 
 				bucket++
 			}
 		}
-		key, kind := prJobKey(run.Owner, run.Repo, run.Number), runDeadlineJobKind
-		if run.Scaffold {
-			key, kind = scaffoldJobKey(gate.RepoRef{Owner: run.Owner, Repo: run.Repo}), scaffoldDeadlineJobKind
-		}
 		if _, err := jobs.Enqueue(ctx, jobqueue.NewJob{
 			DeliveryID: fmt.Sprintf("deadline:%s:%d", run.Nonce, bucket),
 			Key:        key,
 			Kind:       kind,
 			Payload:    payload,
 		}); err != nil {
-			return fmt.Errorf("enqueue deadline job for %s/%s#%d: %w", run.Owner, run.Repo, run.Number, err)
+			return fmt.Errorf("enqueue deadline job for %s: %w", subject, err)
 		}
 	}
 	return nil

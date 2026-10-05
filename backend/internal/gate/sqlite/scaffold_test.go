@@ -31,10 +31,10 @@ func TestSaveScaffold_RoundTrips(t *testing.T) {
 	store, _ := open(t)
 
 	want := gate.ScaffoldState{
-		Owner: "acme", Repo: "widgets", InstallationID: 9, Phase: gate.ScaffoldWritten, Attempt: 2,
+		Owner: "acme", Repo: "widgets", InstallationID: 9, Phase: gate.ScaffoldWritten, Attempt: 3, Failures: 2,
 		BaseSHA: "abc", Run: &gate.AwaitingRun{RunID: 5, Nonce: "n", Deadline: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)},
-		Files:  &review.Scaffold{Runner: "r", Model: "m", Index: "i", Architecture: "a", Setup: "s"},
-		Branch: "pollux-agent/docs-scaffold", PRNumber: 4, PRURL: "https://gh/pull/4",
+		Files:     &review.Scaffold{Runner: "r", Model: "m", Index: "i", Architecture: "a", Setup: "s"},
+		CommitSHA: "c0ffee", PRNumber: 4, PRURL: "https://gh/pull/4",
 	}
 	if err := store.SaveScaffold(t.Context(), want); err != nil {
 		t.Fatalf("SaveScaffold() = %v, want nil error", err)
@@ -53,7 +53,7 @@ func TestRequestScaffold_CreatesOnceAndKeepsExistingState(t *testing.T) {
 
 	store, _ := open(t)
 
-	first, err := store.RequestScaffold(t.Context(), 9, "acme", "widgets", gate.ScaffoldWaiter{CheckRunID: 11, PRNumber: 1})
+	first, err := store.RequestScaffold(t.Context(), 9, "acme", "widgets", gate.ScaffoldWaiter{CheckRunID: 11})
 	if err != nil {
 		t.Fatalf("first RequestScaffold() = %v, want nil error", err)
 	}
@@ -62,12 +62,13 @@ func TestRequestScaffold_CreatesOnceAndKeepsExistingState(t *testing.T) {
 		t.Errorf("first RequestScaffold() (-want +got):\n%s", diff)
 	}
 
-	opened := gate.OnScaffoldOpened(first, "b", gate.ScaffoldPR{Number: 4, URL: "u"})
+	opened := first
+	opened.Phase, opened.PRNumber, opened.PRURL = gate.ScaffoldWritten, 4, "u"
 	if err := store.SaveScaffold(t.Context(), opened); err != nil {
 		t.Fatalf("SaveScaffold() = %v, want nil error", err)
 	}
 
-	second, err := store.RequestScaffold(t.Context(), 9, "acme", "widgets", gate.ScaffoldWaiter{CheckRunID: 12, PRNumber: 2})
+	second, err := store.RequestScaffold(t.Context(), 9, "acme", "widgets", gate.ScaffoldWaiter{CheckRunID: 12})
 	if err != nil {
 		t.Fatalf("second RequestScaffold() = %v, want nil error", err)
 	}
@@ -76,17 +77,41 @@ func TestRequestScaffold_CreatesOnceAndKeepsExistingState(t *testing.T) {
 	}
 }
 
+func TestRequestScaffold_RefreshesInstallationID(t *testing.T) {
+	t.Parallel()
+
+	store, _ := open(t)
+
+	opened := gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 9, Phase: gate.ScaffoldWritten, PRNumber: 4, PRURL: "u"}
+	if err := store.SaveScaffold(t.Context(), opened); err != nil {
+		t.Fatalf("SaveScaffold() = %v, want nil error", err)
+	}
+
+	got, err := store.RequestScaffold(t.Context(), 77, "acme", "widgets", gate.ScaffoldWaiter{CheckRunID: 12})
+	if err != nil {
+		t.Fatalf("RequestScaffold() = %v, want nil error", err)
+	}
+	opened.InstallationID = 77
+	if diff := cmp.Diff(opened, got); diff != "" {
+		t.Errorf("RequestScaffold() (-want +got):\n%s", diff)
+	}
+	loaded, err := store.LoadScaffold(t.Context(), "acme", "widgets")
+	if err != nil || loaded.InstallationID != 77 {
+		t.Errorf("LoadScaffold() = %+v, %v; want installation 77 persisted", loaded, err)
+	}
+}
+
 func TestUnlinkedScaffoldWaiters_AppendOnlyAndDeduplicated(t *testing.T) {
 	t.Parallel()
 
 	store, _ := open(t)
 
-	for _, w := range []gate.ScaffoldWaiter{{CheckRunID: 11, PRNumber: 1}, {CheckRunID: 12, PRNumber: 2}, {CheckRunID: 11, PRNumber: 1}} {
+	for _, w := range []gate.ScaffoldWaiter{{CheckRunID: 11}, {CheckRunID: 12}, {CheckRunID: 11}} {
 		if _, err := store.RequestScaffold(t.Context(), 9, "acme", "widgets", w); err != nil {
 			t.Fatalf("RequestScaffold(%+v) = %v, want nil error", w, err)
 		}
 	}
-	if _, err := store.RequestScaffold(t.Context(), 9, "acme", "other", gate.ScaffoldWaiter{CheckRunID: 13, PRNumber: 1}); err != nil {
+	if _, err := store.RequestScaffold(t.Context(), 9, "acme", "other", gate.ScaffoldWaiter{CheckRunID: 13}); err != nil {
 		t.Fatalf("RequestScaffold(other repo) = %v, want nil error", err)
 	}
 
@@ -94,7 +119,7 @@ func TestUnlinkedScaffoldWaiters_AppendOnlyAndDeduplicated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UnlinkedScaffoldWaiters() = %v, want nil error", err)
 	}
-	want := []gate.ScaffoldWaiter{{CheckRunID: 11, PRNumber: 1}, {CheckRunID: 12, PRNumber: 2}}
+	want := []gate.ScaffoldWaiter{{CheckRunID: 11}, {CheckRunID: 12}}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("UnlinkedScaffoldWaiters() (-want +got):\n%s", diff)
 	}
@@ -105,7 +130,7 @@ func TestMarkScaffoldWaiterLinked_HidesOnlyThatWaiter(t *testing.T) {
 
 	store, _ := open(t)
 
-	for _, w := range []gate.ScaffoldWaiter{{CheckRunID: 11, PRNumber: 1}, {CheckRunID: 12, PRNumber: 2}} {
+	for _, w := range []gate.ScaffoldWaiter{{CheckRunID: 11}, {CheckRunID: 12}} {
 		if _, err := store.RequestScaffold(t.Context(), 9, "acme", "widgets", w); err != nil {
 			t.Fatalf("RequestScaffold(%+v) = %v, want nil error", w, err)
 		}
@@ -113,7 +138,7 @@ func TestMarkScaffoldWaiterLinked_HidesOnlyThatWaiter(t *testing.T) {
 	if err := store.MarkScaffoldWaiterLinked(t.Context(), "acme", "widgets", 11); err != nil {
 		t.Fatalf("MarkScaffoldWaiterLinked() = %v, want nil error", err)
 	}
-	if _, err := store.RequestScaffold(t.Context(), 9, "acme", "widgets", gate.ScaffoldWaiter{CheckRunID: 11, PRNumber: 1}); err != nil {
+	if _, err := store.RequestScaffold(t.Context(), 9, "acme", "widgets", gate.ScaffoldWaiter{CheckRunID: 11}); err != nil {
 		t.Fatalf("repeated RequestScaffold() = %v, want nil error", err)
 	}
 
@@ -121,7 +146,7 @@ func TestMarkScaffoldWaiterLinked_HidesOnlyThatWaiter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UnlinkedScaffoldWaiters() = %v, want nil error", err)
 	}
-	want := []gate.ScaffoldWaiter{{CheckRunID: 12, PRNumber: 2}}
+	want := []gate.ScaffoldWaiter{{CheckRunID: 12}}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("UnlinkedScaffoldWaiters() (-want +got):\n%s", diff)
 	}
@@ -198,5 +223,30 @@ func TestOverdueRuns_IncludesAwaitedScaffolds(t *testing.T) {
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("OverdueRuns() (-want +got):\n%s", diff)
+	}
+}
+
+func TestSaveScaffold_KeepsTheInstallationRequestScaffoldRecorded(t *testing.T) {
+	t.Parallel()
+
+	store, _ := open(t)
+
+	if _, err := store.RequestScaffold(t.Context(), 9, "acme", "widgets", gate.ScaffoldWaiter{CheckRunID: 11}); err != nil {
+		t.Fatalf("RequestScaffold() = %v, want nil error", err)
+	}
+	if _, err := store.RequestScaffold(t.Context(), 10, "acme", "widgets", gate.ScaffoldWaiter{CheckRunID: 12}); err != nil {
+		t.Fatalf("second RequestScaffold() = %v, want nil error", err)
+	}
+	stale := gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 9, Phase: gate.ScaffoldWriting, Attempt: 1}
+	if err := store.SaveScaffold(t.Context(), stale); err != nil {
+		t.Fatalf("SaveScaffold() = %v, want nil error", err)
+	}
+
+	got, err := store.LoadScaffold(t.Context(), "acme", "widgets")
+	if err != nil {
+		t.Fatalf("LoadScaffold() = %v, want nil error", err)
+	}
+	if got.InstallationID != 10 || got.Phase != gate.ScaffoldWriting {
+		t.Errorf("LoadScaffold() = %+v, want installation 10 kept and phase Writing saved", got)
 	}
 }

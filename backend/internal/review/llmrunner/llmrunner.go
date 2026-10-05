@@ -31,13 +31,6 @@ const (
 	maxCandidateDocs = 10
 )
 
-// Caps on one scaffold run, which reads the whole repo rather than one diff.
-const (
-	scaffoldStepCap     = 40
-	scaffoldTokenBudget = 600_000
-	scaffoldTimeout     = 8 * time.Minute
-)
-
 // Runner implements review.Runner by triaging candidate docs with a small
 // model and drafting proposals with an agent loop.
 type Runner struct {
@@ -116,29 +109,11 @@ func (r *Runner) noImpact(reason string) review.Result {
 }
 
 func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result, error) {
-	token, err := r.token(ctx, req.InstallationID, req.Repo)
+	root, cleanup, err := r.openClone(ctx, req.InstallationID, req.Owner, req.Repo, req.HeadSHA)
 	if err != nil {
-		return review.Result{}, fmt.Errorf("get installation token: %w: %w", errClone, err)
+		return review.Result{}, err
 	}
-
-	remoteURL := r.remote
-	if remoteURL == "" {
-		remoteURL = fmt.Sprintf("https://github.com/%s/%s.git", req.Owner, req.Repo)
-	}
-
-	dir, err := cloneHead(ctx, remoteURL, req.HeadSHA, token)
-	if dir != "" {
-		defer func() { _ = os.RemoveAll(dir) }() // best-effort cleanup of a temp dir; the runner has no logger
-	}
-	if err != nil {
-		return review.Result{}, fmt.Errorf("%w: %w", errClone, err)
-	}
-
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		return review.Result{}, fmt.Errorf("open clone root: %w", err)
-	}
-	defer func() { _ = root.Close() }()
+	defer cleanup()
 
 	tree, err := docs.Parse(root.FS())
 	if err != nil {

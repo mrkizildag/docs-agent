@@ -415,6 +415,7 @@ func TestCheckScaffold(t *testing.T) {
 		{name: "architecture without summary", index: index, architecture: "---\ntitle: T\ncovers: []\n---\n", set: frontmatter, wantErr: "docs/architecture.md"},
 		{name: "setup without title", index: index, architecture: frontmatter, set: "---\nsummary: S\ncovers: []\n---\n", wantErr: "docs/guides/setup.md"},
 		{name: "index misses architecture link", index: frontmatter + "[s](guides/setup.md)\n", architecture: frontmatter, set: frontmatter, wantErr: "](architecture.md)"},
+		{name: "architecture over the byte cap", index: index, architecture: frontmatter + strings.Repeat("x", docs.MaxDocBytes), set: frontmatter, wantErr: "byte cap"},
 		{name: "index misses setup link", index: frontmatter + "[a](architecture.md)\n", architecture: frontmatter, set: frontmatter, wantErr: "](guides/setup.md)"},
 	}
 	for _, tc := range tests {

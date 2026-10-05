@@ -14,22 +14,22 @@ import (
 
 var _ gate.ScaffoldGitHub = (*Client)(nil)
 
-// DocsExist reports whether owner/repo has a docs/ directory at ref. A missing
-// path, or a file named docs, is false.
+// DocsExist reports whether owner/repo has any entry named docs at ref: a
+// directory, a file, or a submodule. Only a missing path is false.
 func (c *Client) DocsExist(ctx context.Context, installationID int64, owner, repo, ref string) (bool, error) {
 	client, err := c.installationClient(installationID)
 	if err != nil {
-		return false, fmt.Errorf("look for docs/ in %s/%s at %s: %w", owner, repo, ref, err)
+		return false, fmt.Errorf("look for docs in %s/%s at %s: %w", owner, repo, ref, err)
 	}
 
-	_, dir, resp, err := client.Repositories.GetContents(ctx, owner, repo, "docs", &github.RepositoryContentGetOptions{Ref: ref})
+	_, _, resp, err := client.Repositories.GetContents(ctx, owner, repo, "docs", &github.RepositoryContentGetOptions{Ref: ref})
 	if err != nil {
 		if isNotFound(resp) {
 			return false, nil
 		}
-		return false, fmt.Errorf("look for docs/ in %s/%s at %s: %w", owner, repo, ref, err)
+		return false, fmt.Errorf("look for docs in %s/%s at %s: %w", owner, repo, ref, err)
 	}
-	return dir != nil, nil
+	return true, nil
 }
 
 // DefaultBranch returns the name and tip commit of owner/repo's default branch.
@@ -66,6 +66,20 @@ func (c *Client) CreateBranch(ctx context.Context, installationID int64, owner, 
 			return fmt.Errorf("create branch %s of %s/%s: %w", branch, owner, repo, gate.ErrBranchExists)
 		}
 		return fmt.Errorf("create branch %s of %s/%s: %w", branch, owner, repo, err)
+	}
+	return nil
+}
+
+// ResetBranch force-moves an existing branch to sha.
+func (c *Client) ResetBranch(ctx context.Context, installationID int64, owner, repo, branch, sha string) error {
+	client, err := c.installationClient(installationID)
+	if err != nil {
+		return fmt.Errorf("reset branch %s of %s/%s: %w", branch, owner, repo, err)
+	}
+
+	force := true
+	if _, _, err := client.Git.UpdateRef(ctx, owner, repo, "refs/heads/"+branch, github.UpdateRef{SHA: sha, Force: &force}); err != nil {
+		return fmt.Errorf("reset branch %s of %s/%s: %w", branch, owner, repo, err)
 	}
 	return nil
 }

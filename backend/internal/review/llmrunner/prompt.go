@@ -141,6 +141,8 @@ const scaffoldSystemPrompt = `You write the starting documentation for a reposit
 	`exactly [Architecture](architecture.md) and [Setup](guides/setup.md). ` +
 	`Document what the code cannot say: why the parts exist, how data flows between them, invariants, external contracts, ` +
 	`and the commands that actually work. Name real directories, files and commands you found; never invent any. ` +
+	`State alternatives as alternatives (for example "either secret A or secret B"), never as joint requirements, ` +
+	`and claim a requirement only if the code enforces it. ` +
 	`No file trees, no function signatures, no placeholders or TODOs. Keep each document short and specific.`
 
 func scaffoldUserPrompt(f fence, owner, repo, baseSHA string) string {

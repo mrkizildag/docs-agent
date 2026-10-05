@@ -70,7 +70,8 @@ type GitHub interface {
 	// WorkflowExists reports whether the repo's default branch has the
 	// pollux-agent Actions workflow.
 	WorkflowExists(ctx context.Context, installationID int64, owner, repo string) (bool, error)
-	// DocsExist reports whether the repo has a docs/ folder at ref.
+	// DocsExist reports whether an entry named docs exists at ref, be it a
+	// directory, a file or a submodule.
 	DocsExist(ctx context.Context, installationID int64, owner, repo, ref string) (bool, error)
 	// ListChangedFiles returns the files in the pull request's diff with their head-side hunk ranges.
 	ListChangedFiles(ctx context.Context, installationID int64, owner, repo string, number int) ([]review.ChangedFile, error)
@@ -269,7 +270,8 @@ type Store interface {
 	// ScaffoldForRun reports whether the repo's scaffold awaits the external run runID.
 	ScaffoldForRun(ctx context.Context, owner, repo string, runID int64) (bool, error)
 	// RequestScaffold atomically creates the repo's Idle scaffold state if it has
-	// none and records waiter, returning the state as it stands. Existing state is untouched.
+	// none and records waiter, returning the state as it stands. Existing state is
+	// untouched except that its installation ID becomes installationID.
 	RequestScaffold(ctx context.Context, installationID int64, owner, repo string, waiter ScaffoldWaiter) (ScaffoldState, error)
 	// UnlinkedScaffoldWaiters returns the repo's recorded check runs not yet marked linked, oldest first.
 	UnlinkedScaffoldWaiters(ctx context.Context, owner, repo string) ([]ScaffoldWaiter, error)
@@ -1174,16 +1176,17 @@ func (s *Service) collect(ctx context.Context, state PRState, rc RunCompleted) (
 	var invalid *review.InvalidResultError
 	failed := rc.Conclusion != "success"
 
-	result, err := s.runners.Actions.Collect(ctx, completion)
-	backoff := s.collectBackoff
-	for attempt := 1; attempt < collectAttempts && err != nil && !failed && !errors.As(err, &invalid); attempt++ {
-		select {
-		case <-ctx.Done():
-			return Outcome{}, fmt.Errorf("collect result: %w", ctx.Err())
-		case <-time.After(backoff):
-		}
-		backoff *= 2
+	var result review.Result
+	var err error
+	if failed {
 		result, err = s.runners.Actions.Collect(ctx, completion)
+	} else {
+		result, err = collectWithRetry(ctx, s.collectBackoff, func(ctx context.Context) (review.Result, error) {
+			return s.runners.Actions.Collect(ctx, completion)
+		})
+	}
+	if err != nil && !failed && ctx.Err() != nil {
+		return Outcome{}, fmt.Errorf("collect result: %w", err)
 	}
 	switch {
 	case failed:
@@ -1195,6 +1198,25 @@ func (s *Service) collect(ctx context.Context, state PRState, rc RunCompleted) (
 	default:
 		return resultOutcome(result), nil
 	}
+}
+
+// collectWithRetry returns try's result, retrying a transient error with a
+// doubling backoff up to collectAttempts tries. It stops at once on
+// *review.InvalidResultError or when ctx ends.
+func collectWithRetry[T any](ctx context.Context, backoff time.Duration, try func(context.Context) (T, error)) (T, error) {
+	var invalid *review.InvalidResultError
+	result, err := try(ctx)
+	for attempt := 1; attempt < collectAttempts && err != nil && !errors.As(err, &invalid); attempt++ {
+		select {
+		case <-ctx.Done():
+			var zero T
+			return zero, fmt.Errorf("wait to retry collect: %w", ctx.Err())
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		result, err = try(ctx)
+	}
+	return result, err
 }
 
 // postComments lists the PR's comments when there is anything to reconcile,
