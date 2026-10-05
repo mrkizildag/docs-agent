@@ -72,7 +72,8 @@ type ScaffoldWaiter struct {
 type ScaffoldPR struct {
 	Number int
 	URL    string
-	ByBot  bool // the author is a GitHub App bot
+	ByBot  bool // the author is this App's bot user
+	Open   bool // the pull request is open
 }
 
 // NewPullRequest is a pull request to open from branch Head into Base.
@@ -93,7 +94,7 @@ type ScaffoldGitHub interface {
 	ResetBranch(ctx context.Context, installationID int64, owner, repo, branch, sha string) error
 	BranchSHA(ctx context.Context, installationID int64, owner, repo, branch string) (string, error)
 	CreatePullRequest(ctx context.Context, installationID int64, owner, repo string, pr NewPullRequest) (ScaffoldPR, error)
-	// FindPullRequest returns the pull request opened from branch, preferring an open one over closed ones.
+	// FindPullRequest returns the pull request opened from branch, preferring the bot's (open first), then an open one, over the rest.
 	FindPullRequest(ctx context.Context, installationID int64, owner, repo, branch string) (pr ScaffoldPR, ok bool, err error)
 }
 
@@ -557,18 +558,29 @@ func (s *Service) concludeNoRunner(ctx context.Context, state ScaffoldState) (Sc
 	return idle, nil
 }
 
-// openScaffoldPR creates the branch at the state's base commit. An existing
-// branch at state's CommitSHA is Pollux's own earlier commit and is kept; one at
-// the base commit is committed to. Any other tip is never reset while a pull
-// request exists from it, because the reset would close that pull request: a
-// bot's is adopted, a human's fails the attempt, and only a branch without one
-// is moved to the base commit. It commits the files unless that commit exists,
-// then creates, or adopts, the pull request into base. The returned state
-// records the commit, also on error.
+// openScaffoldPR adopts the pull request from the scaffold branch when Pollux
+// opened it, in any state, so a scaffold PR is never opened twice. An open pull
+// request from anyone else fails the attempt before anything is touched.
+// Otherwise it creates the branch at the state's base commit; an existing branch
+// at state's CommitSHA is Pollux's own earlier commit and is kept, one at the
+// base commit is committed to, and any other tip is reset to the base commit. It
+// commits the files unless that commit exists, then creates, or adopts, the pull
+// request into base. The returned state records the commit, also on error.
 func (s *Service) openScaffoldPR(ctx context.Context, state ScaffoldState, base string) (ScaffoldState, ScaffoldPR, error) {
 	inst, owner, repo := state.InstallationID, state.Owner, state.Repo
+	existing, ok, err := s.scaffoldGH.FindPullRequest(ctx, inst, owner, repo, scaffoldBranch)
+	if err != nil {
+		return state, ScaffoldPR{}, fmt.Errorf("find pull request from %s: %w", scaffoldBranch, err)
+	}
+	if ok && existing.ByBot {
+		return state, existing, nil
+	}
+	if ok && existing.Open {
+		return state, ScaffoldPR{}, fmt.Errorf("branch %s has an open pull request not opened by pollux: %s", scaffoldBranch, existing.URL)
+	}
+
 	committed := false
-	err := s.scaffoldGH.CreateBranch(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA)
+	err = s.scaffoldGH.CreateBranch(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA)
 	switch {
 	case err == nil:
 	case errors.Is(err, ErrBranchExists):
@@ -578,16 +590,6 @@ func (s *Service) openScaffoldPR(ctx context.Context, state ScaffoldState, base 
 		}
 		committed = state.CommitSHA != "" && tip == state.CommitSHA
 		if !committed && tip != state.BaseSHA {
-			found, ok, err := s.scaffoldGH.FindPullRequest(ctx, inst, owner, repo, scaffoldBranch)
-			if err != nil {
-				return state, ScaffoldPR{}, fmt.Errorf("find pull request from %s: %w", scaffoldBranch, err)
-			}
-			if ok {
-				if !found.ByBot {
-					return state, ScaffoldPR{}, fmt.Errorf("branch %s has a pull request not opened by pollux: %s", scaffoldBranch, found.URL)
-				}
-				return state, found, nil
-			}
 			if err := s.scaffoldGH.ResetBranch(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA); err != nil {
 				return state, ScaffoldPR{}, fmt.Errorf("reset branch %s to %s: %w", scaffoldBranch, shortSHA(state.BaseSHA), err)
 			}

@@ -114,10 +114,15 @@ func (c *Client) CreatePullRequest(ctx context.Context, installationID int64, ow
 }
 
 // FindPullRequest returns the pull request opened from branch of owner/repo
-// itself, preferring an open one over closed ones. ByBot is set when its author
-// is a bot.
+// itself, preferring this App's bot's (open first), then an open one, over the rest. ByBot is set when its author
+// is this App's bot user.
 func (c *Client) FindPullRequest(ctx context.Context, installationID int64, owner, repo, branch string) (gate.ScaffoldPR, bool, error) {
 	client, err := c.installationClient(installationID)
+	if err != nil {
+		return gate.ScaffoldPR{}, false, fmt.Errorf("find pull request from %s in %s/%s: %w", branch, owner, repo, err)
+	}
+
+	bot, err := c.appBotLogin(ctx)
 	if err != nil {
 		return gate.ScaffoldPR{}, false, fmt.Errorf("find pull request from %s in %s/%s: %w", branch, owner, repo, err)
 	}
@@ -129,9 +134,16 @@ func (c *Client) FindPullRequest(ctx context.Context, installationID int64, owne
 	if len(list) == 0 {
 		return gate.ScaffoldPR{}, false, nil
 	}
+	isBot := func(pr *github.PullRequest) bool { return pr.GetUser().GetLogin() == bot }
+	isOpen := func(pr *github.PullRequest) bool { return pr.GetState() == "open" }
 	found := list[0]
-	if i := slices.IndexFunc(list, func(pr *github.PullRequest) bool { return pr.GetState() == "open" }); i >= 0 {
-		found = list[i]
+	for _, match := range []func(*github.PullRequest) bool{
+		func(pr *github.PullRequest) bool { return isBot(pr) && isOpen(pr) }, isBot, isOpen,
+	} {
+		if i := slices.IndexFunc(list, match); i >= 0 {
+			found = list[i]
+			break
+		}
 	}
-	return gate.ScaffoldPR{Number: found.GetNumber(), URL: found.GetHTMLURL(), ByBot: found.GetUser().GetType() == "Bot"}, true, nil
+	return gate.ScaffoldPR{Number: found.GetNumber(), URL: found.GetHTMLURL(), ByBot: isBot(found), Open: isOpen(found)}, true, nil
 }

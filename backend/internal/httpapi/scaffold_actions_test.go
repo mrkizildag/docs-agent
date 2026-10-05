@@ -233,6 +233,12 @@ func (f *scaffoldAPI) handler() http.Handler {
 		f.mu.Unlock()
 		f.json(w, http.StatusCreated, fmt.Sprintf(`{"sha":"commit-%d"}`, n))
 	})
+	mux.HandleFunc("GET /app", func(w http.ResponseWriter, _ *http.Request) {
+		f.json(w, http.StatusOK, `{"id":1,"slug":"pollux-agent"}`)
+	})
+	mux.HandleFunc("GET /repos/acme/widgets/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		f.json(w, http.StatusOK, `[]`)
+	})
 	mux.HandleFunc("POST /repos/acme/widgets/pulls", func(w http.ResponseWriter, r *http.Request) {
 		body := f.decode(r)
 		f.mu.Lock()

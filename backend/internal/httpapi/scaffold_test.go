@@ -293,6 +293,18 @@ func TestWebhookToScaffoldPullRequest(t *testing.T) {
 }
 
 func TestWebhookAdoptsTheBotsScaffoldPullRequestAfterStateLoss(t *testing.T) {
+	adoptBotScaffoldPullRequest(t, "bot-commit")
+}
+
+func TestWebhookAdoptsAClosedBotScaffoldPullRequestWithoutItsBranch(t *testing.T) {
+	adoptBotScaffoldPullRequest(t, "")
+}
+
+// adoptBotScaffoldPullRequest runs a fresh store against a repo whose scaffold
+// branch is at branchTip (absent when empty) with a bot pull request from it.
+func adoptBotScaffoldPullRequest(t *testing.T, branchTip string) {
+	t.Helper()
+
 	repoDir, tip := newGitRepo(t, map[string]string{
 		"Makefile":        "test:\n\tgo test ./...\n",
 		"cmd/app/main.go": "package main\n\nfunc main() {}\n",
@@ -313,7 +325,9 @@ func TestWebhookAdoptsTheBotsScaffoldPullRequestAfterStateLoss(t *testing.T) {
 	})
 
 	gh := newScaffoldGitHub(tip)
-	gh.branches["pollux-agent/docs-scaffold"] = "bot-commit"
+	if branchTip != "" {
+		gh.branches["pollux-agent/docs-scaffold"] = branchTip
+	}
 	gh.existing = &gate.ScaffoldPR{Number: 7, URL: "https://github.com/acme/widgets/pull/7", ByBot: true}
 	model := &scaffoldModel{}
 	noToken := func(context.Context, int64, string) (string, error) { return "", nil }
@@ -343,6 +357,9 @@ func TestWebhookAdoptsTheBotsScaffoldPullRequestAfterStateLoss(t *testing.T) {
 
 	gh.mu.Lock()
 	defer gh.mu.Unlock()
+	if branchTip == "" && gh.creates != 0 {
+		t.Errorf("branch creations = %d, want none", gh.creates)
+	}
 	if gh.resets != 0 || len(gh.prs) != 0 || len(gh.commits) != 0 {
 		t.Errorf("resets = %d, new pull requests = %d, commits = %d, want none", gh.resets, len(gh.prs), len(gh.commits))
 	}

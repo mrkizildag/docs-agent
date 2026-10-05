@@ -43,7 +43,7 @@ The output is exactly three files: `docs/README.md`, `docs/architecture.md`, `do
 
 ## Opening the PR
 
-The branch `pollux-agent/docs-scaffold` is created off the default tip, with one commit and one PR into the default branch. If the branch already exists at another commit, pollux force-resets it to the default tip before committing; it never opens a PR from content it did not commit. The validated files are stored as soon as they are written, so a failed commit or PR step retries without running the model again. A crash after the branch or PR exists is recovered by adopting them, not creating duplicates.
+The branch `pollux-agent/docs-scaffold` is created off the default tip, with one commit and one PR into the default branch. Before touching the branch, pollux looks up PRs from it: one opened by the pollux bot (matched by its exact `<app-slug>[bot]` login) in any state, open, closed, or merged, is adopted, so no second scaffold PR is ever opened for the repo. An open PR from anyone else fails the attempt without changing anything; otherwise a branch at another commit is force-reset to the default tip before committing. The validated files are stored as soon as they are written, so a failed commit or PR step retries without running the model again. A crash after the branch or PR exists is recovered by adopting them, not creating duplicates.
 
 Any failure before the PR exists, including a workflow run that fails, is cancelled, or passes its deadline, leaves the repo's state retryable. Waiting checks then say an attempt failed, and the next PR event on a docs-less PR tries again. After 3 failed attempts the scaffold stops for good and the checks say it could not be written, so `docs/` has to be added by hand.
 

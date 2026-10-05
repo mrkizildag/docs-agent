@@ -602,7 +602,7 @@ func TestHandleScaffold_ForeignBranchWithAPullRequest(t *testing.T) {
 		wantPhase gate.ScaffoldPhase
 	}{
 		{name: "a bot's pull request is adopted", existing: gate.ScaffoldPR{Number: 7, URL: "https://gh/pull/7", ByBot: true}, wantPhase: gate.ScaffoldOpened},
-		{name: "a human's pull request fails the attempt", existing: gate.ScaffoldPR{Number: 8, URL: "https://gh/pull/8"}, wantErr: true, wantPhase: gate.ScaffoldWritten},
+		{name: "an open human pull request fails the attempt", existing: gate.ScaffoldPR{Number: 8, URL: "https://gh/pull/8", Open: true}, wantErr: true, wantPhase: gate.ScaffoldWritten},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -633,6 +633,48 @@ func TestHandleScaffold_ForeignBranchWithAPullRequest(t *testing.T) {
 				t.Errorf("error = %v, want it to say the pull request was not opened by pollux", err)
 			}
 		})
+	}
+}
+
+func TestHandleScaffold_AdoptsAClosedBotPullRequestWithoutABranch(t *testing.T) {
+	t.Parallel()
+
+	files := review.Scaffold{Index: "i", Architecture: "a", Setup: "s"}
+	written := gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldWritten, Attempt: 1, BaseSHA: "tip", Files: &files}
+	closed := gate.ScaffoldPR{Number: 7, URL: "https://gh/pull/7", ByBot: true}
+	sgh := &scaffoldGitHub{branches: map[string]string{}, existing: &closed}
+	comments := &fakeCommentGitHub{}
+	store := &scaffoldStore{fakeStore: &fakeStore{}, state: written}
+	svc := gate.NewService(&fakeGitHub{noDocs: true}, comments, store, gate.Runners{Server: &fakeRunner{}}, sgh, &fakeScaffoldQueue{})
+
+	if err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"}); err != nil {
+		t.Fatalf("HandleScaffold() = %v, want nil", err)
+	}
+
+	if len(sgh.branches) != 0 || len(sgh.resets) != 0 || len(comments.commits) != 0 || len(sgh.prs) != 0 {
+		t.Errorf("branches = %v, resets = %v, commits = %v, pull requests = %v, want none", sgh.branches, sgh.resets, comments.commits, sgh.prs)
+	}
+	if store.state.Phase != gate.ScaffoldOpened || store.state.PRNumber != 7 || store.state.PRURL != closed.URL {
+		t.Errorf("state = %+v, want Opened with the adopted pull request %+v", store.state, closed)
+	}
+}
+
+func TestHandleScaffold_ClosedHumanPullRequestDoesNotBlock(t *testing.T) {
+	t.Parallel()
+
+	files := review.Scaffold{Index: "i", Architecture: "a", Setup: "s"}
+	written := gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldWritten, Attempt: 1, BaseSHA: "tip", Files: &files}
+	sgh := &scaffoldGitHub{branches: map[string]string{}, existing: &gate.ScaffoldPR{Number: 8, URL: "https://gh/pull/8"}}
+	comments := &fakeCommentGitHub{}
+	store := &scaffoldStore{fakeStore: &fakeStore{}, state: written}
+	svc := gate.NewService(&fakeGitHub{noDocs: true}, comments, store, gate.Runners{Server: &fakeRunner{}}, sgh, &fakeScaffoldQueue{})
+
+	if err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"}); err != nil {
+		t.Fatalf("HandleScaffold() = %v, want nil", err)
+	}
+
+	if len(sgh.prs) != 1 || len(comments.commits) != 1 || store.state.Phase != gate.ScaffoldOpened || store.state.PRNumber != 9 {
+		t.Errorf("pull requests = %v, commits = %v, state = %+v, want a new pull request 9 and an Opened scaffold", sgh.prs, comments.commits, store.state)
 	}
 }
 

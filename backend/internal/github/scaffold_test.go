@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -151,24 +153,43 @@ func TestFindPullRequest(t *testing.T) {
 
 	mux := http.NewServeMux()
 	handleAccessToken(t, mux)
-	mux.HandleFunc("GET /repos/o/found/pulls", func(w http.ResponseWriter, r *http.Request) {
+	var appCalls atomic.Int32
+	mux.HandleFunc("GET /app", func(w http.ResponseWriter, r *http.Request) {
+		appCalls.Add(1)
+		if got := r.Header.Get("Authorization"); !strings.HasPrefix(got, "Bearer ") {
+			t.Errorf("GET /app Authorization = %q, want an App JWT bearer token", got)
+		}
+		writeJSON(t, w, http.StatusOK, `{"id":1,"slug":"pollux-agent"}`)
+	})
+	mux.HandleFunc("GET /repos/o/{repo}/pulls", func(w http.ResponseWriter, r *http.Request) {
 		if q := r.URL.Query(); q.Get("head") != "o:b" || q.Get("state") != "all" {
 			t.Errorf("query = %v, want head=o:b state=all", q)
 		}
-		writeJSON(t, w, http.StatusOK, `[{"number":6,"state":"closed","html_url":"https://github.com/o/found/pull/6","user":{"type":"User"}},`+
-			`{"number":7,"state":"open","html_url":"https://github.com/o/found/pull/7","user":{"type":"Bot"}}]`)
-	})
-	mux.HandleFunc("GET /repos/o/none/pulls", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(t, w, http.StatusOK, `[]`)
+		switch r.PathValue("repo") {
+		case "found":
+			writeJSON(t, w, http.StatusOK, `[{"number":6,"state":"closed","html_url":"https://github.com/o/found/pull/6","user":{"login":"alice","type":"User"}},`+
+				`{"number":7,"state":"open","html_url":"https://github.com/o/found/pull/7","user":{"login":"pollux-agent[bot]","type":"Bot"}}]`)
+		case "other-bot":
+			writeJSON(t, w, http.StatusOK, `[{"number":8,"state":"open","html_url":"https://github.com/o/other-bot/pull/8","user":{"login":"renovate[bot]","type":"Bot"}}]`)
+		default:
+			writeJSON(t, w, http.StatusOK, `[]`)
+		}
 	})
 	client := newTestClient(t, mux)
 
 	got, ok, err := client.FindPullRequest(t.Context(), 1, "o", "found", "b")
-	if want := (gate.ScaffoldPR{Number: 7, URL: "https://github.com/o/found/pull/7", ByBot: true}); err != nil || !ok || got != want {
+	if want := (gate.ScaffoldPR{Number: 7, URL: "https://github.com/o/found/pull/7", ByBot: true, Open: true}); err != nil || !ok || got != want {
 		t.Errorf("FindPullRequest(found) = %+v, %v, %v; want %+v, true, nil", got, ok, err, want)
+	}
+	got, ok, err = client.FindPullRequest(t.Context(), 1, "o", "other-bot", "b")
+	if want := (gate.ScaffoldPR{Number: 8, URL: "https://github.com/o/other-bot/pull/8", Open: true}); err != nil || !ok || got != want {
+		t.Errorf("FindPullRequest(other bot) = %+v, %v, %v; want %+v, true, nil", got, ok, err, want)
 	}
 	if _, ok, err := client.FindPullRequest(t.Context(), 1, "o", "none", "b"); err != nil || ok {
 		t.Errorf("FindPullRequest(none) = _, %v, %v; want false, nil", ok, err)
+	}
+	if n := appCalls.Load(); n != 1 {
+		t.Errorf("GET /app calls = %d, want 1 (slug cached)", n)
 	}
 }
 
