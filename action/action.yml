@@ -10,6 +10,9 @@ inputs:
   nonce:
     description: Dispatch nonce, echoed back in the result.
     required: true
+  docs:
+    description: JSON array of the doc paths to review, chosen by the pollux-agent server.
+    required: true
   claude_code_oauth_token:
     description: Claude subscription token. One of this or anthropic_api_key is required.
     required: false
@@ -68,6 +71,7 @@ runs:
         HEAD_SHA: ${{ inputs.head_sha }}
         PR_NUMBER: ${{ inputs.pr_number }}
         NONCE: ${{ inputs.nonce }}
+        DOCS: ${{ inputs.docs }}
         DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         ACTION_PATH: ${{ github.action_path }}
         CHECKOUT: ${{ github.workspace }}/pr
@@ -79,6 +83,11 @@ runs:
         [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || unset CLAUDE_CODE_OAUTH_TOKEN
         [ -n "$ANTHROPIC_API_KEY" ] || unset ANTHROPIC_API_KEY
 
+        docs_list="$(jq -r 'if type == "array" and all(.[]; type == "string") then (if length == 0 then "(none)" else map("- " + tojson) | join("\n") end) else error("docs must be a JSON array of strings") end' <<< "$DOCS")" || {
+          echo "::error::The docs input is not a JSON array of strings."
+          exit 1
+        }
+
         prompt="$(cat "$ACTION_PATH/prompt.md")
 
         ## Pull request
@@ -87,6 +96,8 @@ runs:
         - Repository checkout: $CHECKOUT
         - Head commit: $HEAD_SHA (checked out there)
         - Default branch: $DEFAULT_BRANCH
+        - Docs to review (JSON-quoted paths at the head checkout):
+        $docs_list
         - Diff of the head against the merge base, unified format: $out/pr.diff"
 
         status=0

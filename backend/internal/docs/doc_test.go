@@ -365,3 +365,37 @@ func TestDocSectionSpanDuplicateHeading(t *testing.T) {
 		t.Errorf("SectionSpan(unique) ok = false, want true")
 	}
 }
+
+func TestParseBody(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		src          string
+		wantHeadings []string
+	}{
+		{name: "valid frontmatter", src: "---\ncovers: [a]\n---\n# A\n## B\n", wantHeadings: []string{"A", "B"}},
+		{name: "malformed frontmatter", src: "---\ncovers: [unclosed\n# not a heading\n---\n# A\n", wantHeadings: []string{"A"}},
+		{name: "unterminated frontmatter", src: "---\ncovers: x\n# not a heading\n"},
+		{name: "no frontmatter", src: "# A\ntext\n", wantHeadings: []string{"A"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			d := docs.ParseBody("docs/a.md", []byte(tc.src))
+			if d.Path != "docs/a.md" || string(d.Source) != tc.src {
+				t.Errorf("ParseBody() path %q source %q, want input echoed", d.Path, d.Source)
+			}
+			var got []string
+			for _, s := range d.Sections {
+				if s.Level > 0 {
+					got = append(got, s.Heading)
+				}
+			}
+			if diff := cmp.Diff(tc.wantHeadings, got); diff != "" {
+				t.Errorf("headings (-want +got):\n%s", diff)
+			}
+		})
+	}
+}

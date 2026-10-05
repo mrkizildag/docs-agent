@@ -116,6 +116,11 @@ func (t Tree) Match(changed []string) []string {
 	return paths
 }
 
+// CoversAny reports whether any of d's covers globs matches any of paths.
+func (d Doc) CoversAny(paths ...string) bool {
+	return coversAny(d.Covers, paths)
+}
+
 // coversAny relies on ParseDoc having validated every glob.
 func coversAny(globs, files []string) bool {
 	for _, glob := range globs {

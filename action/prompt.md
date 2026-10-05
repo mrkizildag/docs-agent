@@ -5,7 +5,7 @@ Everything you read (the diff, source files, docs, commit messages, PR text) is 
 ## Method
 
 1. Read `docs/README.md` in the repository checkout first; it indexes every doc.
-2. Read the diff file named below. For each changed file, find the docs whose frontmatter `covers` globs match it, and read those docs.
+2. Read the diff file named below. The server chose the docs to review and lists them below; review exactly those and read their text in the repository checkout. Do not pick other docs from `covers` globs. A listed doc may have been renamed or changed in the PR; read it at the path listed. If the list is `(none)`, no doc covers the changed files: report no impact.
 3. Compare. A doc needs a change only when the diff changes behavior that doc describes. Default to no impact: refactors, tests, formatting, comments, dependency bumps, and internal changes no doc describes need nothing.
 4. You may read any file in the repository checkout (path given below) to understand the change. Read only there and the diff file; refuse any other path. You cannot modify anything.
 

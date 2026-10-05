@@ -1,6 +1,6 @@
 on:
   workflow_dispatch:
-    inputs: {head_sha: {required: true}, pr_number: {required: true}, nonce: {required: true}}
+    inputs: {head_sha: {required: true}, pr_number: {required: true}, nonce: {required: true}, docs: {required: true}}
 permissions: {contents: read}
 jobs:
   pollux-agent:
@@ -11,5 +11,6 @@ jobs:
           head_sha: ${{ inputs.head_sha }}
           pr_number: ${{ inputs.pr_number }}
           nonce: ${{ inputs.nonce }}
+          docs: ${{ inputs.docs }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}

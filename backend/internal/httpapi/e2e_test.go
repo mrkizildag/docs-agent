@@ -110,6 +110,10 @@ func (f *e2eGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (boo
 	return false, nil
 }
 
+func (f *e2eGitHub) MergeBase(_ context.Context, _ int64, _, _, base, _ string) (string, error) {
+	return base, nil
+}
+
 func (f *e2eGitHub) ListChangedFiles(_ context.Context, _ int64, _, _ string, _ int) ([]review.ChangedFile, error) {
 	return nil, nil
 }
@@ -123,6 +127,8 @@ func (f *e2eGitHub) UpdateCheckRun(context.Context, int64, string, string, int64
 	return nil
 }
 
+const baseGreetingDoc = "---\ntitle: Greeting\nsummary: Greets users.\ncovers:\n  - \"src/**\"\n---\n# Greeting\n\n## Greeting\n\nHi.\n"
+
 func e2ePullRequestBody(t *testing.T, number int, sha string) []byte {
 	t.Helper()
 
@@ -132,6 +138,7 @@ func e2ePullRequestBody(t *testing.T, number int, sha string) []byte {
 // pushOpts varies a pull_request delivery; zero values mean a push by user dev
 // from a branch of the base repository.
 type pushOpts struct {
+	baseSHA    string
 	headRepo   string
 	sender     string
 	senderType string
@@ -140,6 +147,7 @@ type pushOpts struct {
 func e2ePullRequestFrom(t *testing.T, number int, sha string, o pushOpts) []byte {
 	t.Helper()
 
+	o.baseSHA = cmp.Or(o.baseSHA, "base1")
 	o.headRepo = cmp.Or(o.headRepo, "acme/widgets")
 	o.sender = cmp.Or(o.sender, "dev")
 	o.senderType = cmp.Or(o.senderType, "User")
@@ -147,6 +155,7 @@ func e2ePullRequestFrom(t *testing.T, number int, sha string, o pushOpts) []byte
 		"action": "opened",
 		"number": number,
 		"pull_request": map[string]any{
+			"base": map[string]any{"sha": o.baseSHA},
 			"head": map[string]any{"sha": sha, "ref": "feature", "repo": map[string]any{"full_name": o.headRepo}},
 		},
 		"repository": map[string]any{
@@ -375,6 +384,20 @@ func (f *fakeActionsGitHub) handler() http.Handler {
 	mux.HandleFunc("GET /repos/acme/widgets/pulls/{number}/files", func(w http.ResponseWriter, _ *http.Request) {
 		f.json(w, http.StatusOK, `[{"filename":"src/greet.py","status":"modified","patch":"@@ -1,3 +1,4 @@\n a\n b\n+c\n d"}]`)
 	})
+	mux.HandleFunc("GET /repos/acme/widgets/compare/{basehead}", func(w http.ResponseWriter, _ *http.Request) {
+		f.json(w, http.StatusOK, `{"merge_base_commit":{"sha":"base1"}}`)
+	})
+	mux.HandleFunc("GET /repos/acme/widgets/git/trees/base1", func(w http.ResponseWriter, _ *http.Request) {
+		f.json(w, http.StatusOK, `{"sha":"base1","truncated":false,"tree":[{"path":"docs","mode":"040000","type":"tree","sha":"docs1"}]}`)
+	})
+	mux.HandleFunc("GET /repos/acme/widgets/git/trees/docs1", func(w http.ResponseWriter, _ *http.Request) {
+		f.json(w, http.StatusOK, `{"sha":"docs1","truncated":false,"tree":[{"path":"features/greeting.md","mode":"100644","type":"blob","sha":"doc1","size":80}]}`)
+	})
+	mux.HandleFunc("GET /repos/acme/widgets/git/blobs/doc1", func(w http.ResponseWriter, _ *http.Request) {
+		if _, err := w.Write([]byte(baseGreetingDoc)); err != nil {
+			f.t.Errorf("write base doc blob: %v", err)
+		}
+	})
 	mux.HandleFunc("GET /blob", func(w http.ResponseWriter, _ *http.Request) {
 		if _, err := w.Write(f.resultZip()); err != nil {
 			f.t.Errorf("write blob: %v", err)
@@ -533,6 +556,10 @@ func (f *commentGitHub) WorkflowExists(context.Context, int64, string, string) (
 func (f *commentGitHub) UpdateCheckRun(_ context.Context, _ int64, _, _ string, _ int64, run gate.CheckRun) error {
 	f.checkRuns <- run
 	return nil
+}
+
+func (f *commentGitHub) MergeBase(_ context.Context, _ int64, _, _, base, _ string) (string, error) {
+	return base, nil
 }
 
 func (f *commentGitHub) ListChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {
@@ -780,6 +807,10 @@ func (f *statefulGitHub) UpdateCheckRun(_ context.Context, _ int64, _, _ string,
 	f.mu.Unlock()
 	f.checkRuns <- run
 	return nil
+}
+
+func (f *statefulGitHub) MergeBase(_ context.Context, _ int64, _, _, base, _ string) (string, error) {
+	return base, nil
 }
 
 func (f *statefulGitHub) ListChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {

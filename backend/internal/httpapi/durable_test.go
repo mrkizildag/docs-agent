@@ -37,6 +37,10 @@ func (f *blockingGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string)
 	return false, nil
 }
 
+func (f *blockingGitHub) MergeBase(_ context.Context, _ int64, _, _, base, _ string) (string, error) {
+	return base, nil
+}
+
 func (f *blockingGitHub) ListChangedFiles(_ context.Context, _ int64, _, _ string, _ int) ([]review.ChangedFile, error) {
 	return nil, nil
 }
@@ -133,6 +137,10 @@ func newFailThenSucceedGitHub() *failThenSucceedGitHub {
 
 func (f *failThenSucceedGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (bool, error) {
 	return false, nil
+}
+
+func (f *failThenSucceedGitHub) MergeBase(_ context.Context, _ int64, _, _, base, _ string) (string, error) {
+	return base, nil
 }
 
 func (f *failThenSucceedGitHub) ListChangedFiles(_ context.Context, _ int64, _, _ string, _ int) ([]review.ChangedFile, error) {

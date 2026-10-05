@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"slices"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/docs"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/basedocs"
 )
 
 const (
@@ -34,6 +36,8 @@ type DispatchInputs struct {
 	HeadSHA  string
 	PRNumber int
 	Nonce    string
+	// Docs are the candidate doc paths the run must review.
+	Docs []string
 }
 
 // WorkflowAPI is the GitHub Actions surface the runner needs.
@@ -48,6 +52,8 @@ type WorkflowAPI interface {
 	// FileAtRef returns the file's content at ref, or ok=false when the file
 	// does not exist there or exceeds docs.MaxDocBytes.
 	FileAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (content []byte, ok bool, err error)
+	// DocsAtRef returns the .md files under docs/ at ref, rooted at the repo root.
+	DocsAtRef(ctx context.Context, installationID int64, owner, repo, ref string) (fs.FS, error)
 }
 
 // Artifact is the JSON document the workflow uploads as result.json.
@@ -82,20 +88,44 @@ func New(api WorkflowAPI, timeout time.Duration) *Runner {
 	return &Runner{api: api, timeout: timeout}
 }
 
-// Start dispatches the workflow for req and returns review.Pending.
+// Start computes the candidate docs from the PR's base commit and dispatches
+// the workflow to review them, returning review.Pending. When the PR deletes a
+// candidate and a restore can be proposed, it returns the finished
+// review.Result of restore proposals without dispatching.
 func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started, error) {
+	where := fmt.Sprintf("%s/%s#%d", req.Owner, req.Repo, req.Number)
+
+	baseFS, err := r.api.DocsAtRef(ctx, req.InstallationID, req.Owner, req.Repo, req.BaseSHA)
+	if err != nil {
+		return nil, fmt.Errorf("start actions run %s: %w", where, err)
+	}
+	selection, err := basedocs.Select(baseFS, req.ChangedFiles)
+	if err != nil {
+		return nil, fmt.Errorf("start actions run %s: base %s: %w", where, req.BaseSHA, err)
+	}
+	if len(selection.Restores) > 0 {
+		return review.Result{Runner: runnerName, Verdict: review.Proposals(selection.Restores)}, nil
+	}
+	if len(selection.Candidates) > basedocs.MaxCandidates {
+		return nil, &review.FailedError{
+			Cause: review.CauseTooManyCandidates,
+			Err:   fmt.Errorf("start actions run %s: %d candidate docs exceed the cap of %d", where, len(selection.Candidates), basedocs.MaxCandidates),
+		}
+	}
+
 	nonce, err := newNonce()
 	if err != nil {
-		return nil, fmt.Errorf("start actions run %s/%s#%d: %w", req.Owner, req.Repo, req.Number, err)
+		return nil, fmt.Errorf("start actions run %s: %w", where, err)
 	}
 
 	runID, err := r.api.Dispatch(ctx, req.InstallationID, req.Owner, req.Repo, DispatchInputs{
 		HeadSHA:  req.HeadSHA,
 		PRNumber: req.Number,
 		Nonce:    nonce,
+		Docs:     selection.Candidates,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("start actions run %s/%s#%d: dispatch: %w", req.Owner, req.Repo, req.Number, err)
+		return nil, fmt.Errorf("start actions run %s: dispatch: %w", where, err)
 	}
 
 	return review.Pending{RunID: runID, Nonce: nonce, Deadline: time.Now().Add(r.timeout)}, nil

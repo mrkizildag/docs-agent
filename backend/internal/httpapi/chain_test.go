@@ -32,6 +32,10 @@ func (f *chainGitHub) WorkflowExists(context.Context, int64, string, string) (bo
 	return false, nil
 }
 
+func (f *chainGitHub) MergeBase(_ context.Context, _ int64, _, _, base, _ string) (string, error) {
+	return base, nil
+}
+
 func (f *chainGitHub) ListChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {
 	return []review.ChangedFile{{
 		Path:  "src/app.go",
@@ -58,7 +62,7 @@ func (m *chainModel) Complete(_ context.Context, req llm.Request) (llm.Response,
 	return llm.Response{Text: `{"impacted":false,"reason":"wording only"}`}, nil
 }
 
-func newChainRepo(t *testing.T) (string, string) {
+func newChainRepo(t *testing.T) (repoDir, baseSHA, headSHA string) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -92,12 +96,18 @@ func newChainRepo(t *testing.T) (string, string) {
 	git("config", "user.name", "test")
 	git("add", "-A")
 	git("commit", "-q", "-m", "init")
+	baseSHA = strings.TrimSpace(string(git("rev-parse", "HEAD")))
 
-	return dir, strings.TrimSpace(string(git("rev-parse", "HEAD")))
+	if err := os.WriteFile(filepath.Join(dir, "src/app.go"), []byte("package app\n\n// new wording\n"), 0o600); err != nil {
+		t.Fatalf("write src/app.go: %v", err)
+	}
+	git("commit", "-q", "-a", "-m", "reword")
+
+	return dir, baseSHA, strings.TrimSpace(string(git("rev-parse", "HEAD")))
 }
 
 func TestWebhookToServerRunnerChain(t *testing.T) {
-	repoDir, headSHA := newChainRepo(t)
+	repoDir, baseSHA, headSHA := newChainRepo(t)
 
 	t.Setenv("GIT_CONFIG_COUNT", "1")
 	t.Setenv("GIT_CONFIG_KEY_0", "url."+repoDir+".insteadOf")
@@ -135,7 +145,7 @@ func TestWebhookToServerRunnerChain(t *testing.T) {
 	})
 
 	handler := httpapi.NewHandler(logger, secret, worker, store)
-	body := e2ePullRequestBody(t, 1, headSHA)
+	body := e2ePullRequestFrom(t, 1, headSHA, pushOpts{baseSHA: baseSHA})
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-GitHub-Event", "pull_request")
 	req.Header.Set("X-GitHub-Delivery", "d1")

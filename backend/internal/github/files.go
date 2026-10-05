@@ -62,7 +62,11 @@ func (c *Client) ListChangedFiles(ctx context.Context, installationID int64, own
 			if err != nil {
 				return nil, fmt.Errorf("list changed files %s/%s#%d: parse patch of %s: %w", owner, repo, number, f.GetFilename(), err)
 			}
-			files = append(files, review.ChangedFile{Path: f.GetFilename(), PreviousPath: f.GetPreviousFilename(), Hunks: hunks, Patch: f.GetPatch(), Changes: f.GetChanges()})
+			previous := ""
+			if f.GetStatus() == "renamed" {
+				previous = f.GetPreviousFilename()
+			}
+			files = append(files, review.ChangedFile{Path: f.GetFilename(), PreviousPath: previous, Removed: f.GetStatus() == "removed", Hunks: hunks, Patch: f.GetPatch(), Changes: f.GetChanges()})
 		}
 
 		if resp.NextPage == 0 {

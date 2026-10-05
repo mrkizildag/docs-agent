@@ -6,6 +6,8 @@ covers:
   - backend/internal/agent/**
   - backend/internal/review/llmrunner/**
   - backend/internal/github/files.go
+  - backend/internal/review/basedocs/**
+  - backend/internal/docs/candidates.go
 ---
 
 # Server runner
@@ -15,8 +17,10 @@ The server runner is the analysis runner for repos without the pollux-agent Acti
 ## Pipeline
 
 1. **Changed files.** The gate lists the PR's files from GitHub, each with its patch and the head-side line ranges of its hunks, and passes them in the request. No changed files means "no impact" without cloning.
-2. **Clone.** A depth-1 clone of the PR head commit, authenticated with the installation token. The token goes to git through its environment as an HTTP header, never in the remote URL, so it does not land in `.git/config` or in logs. `git` must be on the server's PATH.
-3. **Candidate docs.** The runner parses `docs/` in the clone and keeps the docs whose `covers` globs match a changed file (see [Architecture](../architecture.md) for the docs model). Reading docs at the head commit means a doc the PR adds or edits is judged as the PR leaves it. No candidate means "no impact" without a model call; a doc that fails to parse is skipped.
+2. **Clone.** A depth-1 fetch of the PR head and its merge base, with head checked out; the base's `docs/` is read straight from git objects into memory, never checked out: a checkout would apply the PR's `.gitattributes` (encodings, line endings) to the base docs, and the agent's tools cannot reach them. Authenticated with the installation token. The token goes to git through its environment as an HTTP header, never in the remote URL, so it does not land in `.git/config` or in logs. `git` must be on the server's PATH.
+3. **Candidate docs.** The runner parses `docs/` at the merge base (the base-branch commit the PR's diff starts from, resolved once by the gate through GitHub's compare API, not the base branch's current tip, so a doc added to main after the PR forked is not a candidate the head lacks) and keeps the docs whose `covers` globs there match a changed file or its old path (see [Architecture](../architecture.md) for the docs model). Matching at base is the point: a PR could otherwise empty or narrow `covers` to opt itself out, and editing `covers` is a doc change to review, not trust. The doc text still comes from head, so an edited doc is judged as the PR leaves it; a doc the PR adds is not a candidate, a renamed doc is followed to its new path (a doc renamed out of `docs/` or to a non-`.md` path counts as deleted; a file GitHub reports as copied is not a rename), and a candidate whose frontmatter the PR broke is triaged from its headings and text and can still get section proposals. A candidate the PR replaced with a symlink or other non-regular file at head, or a doc over 1 MiB at head, ends the analysis as a failure. No candidate means "no impact" without a model call; a doc that fails to parse at base is skipped.
+
+    A candidate the PR deletes ends the run here, with no model call: the result is a restore proposal (a new-doc proposal carrying the doc's base content and its base index line) whose reason names the doc and the changed files it covered, with paths quoted. Apply brings it back, and the next push gets the full analysis. A covered change with no line diff (binary, pure rename, omitted patch) still gets the restore, anchored on any changed line in the PR. If every covered changed file is itself deleted, there is no restore: the feature and its doc were removed together. Deleting a covering doc on purpose needs Skip until merge.
 4. **Triage.** One call per candidate doc to the triage model, given the PR's diff and the doc. Each answers impacted or not, with a reason. If every doc is "no", the result is "no impact" carrying those reasons, and nothing further runs. Most PRs end here, which keeps them cheap.
 5. **Agent loop.** For impacted docs, the main model reads the clone through tools and finishes by calling `submit_proposals`. Its arguments must pass proposal validation (path a `.md` or `.mdx` file under `docs/`, anchor inside a diff hunk). A submission that fails is not returned: the model is told why and may resubmit while steps remain.
 6. **Verification.** One call per proposal asks whether it is right. Rejected proposals are dropped; if all are dropped, the result is "no impact".

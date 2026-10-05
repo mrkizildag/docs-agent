@@ -369,6 +369,39 @@ func TestHandleComment(t *testing.T) {
 			wantReact: gate.ReactionDone,
 		},
 		{
+			name: "index entry already present is not added again", event: issueComment("/pollux-agent apply"),
+			state: func(s *gate.PRState) { s.Proposals = s.Proposals[2:] },
+			gh: func(f *fakeCommentGitHub) {
+				f.files["docs/README.md"] = "# Docs\n\n## Index\n\n- [C](c.md)\n- [A](a.md)\n\n## More\ntext\n"
+			},
+			wantMessage: "docs: apply pollux-agent proposal for docs/c.md",
+			wantFiles:   map[string]string{"docs/c.md": "# C\n", "docs/README.md": "# Docs\n\n## Index\n\n- [C](c.md)\n- [A](a.md)\n\n## More\ntext\n"},
+			wantApplied: []string{"p3"}, wantReplies: []int64{3}, wantTicks: 1,
+			wantReact: gate.ReactionDone,
+		},
+		{
+			name: "index entry under another heading is still added", event: issueComment("/pollux-agent apply"),
+			state: func(s *gate.PRState) { s.Proposals = s.Proposals[2:] },
+			gh: func(f *fakeCommentGitHub) {
+				f.files["docs/README.md"] = "# Docs\n\n## Index\n\n- [A](a.md)\n\n## More\n- [C](c.md)\n"
+			},
+			wantMessage: "docs: apply pollux-agent proposal for docs/c.md",
+			wantFiles:   map[string]string{"docs/c.md": "# C\n", "docs/README.md": "# Docs\n\n## Index\n\n- [A](a.md)\n- [C](c.md)\n\n## More\n- [C](c.md)\n"},
+			wantApplied: []string{"p3"}, wantReplies: []int64{3}, wantTicks: 1,
+			wantReact: gate.ReactionDone,
+		},
+		{
+			name: "index entry already listed in a readme without an index heading is not added again", event: issueComment("/pollux-agent apply"),
+			state: func(s *gate.PRState) { s.Proposals = s.Proposals[2:] },
+			gh: func(f *fakeCommentGitHub) {
+				f.files["docs/README.md"] = "# Docs\n\n## Docs\n\n- [C](c.md)\n- [A](a.md)\n"
+			},
+			wantMessage: "docs: apply pollux-agent proposal for docs/c.md",
+			wantFiles:   map[string]string{"docs/c.md": "# C\n", "docs/README.md": "# Docs\n\n## Docs\n\n- [C](c.md)\n- [A](a.md)\n"},
+			wantApplied: []string{"p3"}, wantReplies: []int64{3}, wantTicks: 1,
+			wantReact: gate.ReactionDone,
+		},
+		{
 			name: "index heading without items gets the entry right after it", event: issueComment("/pollux-agent apply"),
 			state:       func(s *gate.PRState) { s.Proposals = s.Proposals[2:] },
 			gh:          func(f *fakeCommentGitHub) { f.files["docs/README.md"] = "# Docs\n\n## Index\n\n## More\ntext\n" },
