@@ -1,8 +1,0 @@
-[Unit]
-Description=Deploy pollux when origin/main moves
-After=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=%h/pollux-agent/deploy/pollux-update.sh
-TimeoutStartSec=15min

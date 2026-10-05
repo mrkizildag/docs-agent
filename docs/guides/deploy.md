@@ -32,7 +32,7 @@ The image is built in stages from static Go binaries and runs on distroless `sta
    chmod 0444 ~/.config/pollux-agent/github-app.pem
    ```
 
-3. Clone the repo to `~/pollux-agent` (`git clone https://github.com/mrkizildag/pollux-agent ~/pollux-agent`); the update timer expects it there. Copy `backend/.env.example` to `.env` at the repo root and fill it in (variables are listed in [Setup](setup.md)). Compose uses `.env` both as the container's `env_file` and for its own interpolation. Set `GITHUB_APP_PRIVATE_KEY_FILE` to the **host** path of the key. Compose bind-mounts it read-only at `/run/secrets/github-app.pem` and overrides the variable inside the container. It also overrides `DATABASE_PATH` and `ADDR`, so those two values in `.env` are ignored under compose.
+3. Clone the repo to `~/pollux-agent` (`git clone https://github.com/mrkizildag/pollux-agent ~/pollux-agent`); `pollux-deploy` expects it there. Copy `backend/.env.example` to `.env` at the repo root and fill it in (variables are listed in [Setup](setup.md)). Compose uses `.env` both as the container's `env_file` and for its own interpolation. Set `GITHUB_APP_PRIVATE_KEY_FILE` to the **host** path of the key. Compose bind-mounts it read-only at `/run/secrets/github-app.pem` and overrides the variable inside the container. It also overrides `DATABASE_PATH` and `ADDR`, so those two values in `.env` are ignored under compose.
 4. Start it:
 
    ```
@@ -59,21 +59,17 @@ prints `ok`. Then in the App's "Advanced → Recent deliveries", redeliver the `
 
 ## Updates
 
-A systemd user timer deploys every merge to `main`. Every 2 minutes it fetches `origin/main`; when that differs from the last deployed commit, it checks the commit out (detached) and runs `docker compose up -d --build --wait`. When the build fails or the new container never turns healthy, the script redeploys the last good commit and records the bad one in `~/.local/state/pollux/failed`, so it isn't retried; the next merge, or deleting that file, tries again. A lock keeps a manual run from overlapping the timer's. The checkout must live at `~/pollux-agent` and carry no local changes. Whatever lands on `main` runs on this host next to the App key, so the repo's `protect main` ruleset requires a pull request and blocks force-pushes and deleting `main`; keep it on.
-
-Install it once, after the first deploy:
+Deploys are manual. Link the deploy script onto your `PATH` once:
 
 ```
-mkdir -p ~/.config/systemd/user
-ln -sf ~/pollux-agent/deploy/pollux-update.service ~/pollux-agent/deploy/pollux-update.timer ~/.config/systemd/user/
-loginctl enable-linger
-systemctl --user daemon-reload
-systemctl --user enable --now pollux-update.timer
+ln -sf ~/pollux-agent/deploy/pollux-deploy.sh ~/.local/bin/pollux-deploy
 ```
 
-`enable-linger` keeps the timer running while you are logged out. Follow deploys with `journalctl --user -u pollux-update -f`. The last deployed commit is in `~/.local/state/pollux/deployed`; delete it to force a redeploy. To deploy by hand instead, run `deploy/pollux-update.sh`.
+Then, after merging to `main`, SSH in and run `pollux-deploy`. It fetches `origin/main`, checks it out (detached), and runs `docker compose up -d --build --wait`. If the build fails or the new container never turns healthy, it checks the previous commit out again, brings that back up, and exits non-zero. The checkout must live at `~/pollux-agent` (or set `POLLUX_DIR`) and carry no local changes.
 
-The volume keeps the database across rebuilds. Never run `docker compose down -v`: it deletes the volume, and with it the queue and PR state. `docker compose stop` shuts the server down gracefully (SIGTERM) and keeps everything. A deploy or stop interrupts any running job; it is requeued on the next start and may run twice (see [Job queue](../features/job-queue.md)), so a PR's check can get one extra run after a merge to `main`.
+The webhook URL does not change across deploys: Funnel serves the machine's name, and `--bg` keeps it across reboots. Only renaming the machine or moving to another host means editing the App's webhook URL.
+
+The volume keeps the database across rebuilds. Never run `docker compose down -v`: it deletes the volume, and with it the queue and PR state. `docker compose stop` shuts the server down gracefully (SIGTERM) and keeps everything. A deploy or stop interrupts any running job; it is requeued on the next start and may run twice (see [Job queue](../features/job-queue.md)), so a PR's check can get one extra run after a deploy.
 
 The database lives in the `pollux-data` volume. Backups are not covered here.
 
@@ -87,5 +83,5 @@ The database lives in the `pollux-data` volume. Backups are not covered here.
 - **`permission denied` reading the private key**: the container runs as uid 65532. Re-run the `chmod` from step 2 on the host file that `GITHUB_APP_PRIVATE_KEY_FILE` points to.
 - **Container `unhealthy`**: check `docker compose logs pollux` for why the server is not serving, then `curl http://127.0.0.1:8080/healthz` from the host. The distroless image has no shell, so `docker compose exec` into it will not work.
 - **Exits right after start with a config error**: a required variable in `.env` is missing or invalid; the log line names it. See [Setup](setup.md). Remember `ADDR`, `DATABASE_PATH`, and the key path inside the container are set by compose.
-- **A merge did not deploy**: `journalctl --user -u pollux-update -n 50` shows the failing step (fetch, checkout, build, or health wait).
+- **`pollux-deploy` rolled back**: its output shows the failing step (fetch, build, or health wait); `docker compose logs pollux` shows why the new container didn't turn healthy.
 - **Deliveries fail from GitHub but `/healthz` is fine**: run `tailscale funnel status` and confirm the URL and the `/webhook` path match the App's webhook URL.
