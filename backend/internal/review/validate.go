@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"unicode"
 )
 
 // Validate reports every way p is malformed given the files changed in the
@@ -14,7 +15,7 @@ import (
 func (p Proposal) Validate(changed []ChangedFile) error {
 	var errs []error
 
-	if err := validateDocPath(p.DocPath); err != nil {
+	if err := p.ValidateTarget(); err != nil {
 		errs = append(errs, err)
 	}
 	if err := validateAnchor(p.Anchor, changed); err != nil {
@@ -51,6 +52,15 @@ func validateDocPath(docPath string) error {
 	if docPath == "docs" || !strings.HasPrefix(docPath, "docs/") {
 		return fmt.Errorf("doc_path %q: must be under \"docs/\"", docPath)
 	}
+	if ext := path.Ext(docPath); ext != ".md" && ext != ".mdx" {
+		return fmt.Errorf("doc_path %q: must end in .md or .mdx", docPath)
+	}
+	if strings.ContainsFunc(docPath, unicode.IsControl) {
+		return fmt.Errorf("doc_path %q: must not contain control characters", docPath)
+	}
+	if strings.Contains(docPath, "`") {
+		return fmt.Errorf("doc_path %q: must not contain backticks", docPath)
+	}
 	return nil
 }
 
@@ -67,4 +77,29 @@ func validateAnchor(anchor Anchor, changed []ChangedFile) error {
 		return fmt.Errorf("anchor.line %d: outside the diff hunks of %q", anchor.Line, anchor.File)
 	}
 	return fmt.Errorf("anchor.file %q: not a changed file", anchor.File)
+}
+
+// ValidateTarget checks the parts of p that decide what Apply writes: the doc
+// path, the section heading, and the index entry.
+func (p Proposal) ValidateTarget() error {
+	var errs []error
+
+	if err := validateDocPath(p.DocPath); err != nil {
+		errs = append(errs, err)
+	}
+	if err := validateSingleLine("section", p.Section); err != nil {
+		errs = append(errs, err)
+	}
+	if err := validateSingleLine("index_entry", p.IndexEntry); err != nil {
+		errs = append(errs, err)
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateSingleLine(field, value string) error {
+	if strings.ContainsFunc(value, unicode.IsControl) {
+		return fmt.Errorf("%s: must be one line without control characters", field)
+	}
+	return nil
 }

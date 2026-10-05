@@ -35,6 +35,8 @@ func (c *Client) GetPullRequest(ctx context.Context, installationID int64, owner
 		Number:         number,
 		BaseSHA:        pr.GetBase().GetSHA(),
 		HeadSHA:        pr.GetHead().GetSHA(),
+		HeadRef:        pr.GetHead().GetRef(),
+		Fork:           pr.GetHead().GetRepo().GetFullName() != pr.GetBase().GetRepo().GetFullName(),
 		Open:           pr.GetState() == "open",
 	}, nil
 }

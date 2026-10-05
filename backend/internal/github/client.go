@@ -161,7 +161,7 @@ func (c *Client) WorkflowExists(ctx context.Context, installationID int64, owner
 
 	_, _, resp, err := client.Repositories.GetContents(ctx, owner, repo, gate.WorkflowPath, nil)
 	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
+		if isNotFound(resp) {
 			return false, nil
 		}
 		return false, fmt.Errorf("check workflow %s/%s: %w", owner, repo, err)

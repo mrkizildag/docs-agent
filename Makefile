@@ -1,5 +1,8 @@
 .PHONY: check fmt lint test vuln run generate
 
+# golangci-lint's default cache is per user, so worktrees of this repo share it and report each other's files.
+export GOLANGCI_LINT_CACHE ?= $(CURDIR)/.cache/golangci-lint
+
 check: lint test vuln
 
 generate:

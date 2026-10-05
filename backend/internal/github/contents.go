@@ -3,7 +3,6 @@ package github
 import (
 	"context"
 	"fmt"
-	"net/http"
 
 	"github.com/google/go-github/v92/github"
 
@@ -20,7 +19,7 @@ func (c *Client) FileAtRef(ctx context.Context, installationID int64, owner, rep
 
 	file, _, resp, err := client.Repositories.GetContents(ctx, owner, repo, path, &github.RepositoryContentGetOptions{Ref: ref})
 	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
+		if isNotFound(resp) {
 			return nil, false, nil
 		}
 		return nil, false, fmt.Errorf("read %s of %s/%s at %s: %w", path, owner, repo, ref, err)

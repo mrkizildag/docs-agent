@@ -23,11 +23,10 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 )
 
-const testAppID = 123
-
 const (
 	pullRequestJobKind = "pull_request"
 	workflowRunJobKind = "workflow_run"
+	commentJobKind     = "comment"
 )
 
 type fakeRunLookup struct {
@@ -70,7 +69,7 @@ func TestHealthz(t *testing.T) {
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, []byte("secret"), testAppID, newFakeEnqueuer(), fakeRunLookup{}).ServeHTTP(rec, req)
+	httpapi.NewHandler(logger, []byte("secret"), newFakeEnqueuer(), fakeRunLookup{}).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
 		t.Errorf("GET /healthz = %d %q, want 200 \"ok\"", rec.Code, rec.Body.String())
@@ -147,7 +146,7 @@ func TestWebhook(t *testing.T) {
 			}
 			rec := httptest.NewRecorder()
 
-			httpapi.NewHandler(logger, secret, testAppID, enqueuer, fakeRunLookup{}).ServeHTTP(rec, req)
+			httpapi.NewHandler(logger, secret, enqueuer, fakeRunLookup{}).ServeHTTP(rec, req)
 
 			if rec.Code != tc.wantStatus {
 				t.Errorf("POST /webhook = %d, want %d", rec.Code, tc.wantStatus)
@@ -170,7 +169,7 @@ func TestWebhookBodyTooLarge(t *testing.T) {
 	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, secret, testAppID, newFakeEnqueuer(), fakeRunLookup{}).ServeHTTP(rec, req)
+	httpapi.NewHandler(logger, secret, newFakeEnqueuer(), fakeRunLookup{}).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("POST /webhook with oversized body = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
@@ -185,11 +184,12 @@ func pullRequestPayload(t *testing.T, action string) []byte {
 		"number": 7,
 		"pull_request": map[string]any{
 			"base": map[string]any{"sha": "base123"},
-			"head": map[string]any{"sha": "abc123"},
+			"head": map[string]any{"sha": "abc123", "ref": "feature", "repo": map[string]any{"full_name": "acme/widgets"}},
 		},
 		"repository": map[string]any{
-			"name":  "widgets",
-			"owner": map[string]any{"login": "acme"},
+			"name":      "widgets",
+			"full_name": "acme/widgets",
+			"owner":     map[string]any{"login": "acme"},
 		},
 		"installation": map[string]any{"id": 42},
 	}
@@ -219,7 +219,7 @@ func postWebhookWithLookup(t *testing.T, secret []byte, jobs httpapi.Enqueuer, r
 	}
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, secret, testAppID, jobs, runs).ServeHTTP(rec, req)
+	httpapi.NewHandler(logger, secret, jobs, runs).ServeHTTP(rec, req)
 	return rec
 }
 
@@ -270,7 +270,7 @@ func TestWebhookPullRequest(t *testing.T) {
 			if err := json.Unmarshal(job.Payload, &pr); err != nil {
 				t.Fatalf("decode job payload: %v", err)
 			}
-			want := gate.PullRequest{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, BaseSHA: "base123", HeadSHA: "abc123"}
+			want := gate.PullRequest{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, BaseSHA: "base123", HeadSHA: "abc123", HeadRef: "feature"}
 			if diff := cmp.Diff(want, pr); diff != "" {
 				t.Errorf("job payload (-want +got):\n%s", diff)
 			}
@@ -384,11 +384,17 @@ func TestWebhookPullRequestClosedWithMissingFields(t *testing.T) {
 
 type fakePullRequestHandler struct {
 	calls    []gate.PullRequest
+	comments []gate.CommentEvent
 	runCalls []gate.RunCompleted
 	err      error
 }
 
 func (f *fakePullRequestHandler) HandleDeadline(context.Context, gate.PRRef, string, time.Time) error {
+	return f.err
+}
+
+func (f *fakePullRequestHandler) HandleComment(_ context.Context, ev gate.CommentEvent) error {
+	f.comments = append(f.comments, ev)
 	return f.err
 }
 
@@ -450,6 +456,49 @@ func TestHandleJob(t *testing.T) {
 		}
 	})
 
+	t.Run("dispatches comments", func(t *testing.T) {
+		t.Parallel()
+
+		ev := gate.CommentEvent{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, Sender: "dev", CommentID: 5, Kind: gate.CommentKindReview, Ticked: "- [x] Apply this change"}
+		evPayload, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatalf("marshal comment event: %v", err)
+		}
+		handler := &fakePullRequestHandler{}
+		job := jobqueue.Job{ID: 5, Key: "acme/widgets#7", Kind: commentJobKind, Payload: evPayload}
+
+		if err := httpapi.HandleJob(handler)(t.Context(), job); err != nil {
+			t.Fatalf("HandleJob() error = %v", err)
+		}
+
+		if diff := cmp.Diff([]gate.CommentEvent{ev}, handler.comments); diff != "" {
+			t.Errorf("HandleComment calls (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("dispatches rerun ticks as comments", func(t *testing.T) {
+		t.Parallel()
+
+		ev := gate.CommentEvent{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, Sender: "dev", CommentID: 5, Kind: gate.CommentKindIssue, Ticked: "- [x] Re-run analysis"}
+		evPayload, err := json.Marshal(map[string]any{"Comment": ev})
+		if err != nil {
+			t.Fatalf("marshal rerun comment job: %v", err)
+		}
+		handler := &fakePullRequestHandler{}
+		job := jobqueue.Job{ID: 6, Key: "acme/widgets#7", Kind: pullRequestJobKind, Payload: evPayload}
+
+		if err := httpapi.HandleJob(handler)(t.Context(), job); err != nil {
+			t.Fatalf("HandleJob() error = %v", err)
+		}
+
+		if diff := cmp.Diff([]gate.CommentEvent{ev}, handler.comments); diff != "" {
+			t.Errorf("HandleComment calls (-want +got):\n%s", diff)
+		}
+		if len(handler.calls) != 0 {
+			t.Errorf("HandlePullRequest calls = %v, want none", handler.calls)
+		}
+	})
+
 	t.Run("unknown kind errors", func(t *testing.T) {
 		t.Parallel()
 
@@ -505,7 +554,7 @@ func postWorkflowRun(t *testing.T, runs httpapi.RunLookup, jobs httpapi.Enqueuer
 	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, testAppID, jobs, runs).ServeHTTP(rec, req)
+	httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, jobs, runs).ServeHTTP(rec, req)
 	return rec
 }
 
@@ -551,6 +600,276 @@ func TestWebhookWorkflowRun(t *testing.T) {
 			want := []jobqueue.NewJob{{DeliveryID: "d-run", Key: "acme/widgets#7", Kind: workflowRunJobKind, Payload: wantPayload}}
 			if diff := cmp.Diff(want, jobs.jobs); diff != "" {
 				t.Errorf("Enqueue calls (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func reviewCommentPayload(t *testing.T, action, senderType, from, body string) []byte {
+	t.Helper()
+
+	payload := map[string]any{
+		"action":       action,
+		"changes":      map[string]any{"body": map[string]any{"from": from}},
+		"comment":      map[string]any{"id": 5, "body": body},
+		"pull_request": map[string]any{"number": 7},
+		"repository":   map[string]any{"name": "widgets", "owner": map[string]any{"login": "acme"}},
+		"installation": map[string]any{"id": 42},
+		"sender":       map[string]any{"login": "dev", "type": senderType},
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal pull_request_review_comment payload: %v", err)
+	}
+	return out
+}
+
+func TestWebhookReviewComment(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("test-secret")
+	unticked := "intro\n\n- [ ] Apply this change\n"
+	ticked := "intro\n\n- [x] Apply this change\n"
+
+	tests := []struct {
+		name       string
+		action     string
+		senderType string
+		from, body string
+		wantQueued bool
+	}{
+		{name: "tick", action: "edited", senderType: "User", from: unticked, body: ticked, wantQueued: true},
+		{name: "untick", action: "edited", senderType: "User", from: ticked, body: unticked},
+		{name: "text edit", action: "edited", senderType: "User", from: unticked, body: "other\n\n- [ ] Apply this change\n"},
+		{name: "tick and text edit", action: "edited", senderType: "User", from: unticked, body: "other\n\n- [x] Apply this change\n"},
+		{name: "bot", action: "edited", senderType: "Bot", from: unticked, body: ticked},
+		{name: "created", action: "created", senderType: "User", from: unticked, body: ticked},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			enqueuer := newFakeEnqueuer()
+			body := reviewCommentPayload(t, tc.action, tc.senderType, tc.from, tc.body)
+			rec := postWebhook(t, secret, enqueuer, "pull_request_review_comment", "delivery-id", body)
+
+			if rec.Code != http.StatusAccepted {
+				t.Errorf("POST /webhook = %d, want %d", rec.Code, http.StatusAccepted)
+			}
+			if !tc.wantQueued {
+				if len(enqueuer.jobs) != 0 {
+					t.Errorf("Enqueue calls = %v, want none", enqueuer.jobs)
+				}
+				return
+			}
+			if len(enqueuer.jobs) != 1 {
+				t.Fatalf("Enqueue calls = %d, want 1", len(enqueuer.jobs))
+			}
+			job := enqueuer.jobs[0]
+			if job.Key != "acme/widgets#7" || job.Kind != commentJobKind || job.Supersedes || job.DeliveryID != "delivery-id" {
+				t.Errorf("NewJob = %+v, want Key=acme/widgets#7 Kind=%s Supersedes=false DeliveryID=delivery-id", job, commentJobKind)
+			}
+			var ev gate.CommentEvent
+			if err := json.Unmarshal(job.Payload, &ev); err != nil {
+				t.Fatalf("decode job payload: %v", err)
+			}
+			want := gate.CommentEvent{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, Sender: "dev", CommentID: 5, Kind: gate.CommentKindReview, Ticked: "- [x] Apply this change", Body: ticked}
+			if diff := cmp.Diff(want, ev); diff != "" {
+				t.Errorf("job payload (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func issueCommentPayload(t *testing.T, action, senderType string, isPR bool, from, body string) []byte {
+	t.Helper()
+
+	issue := map[string]any{"number": 7}
+	if isPR {
+		issue["pull_request"] = map[string]any{}
+	}
+	payload := map[string]any{
+		"action":       action,
+		"changes":      map[string]any{"body": map[string]any{"from": from}},
+		"comment":      map[string]any{"id": 5, "body": body},
+		"issue":        issue,
+		"repository":   map[string]any{"name": "widgets", "owner": map[string]any{"login": "acme"}},
+		"installation": map[string]any{"id": 42},
+		"sender":       map[string]any{"login": "dev", "type": senderType},
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal issue_comment payload: %v", err)
+	}
+	return out
+}
+
+func TestWebhookIssueComment(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("test-secret")
+	unticked := "intro\n\n- [ ] Skip this commit\n"
+	ticked := "intro\n\n- [x] Skip this commit\n"
+
+	tests := []struct {
+		name       string
+		action     string
+		senderType string
+		isPR       bool
+		from, body string
+		want       *gate.CommentEvent
+	}{
+		{
+			name: "created", action: "created", senderType: "User", isPR: true, body: "/pollux-agent skip",
+			want: &gate.CommentEvent{Body: "/pollux-agent skip"},
+		},
+		{
+			name: "edited tick", action: "edited", senderType: "User", isPR: true, from: unticked, body: ticked,
+			want: &gate.CommentEvent{Ticked: "- [x] Skip this commit", Body: ticked},
+		},
+		{name: "created on plain issue", action: "created", senderType: "User", body: "hello"},
+		{name: "created by bot", action: "created", senderType: "Bot", isPR: true, body: "hello"},
+		{name: "created empty", action: "created", senderType: "User", isPR: true},
+		{name: "edited without flip", action: "edited", senderType: "User", isPR: true, from: unticked, body: "other\n\n- [ ] Skip this commit\n"},
+		{name: "edited untick", action: "edited", senderType: "User", isPR: true, from: ticked, body: unticked},
+		{name: "deleted", action: "deleted", senderType: "User", isPR: true, body: "hello"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			enqueuer := newFakeEnqueuer()
+			body := issueCommentPayload(t, tc.action, tc.senderType, tc.isPR, tc.from, tc.body)
+			rec := postWebhook(t, secret, enqueuer, "issue_comment", "delivery-id", body)
+
+			if rec.Code != http.StatusAccepted {
+				t.Errorf("POST /webhook = %d, want %d", rec.Code, http.StatusAccepted)
+			}
+			if tc.want == nil {
+				if len(enqueuer.jobs) != 0 {
+					t.Errorf("Enqueue calls = %v, want none", enqueuer.jobs)
+				}
+				return
+			}
+			if len(enqueuer.jobs) != 1 {
+				t.Fatalf("Enqueue calls = %d, want 1", len(enqueuer.jobs))
+			}
+			job := enqueuer.jobs[0]
+			if job.Key != "acme/widgets#7" || job.Kind != commentJobKind || job.Supersedes || job.DeliveryID != "delivery-id" {
+				t.Errorf("NewJob = %+v, want Key=acme/widgets#7 Kind=%s Supersedes=false DeliveryID=delivery-id", job, commentJobKind)
+			}
+			var ev gate.CommentEvent
+			if err := json.Unmarshal(job.Payload, &ev); err != nil {
+				t.Fatalf("decode job payload: %v", err)
+			}
+			want := *tc.want
+			want.InstallationID, want.Owner, want.Repo, want.Number = 42, "acme", "widgets", 7
+			want.Sender, want.CommentID, want.Kind = "dev", 5, gate.CommentKindIssue
+			if diff := cmp.Diff(want, ev); diff != "" {
+				t.Errorf("job payload (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestWebhookIssueCommentRerunTickIsPullRequestJob(t *testing.T) {
+	t.Parallel()
+
+	unticked := "intro\n\n- [ ] Re-run analysis\n"
+	ticked := "intro\n\n- [x] Re-run analysis\n"
+	enqueuer := newFakeEnqueuer()
+	rec := postWebhook(t, []byte("test-secret"), enqueuer, "issue_comment", "delivery-id", issueCommentPayload(t, "edited", "User", true, unticked, ticked))
+
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("POST /webhook = %d, want %d", rec.Code, http.StatusAccepted)
+	}
+	if len(enqueuer.jobs) != 1 {
+		t.Fatalf("Enqueue calls = %d, want 1", len(enqueuer.jobs))
+	}
+	job := enqueuer.jobs[0]
+	if job.Key != "acme/widgets#7" || job.Kind != pullRequestJobKind || job.Supersedes || job.DeliveryID != "delivery-id" {
+		t.Errorf("NewJob = %+v, want Key=acme/widgets#7 Kind=%s Supersedes=false DeliveryID=delivery-id", job, pullRequestJobKind)
+	}
+	var payload struct{ Comment *gate.CommentEvent }
+	if err := json.Unmarshal(job.Payload, &payload); err != nil {
+		t.Fatalf("decode job payload: %v", err)
+	}
+	want := &gate.CommentEvent{
+		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, Sender: "dev", CommentID: 5,
+		Kind: gate.CommentKindIssue, Ticked: "- [x] Re-run analysis", Body: ticked,
+	}
+	if diff := cmp.Diff(want, payload.Comment); diff != "" {
+		t.Errorf("job payload Comment (-want +got):\n%s", diff)
+	}
+}
+
+func TestWebhookIssueCommentMissingFields(t *testing.T) {
+	t.Parallel()
+
+	body, err := json.Marshal(map[string]any{
+		"action":  "created",
+		"comment": map[string]any{"id": 5, "body": "hello"},
+		"issue":   map[string]any{"pull_request": map[string]any{}},
+		"sender":  map[string]any{"login": "dev", "type": "User"},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	enqueuer := newFakeEnqueuer()
+	rec := postWebhook(t, []byte("test-secret"), enqueuer, "issue_comment", "delivery-id", body)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("POST /webhook = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	if len(enqueuer.jobs) != 0 {
+		t.Errorf("Enqueue calls = %v, want none", enqueuer.jobs)
+	}
+}
+
+func TestWebhookPullRequestFork(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		head any
+		want bool
+	}{
+		{name: "same repo", head: map[string]any{"full_name": "acme/widgets"}, want: false},
+		{name: "fork", head: map[string]any{"full_name": "dev/widgets"}, want: true},
+		{name: "deleted fork", head: nil, want: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			body, err := json.Marshal(map[string]any{
+				"action": "opened",
+				"number": 7,
+				"pull_request": map[string]any{
+					"base": map[string]any{"sha": "base123"},
+					"head": map[string]any{"sha": "abc123", "ref": "feature", "repo": tc.head},
+				},
+				"repository":   map[string]any{"name": "widgets", "full_name": "acme/widgets", "owner": map[string]any{"login": "acme"}},
+				"installation": map[string]any{"id": 42},
+			})
+			if err != nil {
+				t.Fatalf("marshal pull_request payload: %v", err)
+			}
+			enqueuer := newFakeEnqueuer()
+			rec := postWebhook(t, []byte("test-secret"), enqueuer, "pull_request", "delivery-id", body)
+
+			if rec.Code != http.StatusAccepted || len(enqueuer.jobs) != 1 {
+				t.Fatalf("POST /webhook = %d with %d jobs, want %d with 1", rec.Code, len(enqueuer.jobs), http.StatusAccepted)
+			}
+			var pr gate.PullRequest
+			if err := json.Unmarshal(enqueuer.jobs[0].Payload, &pr); err != nil {
+				t.Fatalf("decode job payload: %v", err)
+			}
+			if pr.Fork != tc.want {
+				t.Errorf("PullRequest.Fork = %v, want %v", pr.Fork, tc.want)
 			}
 		})
 	}
@@ -670,30 +989,4 @@ func TestWebhookCheckRun(t *testing.T) {
 			t.Errorf("status = %d, jobs = %d, want %d and none", rec.Code, len(jobs.jobs), http.StatusBadRequest)
 		}
 	})
-}
-
-func TestWebhookIssueCommentRequiresThisApp(t *testing.T) {
-	t.Parallel()
-
-	secret := []byte("test-secret")
-	const before, after = "<!-- pollux-agent:summary -->\n- [ ] Re-run analysis", "<!-- pollux-agent:summary -->\n- [x] Re-run analysis"
-	for _, tc := range []struct {
-		name     string
-		appID    int64
-		wantJobs int
-	}{
-		{"this app", testAppID, 1},
-		{"another app", testAppID + 1, 0},
-		{"no app", 0, 0},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			jobs := newFakeEnqueuer()
-			rec := postWebhook(t, secret, jobs, "issue_comment", "d1", issueCommentBody(t, 5, tc.appID, before, after))
-			if rec.Code != http.StatusAccepted || len(jobs.jobs) != tc.wantJobs {
-				t.Errorf("status = %d, jobs = %d, want %d and %d", rec.Code, len(jobs.jobs), http.StatusAccepted, tc.wantJobs)
-			}
-		})
-	}
 }

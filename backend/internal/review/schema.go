@@ -45,7 +45,7 @@ func marshalSchema(schema *jsonschema.Schema, name string) ([]byte, error) {
 	return append(out, '\n'), nil
 }
 
-// The jsonschema tag only carries descriptions, so the docs/ rule is added here.
+// The jsonschema tag only carries descriptions, so the doc path rule is added here.
 func annotate(schema *jsonschema.Schema) {
-	schema.Properties["doc_path"].Pattern = "^docs/"
+	schema.Properties["doc_path"].Pattern = `^docs/.*\.mdx?$`
 }

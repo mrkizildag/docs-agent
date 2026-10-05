@@ -63,7 +63,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("build analysis runners: %w", err)
 	}
-	gateSvc := gate.NewService(ghClient, store, runners)
+	gateSvc := gate.NewService(ghClient, ghClient, store, runners)
 
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, maxParallelJobs)
 	workerCtx, cancelWorker := context.WithCancel(context.WithoutCancel(ctx))
@@ -87,7 +87,7 @@ func run(ctx context.Context) error {
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpapi.NewHandler(logger, []byte(cfg.WebhookSecret.Reveal()), cfg.GitHubAppID, worker, store),
+		Handler:           httpapi.NewHandler(logger, []byte(cfg.WebhookSecret.Reveal()), worker, store),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,

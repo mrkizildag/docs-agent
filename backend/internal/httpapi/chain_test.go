@@ -119,7 +119,7 @@ func TestWebhookToServerRunnerChain(t *testing.T) {
 	model := &chainModel{}
 	noToken := func(context.Context, int64, string) (string, error) { return "", nil }
 	runner := llmrunner.New(model, noToken, "triage", "draft")
-	gateSvc := gate.NewService(gh, store, gate.Runners{Server: runner})
+	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{Server: runner})
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
@@ -134,7 +134,7 @@ func TestWebhookToServerRunnerChain(t *testing.T) {
 		}
 	})
 
-	handler := httpapi.NewHandler(logger, secret, testAppID, worker, store)
+	handler := httpapi.NewHandler(logger, secret, worker, store)
 	body := e2ePullRequestBody(t, 1, headSHA)
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-GitHub-Event", "pull_request")

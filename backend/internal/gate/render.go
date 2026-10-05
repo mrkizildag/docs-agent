@@ -16,7 +16,7 @@ func proposalMarker(id string) string {
 // proposalComment is the review comment for p: a suggestion on the doc's own
 // lines when they lie within one head-side hunk of the PR diff, else the
 // checkbox variant on the anchor line.
-func proposalComment(headSHA, id string, p review.Proposal, changed []review.ChangedFile) ReviewComment {
+func proposalComment(headSHA, id string, p review.Proposal, changed []review.ChangedFile, fork bool) ReviewComment {
 	if suggestable(p, changed) {
 		rc := ReviewComment{CommitSHA: headSHA, Path: p.DocPath, Line: p.Lines.End, Body: renderSuggestion(id, p)}
 		if p.Lines.Start != p.Lines.End {
@@ -24,7 +24,7 @@ func proposalComment(headSHA, id string, p review.Proposal, changed []review.Cha
 		}
 		return rc
 	}
-	return ReviewComment{CommitSHA: headSHA, Path: p.Anchor.File, Line: p.Anchor.Line, Body: renderCheckbox(id, p)}
+	return ReviewComment{CommitSHA: headSHA, Path: p.Anchor.File, Line: p.Anchor.Line, Body: renderCheckbox(id, p, fork)}
 }
 
 func suggestable(p review.Proposal, changed []review.ChangedFile) bool {
@@ -54,13 +54,13 @@ func renderSuggestion(id string, p review.Proposal) string {
 	return proposalMarker(id) + "\n\n" + p.Reason + "\n\n" + fence + "suggestion\n" + content + fence + "\n"
 }
 
-// renderOutdated keeps the old comment body readable under an outdated notice.
+// renderOutdated keeps the old comment body readable under an outdated notice,
+// without its Apply box: ticking it would apply a proposal that no longer holds.
 func renderOutdated(id, headSHA, old string) string {
-	old = strings.TrimSpace(strings.ReplaceAll(old, proposalMarker(id), ""))
-	short := headSHA[:min(7, len(headSHA))]
+	old = strings.TrimSpace(withoutCheckbox(strings.ReplaceAll(old, proposalMarker(id), ""), applyLabel))
 	var b strings.Builder
 	b.WriteString(proposalMarker(id))
-	fmt.Fprintf(&b, "\n\n**Outdated: no longer needed as of %s**\n", short)
+	fmt.Fprintf(&b, "\n\n**Outdated: no longer needed as of %s**\n", shortSHA(headSHA))
 	if old != "" {
 		b.WriteString("\n<details>\n<summary>Original proposal</summary>\n\n" + old + "\n\n</details>\n")
 	}
@@ -69,7 +69,7 @@ func renderOutdated(id, headSHA, old string) string {
 
 // renderCheckbox is the checkbox-variant review comment body: the edit as a
 // diff of the section's old lines against the proposed ones.
-func renderCheckbox(id string, p review.Proposal) string {
+func renderCheckbox(id string, p review.Proposal, fork bool) string {
 	var diff strings.Builder
 	if p.Original != "" {
 		writePrefixed(&diff, "-", p.Original)
@@ -88,8 +88,45 @@ func renderCheckbox(id string, p review.Proposal) string {
 	if p.IndexEntry != "" {
 		fmt.Fprintf(&b, "\nIndex entry: `%s`\n", p.IndexEntry)
 	}
-	b.WriteString("\n- [ ] Apply this change\n")
+	if fork {
+		b.WriteString("\nApply is not available: this pull request comes from a fork the bot cannot push to.\n")
+	} else {
+		b.WriteString("\n" + checkbox(false, applyLabel) + "\n")
+	}
 	return b.String()
+}
+
+// checkbox is the markdown line for a box labelled label.
+func checkbox(ticked bool, label string) string {
+	if ticked {
+		return "- [x] " + label
+	}
+	return "- [ ] " + label
+}
+
+// setCheckbox sets the box labelled label in body to ticked; ok is false when
+// body has no such box in the other state.
+func setCheckbox(body, label string, ticked bool) (string, bool) {
+	from, to := checkbox(!ticked, label), checkbox(ticked, label)
+	lines := strings.Split(body, "\n")
+	for i, l := range lines {
+		if strings.TrimSpace(l) == from {
+			lines[i] = strings.Replace(l, from, to, 1)
+			return strings.Join(lines, "\n"), true
+		}
+	}
+	return body, false
+}
+
+// withoutCheckbox is body without the lines of the box labelled label, ticked or not.
+func withoutCheckbox(body, label string) string {
+	var kept []string
+	for l := range strings.SplitSeq(body, "\n") {
+		if t := strings.TrimSpace(l); t != checkbox(false, label) && t != checkbox(true, label) {
+			kept = append(kept, l)
+		}
+	}
+	return strings.Join(kept, "\n")
 }
 
 func proposalTarget(p review.Proposal) string {
@@ -120,27 +157,27 @@ func fenceFor(body string) string {
 	return strings.Repeat("`", max(3, longest+1))
 }
 
-const (
-	rerunUnticked = "- [ ] Re-run analysis"
-	rerunTicked   = "- [x] Re-run analysis"
-)
-
 // renderSummary is the summary comment body: a heading (the failure cause when
 // the last analysis failed, else the open proposal count), one row per proposal
-// in state, and, for a failure only, the Re-run checkbox.
-func renderSummary(state PRState, cause string) string {
+// in state, then the PR-wide checkboxes redrawn from state. Re-run is offered
+// for a failure only; Apply all is never drawn ticked.
+func renderSummary(state PRState) string {
 	var b strings.Builder
 	b.WriteString(summaryMarker)
 	b.WriteString("\n\n")
-	if cause != "" {
-		b.WriteString("**Analysis failed:** " + cause + "\n\n")
-	} else {
-		open := 0
-		for _, p := range state.Proposals {
-			if p.State == ProposalOpen {
-				open++
-			}
+	applied, open := 0, 0
+	for _, p := range state.Proposals {
+		switch p.State {
+		case ProposalApplied:
+			applied++
+		case ProposalOpen:
+			open++
+		case ProposalOutdated:
 		}
+	}
+	if state.FailureCause != "" {
+		b.WriteString("**Analysis failed:** " + state.FailureCause + "\n\n")
+	} else {
 		noun := "updates"
 		if open == 1 {
 			noun = "update"
@@ -155,28 +192,49 @@ func renderSummary(state PRState, cause string) string {
 		if p.Section != "" {
 			section = strings.ReplaceAll(p.Section, "|", `\|`)
 		}
-		fmt.Fprintf(&b, "| `%s` | %s | [view](%s) | %s |\n", strings.ReplaceAll(p.DocPath, "|", `\|`), section, p.CommentURL, p.State)
+		status := string(p.State)
+		if p.State == ProposalApplied {
+			status = fmt.Sprintf("applied (%s)", shortSHA(p.AppliedSHA))
+		}
+		link := "-"
+		if p.CommentURL != "" {
+			link = fmt.Sprintf("[view](%s)", p.CommentURL)
+		}
+		fmt.Fprintf(&b, "| `%s` | %s | %s | %s |\n", strings.ReplaceAll(p.DocPath, "|", `\|`), section, link, status)
 	}
+
 	if len(state.Proposals) > 0 {
 		b.WriteString("\n")
+		switch {
+		case state.Fork:
+			b.WriteString("Apply all is not available: this pull request comes from a fork the bot cannot push to.\n")
+		case applied > 0 && open == 0:
+			b.WriteString("✅ All proposals applied.\n")
+		default:
+			b.WriteString(checkbox(false, applyAllLabel) + "\n")
+		}
 	}
-	if cause != "" {
-		b.WriteString(rerunUnticked + "\n")
+	active := state.Skip
+	if !skipActive(state) {
+		active = nil
 	}
+	pending := state.PendingSkip
+	b.WriteString(checkbox(scopeIs(SkipCommit, pending, active), skipCommitLabel) + "\n")
+	b.WriteString(checkbox(scopeIs(SkipPR, pending, active), skipPRLabel) + "\n")
+	if state.FailureCause != "" {
+		b.WriteString(checkbox(false, rerunLabel) + "\n")
+	}
+
+	if active != nil {
+		fmt.Fprintf(&b, "\nSkipped by @%s for this %s: %s\n", active.User, active.Scope.noun(), active.Reason)
+	}
+	if state.PendingSkip != nil {
+		fmt.Fprintf(&b, "\nWaiting for @%s to reply with a reason.\n", state.PendingSkip.User)
+	}
+	fmt.Fprintf(&b, "\nCommands: `%[1]s %[2]s`, `%[1]s %[3]s <reason>`, `%[1]s %[4]s <reason>`.\n", commandPrefix, applyCommand, skipCommand, skipPRCommand)
 	return b.String()
 }
 
-// RerunTicked reports whether an edit of the summary comment from before to
-// after ticked its Re-run analysis box.
-func RerunTicked(before, after string) bool {
-	return hasMarker(before, summaryMarker) && hasMarker(after, summaryMarker) && hasLine(before, rerunUnticked) && hasLine(after, rerunTicked)
-}
-
-func hasLine(body, line string) bool {
-	for l := range strings.SplitSeq(body, "\n") {
-		if strings.TrimRight(l, "\r") == line {
-			return true
-		}
-	}
-	return false
+func scopeIs(scope SkipScope, pending *SkipAsk, active *Skip) bool {
+	return pending != nil && pending.Scope == scope || active != nil && active.Scope == scope
 }

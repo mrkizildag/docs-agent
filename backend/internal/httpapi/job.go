@@ -20,12 +20,16 @@ func prJobKey(owner, repo string, number int) string {
 // webhookHandler encodes jobs with this kind; HandleJob decodes them.
 const pullRequestJobKind = "pull_request"
 
+// commentJobKind identifies durable jobs carrying a gate.CommentEvent payload.
+const commentJobKind = "comment"
+
 // pullRequestJobPayload is a gate.PullRequest to analyze, or when Rerun is set,
-// a request to re-analyze the PR's current head (the embedded PullRequest is
-// then zero).
+// a request to re-analyze the PR's current head, or when Comment is set, a
+// summary Re-run tick to act on (the embedded PullRequest is then zero).
 type pullRequestJobPayload struct {
 	gate.PullRequest
-	Rerun *gate.RerunRequest `json:",omitempty"`
+	Rerun   *gate.RerunRequest `json:",omitempty"`
+	Comment *gate.CommentEvent `json:",omitempty"`
 }
 
 // workflowRunJobKind identifies durable jobs carrying a gate.RunCompleted payload.
@@ -95,6 +99,7 @@ func EnqueueDeadlineJobs(ctx context.Context, src OverdueSource, jobs Enqueuer, 
 // PullRequestHandler reports the pollux-agent check run for a pull request.
 type PullRequestHandler interface {
 	HandlePullRequest(ctx context.Context, pr gate.PullRequest) error
+	HandleComment(ctx context.Context, ev gate.CommentEvent) error
 	HandleRerun(ctx context.Context, r gate.RerunRequest) error
 	HandleRunCompleted(ctx context.Context, rc gate.RunCompleted) error
 	HandleDeadline(ctx context.Context, ref gate.PRRef, nonce string, now time.Time) error
@@ -109,6 +114,12 @@ func HandleJob(prs PullRequestHandler) jobqueue.Handler {
 			if err := json.Unmarshal(job.Payload, &payload); err != nil {
 				return fmt.Errorf("decode job %d payload (kind %s): %w", job.ID, job.Kind, err)
 			}
+			if payload.Comment != nil {
+				if err := prs.HandleComment(ctx, *payload.Comment); err != nil {
+					return fmt.Errorf("handle rerun comment job %d: %w", job.ID, err)
+				}
+				return nil
+			}
 			if payload.Rerun != nil {
 				if err := prs.HandleRerun(ctx, *payload.Rerun); err != nil {
 					return fmt.Errorf("handle rerun job %d: %w", job.ID, err)
@@ -117,6 +128,15 @@ func HandleJob(prs PullRequestHandler) jobqueue.Handler {
 			}
 			if err := prs.HandlePullRequest(ctx, payload.PullRequest); err != nil {
 				return fmt.Errorf("handle pull request job %d: %w", job.ID, err)
+			}
+			return nil
+		case commentJobKind:
+			var ev gate.CommentEvent
+			if err := json.Unmarshal(job.Payload, &ev); err != nil {
+				return fmt.Errorf("decode job %d payload (kind %s): %w", job.ID, job.Kind, err)
+			}
+			if err := prs.HandleComment(ctx, ev); err != nil {
+				return fmt.Errorf("handle comment job %d: %w", job.ID, err)
 			}
 			return nil
 		case workflowRunJobKind:
