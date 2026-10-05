@@ -365,3 +365,70 @@ func TestDocSectionSpanDuplicateHeading(t *testing.T) {
 		t.Errorf("SectionSpan(unique) ok = false, want true")
 	}
 }
+
+func TestCheckScaffoldDoc(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		src     string
+		wantErr string
+	}{
+		{name: "complete", src: "---\ntitle: T\nsummary: S\ncovers:\n  - \"src/**\"\n---\n# T\n"},
+		{name: "empty covers list", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n# T\n"},
+		{name: "no frontmatter", src: "# T\n", wantErr: "missing frontmatter"},
+		{name: "blank title", src: "---\ntitle: \" \"\nsummary: S\ncovers: []\n---\n", wantErr: "no title"},
+		{name: "no summary", src: "---\ntitle: T\ncovers: []\n---\n", wantErr: "no summary"},
+		{name: "no covers key", src: "---\ntitle: T\nsummary: S\n---\n", wantErr: "no covers list"},
+		{name: "invalid glob", src: "---\ntitle: T\nsummary: S\ncovers:\n  - \"/abs\"\n---\n", wantErr: "must be repo-root relative"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := docs.CheckScaffoldDoc("docs/x.md", []byte(tc.src))
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Errorf("CheckScaffoldDoc() error = %v, want nil", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Errorf("CheckScaffoldDoc() error = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestCheckScaffold(t *testing.T) {
+	t.Parallel()
+
+	const (
+		frontmatter = "---\ntitle: T\nsummary: S\ncovers: []\n---\n"
+		index       = frontmatter + "[a](architecture.md) [s](guides/setup.md)\n"
+	)
+
+	tests := []struct {
+		name                     string
+		index, architecture, set string
+		wantErr                  string
+	}{
+		{name: "complete", index: index, architecture: frontmatter, set: frontmatter},
+		{name: "index without frontmatter", index: "[a](architecture.md) [s](guides/setup.md)", architecture: frontmatter, set: frontmatter, wantErr: "docs/README.md"},
+		{name: "architecture without summary", index: index, architecture: "---\ntitle: T\ncovers: []\n---\n", set: frontmatter, wantErr: "docs/architecture.md"},
+		{name: "setup without title", index: index, architecture: frontmatter, set: "---\nsummary: S\ncovers: []\n---\n", wantErr: "docs/guides/setup.md"},
+		{name: "index misses architecture link", index: frontmatter + "[s](guides/setup.md)\n", architecture: frontmatter, set: frontmatter, wantErr: "](architecture.md)"},
+		{name: "architecture over the byte cap", index: index, architecture: frontmatter + strings.Repeat("x", docs.MaxDocBytes), set: frontmatter, wantErr: "byte cap"},
+		{name: "index misses setup link", index: frontmatter + "[a](architecture.md)\n", architecture: frontmatter, set: frontmatter, wantErr: "](guides/setup.md)"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := docs.CheckScaffold(tc.index, tc.architecture, tc.set)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Errorf("CheckScaffold() error = %v, want nil", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Errorf("CheckScaffold() error = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}

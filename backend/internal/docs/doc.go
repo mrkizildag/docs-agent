@@ -65,6 +65,48 @@ func ParseDoc(path string, src []byte) (Doc, error) {
 	}, nil
 }
 
+// CheckScaffoldDoc reports why src is not a usable scaffold doc: it must parse
+// and carry a title, a summary and a covers key (an empty list is a value).
+func CheckScaffoldDoc(path string, src []byte) error {
+	doc, err := ParseDoc(path, src)
+	if err != nil {
+		return fmt.Errorf("check scaffold doc %s: %w", path, err)
+	}
+	switch {
+	case strings.TrimSpace(doc.Title) == "":
+		return fmt.Errorf("check scaffold doc %s: frontmatter has no title", path)
+	case strings.TrimSpace(doc.Summary) == "":
+		return fmt.Errorf("check scaffold doc %s: frontmatter has no summary", path)
+	case doc.Covers == nil:
+		return fmt.Errorf("check scaffold doc %s: frontmatter has no covers list", path)
+	}
+	return nil
+}
+
+// CheckScaffold reports why index, architecture and setup are not a usable
+// starting docs folder: each must pass CheckScaffoldDoc at its path, and the
+// index must link the other two relatively. Each file must fit in MaxDocBytes.
+func CheckScaffold(index, architecture, setup string) error {
+	for _, doc := range []struct{ path, src string }{
+		{"docs/README.md", index},
+		{"docs/architecture.md", architecture},
+		{"docs/guides/setup.md", setup},
+	} {
+		if len(doc.src) > MaxDocBytes {
+			return fmt.Errorf("check scaffold doc %s: %d bytes exceed the %d byte cap", doc.path, len(doc.src), MaxDocBytes)
+		}
+		if err := CheckScaffoldDoc(doc.path, []byte(doc.src)); err != nil {
+			return err
+		}
+	}
+	for _, link := range []string{"](architecture.md)", "](guides/setup.md)"} {
+		if !strings.Contains(index, link) {
+			return fmt.Errorf("check scaffold doc docs/README.md: the index must link its sibling docs relatively, missing %q", link)
+		}
+	}
+	return nil
+}
+
 // SectionSpan returns the text of the section titled heading (leading "#"s and
 // surrounding space ignored) and its 1-based inclusive line range, from the
 // heading line through the section's last line. ok is false when no heading

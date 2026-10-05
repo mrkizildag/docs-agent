@@ -30,6 +30,8 @@ type Enqueuer interface {
 type RunLookup interface {
 	PRForRun(ctx context.Context, owner, repo string, runID int64) (number int, ok bool, err error)
 	PRsForHead(ctx context.Context, owner, repo, headSHA string) ([]int, error)
+	// ScaffoldForRun reports whether the repo's scaffold awaits the workflow run runID.
+	ScaffoldForRun(ctx context.Context, owner, repo string, runID int64) (bool, error)
 }
 
 func NewHandler(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer, runs RunLookup) *http.ServeMux {
@@ -540,9 +542,19 @@ func handleWorkflowRunEvent(logger *slog.Logger, jobs Enqueuer, runs RunLookup, 
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	key, kind := prJobKey(owner, repo, number), workflowRunJobKind
 	if !ok {
-		w.WriteHeader(http.StatusAccepted)
-		return
+		scaffold, err := runs.ScaffoldForRun(r.Context(), owner, repo, payload.WorkflowRun.ID)
+		if err != nil {
+			logger.Error("look up scaffold for workflow run", "delivery_id", deliveryID, "run_id", payload.WorkflowRun.ID, "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if !scaffold {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		key, kind, number = scaffoldJobKey(gate.RepoRef{Owner: owner, Repo: repo}), scaffoldRunJobKind, 0
 	}
 
 	completed := gate.RunCompleted{
@@ -562,8 +574,8 @@ func handleWorkflowRunEvent(logger *slog.Logger, jobs Enqueuer, runs RunLookup, 
 
 	enqueued, err := jobs.Enqueue(r.Context(), jobqueue.NewJob{
 		DeliveryID: deliveryID,
-		Key:        prJobKey(owner, repo, number),
-		Kind:       workflowRunJobKind,
+		Key:        key,
+		Kind:       kind,
 		Payload:    jobPayload,
 	})
 	if err != nil {

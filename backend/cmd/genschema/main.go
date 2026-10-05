@@ -1,5 +1,6 @@
-// Command genschema writes the JSON Schemas for review.Proposal and
-// review.StructuredOutput to the two paths given as its arguments.
+// Command genschema writes the JSON Schemas for review.Proposal,
+// review.StructuredOutput and review.ScaffoldDocs to the three paths given as
+// its arguments.
 package main
 
 import (
@@ -17,8 +18,8 @@ func main() {
 }
 
 func run(args []string) error {
-	if len(args) != 3 {
-		return fmt.Errorf("usage: %s <proposal-schema-path> <result-schema-path>", args[0])
+	if len(args) != 4 {
+		return fmt.Errorf("usage: %s <proposal-schema-path> <result-schema-path> <scaffold-schema-path>", args[0])
 	}
 
 	outputs := []struct {
@@ -28,6 +29,7 @@ func run(args []string) error {
 	}{
 		{"proposal", review.ProposalSchema, args[1]},
 		{"result", review.ResultSchema, args[2]},
+		{"scaffold", review.ScaffoldSchema, args[3]},
 	}
 	for _, o := range outputs {
 		schema, err := o.generate()

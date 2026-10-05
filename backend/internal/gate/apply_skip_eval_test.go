@@ -20,7 +20,7 @@ func TestEvalApplyAllRedeliveredAfterCrashCommitsOnce(t *testing.T) {
 	api.pullRequest = gate.PullRequest{HeadSHA: "botall1234", Open: true}
 	landed := gate.Commit{SHA: "botall1234", Parents: []string{"head1"}, Message: msg, Mine: true}
 	comments := &fakeCommentGitHub{canWrite: true, files: baseFiles(), api: api, byAdd: map[string]gate.Commit{"botall1234": landed}}
-	svc := gate.NewService(api, comments, store, gate.Runners{})
+	svc := gate.NewService(api, comments, store, gate.Runners{}, nil, nil)
 
 	for range 2 {
 		if err := svc.HandleComment(t.Context(), issueComment("/pollux-agent apply")); err != nil {

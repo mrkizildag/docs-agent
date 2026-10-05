@@ -32,6 +32,10 @@ func (f *chainGitHub) WorkflowExists(context.Context, int64, string, string) (bo
 	return false, nil
 }
 
+func (f *chainGitHub) DocsExist(context.Context, int64, string, string, string) (bool, error) {
+	return true, nil
+}
+
 func (f *chainGitHub) ListChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {
 	return []review.ChangedFile{{
 		Path:  "src/app.go",
@@ -61,6 +65,16 @@ func (m *chainModel) Complete(_ context.Context, req llm.Request) (llm.Response,
 func newChainRepo(t *testing.T) (string, string) {
 	t.Helper()
 
+	return newGitRepo(t, map[string]string{
+		"src/app.go":  "package app\n\n// old wording\n",
+		"docs/app.md": "---\ntitle: App\nsummary: Describes the app.\ncovers:\n  - \"src/**\"\n---\n# App\n\n## Behavior\n\nThe app greets users.\n",
+	})
+}
+
+// newGitRepo commits files to a new repository and returns its directory and head SHA.
+func newGitRepo(t *testing.T, files map[string]string) (string, string) {
+	t.Helper()
+
 	dir := t.TempDir()
 	git := func(args ...string) []byte {
 		t.Helper()
@@ -73,10 +87,6 @@ func newChainRepo(t *testing.T) (string, string) {
 		return out
 	}
 
-	files := map[string]string{
-		"src/app.go":  "package app\n\n// old wording\n",
-		"docs/app.md": "---\ntitle: App\nsummary: Describes the app.\ncovers:\n  - \"src/**\"\n---\n# App\n\n## Behavior\n\nThe app greets users.\n",
-	}
 	for name, content := range files {
 		path := filepath.Join(dir, name)
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -119,7 +129,7 @@ func TestWebhookToServerRunnerChain(t *testing.T) {
 	model := &chainModel{}
 	noToken := func(context.Context, int64, string) (string, error) { return "", nil }
 	runner := llmrunner.New(model, noToken, "triage", "draft")
-	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{Server: runner})
+	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{Server: runner}, nil, nil)
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)

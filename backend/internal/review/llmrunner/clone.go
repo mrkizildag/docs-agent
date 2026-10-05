@@ -44,6 +44,38 @@ func cloneHead(ctx context.Context, remoteURL, headSHA, token string) (string, e
 	return dir, nil
 }
 
+// openClone clones sha of owner/repo and opens its root. cleanup closes the
+// root and removes the clone; it is non-nil only when err is nil.
+func (r *Runner) openClone(ctx context.Context, installationID int64, owner, repo, sha string) (*os.Root, func(), error) {
+	token, err := r.token(ctx, installationID, repo)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get installation token: %w: %w", errClone, err)
+	}
+
+	remoteURL := r.remote
+	if remoteURL == "" {
+		remoteURL = fmt.Sprintf("https://github.com/%s/%s.git", owner, repo)
+	}
+
+	dir, err := cloneHead(ctx, remoteURL, sha, token)
+	if err != nil {
+		if dir != "" {
+			_ = os.RemoveAll(dir) // best-effort cleanup of a temp dir; the runner has no logger
+		}
+		return nil, nil, fmt.Errorf("%w: %w", errClone, err)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, nil, fmt.Errorf("open clone root: %w", err)
+	}
+	return root, func() {
+		_ = root.Close()
+		_ = os.RemoveAll(dir)
+	}, nil
+}
+
 func runGit(ctx context.Context, dir, remoteURL, token string, args ...string) error {
 	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // args are fixed git subcommands plus a validated SHA and the runner's remote, not request text
 	cmd.Dir = dir

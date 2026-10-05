@@ -67,6 +67,8 @@ ln -sf ~/pollux-agent/deploy/pollux-deploy.sh ~/.local/bin/pollux-deploy
 
 Then, after merging to `main`, SSH in and run `pollux-deploy`. It fetches `origin/main`, checks it out (detached), and runs `docker compose up -d --build --wait`. If the build fails or the new container never turns healthy, it checks the previous commit out again, brings that back up, and exits non-zero. The checkout must live at `~/pollux-agent` (or set `POLLUX_DIR`) and carry no local changes.
 
+Installed workflows use `mrkizildag/pollux-agent/action@main`. When a release changes both `action/` and the server's dispatch inputs, merge the action to `main` before running `pollux-deploy`, or dispatched runs fail at checkout.
+
 The webhook URL does not change across deploys: Funnel serves the machine's name, and `--bg` keeps it across reboots. Only renaming the machine or moving to another host means editing the App's webhook URL.
 
 The volume keeps the database across rebuilds. Never run `docker compose down -v`: it deletes the volume, and with it the queue and PR state. `docker compose stop` shuts the server down gracefully (SIGTERM) and keeps everything. A deploy or stop interrupts any running job; it is requeued on the next start and may run twice (see [Job queue](../features/job-queue.md)), so a PR's check can get one extra run after a deploy.

@@ -32,11 +32,17 @@ const (
 type fakeRunLookup struct {
 	numbers map[int64]int
 	heads   map[string][]int
-	err     error
+	// scaffolds holds the workflow run IDs a repo's scaffold awaits.
+	scaffolds map[int64]bool
+	err       error
 }
 
 func (f fakeRunLookup) PRsForHead(_ context.Context, _, _, headSHA string) ([]int, error) {
 	return f.heads[headSHA], f.err
+}
+
+func (f fakeRunLookup) ScaffoldForRun(_ context.Context, _, _ string, runID int64) (bool, error) {
+	return f.scaffolds[runID], f.err
 }
 
 func (f fakeRunLookup) PRForRun(_ context.Context, _, _ string, runID int64) (int, bool, error) {
@@ -390,6 +396,18 @@ type fakePullRequestHandler struct {
 }
 
 func (f *fakePullRequestHandler) HandleDeadline(context.Context, gate.PRRef, string, time.Time) error {
+	return f.err
+}
+
+func (f *fakePullRequestHandler) HandleScaffoldRun(context.Context, gate.RunCompleted) error {
+	return nil
+}
+
+func (f *fakePullRequestHandler) HandleScaffoldDeadline(context.Context, gate.RepoRef, string, time.Time) error {
+	return nil
+}
+
+func (f *fakePullRequestHandler) HandleScaffold(context.Context, gate.RepoRef) error {
 	return f.err
 }
 
@@ -989,4 +1007,44 @@ func TestWebhookCheckRun(t *testing.T) {
 			t.Errorf("status = %d, jobs = %d, want %d and none", rec.Code, len(jobs.jobs), http.StatusBadRequest)
 		}
 	})
+}
+
+func TestWebhookWorkflowRunOfScaffold(t *testing.T) {
+	t.Parallel()
+
+	runs := fakeRunLookup{numbers: map[int64]int{99: 7}, scaffolds: map[int64]bool{55: true}}
+	jobs := newFakeEnqueuer()
+	body := workflowRunBody(t, "completed", ".github/workflows/pollux-agent.yml", 55)
+	if rec := postWorkflowRun(t, runs, jobs, body); rec.Code != http.StatusAccepted {
+		t.Fatalf("POST /webhook = %d, want %d", rec.Code, http.StatusAccepted)
+	}
+
+	wantPayload, err := json.Marshal(gate.RunCompleted{InstallationID: 42, Owner: "acme", Repo: "widgets", RunID: 55, Conclusion: "success"})
+	if err != nil {
+		t.Fatalf("marshal want payload: %v", err)
+	}
+	want := []jobqueue.NewJob{{DeliveryID: "d-run", Key: "acme/widgets#scaffold", Kind: "scaffold_run", Payload: wantPayload}}
+	if diff := cmp.Diff(want, jobs.jobs); diff != "" {
+		t.Errorf("Enqueue calls (-want +got):\n%s", diff)
+	}
+}
+
+func TestEnqueueDeadlineJobsKeysAScaffoldByRepo(t *testing.T) {
+	t.Parallel()
+
+	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	run := gate.OverdueRun{PRRef: gate.PRRef{Owner: "acme", Repo: "widgets"}, Scaffold: true, Nonce: "n1", Deadline: deadline}
+	jobs := newFakeEnqueuer()
+	if err := httpapi.EnqueueDeadlineJobs(t.Context(), fakeOverdueSource{run}, jobs, slog.New(slog.DiscardHandler), deadline.Add(time.Second)); err != nil {
+		t.Fatalf("EnqueueDeadlineJobs() = %v, want nil", err)
+	}
+
+	wantPayload, err := json.Marshal(run)
+	if err != nil {
+		t.Fatalf("marshal want payload: %v", err)
+	}
+	want := []jobqueue.NewJob{{DeliveryID: "deadline:n1:0", Key: "acme/widgets#scaffold", Kind: "scaffold_deadline", Payload: wantPayload}}
+	if diff := cmp.Diff(want, jobs.jobs); diff != "" {
+		t.Errorf("Enqueue calls (-want +got):\n%s", diff)
+	}
 }
