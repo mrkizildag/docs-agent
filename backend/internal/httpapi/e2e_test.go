@@ -114,6 +114,10 @@ func (f *e2eGitHub) MergeBase(_ context.Context, _ int64, _, _, base, _ string) 
 	return base, nil
 }
 
+func (f *e2eGitHub) DocsExist(context.Context, int64, string, string, string) (bool, error) {
+	return true, nil
+}
+
 func (f *e2eGitHub) ListChangedFiles(_ context.Context, _ int64, _, _ string, _ int) ([]review.ChangedFile, error) {
 	return nil, nil
 }
@@ -203,7 +207,7 @@ func TestWebhookToCheckRunEndToEnd(t *testing.T) {
 	})
 
 	gh := &e2eGitHub{calls: make(chan e2eCheckRunCall, 10)}
-	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{})
+	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
@@ -354,6 +358,9 @@ func (f *fakeActionsGitHub) handler() http.Handler {
 	mux.HandleFunc("GET /repos/acme/widgets/contents/.github/workflows/pollux-agent.yml", func(w http.ResponseWriter, _ *http.Request) {
 		f.json(w, http.StatusOK, `{"type":"file","name":"pollux-agent.yml","path":".github/workflows/pollux-agent.yml"}`)
 	})
+	mux.HandleFunc("GET /repos/acme/widgets/contents/docs", func(w http.ResponseWriter, _ *http.Request) {
+		f.json(w, http.StatusOK, `[{"type":"file","name":"README.md","path":"docs/README.md"}]`)
+	})
 	mux.HandleFunc("GET /repos/acme/widgets", func(w http.ResponseWriter, _ *http.Request) {
 		f.json(w, http.StatusOK, `{"default_branch":"main"}`)
 	})
@@ -460,7 +467,7 @@ func TestActionsRunnerEndToEnd(t *testing.T) {
 		t.Fatalf("NewClient() error = %v", err)
 	}
 
-	gateSvc := gate.NewService(client, unusedCommentGitHub{}, store, gate.Runners{Actions: actions.New(client, 10*time.Minute)})
+	gateSvc := gate.NewService(client, unusedCommentGitHub{}, store, gate.Runners{Actions: actions.New(client, 10*time.Minute)}, nil, nil)
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(baseStore, httpapi.HandleJob(gateSvc), logger, 8)
 
@@ -553,6 +560,10 @@ func (f *commentGitHub) WorkflowExists(context.Context, int64, string, string) (
 	return false, nil
 }
 
+func (f *commentGitHub) DocsExist(context.Context, int64, string, string, string) (bool, error) {
+	return true, nil
+}
+
 func (f *commentGitHub) UpdateCheckRun(_ context.Context, _ int64, _, _ string, _ int64, run gate.CheckRun) error {
 	f.checkRuns <- run
 	return nil
@@ -596,6 +607,10 @@ func (r proposalRunner) Start(context.Context, review.Request) (review.Started, 
 	return review.Result{Runner: "fake", Verdict: r.proposals}, nil
 }
 
+func (proposalRunner) StartScaffold(context.Context, review.ScaffoldRequest) (review.ScaffoldStarted, error) {
+	return nil, errors.New("proposalRunner does not scaffold")
+}
+
 func TestWebhookToProposalCommentsEndToEnd(t *testing.T) {
 	t.Parallel()
 
@@ -615,7 +630,7 @@ func TestWebhookToProposalCommentsEndToEnd(t *testing.T) {
 		{DocPath: "docs/a.md", Section: "Usage", Anchor: review.Anchor{File: "a.go", Line: 4}, Reason: "flag renamed", Original: "## Usage\nold\n", Lines: review.LineRange{Start: 3, End: 4}, Content: "## Usage\nnew\n"},
 		{DocPath: "docs/b.md", Anchor: review.Anchor{File: "b.go", Line: 9}, Reason: "new feature", Content: "# B\n", IndexEntry: "- [B](b.md)"},
 	}}
-	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{Server: runner})
+	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{Server: runner}, nil, nil)
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
@@ -800,6 +815,10 @@ func (f *statefulGitHub) WorkflowExists(context.Context, int64, string, string) 
 	return f.workflow, nil
 }
 
+func (f *statefulGitHub) DocsExist(context.Context, int64, string, string, string) (bool, error) {
+	return true, nil
+}
+
 func (f *statefulGitHub) UpdateCheckRun(_ context.Context, _ int64, _, _ string, id int64, run gate.CheckRun) error {
 	f.mu.Lock()
 	f.runs = append(f.runs, run)
@@ -886,6 +905,14 @@ func (f *statefulGitHub) snapshot() (comments []gate.Comment, creates, edits int
 // one. Collect never finds a result, which is what a failed workflow run leaves.
 type scriptedRunner struct{ outcomes chan any }
 
+func (scriptedRunner) StartScaffold(context.Context, review.ScaffoldRequest) (review.ScaffoldStarted, error) {
+	return nil, errors.New("scriptedRunner does not scaffold")
+}
+
+func (scriptedRunner) CollectScaffold(context.Context, review.Completion) (review.Scaffold, error) {
+	return review.Scaffold{}, errors.New("scriptedRunner does not scaffold")
+}
+
 // blockedRun is an outcome that holds the analysis until its context is
 // cancelled, then fails the way an interrupted server analysis does.
 type blockedRun struct{ started chan struct{} }
@@ -960,7 +987,7 @@ func newPushHarness(t *testing.T, outcomes ...any) *pushHarness {
 		queued <- o
 	}
 	gh := &statefulGitHub{checkRuns: make(chan gate.CheckRun, len(outcomes)+8), files: map[string]string{}}
-	gateSvc := gate.NewService(gh, gh, store, gate.Runners{Actions: scriptedRunner{outcomes: queued}, Server: scriptedRunner{outcomes: queued}})
+	gateSvc := gate.NewService(gh, gh, store, gate.Runners{Actions: scriptedRunner{outcomes: queued}, Server: scriptedRunner{outcomes: queued}}, nil, nil)
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)

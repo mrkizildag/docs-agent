@@ -30,7 +30,7 @@ The diff comes from GitHub's per-file patches, not from git in the clone, so anc
 
 ## Why read-only tools rooted in the clone
 
-PR content (code, comments, docs, commit messages) is attacker-controlled text that the model reads. Safety comes from what the model can do, not from asking it nicely. The only tools are `read_file`, `grep`, `list_dir`, and the finishing `submit_proposals`: there is nothing to write, execute, or fetch, so an injected instruction has nothing to call. File access goes through `os.Root` on the clone, so `../`, absolute paths, and symlinks pointing out are refused by the OS-level check, not by string filtering. A refused call returns a tool error to the model and the run continues.
+PR content (code, comments, docs, commit messages) is attacker-controlled text that the model reads. Safety comes from what the model can do, not from asking it nicely. The only tools are `read_file`, `grep`, `list_dir`, and the finishing `submit_proposals` (`submit_docs` for a scaffold run): there is nothing to write, execute, or fetch, so an injected instruction has nothing to call. File access goes through `os.Root` on the clone, so `../`, absolute paths, and symlinks pointing out are refused by the OS-level check, not by string filtering. A refused call returns a tool error to the model and the run continues.
 
 Everything taken from the PR (patch, doc text, the proposal under verification) reaches the model inside markers carrying a per-run random nonce, and every system prompt says text inside them is data. That lowers the odds of injection; it does not remove them, which is why the tools stay read-only and a human still applies every edit. Git itself runs on attacker-controlled content, so it gets a minimal environment: no server secrets, no system or global git config (so no host-configured filters or hooks), no terminal prompts, HTTPS only, and a token narrowed to the one repo with `contents: read`. Prompt inputs are capped (64 KiB per doc, 128 KiB of patch, with a visible truncation note) and more than 10 candidate docs is an analysis failure, so a PR cannot buy unbounded model spend. A file whose patch GitHub omits (large or binary) is shown to the model as omitted, not as an empty diff, and a renamed file matches docs covering its old path too.
 
@@ -38,7 +38,7 @@ The agent and LLM packages know nothing about GitHub or the review domain; the i
 
 ## Limits
 
-A run has a step cap, a token budget, and a deadline that leaves room inside the 3-minute target for GitHub calls. They are checked every step. Hitting any of them is an analysis failure, not a result: the error names which limit, and no partial proposals are returned. The gate ends the check neutral, titled "Analysis failed" (see [Proposal output](proposal-output.md)). The caps (12 steps, 120k tokens counting thinking tokens, 150 s) come from a Gemini free-tier spike where runs took 1–3 steps and under 50k tokens. Three empty replies in a row (Gemini's malformed function calls) also end the run.
+A run has a step cap, a token budget, and a deadline that leaves room inside the 3-minute target for GitHub calls. They are checked every step. Hitting any of them is an analysis failure, not a result: the error names which limit, and no partial proposals are returned. The gate ends the check neutral, titled "Analysis failed" (see [Proposal output](proposal-output.md)). The caps (12 steps, 120k tokens counting thinking tokens, 150 s) come from a Gemini free-tier spike where runs took 1–3 steps and under 50k tokens. A scaffold run reads the whole repo and is not on a PR's 3-minute path, so it gets 40 steps, 600k tokens, and 8 minutes. Three empty replies in a row (Gemini's malformed function calls) also end the run.
 
 ## Failure causes
 
@@ -46,7 +46,7 @@ The runner classifies every failure once, at the point it starts, into a fixed c
 
 ## Size limits
 
-Before any LLM call or dispatch, the gate rejects a PR with more than 50 changed files or more than 1 MiB of patch text, for both runners; the check ends neutral "PR too large to analyze" naming the limit. A text file whose patch GitHub omitted (it reports changes but no patch) counts as over, since its size is unknown; a binary file has no patch and does not. Partial analysis of a large PR is not attempted. The file limit is one named constant so a per-plan value can replace it later; at 50 files the listing is far below GitHub's 3000-file cap, so a truncated listing cannot reach analysis.
+Before any review LLM call or dispatch, the gate rejects a PR with more than 50 changed files or more than 1 MiB of patch text, for both runners; the check ends neutral "PR too large to analyze" naming the limit. A text file whose patch GitHub omitted (it reports changes but no patch) counts as over, since its size is unknown; a binary file has no patch and does not. Partial analysis of a large PR is not attempted. The file limit is one named constant so a per-plan value can replace it later; at 50 files the listing is far below GitHub's 3000-file cap, so a truncated listing cannot reach analysis.
 
 A newer push cancels the running job; the context reaches every model call and git command.
 

@@ -46,7 +46,10 @@ type Runner struct {
 	budget  int
 }
 
-var _ review.Runner = (*Runner)(nil)
+var (
+	_ review.Runner     = (*Runner)(nil)
+	_ review.Scaffolder = (*Runner)(nil)
+)
 
 // New returns a Runner that triages with triageModel, drafts with model, both
 // served by m, and authenticates clones with a token from token.
@@ -72,13 +75,17 @@ func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started,
 
 	res, err := r.analyze(ctx, req)
 	if err != nil {
-		err = fmt.Errorf("start analysis %s/%s#%d: %w", req.Owner, req.Repo, req.Number, err)
-		if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, agent.ErrDeadline) {
-			err = fmt.Errorf("%w: %w", agent.ErrDeadline, err)
-		}
-		return nil, &review.FailedError{Cause: classify(err), Err: err}
+		return nil, failed(fmt.Errorf("start analysis %s/%s#%d: %w", req.Owner, req.Repo, req.Number, err))
 	}
 	return res, nil
+}
+
+// failed classifies err into the *review.FailedError a runner returns.
+func failed(err error) *review.FailedError {
+	if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, agent.ErrDeadline) {
+		err = fmt.Errorf("%w: %w", agent.ErrDeadline, err)
+	}
+	return &review.FailedError{Cause: classify(err), Err: err}
 }
 
 func classify(err error) review.FailureCause {
@@ -103,31 +110,14 @@ func (r *Runner) noImpact(reason string) review.Result {
 }
 
 func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result, error) {
-	token, err := r.token(ctx, req.InstallationID, req.Repo)
+	c, cleanup, err := r.openClone(ctx, req.InstallationID, req.Owner, req.Repo, req.HeadSHA, req.BaseSHA)
 	if err != nil {
-		return review.Result{}, fmt.Errorf("get installation token: %w: %w", errClone, err)
+		return review.Result{}, err
 	}
+	defer cleanup()
+	root := c.root
 
-	remoteURL := r.remote
-	if remoteURL == "" {
-		remoteURL = fmt.Sprintf("https://github.com/%s/%s.git", req.Owner, req.Repo)
-	}
-
-	dir, err := clonePR(ctx, remoteURL, req.HeadSHA, req.BaseSHA, token)
-	if dir != "" {
-		defer func() { _ = os.RemoveAll(dir) }() // best-effort cleanup of a temp dir; the runner has no logger
-	}
-	if err != nil {
-		return review.Result{}, fmt.Errorf("%w: %w", errClone, err)
-	}
-
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		return review.Result{}, fmt.Errorf("open clone root: %w", err)
-	}
-	defer func() { _ = root.Close() }()
-
-	baseFS, err := baseDocs(ctx, dir, remoteURL, token, req.BaseSHA)
+	baseFS, err := c.docsAt(ctx, req.BaseSHA)
 	if err != nil {
 		return review.Result{}, fmt.Errorf("%w: %w", errClone, err)
 	}

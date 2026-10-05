@@ -20,6 +20,10 @@ func (b *blockingRunner) Start(ctx context.Context, _ review.Request) (review.St
 	return nil, &review.FailedError{Cause: review.CauseTimeout, Err: ctx.Err()}
 }
 
+func (*blockingRunner) StartScaffold(context.Context, review.ScaffoldRequest) (review.ScaffoldStarted, error) {
+	return nil, errors.New("blockingRunner does not scaffold")
+}
+
 func (*blockingRunner) Collect(context.Context, review.Completion) (review.Result, error) {
 	return review.Result{}, nil
 }
@@ -34,7 +38,7 @@ func TestHandlePullRequestCancelledAnalysisStaysArmed(t *testing.T) {
 	runner := &blockingRunner{started: make(chan struct{})}
 	gh := &fakeGitHub{checkRunID: 555}
 	store := &fakeStore{}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner})
+	svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner}, nil, nil)
 
 	errc := make(chan error, 1)
 	go func() { errc <- svc.HandlePullRequest(ctx, testPR()) }()
@@ -59,7 +63,7 @@ func TestHandleRunCompletedInvalidResultHidesDetail(t *testing.T) {
 	const injected = "@someone [link](http://x)"
 	gh := &fakeGitHub{}
 	runner := &fakeRunner{collectErr: &review.InvalidResultError{Cause: errors.New(injected)}}
-	svc := gate.NewService(gh, nil, &fakeStore{stored: awaitingState()}, gate.Runners{Actions: runner})
+	svc := gate.NewService(gh, nil, &fakeStore{stored: awaitingState()}, gate.Runners{Actions: runner}, nil, nil)
 
 	err := svc.HandleRunCompleted(t.Context(), completedRun("success"))
 	if err == nil || !strings.Contains(err.Error(), injected) {
@@ -85,7 +89,7 @@ func TestHandleRunCompletedFailureWritesFailureSummary(t *testing.T) {
 
 			gh := &fakeGitHub{}
 			store := &fakeStore{stored: awaitingState()}
-			svc := gate.NewService(gh, nil, store, gate.Runners{Actions: &fakeRunner{}})
+			svc := gate.NewService(gh, nil, store, gate.Runners{Actions: &fakeRunner{}}, nil, nil)
 
 			if err := svc.HandleRunCompleted(t.Context(), completedRun(conclusion)); err != nil {
 				t.Fatalf("HandleRunCompleted() = %v, want nil", err)
@@ -117,7 +121,7 @@ func TestHandleRunCompletedFailureUnticksSummaryAndKeepsProposals(t *testing.T) 
 		CommentID: review.ID, State: gate.ProposalOpen,
 	}}
 	store := &fakeStore{stored: state}
-	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: &fakeRunner{}})
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: &fakeRunner{}}, nil, nil)
 
 	if err := svc.HandleRunCompleted(t.Context(), completedRun("failure")); err != nil {
 		t.Fatalf("HandleRunCompleted() = %v, want nil", err)

@@ -57,21 +57,21 @@ type WorkflowAPI interface {
 }
 
 // Artifact is the JSON document the workflow uploads as result.json.
-type Artifact struct {
-	HeadSHA string       `json:"head_sha"`
-	Nonce   string       `json:"nonce"`
-	Claude  ClaudeOutput `json:"claude"`
+type Artifact[T any] struct {
+	HeadSHA string          `json:"head_sha"`
+	Nonce   string          `json:"nonce"`
+	Claude  ClaudeOutput[T] `json:"claude"`
 }
 
 // ClaudeOutput is the subset of `claude -p --output-format json` stdout the
 // runner reads.
-type ClaudeOutput struct {
+type ClaudeOutput[T any] struct {
 	IsError          bool                       `json:"is_error"`
 	Subtype          string                     `json:"subtype"`
 	TerminalReason   string                     `json:"terminal_reason"`
 	APIErrorStatus   *int                       `json:"api_error_status"`
 	ModelUsage       map[string]json.RawMessage `json:"modelUsage"`
-	StructuredOutput *review.StructuredOutput   `json:"structured_output"`
+	StructuredOutput *T                         `json:"structured_output"`
 }
 
 // Runner dispatches the repo's pollux-agent workflow and collects its result.
@@ -80,7 +80,10 @@ type Runner struct {
 	timeout time.Duration
 }
 
-var _ review.AsyncRunner = (*Runner)(nil)
+var (
+	_ review.AsyncRunner     = (*Runner)(nil)
+	_ review.AsyncScaffolder = (*Runner)(nil)
+)
 
 // New returns a Runner that dispatches through api and gives each run timeout
 // to complete.
@@ -113,22 +116,66 @@ func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started,
 		}
 	}
 
-	nonce, err := newNonce()
+	pending, err := r.dispatch(ctx, req.InstallationID, req.Owner, req.Repo, req.HeadSHA, req.Number, selection.Candidates)
 	if err != nil {
 		return nil, fmt.Errorf("start actions run %s: %w", where, err)
 	}
+	return pending, nil
+}
 
-	runID, err := r.api.Dispatch(ctx, req.InstallationID, req.Owner, req.Repo, DispatchInputs{
-		HeadSHA:  req.HeadSHA,
-		PRNumber: req.Number,
-		Nonce:    nonce,
-		Docs:     selection.Candidates,
-	})
+// StartScaffold dispatches the workflow with pr_number 0 and no docs at
+// req.BaseSHA and returns review.Pending.
+func (r *Runner) StartScaffold(ctx context.Context, req review.ScaffoldRequest) (review.ScaffoldStarted, error) {
+	pending, err := r.dispatch(ctx, req.InstallationID, req.Owner, req.Repo, req.BaseSHA, 0, nil)
 	if err != nil {
-		return nil, fmt.Errorf("start actions run %s: dispatch: %w", where, err)
+		return nil, fmt.Errorf("start actions scaffold %s/%s: %w", req.Owner, req.Repo, err)
+	}
+	return pending, nil
+}
+
+func (r *Runner) dispatch(ctx context.Context, installationID int64, owner, repo, sha string, number int, docs []string) (review.Pending, error) {
+	nonce, err := newNonce()
+	if err != nil {
+		return review.Pending{}, err
+	}
+
+	runID, err := r.api.Dispatch(ctx, installationID, owner, repo, DispatchInputs{HeadSHA: sha, PRNumber: number, Nonce: nonce, Docs: docs})
+	if err != nil {
+		return review.Pending{}, fmt.Errorf("dispatch: %w", err)
 	}
 
 	return review.Pending{RunID: runID, Nonce: nonce, Deadline: time.Now().Add(r.timeout)}, nil
+}
+
+// CollectScaffold decodes the completed run's result artifact. It returns
+// *review.InvalidResultError when the artifact is for another commit or
+// dispatch, reports an error, or holds docs that fail docs.CheckScaffold.
+func (r *Runner) CollectScaffold(ctx context.Context, c review.Completion) (review.Scaffold, error) {
+	raw, err := r.api.ResultArtifact(ctx, c.InstallationID, c.Owner, c.Repo, c.RunID)
+	if err != nil {
+		return review.Scaffold{}, fmt.Errorf("collect actions scaffold run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
+	}
+
+	var art Artifact[review.ScaffoldDocs]
+	if err := json.Unmarshal(raw, &art); err != nil {
+		return review.Scaffold{}, &review.InvalidResultError{Cause: fmt.Errorf("decode result artifact: %w", err)}
+	}
+
+	out, err := art.output(c)
+	if err != nil {
+		return review.Scaffold{}, &review.InvalidResultError{Cause: err}
+	}
+	if err := docs.CheckScaffold(out.Index, out.Architecture, out.Setup); err != nil {
+		return review.Scaffold{}, &review.InvalidResultError{Cause: errors.New(capText(err.Error()))}
+	}
+
+	return review.Scaffold{
+		Runner:       runnerName,
+		Model:        art.Claude.model(),
+		Index:        out.Index,
+		Architecture: out.Architecture,
+		Setup:        out.Setup,
+	}, nil
 }
 
 // Collect decodes the completed run's result artifact. It returns
@@ -142,7 +189,7 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 		return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
 	}
 
-	var art Artifact
+	var art Artifact[review.StructuredOutput]
 	if err := json.Unmarshal(raw, &art); err != nil {
 		return review.Result{}, &review.InvalidResultError{Cause: fmt.Errorf("decode result artifact: %w", err)}
 	}
@@ -212,7 +259,9 @@ func (r *Runner) fillOriginals(ctx context.Context, c review.Completion, proposa
 	return nil
 }
 
-func (a Artifact) output(c review.Completion) (*review.StructuredOutput, error) {
+// output returns the structured output of an artifact that belongs to c's
+// dispatch and reports no error.
+func (a Artifact[T]) output(c review.Completion) (*T, error) {
 	if a.HeadSHA != c.HeadSHA {
 		return nil, fmt.Errorf("artifact head_sha %q, want %q", a.HeadSHA, c.HeadSHA)
 	}
@@ -230,7 +279,7 @@ func (a Artifact) output(c review.Completion) (*review.StructuredOutput, error) 
 
 // failure describes an errored run from structured fields only; the free-form
 // result text is attacker-influenced and must not reach a public check run.
-func (o ClaudeOutput) failure() error {
+func (o ClaudeOutput[T]) failure() error {
 	status := "none"
 	if o.APIErrorStatus != nil {
 		status = strconv.Itoa(*o.APIErrorStatus)
@@ -246,7 +295,7 @@ func capText(s string) string {
 	return strings.ToValidUTF8(s[:maxCauseText], "") + "..."
 }
 
-func (o ClaudeOutput) model() string {
+func (o ClaudeOutput[T]) model() string {
 	if models := slices.Sorted(maps.Keys(o.ModelUsage)); len(models) > 0 {
 		return models[0]
 	}

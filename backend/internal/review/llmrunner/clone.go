@@ -23,17 +23,26 @@ const maxGitOutputLen = 500
 
 var fullSHA = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
 
-// clonePR fetches headSHA and baseSHA from remoteURL at depth 1 into a new
-// temp directory and checks headSHA out detached, authenticating with token if
-// it's non-empty. The base commit is only fetched, never checked out. It
-// returns the directory even on error once one was created, so the caller can
-// always remove it.
-func clonePR(ctx context.Context, remoteURL, headSHA, baseSHA, token string) (string, error) {
-	if !fullSHA.MatchString(headSHA) {
-		return "", fmt.Errorf("clone %s: head sha %q is not a full hex object id", remoteURL, headSHA)
-	}
-	if !fullSHA.MatchString(baseSHA) {
-		return "", fmt.Errorf("clone %s: base sha %q is not a full hex object id", remoteURL, baseSHA)
+// clone is a fetched repository: its checked-out commit opened as root, and
+// what git needs to read the other commits fetched with it.
+type clone struct {
+	root      *os.Root
+	dir       string
+	remoteURL string
+	token     string
+}
+
+// cloneAt fetches checkout and alsoFetch from remoteURL at depth 1 into a new
+// temp directory and checks checkout out detached, authenticating with token
+// if it's non-empty. The alsoFetch commits are only fetched, never checked
+// out. It returns the directory even on error once one was created, so the
+// caller can always remove it.
+func cloneAt(ctx context.Context, remoteURL, token, checkout string, alsoFetch ...string) (string, error) {
+	shas := append([]string{checkout}, alsoFetch...)
+	for _, sha := range shas {
+		if !fullSHA.MatchString(sha) {
+			return "", fmt.Errorf("clone %s: sha %q is not a full hex object id", remoteURL, sha)
+		}
 	}
 
 	dir, err := os.MkdirTemp("", "pollux-agent-clone-")
@@ -43,25 +52,58 @@ func clonePR(ctx context.Context, remoteURL, headSHA, baseSHA, token string) (st
 
 	steps := [][]string{
 		{"init"},
-		{"fetch", "--depth=1", "--no-tags", remoteURL, headSHA, baseSHA},
-		{"checkout", "--detach", headSHA},
+		append([]string{"fetch", "--depth=1", "--no-tags", remoteURL}, shas...),
+		{"checkout", "--detach", checkout},
 	}
 	for _, args := range steps {
 		if _, err := runGit(ctx, dir, remoteURL, token, args...); err != nil {
-			return dir, fmt.Errorf("clone %s at %s (base %s): %w", remoteURL, headSHA, baseSHA, err)
+			return dir, fmt.Errorf("clone %s at %s: %w", remoteURL, checkout, err)
 		}
 	}
 
 	return dir, nil
 }
 
-// baseDocs reads docs/ at baseSHA, which clonePR fetched into dir, straight
-// from git objects and returns it as an in-memory fs.FS rooted at the repo
+// openClone clones sha of owner/repo, also fetching alsoFetch, and opens its
+// root. cleanup closes the root and removes the clone; it is non-nil only when
+// err is nil.
+func (r *Runner) openClone(ctx context.Context, installationID int64, owner, repo, sha string, alsoFetch ...string) (*clone, func(), error) {
+	token, err := r.token(ctx, installationID, repo)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get installation token: %w: %w", errClone, err)
+	}
+
+	remoteURL := r.remote
+	if remoteURL == "" {
+		remoteURL = fmt.Sprintf("https://github.com/%s/%s.git", owner, repo)
+	}
+
+	dir, err := cloneAt(ctx, remoteURL, token, sha, alsoFetch...)
+	if err != nil {
+		if dir != "" {
+			_ = os.RemoveAll(dir) // best-effort cleanup of a temp dir; the runner has no logger
+		}
+		return nil, nil, fmt.Errorf("%w: %w", errClone, err)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, nil, fmt.Errorf("open clone root: %w", err)
+	}
+	return &clone{root: root, dir: dir, remoteURL: remoteURL, token: token}, func() {
+		_ = root.Close()
+		_ = os.RemoveAll(dir)
+	}, nil
+}
+
+// docsAt reads docs/ at sha, which openClone fetched, straight from git
+// objects and returns it as an in-memory fs.FS rooted at the repo
 // root. Nothing is checked out, so the PR's .gitattributes can't rewrite the
 // base docs, and the agent's root over the clone can't reach them. Only regular
 // .md files of at most docs.MaxDocBytes are included.
-func baseDocs(ctx context.Context, dir, remoteURL, token, baseSHA string) (fs.FS, error) {
-	listing, err := runGit(ctx, dir, remoteURL, token, "ls-tree", "-r", "-z", "--long", baseSHA, "--", "docs")
+func (c *clone) docsAt(ctx context.Context, baseSHA string) (fs.FS, error) {
+	listing, err := runGit(ctx, c.dir, c.remoteURL, c.token, "ls-tree", "-r", "-z", "--long", baseSHA, "--", "docs")
 	if err != nil {
 		return nil, fmt.Errorf("list docs at %s: %w", baseSHA, err)
 	}
@@ -88,7 +130,7 @@ func baseDocs(ctx context.Context, dir, remoteURL, token, baseSHA string) (fs.FS
 		return files, nil
 	}
 
-	out, err := runGitStdin(ctx, dir, remoteURL, token, strings.Join(shas, "\n")+"\n", "cat-file", "--batch")
+	out, err := runGitStdin(ctx, c.dir, c.remoteURL, c.token, strings.Join(shas, "\n")+"\n", "cat-file", "--batch")
 	if err != nil {
 		return nil, fmt.Errorf("read docs at %s: %w", baseSHA, err)
 	}

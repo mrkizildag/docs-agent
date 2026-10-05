@@ -1,11 +1,11 @@
 name: pollux-agent
-description: Review a pull request for documentation impact with Claude Code and upload the result for the pollux-agent server.
+description: Review a pull request for documentation impact with Claude Code, or (pr_number 0) draft a repository's first docs from its default-branch code, and upload the result for the pollux-agent server.
 inputs:
   head_sha:
-    description: Head commit SHA of the pull request.
+    description: Head commit SHA of the pull request, or the default-branch tip when pr_number is 0.
     required: true
   pr_number:
-    description: Pull request number.
+    description: Pull request number. 0 selects scaffold mode.
     required: true
   nonce:
     description: Dispatch nonce, echoed back in the result.
@@ -38,17 +38,18 @@ runs:
       working-directory: ${{ runner.temp }}
       run: npm install -g @anthropic-ai/claude-code@2.1.289
 
-    - name: Check out the PR head
+    - name: Check out the head
       uses: actions/checkout@v5
       with:
         path: pr
-        ref: refs/pull/${{ inputs.pr_number }}/head
+        ref: ${{ inputs.pr_number == '0' && inputs.head_sha || format('refs/pull/{0}/head', inputs.pr_number) }}
         fetch-depth: 0
         persist-credentials: false
 
     - name: Verify the head commit and write the diff
       shell: bash
       env:
+        PR_NUMBER: ${{ inputs.pr_number }}
         HEAD_SHA: ${{ inputs.head_sha }}
         DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         CHECKOUT: ${{ github.workspace }}/pr
@@ -57,13 +58,14 @@ runs:
         cd "$CHECKOUT"
         actual="$(git rev-parse HEAD)"
         if [ "$actual" != "$HEAD_SHA" ]; then
-          echo "::error::PR head is $actual, expected $HEAD_SHA"
+          echo "::error::Checked-out HEAD is $actual, expected $HEAD_SHA"
           exit 1
         fi
         mkdir -p "$RUNNER_TEMP/pollux-agent"
+        [ "$PR_NUMBER" != "0" ] || exit 0
         git diff "origin/$DEFAULT_BRANCH...HEAD" > "$RUNNER_TEMP/pollux-agent/pr.diff"
 
-    - name: Review
+    - name: Run Claude
       shell: bash
       env:
         CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude_code_oauth_token }}
@@ -83,12 +85,22 @@ runs:
         [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || unset CLAUDE_CODE_OAUTH_TOKEN
         [ -n "$ANTHROPIC_API_KEY" ] || unset ANTHROPIC_API_KEY
 
-        docs_list="$(jq -r 'if type == "array" and all(.[]; type == "string") then (if length == 0 then "(none)" else map("- " + tojson) | join("\n") end) else error("docs must be a JSON array of strings") end' <<< "$DOCS")" || {
-          echo "::error::The docs input is not a JSON array of strings."
-          exit 1
-        }
+        if [ "$PR_NUMBER" = "0" ]; then
+          schema_file="$ACTION_PATH/scaffold.schema.json"
+          prompt="$(cat "$ACTION_PATH/scaffold.md")
 
-        prompt="$(cat "$ACTION_PATH/prompt.md")
+        ## Repository
+
+        - Repository checkout: $CHECKOUT
+        - Commit: $HEAD_SHA (checked out there)
+        - Default branch: $DEFAULT_BRANCH"
+        else
+          docs_list="$(jq -r 'if type == "array" and all(.[]; type == "string") then (if length == 0 then "(none)" else map("- " + tojson) | join("\n") end) else error("docs must be a JSON array of strings") end' <<< "$DOCS")" || {
+            echo "::error::The docs input is not a JSON array of strings."
+            exit 1
+          }
+          schema_file="$ACTION_PATH/result.schema.json"
+          prompt="$(cat "$ACTION_PATH/prompt.md")
 
         ## Pull request
 
@@ -99,12 +111,13 @@ runs:
         - Docs to review (JSON-quoted paths at the head checkout):
         $docs_list
         - Diff of the head against the merge base, unified format: $out/pr.diff"
+        fi
 
         status=0
         cd "$workdir"
         claude -p "$prompt" \
           --output-format json \
-          --json-schema "$(cat "$ACTION_PATH/result.schema.json")" \
+          --json-schema "$(cat "$schema_file")" \
           --tools Read,Grep,Glob \
           --permission-mode default \
           --setting-sources user \

@@ -43,6 +43,10 @@ If you set up the workflow before the `docs` input existed, copy it again: GitHu
 
 No other config. Once the workflow exists on the default branch, the repo uses this runner and never the server runner. A workflow that exists only on a PR branch does nothing: the gate always dispatches the default branch's copy.
 
+## Docs scaffold
+
+The same workflow writes a repo's starting `docs/` when the PR has none: the server dispatches it with `pr_number` "0" and the default branch tip as `head_sha`, and the action runs in scaffold mode. No workflow change is needed. Because installed workflows use `action@main`, merge the action change to `main` before deploying a server that dispatches scaffolds. See [Docs scaffold](../features/scaffold.md).
+
 ## Subscription terms
 
 Running an org-wide bot on one person's Claude subscription may not count as ordinary individual use under Anthropic's consumer terms. For team repos, prefer an `ANTHROPIC_API_KEY` secret.

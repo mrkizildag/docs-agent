@@ -36,6 +36,10 @@ func (f *chainGitHub) MergeBase(_ context.Context, _ int64, _, _, base, _ string
 	return base, nil
 }
 
+func (f *chainGitHub) DocsExist(context.Context, int64, string, string, string) (bool, error) {
+	return true, nil
+}
+
 func (f *chainGitHub) ListChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {
 	return []review.ChangedFile{{
 		Path:  "src/app.go",
@@ -62,7 +66,32 @@ func (m *chainModel) Complete(_ context.Context, req llm.Request) (llm.Response,
 	return llm.Response{Text: `{"impacted":false,"reason":"wording only"}`}, nil
 }
 
+// newChainRepo returns a repository whose base commit has a doc covering
+// src/app.go and whose head commit rewords src/app.go.
 func newChainRepo(t *testing.T) (repoDir, baseSHA, headSHA string) {
+	t.Helper()
+
+	repoDir, baseSHA = newGitRepo(t, map[string]string{
+		"src/app.go":  "package app\n\n// old wording\n",
+		"docs/app.md": "---\ntitle: App\nsummary: Describes the app.\ncovers:\n  - \"src/**\"\n---\n# App\n\n## Behavior\n\nThe app greets users.\n",
+	})
+	if err := os.WriteFile(filepath.Join(repoDir, "src/app.go"), []byte("package app\n\n// new wording\n"), 0o600); err != nil {
+		t.Fatalf("write src/app.go: %v", err)
+	}
+	for _, args := range [][]string{{"commit", "-q", "-a", "-m", "reword"}, {"rev-parse", "HEAD"}} {
+		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
+		cmd.Dir = repoDir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		headSHA = strings.TrimSpace(string(out))
+	}
+	return repoDir, baseSHA, headSHA
+}
+
+// newGitRepo commits files to a new repository and returns its directory and head SHA.
+func newGitRepo(t *testing.T, files map[string]string) (string, string) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -77,10 +106,6 @@ func newChainRepo(t *testing.T) (repoDir, baseSHA, headSHA string) {
 		return out
 	}
 
-	files := map[string]string{
-		"src/app.go":  "package app\n\n// old wording\n",
-		"docs/app.md": "---\ntitle: App\nsummary: Describes the app.\ncovers:\n  - \"src/**\"\n---\n# App\n\n## Behavior\n\nThe app greets users.\n",
-	}
 	for name, content := range files {
 		path := filepath.Join(dir, name)
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -96,14 +121,8 @@ func newChainRepo(t *testing.T) (repoDir, baseSHA, headSHA string) {
 	git("config", "user.name", "test")
 	git("add", "-A")
 	git("commit", "-q", "-m", "init")
-	baseSHA = strings.TrimSpace(string(git("rev-parse", "HEAD")))
 
-	if err := os.WriteFile(filepath.Join(dir, "src/app.go"), []byte("package app\n\n// new wording\n"), 0o600); err != nil {
-		t.Fatalf("write src/app.go: %v", err)
-	}
-	git("commit", "-q", "-a", "-m", "reword")
-
-	return dir, baseSHA, strings.TrimSpace(string(git("rev-parse", "HEAD")))
+	return dir, strings.TrimSpace(string(git("rev-parse", "HEAD")))
 }
 
 func TestWebhookToServerRunnerChain(t *testing.T) {
@@ -129,7 +148,7 @@ func TestWebhookToServerRunnerChain(t *testing.T) {
 	model := &chainModel{}
 	noToken := func(context.Context, int64, string) (string, error) { return "", nil }
 	runner := llmrunner.New(model, noToken, "triage", "draft")
-	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{Server: runner})
+	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{Server: runner}, nil, nil)
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
