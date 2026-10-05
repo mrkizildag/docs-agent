@@ -26,6 +26,7 @@ type fakeCommentGitHub struct {
 	byAdd     map[string]gate.Commit // CommitAt by sha; the branch tip is found too
 	sha       string                 // the commit CommitFiles makes; "abcdef1234567" when empty
 	api       *fakeGitHub            // when set, replies are also added to its comments
+	replyErr  error                  // ReplyToReviewComment fails with it
 
 	permissionCalls int
 	commits         [][]gate.FileChange
@@ -79,6 +80,9 @@ func (f *fakeCommentGitHub) BranchCommit(context.Context, int64, string, string,
 }
 
 func (f *fakeCommentGitHub) ReplyToReviewComment(_ context.Context, _ int64, _, _ string, _ int, to int64, body string) (gate.Comment, error) {
+	if f.replyErr != nil {
+		return gate.Comment{}, f.replyErr
+	}
 	f.replies = append(f.replies, reply{to: to, body: body})
 	if f.api != nil {
 		return f.api.addComment(gate.CommentKindReview, body), nil

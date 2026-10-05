@@ -38,7 +38,7 @@ func (c *Client) CommitFiles(ctx context.Context, installationID int64, owner, r
 		if existing != nil {
 			switch existing.GetMode() {
 			case "120000", "160000":
-				return "", fmt.Errorf("commit to %s/%s %s: %s is a symlink or submodule (mode %s) and cannot be overwritten: %w", owner, repo, branch, f.Path, existing.GetMode(), gate.ErrCommitRejected)
+				return "", fmt.Errorf("commit to %s/%s %s: mode %s cannot be overwritten: %w", owner, repo, branch, existing.GetMode(), &gate.CommitRejectedError{Reason: f.Path + " is a symlink or submodule"})
 			}
 			mode = existing.GetMode()
 		}
@@ -71,7 +71,7 @@ func (c *Client) CommitFiles(ctx context.Context, installationID int64, owner, r
 				return "", fmt.Errorf("commit to %s/%s %s: update ref: %w; read branch tip: %w", owner, repo, branch, err, tipErr)
 			}
 			if tip.GetCommit().GetSHA() == parentSHA {
-				return "", fmt.Errorf("commit to %s/%s %s: update ref: %w: %w", owner, repo, branch, gate.ErrCommitRejected, err)
+				return "", fmt.Errorf("commit to %s/%s %s: update ref: %w: %w", owner, repo, branch, &gate.CommitRejectedError{Reason: "GitHub refused to update the branch (it may be protected)"}, err)
 			}
 			return "", fmt.Errorf("commit to %s/%s %s: update ref: %w", owner, repo, branch, gate.ErrBranchMoved)
 		}
@@ -118,7 +118,7 @@ func (r *treeReader) dir(ctx context.Context, dir string) (map[string]*github.Tr
 			return nil, nil
 		}
 		if parent.GetType() != "tree" {
-			return nil, fmt.Errorf("%s is not a directory: %w", dir, gate.ErrCommitRejected)
+			return nil, fmt.Errorf("look up %s: %w", dir, &gate.CommitRejectedError{Reason: dir + " is a file, not a directory"})
 		}
 		sha = parent.GetSHA()
 	}

@@ -104,25 +104,48 @@ func TestCommitFilesRefRejectedBranchUnmoved(t *testing.T) {
 	if !errors.Is(err, gate.ErrCommitRejected) || errors.Is(err, gate.ErrBranchMoved) {
 		t.Errorf("CommitFiles() error = %v, want ErrCommitRejected and not ErrBranchMoved", err)
 	}
+	assertRejectedReason(t, err, "GitHub refused to update the branch (it may be protected)")
 }
 
-func TestCommitFilesRefusesSymlinkAndSubmodule(t *testing.T) {
+func TestCommitFilesRefusesUnwritablePaths(t *testing.T) {
 	t.Parallel()
 
-	for _, path := range []string{"docs/link.md", "docs/sub"} {
-		t.Run(path, func(t *testing.T) {
+	tests := []struct {
+		path   string
+		reason string
+	}{
+		{"docs/link.md", "docs/link.md is a symlink or submodule"},
+		{"docs/sub", "docs/sub is a symlink or submodule"},
+		{"README.md/x.md", "README.md is a file, not a directory"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.path, func(t *testing.T) {
 			t.Parallel()
 
 			got := map[string]map[string]any{}
 			client := newCommentsClient(t, commitRoutes(t, got, http.StatusOK, `{}`))
 
-			if _, err := client.CommitFiles(t.Context(), 1, "o", "r", "feature", "parent1", []gate.FileChange{{Path: path, Content: "x"}}, "m"); !errors.Is(err, gate.ErrCommitRejected) {
+			_, err := client.CommitFiles(t.Context(), 1, "o", "r", "feature", "parent1", []gate.FileChange{{Path: tc.path, Content: "x"}}, "m")
+			if !errors.Is(err, gate.ErrCommitRejected) {
 				t.Errorf("CommitFiles() error = %v, want ErrCommitRejected", err)
 			}
+			assertRejectedReason(t, err, tc.reason)
 			if _, ok := got["ref"]; ok {
 				t.Error("ref was updated, want no update")
 			}
 		})
+	}
+}
+
+func assertRejectedReason(t *testing.T, err error, want string) {
+	t.Helper()
+
+	var rejected *gate.CommitRejectedError
+	if !errors.As(err, &rejected) {
+		t.Fatalf("error = %v, want *gate.CommitRejectedError", err)
+	}
+	if rejected.Reason != want {
+		t.Errorf("Reason = %q, want %q", rejected.Reason, want)
 	}
 }
 

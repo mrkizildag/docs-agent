@@ -24,6 +24,16 @@ var ErrBranchMoved = errors.New("gate: branch moved")
 // branch, a symlink or submodule at a proposal's path); nothing was committed.
 var ErrCommitRejected = errors.New("gate: commit rejected")
 
+// CommitRejectedError is an ErrCommitRejected with a reason fit to show on the
+// pull request, such as "the branch is protected".
+type CommitRejectedError struct {
+	Reason string
+}
+
+func (e *CommitRejectedError) Error() string { return ErrCommitRejected.Error() + ": " + e.Reason }
+
+func (e *CommitRejectedError) Unwrap() error { return ErrCommitRejected }
+
 // FileChange is a whole-file replacement in a commit.
 type FileChange struct {
 	Path    string
@@ -119,12 +129,7 @@ func (s *Service) handleApply(ctx context.Context, state PRState, ev CommentEven
 	if state.Fork {
 		return s.say(ctx, state, ev, "Apply is not available on a fork the bot cannot push to.", op)
 	}
-	var targets []int
-	for i, p := range state.Proposals {
-		if p.State == ProposalOpen && (in.Kind == IntentApplyAll || p.ID == in.ProposalID) {
-			targets = append(targets, i)
-		}
-	}
+	targets := openTargets(state, in)
 	if len(targets) == 0 {
 		return s.replayApplied(ctx, state, ev, in, op)
 	}
@@ -134,19 +139,26 @@ func (s *Service) handleApply(ctx context.Context, state PRState, ev CommentEven
 		return "", fmt.Errorf("%s: %w", op, err)
 	}
 	if pa := state.PendingApply; pa != nil {
-		c, err := s.comments.CommitAt(ctx, state.InstallationID, state.Owner, state.Repo, live.HeadSHA)
+		c, adopted, err := s.findPendingApply(ctx, state, live.HeadSHA, *pa)
 		if err != nil {
-			return "", fmt.Errorf("%s: read commit %s: %w", op, shortSHA(live.HeadSHA), err)
+			return "", fmt.Errorf("%s: %w", op, err)
 		}
-		if isPendingApply(c, *pa) {
+		if adopted {
 			var tick []string
 			if in.Kind == IntentApplyAll {
 				tick = pa.IDs
 			}
-			if _, err := s.finishAdopted(ctx, state, c.SHA, tick, op); err != nil {
+			if state, err = s.saveAdopted(ctx, state, c.SHA, op); err != nil {
 				return "", err
 			}
-			return ReactionDone, nil
+			writeCtx, cancel := writeContext(ctx)
+			defer cancel()
+			if _, err := s.finishApply(writeCtx, state, tick, "", op); err != nil {
+				return "", err
+			}
+			if targets = openTargets(state, in); len(targets) == 0 {
+				return ReactionDone, nil
+			}
 		}
 	}
 	if !live.Open {
@@ -200,7 +212,11 @@ func (s *Service) handleApply(ctx context.Context, state PRState, ev CommentEven
 		if err := s.saveWrite(ctx, state, "clear pending apply", op); err != nil {
 			return "", err
 		}
-		return s.say(ctx, state, ev, "GitHub rejected the commit (a protected branch, or a symlink or submodule at a doc path); nothing was committed.", op)
+		text := "GitHub rejected the commit (a protected branch, or a symlink or submodule at a doc path); nothing was committed."
+		if rejected := (*CommitRejectedError)(nil); errors.As(err, &rejected) {
+			text = "GitHub rejected the commit: " + rejected.Reason + "; nothing was committed."
+		}
+		return s.say(ctx, state, ev, text, op)
 	} else if err != nil {
 		return "", fmt.Errorf("%s: %w", op, err)
 	}
@@ -220,6 +236,17 @@ func (s *Service) handleApply(ctx context.Context, state PRState, ev CommentEven
 		return "", err
 	}
 	return ReactionDone, nil
+}
+
+// openTargets returns the indexes of the open proposals the intent targets.
+func openTargets(state PRState, in Intent) []int {
+	var targets []int
+	for i, p := range state.Proposals {
+		if p.State == ProposalOpen && (in.Kind == IntentApplyAll || p.ID == in.ProposalID) {
+			targets = append(targets, i)
+		}
+	}
+	return targets
 }
 
 // saveWrite saves state under its own write budget.
@@ -390,49 +417,72 @@ func isPendingApply(c Commit, pa PendingApply) bool {
 	return c.Mine && c.Message == pa.Message && slices.Equal(c.Parents, []string{pa.Parent})
 }
 
+// findPendingApply returns the commit pa was about to create when it is sha or
+// the parent of sha: a user push that superseded the bot's own push job lands
+// on top of it.
+func (s *Service) findPendingApply(ctx context.Context, state PRState, sha string, pa PendingApply) (Commit, bool, error) {
+	c, err := s.comments.CommitAt(ctx, state.InstallationID, state.Owner, state.Repo, sha)
+	if err != nil {
+		return Commit{}, false, fmt.Errorf("read commit %s: %w", shortSHA(sha), err)
+	}
+	return s.lookBack(ctx, state, c, pa)
+}
+
+// lookBack returns c, or else its first parent, when it is the commit pa was
+// about to create.
+func (s *Service) lookBack(ctx context.Context, state PRState, c Commit, pa PendingApply) (Commit, bool, error) {
+	if isPendingApply(c, pa) {
+		return c, true, nil
+	}
+	if len(c.Parents) == 0 {
+		return Commit{}, false, nil
+	}
+	parent, err := s.comments.CommitAt(ctx, state.InstallationID, state.Owner, state.Repo, c.Parents[0])
+	if err != nil {
+		return Commit{}, false, fmt.Errorf("read commit %s: %w", shortSHA(c.Parents[0]), err)
+	}
+	return parent, isPendingApply(parent, pa), nil
+}
+
 // adoptCommit recovers from a commit that landed before its state was saved:
-// the branch tip is ours when it is the pending apply's commit.
+// the branch tip, or the commit under it, is ours when it is the pending apply's commit.
 func (s *Service) adoptCommit(ctx context.Context, state PRState, pa *PendingApply) (sha string, adopted bool, err error) {
 	c, err := s.comments.BranchCommit(ctx, state.InstallationID, state.Owner, state.Repo, state.HeadRef)
 	if err != nil {
 		return "", false, fmt.Errorf("read branch %s: %w", state.HeadRef, err)
 	}
-	if !isPendingApply(c, *pa) {
-		return "", false, nil
+	c, adopted, err = s.lookBack(ctx, state, c, *pa)
+	if err != nil || !adopted {
+		return "", false, err
 	}
 	return c.SHA, true, nil
 }
 
 // adoptPendingApply marks as applied the proposals of an Apply whose commit
-// landed but whose state was never saved, when the push of pr is that commit;
-// without it the push would outdate them. Any other push drops the pending apply.
-func (s *Service) adoptPendingApply(ctx context.Context, state PRState, pr PullRequest) (PRState, error) {
+// landed but whose state was never saved, when the push of pr is that commit
+// or sits on it; without it the push would outdate them. Any other push drops
+// the pending apply. The caller brings the comments up to date when adopted.
+func (s *Service) adoptPendingApply(ctx context.Context, state PRState, pr PullRequest, op string) (next PRState, adopted bool, err error) {
 	pa := state.PendingApply
 	if pa == nil || state.HeadRef == "" || pr.HeadSHA == state.HeadSHA {
-		return state, nil
+		return state, false, nil
 	}
-	op := fmt.Sprintf("adopt pending apply of %s/%s#%d", pr.Owner, pr.Repo, pr.Number)
-	c, err := s.comments.CommitAt(ctx, state.InstallationID, state.Owner, state.Repo, pr.HeadSHA)
+	c, adopted, err := s.findPendingApply(ctx, state, pr.HeadSHA, *pa)
 	if err != nil {
-		return PRState{}, fmt.Errorf("%s: read commit %s: %w", op, shortSHA(pr.HeadSHA), err)
+		return PRState{}, false, fmt.Errorf("%s: %w", op, err)
 	}
-	if !isPendingApply(c, *pa) {
-		return state, nil
+	if !adopted {
+		return state, false, nil
 	}
-	return s.finishAdopted(ctx, state, c.SHA, pa.IDs, op)
+	next, err = s.saveAdopted(ctx, state, c.SHA, op)
+	return next, err == nil, err
 }
 
-// finishAdopted records that the pending apply's commit sha landed, then
-// brings the comments up to date.
-func (s *Service) finishAdopted(ctx context.Context, state PRState, sha string, tick []string, op string) (PRState, error) {
+// saveAdopted records that the pending apply's commit sha landed.
+func (s *Service) saveAdopted(ctx context.Context, state PRState, sha, op string) (PRState, error) {
 	state = OnApply(state, state.PendingApply.IDs, sha)
 	state.PendingApply = nil
 	if err := s.saveWrite(ctx, state, "save adopted commit "+shortSHA(sha), op); err != nil {
-		return PRState{}, err
-	}
-	writeCtx, cancel := writeContext(ctx)
-	defer cancel()
-	if _, err := s.finishApply(writeCtx, state, tick, "", op); err != nil {
 		return PRState{}, err
 	}
 	return state, nil

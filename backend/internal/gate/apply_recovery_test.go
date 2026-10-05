@@ -145,6 +145,132 @@ func TestHandleCommentRefusesARejectedCommit(t *testing.T) {
 	}
 }
 
+func TestHandleCommentRefusesARejectedCommitWithItsReason(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{stored: openState(), live: true}
+	comments := &fakeCommentGitHub{canWrite: true, files: baseFiles(), commitErr: &gate.CommitRejectedError{Reason: "the branch is protected"}}
+	svc := gate.NewService(apiWithComments(), comments, store, gate.Runners{})
+
+	if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
+		t.Fatalf("HandleComment() = %v, want nil", err)
+	}
+	want := "GitHub rejected the commit: the branch is protected; nothing was committed."
+	if len(comments.replies) != 1 || !strings.Contains(comments.replies[0].body, want) {
+		t.Errorf("replies = %v, want one containing %q", comments.replies, want)
+	}
+}
+
+func TestHandleCommentRetryDoesNotClaimTargetsTheAdoptedCommitMissed(t *testing.T) {
+	t.Parallel()
+
+	state := threeState()
+	state.PendingApply = &gate.PendingApply{IDs: []string{"p1"}, Message: singleMsg, Parent: "head1"}
+	store := &fakeStore{stored: state, live: true}
+	api := apiWithComments()
+	api.pullRequest = gate.PullRequest{HeadSHA: "botbot1234", Open: true}
+	comments := &fakeCommentGitHub{canWrite: true, files: baseFiles(), byAdd: map[string]gate.Commit{"botbot1234": botCommit()}}
+	svc := gate.NewService(api, comments, store, gate.Runners{})
+	ev := reviewTick(2)
+
+	if err := svc.HandleComment(t.Context(), ev); err != nil {
+		t.Fatalf("HandleComment() = %v, want nil", err)
+	}
+	if got := store.stored.Proposals; got[0].State != gate.ProposalApplied || got[1].State != gate.ProposalOpen {
+		t.Errorf("proposal states = %s, %s, want applied, open", got[0].State, got[1].State)
+	}
+	if diff := cmp.Diff([]gate.Reaction{gate.ReactionRefused}, comments.reactionsOn(ev.Kind, ev.CommentID)); diff != "" {
+		t.Errorf("reactions (-want +got):\n%s", diff)
+	}
+}
+
+func TestHandlePullRequestAdoptsACommitUnderAUserPush(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{stored: pendingState(), live: true}
+	gh := &fakeGitHub{}
+	gh.addComment(gate.CommentKindReview, "proposal\n- [ ] Apply this change\n")
+	comments := &fakeCommentGitHub{byAdd: map[string]gate.Commit{
+		"user1":      {SHA: "user1", Parents: []string{"botbot1234"}, Message: "wip"},
+		"botbot1234": botCommit(),
+	}}
+	svc := gate.NewService(gh, comments, store, gate.Runners{Server: &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}})
+	pr := gate.PullRequest{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 3, BaseSHA: "base1", HeadSHA: "user1", HeadRef: "feature"}
+
+	if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
+		t.Fatalf("HandlePullRequest() = %v, want nil", err)
+	}
+	if got := store.stored.Proposals[0]; got.State != gate.ProposalApplied || got.AppliedSHA != "botbot1234" {
+		t.Errorf("proposal = %+v, want applied at botbot1234", got)
+	}
+}
+
+func TestHandlePullRequestAnalyzesTheNewHeadWhenAdoptedCommentsFail(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{stored: pendingState(), live: true}
+	gh := &fakeGitHub{}
+	gh.addComment(gate.CommentKindReview, "proposal\n- [ ] Apply this change\n")
+	comments := &fakeCommentGitHub{replyErr: errors.New("502"), byAdd: map[string]gate.Commit{"botbot1234": botCommit()}}
+	svc := gate.NewService(gh, comments, store, gate.Runners{Server: &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}})
+	pr := gate.PullRequest{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 3, BaseSHA: "base1", HeadSHA: "botbot1234", HeadRef: "feature"}
+
+	if err := svc.HandlePullRequest(t.Context(), pr); err == nil {
+		t.Error("HandlePullRequest() = nil, want the reply error")
+	}
+	if len(gh.calls) != 1 {
+		t.Errorf("check runs created = %d, want 1 for the new head", len(gh.calls))
+	}
+}
+
+// ctxGitHub and ctxStore fail like the real adapters once their ctx is cancelled.
+type ctxGitHub struct{ *fakeGitHub }
+
+func (g ctxGitHub) CreateIssueComment(ctx context.Context, id int64, owner, repo string, number int, body string) (gate.Comment, error) {
+	if err := ctx.Err(); err != nil {
+		return gate.Comment{}, fmt.Errorf("create issue comment: %w", err)
+	}
+	return g.fakeGitHub.CreateIssueComment(ctx, id, owner, repo, number, body)
+}
+
+type ctxStore struct{ *fakeStore }
+
+func (s ctxStore) LoadPR(ctx context.Context, owner, repo string, number int) (gate.PRState, error) {
+	if err := ctx.Err(); err != nil {
+		return gate.PRState{}, fmt.Errorf("load pr: %w", err)
+	}
+	return s.fakeStore.LoadPR(ctx, owner, repo, number)
+}
+
+func TestHandleRerunSupersededStillPostsTheSkipCancellationNote(t *testing.T) {
+	t.Parallel()
+
+	state := skipBase()
+	state.Run = nil
+	state.PendingSkip = &gate.SkipAsk{User: "dev", Scope: gate.SkipPR}
+	gh := newHeadGitHub()
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	runner := &fakeRunner{err: errors.New("interrupted"), onStart: func() { cancel(errors.New("superseded")) }}
+	svc := gate.NewService(ctxGitHub{gh}, &fakeCommentGitHub{}, ctxStore{&fakeStore{stored: state, live: true}}, gate.Runners{Server: runner})
+
+	_ = svc.HandleRerun(ctx, gate.RerunRequest{InstallationID: 42, PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}})
+
+	if n := countComments(gh.comments, "was cancelled"); n != 1 {
+		t.Errorf("cancellation notes = %d, want 1", n)
+	}
+}
+
+func countComments(comments []gate.Comment, substr string) int {
+	n := 0
+	for _, c := range comments {
+		if strings.Contains(c.Body, substr) {
+			n++
+		}
+	}
+	return n
+}
+
 func TestHandleCommentApplyAllWithAppliedProposalsIsNotNothingLeft(t *testing.T) {
 	t.Parallel()
 

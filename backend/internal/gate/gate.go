@@ -723,22 +723,33 @@ func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
 // re-run does: the push of a crashed Apply's commit keeps its proposals
 // applied, and a pending skip ask the new head cancels gets a note.
 func (s *Service) analyzeHead(ctx context.Context, loaded PRState, pr PullRequest) error {
-	state, err := s.adoptPendingApply(ctx, loaded, pr)
+	op := fmt.Sprintf("adopt pending apply of %s/%s#%d", pr.Owner, pr.Repo, pr.Number)
+	state, adopted, err := s.adoptPendingApply(ctx, loaded, pr, op)
 	if err != nil {
 		return err
 	}
-	analyzeErr := s.analyze(ctx, state, pr)
+	// Once the adopted state is saved, a failed comment write must not stop the
+	// analysis of the new head.
+	var commentErr error
+	if adopted {
+		writeCtx, cancel := writeContext(ctx)
+		_, commentErr = s.finishApply(writeCtx, state, loaded.PendingApply.IDs, "", op)
+		cancel()
+	}
+	analyzeErr := errors.Join(commentErr, s.analyze(ctx, state, pr))
+	noteCtx, cancel := writeContext(ctx)
+	defer cancel()
 
 	// The ask is cancelled once the new head is saved, so a retried job finds no
 	// pending skip and the note is posted once; an analysis that failed before
 	// saving leaves the ask for the retry.
-	if ask := pendingSkipCancelled(loaded, pr); ask != nil && (analyzeErr == nil || s.headSaved(ctx, pr)) {
+	if ask := pendingSkipCancelled(loaded, pr); ask != nil && (analyzeErr == nil || s.headSaved(noteCtx, pr)) {
 		label := skipCommitLabel
 		if ask.Scope == SkipPR {
 			label = skipPRLabel
 		}
 		body := fmt.Sprintf("@%s, a new push arrived before your reason, so the skip for `%s` was cancelled. Tick **%s** again to skip the new head.", ask.User, shortSHA(loaded.HeadSHA), label)
-		if _, err := s.gh.CreateIssueComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number, body); err != nil {
+		if _, err := s.gh.CreateIssueComment(noteCtx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number, body); err != nil {
 			return errors.Join(analyzeErr, fmt.Errorf("post skip cancellation: %w", err))
 		}
 	}
