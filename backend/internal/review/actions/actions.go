@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"slices"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/docs"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/basedocs"
 )
 
 const (
@@ -34,6 +36,8 @@ type DispatchInputs struct {
 	HeadSHA  string
 	PRNumber int
 	Nonce    string
+	// Docs are the candidate doc paths the run must review.
+	Docs []string
 }
 
 // WorkflowAPI is the GitHub Actions surface the runner needs.
@@ -48,6 +52,8 @@ type WorkflowAPI interface {
 	// FileAtRef returns the file's content at ref, or ok=false when the file
 	// does not exist there or exceeds docs.MaxDocBytes.
 	FileAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (content []byte, ok bool, err error)
+	// DocsAtRef returns the .md files under docs/ at ref, rooted at the repo root.
+	DocsAtRef(ctx context.Context, installationID int64, owner, repo, ref string) (fs.FS, error)
 }
 
 // Artifact is the JSON document the workflow uploads as result.json.
@@ -85,32 +91,55 @@ func New(api WorkflowAPI, timeout time.Duration) *Runner {
 	return &Runner{api: api, timeout: timeout}
 }
 
-// Start dispatches the workflow for req and returns review.Pending.
+// Start computes the candidate docs from the PR's base commit and dispatches
+// the workflow to review them, returning review.Pending. When the PR deletes a
+// candidate and a restore can be proposed, it returns the finished
+// review.Result of restore proposals without dispatching.
 func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started, error) {
-	pending, err := r.dispatch(ctx, req.InstallationID, req.Owner, req.Repo, req.HeadSHA, req.Number)
+	where := fmt.Sprintf("%s/%s#%d", req.Owner, req.Repo, req.Number)
+
+	baseFS, err := r.api.DocsAtRef(ctx, req.InstallationID, req.Owner, req.Repo, req.BaseSHA)
 	if err != nil {
-		return nil, fmt.Errorf("start actions run %s/%s#%d: %w", req.Owner, req.Repo, req.Number, err)
+		return nil, fmt.Errorf("start actions run %s: %w", where, err)
+	}
+	selection, err := basedocs.Select(baseFS, req.ChangedFiles)
+	if err != nil {
+		return nil, fmt.Errorf("start actions run %s: base %s: %w", where, req.BaseSHA, err)
+	}
+	if len(selection.Restores) > 0 {
+		return review.Result{Runner: runnerName, Verdict: review.Proposals(selection.Restores)}, nil
+	}
+	if len(selection.Candidates) > basedocs.MaxCandidates {
+		return nil, &review.FailedError{
+			Cause: review.CauseTooManyCandidates,
+			Err:   fmt.Errorf("start actions run %s: %d candidate docs exceed the cap of %d", where, len(selection.Candidates), basedocs.MaxCandidates),
+		}
+	}
+
+	pending, err := r.dispatch(ctx, req.InstallationID, req.Owner, req.Repo, req.HeadSHA, req.Number, selection.Candidates)
+	if err != nil {
+		return nil, fmt.Errorf("start actions run %s: %w", where, err)
 	}
 	return pending, nil
 }
 
-// StartScaffold dispatches the workflow with pr_number 0 at req.BaseSHA and
-// returns review.Pending.
+// StartScaffold dispatches the workflow with pr_number 0 and no docs at
+// req.BaseSHA and returns review.Pending.
 func (r *Runner) StartScaffold(ctx context.Context, req review.ScaffoldRequest) (review.ScaffoldStarted, error) {
-	pending, err := r.dispatch(ctx, req.InstallationID, req.Owner, req.Repo, req.BaseSHA, 0)
+	pending, err := r.dispatch(ctx, req.InstallationID, req.Owner, req.Repo, req.BaseSHA, 0, nil)
 	if err != nil {
 		return nil, fmt.Errorf("start actions scaffold %s/%s: %w", req.Owner, req.Repo, err)
 	}
 	return pending, nil
 }
 
-func (r *Runner) dispatch(ctx context.Context, installationID int64, owner, repo, sha string, number int) (review.Pending, error) {
+func (r *Runner) dispatch(ctx context.Context, installationID int64, owner, repo, sha string, number int, docs []string) (review.Pending, error) {
 	nonce, err := newNonce()
 	if err != nil {
 		return review.Pending{}, err
 	}
 
-	runID, err := r.api.Dispatch(ctx, installationID, owner, repo, DispatchInputs{HeadSHA: sha, PRNumber: number, Nonce: nonce})
+	runID, err := r.api.Dispatch(ctx, installationID, owner, repo, DispatchInputs{HeadSHA: sha, PRNumber: number, Nonce: nonce, Docs: docs})
 	if err != nil {
 		return review.Pending{}, fmt.Errorf("dispatch: %w", err)
 	}

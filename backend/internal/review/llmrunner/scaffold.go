@@ -35,7 +35,7 @@ func (r *Runner) StartScaffold(ctx context.Context, req review.ScaffoldRequest) 
 }
 
 func (r *Runner) scaffold(ctx context.Context, req review.ScaffoldRequest) (review.Scaffold, error) {
-	root, cleanup, err := r.openClone(ctx, req.InstallationID, req.Owner, req.Repo, req.BaseSHA)
+	c, cleanup, err := r.openClone(ctx, req.InstallationID, req.Owner, req.Repo, req.BaseSHA)
 	if err != nil {
 		return review.Scaffold{}, err
 	}
@@ -54,7 +54,7 @@ func (r *Runner) scaffold(ctx context.Context, req review.ScaffoldRequest) (revi
 		Model:    r.model,
 		System:   scaffoldSystemPrompt,
 		Prompt:   scaffoldUserPrompt(f, req.Owner, req.Repo, req.BaseSHA),
-		Root:     root,
+		Root:     c.root,
 		Finish:   finish,
 		Accept:   checkSubmittedDocs,
 		MaxSteps: scaffoldStepCap,

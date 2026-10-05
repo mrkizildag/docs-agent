@@ -95,17 +95,27 @@ func splice(file, original, content string) (string, error) {
 
 // addIndexEntry inserts entry after the last list item of the "## Index"
 // section of readme, right after the heading when that section has no items,
-// or appends it when there is no such section.
+// or appends it when there is no such section. It returns readme unchanged
+// when a line of that section, or of the whole file when it has no such
+// section, already equals entry.
 func addIndexEntry(readme, entry string) string {
 	lines := strings.Split(readme, "\n")
 	inIndex, heading, last := false, -1, -1
+	hasIndex := slices.ContainsFunc(lines, func(l string) bool {
+		return strings.HasPrefix(l, "## ") && strings.TrimSpace(l) == indexHeading
+	})
 	for i, l := range lines {
+		if !hasIndex && strings.TrimSpace(l) == strings.TrimSpace(entry) {
+			return readme
+		}
 		switch {
 		case strings.HasPrefix(l, "## "):
 			inIndex = strings.TrimSpace(l) == indexHeading
 			if inIndex && heading < 0 {
 				heading = i
 			}
+		case inIndex && strings.TrimSpace(l) == strings.TrimSpace(entry):
+			return readme
 		case inIndex && strings.HasPrefix(l, "- "):
 			last = i
 		}

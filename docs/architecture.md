@@ -27,7 +27,7 @@ Docs model: `internal/docs` reads the `docs/` tree of a checkout into docs (fron
 ## Flow (phase 1 target)
 
 1. A PR is opened or updated; GitHub sends `pull_request` to the backend.
-2. The backend lists the PR's changed files; the analysis runner maps them to docs through each doc's `covers` globs on its own checkout of the head commit (see [0002](decisions/0002-docs-structure.md)).
+2. The backend lists the PR's changed files; the analysis runner maps them to docs through each doc's `covers` globs at the PR's merge base (the base-branch commit its diff starts from), so a PR cannot opt itself out by editing `covers`; doc text is read at head (see [0002](decisions/0002-docs-structure.md)).
 3. The LLM compares the diff with those docs and returns "no impact" or proposed edits.
 3a. If the PR head has no `docs/` folder, the check ends neutral as "No docs/ folder" and nothing is analyzed; the repo gets a one-time scaffold PR instead (see [Docs scaffold](features/scaffold.md)).
 4. The backend sets the `pollux-agent` check: `success` for no impact, `action_required` otherwise, and posts one review comment per proposal plus a summary comment (see [Proposal output](features/proposal-output.md)).

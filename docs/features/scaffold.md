@@ -36,7 +36,7 @@ Before writing, the job probes the default branch. If it already has `docs/` (th
 
 The writer is chosen like the review runner, see [Architecture](../architecture.md).
 
-- **Actions workflow repos**: the gate dispatches the existing workflow with `pr_number` "0" and `head_sha` set to the default branch tip. The action treats PR number 0 as scaffold mode and writes the files instead of reviewing a diff. The workflow file does not change. Installed workflows reference `action@main`, so the action change must reach `main` before the server that dispatches scaffolds is deployed.
+- **Actions workflow repos**: the gate dispatches the existing workflow with `pr_number` "0" and `head_sha` set to the default branch tip. The action treats PR number 0 as scaffold mode and writes the files instead of reviewing a diff. It also sends `docs` as an empty list, since the workflow requires that input for reviews (see [Actions runner](actions-runner.md)). Installed workflows reference `action@main`, so the action change must reach `main` before the server that dispatches scaffolds is deployed.
 - **Server runner**: the LLM agent runs over a clone of the default branch with the same read-only tools as review, confined to the clone, and with larger step, token, and time limits since it reads the whole repo.
 
 The output is exactly three files: `docs/README.md`, `docs/architecture.md`, `docs/guides/setup.md`. Each needs a non-empty `title` and `summary` and a `covers` key in its frontmatter, and the index must link the other two. The result type has no field for any other path, so a model cannot write outside these files.

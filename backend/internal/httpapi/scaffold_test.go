@@ -74,6 +74,10 @@ func (f *scaffoldGitHub) DocsExist(context.Context, int64, string, string, strin
 	return false, nil
 }
 
+func (f *scaffoldGitHub) MergeBase(context.Context, int64, string, string, string, string) (string, error) {
+	return "", fmt.Errorf("a PR without docs/ must not be analyzed")
+}
+
 func (f *scaffoldGitHub) ListChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {
 	return nil, fmt.Errorf("a PR without docs/ must not be analyzed")
 }
