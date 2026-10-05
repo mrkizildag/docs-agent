@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -378,6 +379,10 @@ func (f *fakePullRequestHandler) HandleDeadline(context.Context, gate.PRRef, str
 	return f.err
 }
 
+func (f *fakePullRequestHandler) HandleRerun(context.Context, gate.RerunRequest) error {
+	return f.err
+}
+
 func (f *fakePullRequestHandler) HandleRunCompleted(_ context.Context, rc gate.RunCompleted) error {
 	f.runCalls = append(f.runCalls, rc)
 	return f.err
@@ -536,4 +541,88 @@ func TestWebhookWorkflowRun(t *testing.T) {
 			}
 		})
 	}
+}
+
+func checkRunBody(t *testing.T, action, name string, prNumbers ...int) []byte {
+	t.Helper()
+
+	prs := []map[string]any{}
+	for _, n := range prNumbers {
+		prs = append(prs, map[string]any{"number": n})
+	}
+	body, err := json.Marshal(map[string]any{
+		"action":       action,
+		"check_run":    map[string]any{"name": name, "pull_requests": prs},
+		"repository":   map[string]any{"name": "widgets", "owner": map[string]any{"login": "acme"}},
+		"installation": map[string]any{"id": 42},
+	})
+	if err != nil {
+		t.Fatalf("marshal check_run payload: %v", err)
+	}
+	return body
+}
+
+func TestWebhookCheckRun(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("test-secret")
+
+	t.Run("rerequested enqueues a rerun per pull request", func(t *testing.T) {
+		t.Parallel()
+
+		jobs := newFakeEnqueuer()
+		rec := postWebhook(t, secret, jobs, "check_run", "d1", checkRunBody(t, "rerequested", "pollux-agent", 7, 8))
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusAccepted)
+		}
+		if len(jobs.jobs) != 2 {
+			t.Fatalf("jobs = %d, want 2", len(jobs.jobs))
+		}
+		for i, number := range []int{7, 8} {
+			job := jobs.jobs[i]
+			if job.Kind != pullRequestJobKind || !job.Supersedes || job.Key != fmt.Sprintf("acme/widgets#%d", number) {
+				t.Errorf("job %d = %+v, want a superseding pull_request job for PR %d", i, job, number)
+			}
+			var payload struct{ Rerun gate.RerunRequest }
+			if err := json.Unmarshal(job.Payload, &payload); err != nil {
+				t.Fatalf("decode payload: %v", err)
+			}
+			want := gate.RerunRequest{InstallationID: 42, PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: number}}
+			if diff := cmp.Diff(want, payload.Rerun); diff != "" {
+				t.Errorf("job %d rerun (-want +got):\n%s", i, diff)
+			}
+		}
+		if jobs.jobs[0].DeliveryID == jobs.jobs[1].DeliveryID {
+			t.Errorf("delivery IDs equal (%q), want one per pull request", jobs.jobs[0].DeliveryID)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{"other check name", checkRunBody(t, "rerequested", "lint", 7)},
+		{"other action", checkRunBody(t, "completed", "pollux-agent", 7)},
+		{"empty pull_requests", checkRunBody(t, "rerequested", "pollux-agent")},
+	} {
+		t.Run(tc.name+" enqueues nothing", func(t *testing.T) {
+			t.Parallel()
+
+			jobs := newFakeEnqueuer()
+			rec := postWebhook(t, secret, jobs, "check_run", "d1", tc.body)
+			if rec.Code != http.StatusAccepted || len(jobs.jobs) != 0 {
+				t.Errorf("status = %d, jobs = %d, want %d and none", rec.Code, len(jobs.jobs), http.StatusAccepted)
+			}
+		})
+	}
+
+	t.Run("missing delivery id", func(t *testing.T) {
+		t.Parallel()
+
+		jobs := newFakeEnqueuer()
+		rec := postWebhook(t, secret, jobs, "check_run", "", checkRunBody(t, "rerequested", "pollux-agent", 7))
+		if rec.Code != http.StatusBadRequest || len(jobs.jobs) != 0 {
+			t.Errorf("status = %d, jobs = %d, want %d and none", rec.Code, len(jobs.jobs), http.StatusBadRequest)
+		}
+	})
 }

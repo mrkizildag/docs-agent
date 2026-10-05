@@ -120,11 +120,23 @@ func fenceFor(body string) string {
 	return strings.Repeat("`", max(3, longest+1))
 }
 
-// renderSummary is the summary comment body: one row per proposal in state.
-func renderSummary(state PRState) string {
+const (
+	rerunUnticked = "- [ ] Re-run analysis"
+	rerunTicked   = "- [x] Re-run analysis"
+)
+
+// renderSummary is the summary comment body: the failure cause when the last
+// analysis failed, one row per proposal in state, and the Re-run checkbox.
+func renderSummary(state PRState, cause string) string {
 	var b strings.Builder
 	b.WriteString(summaryMarker)
-	b.WriteString("\n\n| Doc | Section | Comment | State |\n| --- | --- | --- | --- |\n")
+	b.WriteString("\n\n")
+	if cause != "" {
+		b.WriteString("**Analysis failed:** " + cause + "\n\n")
+	}
+	if len(state.Proposals) > 0 {
+		b.WriteString("| Doc | Section | Comment | State |\n| --- | --- | --- | --- |\n")
+	}
 	for _, p := range state.Proposals {
 		section := "(new doc)"
 		if p.Section != "" {
@@ -132,5 +144,29 @@ func renderSummary(state PRState) string {
 		}
 		fmt.Fprintf(&b, "| `%s` | %s | [view](%s) | %s |\n", strings.ReplaceAll(p.DocPath, "|", `\|`), section, p.CommentURL, p.State)
 	}
+	if len(state.Proposals) > 0 {
+		b.WriteString("\n")
+	}
+	b.WriteString(rerunUnticked + "\n")
 	return b.String()
+}
+
+// RerunTicked reports whether an edit of the summary comment from before to
+// after ticked its Re-run analysis box.
+func RerunTicked(before, after string) bool {
+	return isSummary(before) && isSummary(after) && hasLine(before, rerunUnticked) && hasLine(after, rerunTicked)
+}
+
+func isSummary(body string) bool {
+	first, _, _ := strings.Cut(body, "\n")
+	return strings.TrimRight(first, "\r") == summaryMarker
+}
+
+func hasLine(body, line string) bool {
+	for l := range strings.SplitSeq(body, "\n") {
+		if strings.TrimRight(l, "\r") == line {
+			return true
+		}
+	}
+	return false
 }

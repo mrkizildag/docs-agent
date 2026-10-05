@@ -4,13 +4,44 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
+
+func TestRerunTicked(t *testing.T) {
+	t.Parallel()
+
+	const marker = "<!-- pollux-agent:summary -->"
+	unticked := marker + "\n\n**Analysis failed:** x\n\n- [ ] Re-run analysis\n"
+	ticked := marker + "\n\n**Analysis failed:** x\n\n- [x] Re-run analysis\n"
+
+	tests := []struct {
+		name          string
+		before, after string
+		want          bool
+	}{
+		{name: "box ticked", before: unticked, after: ticked, want: true},
+		{name: "windows line endings", before: strings.ReplaceAll(unticked, "\n", "\r\n"), after: strings.ReplaceAll(ticked, "\n", "\r\n"), want: true},
+		{name: "box unticked", before: ticked, after: unticked},
+		{name: "other edit", before: unticked, after: unticked + "more\n"},
+		{name: "already ticked", before: ticked, after: ticked + "more\n"},
+		{name: "not the summary", before: "- [ ] Re-run analysis\n", after: "- [x] Re-run analysis\n"},
+		{name: "marker not first line", before: "hi\n" + unticked, after: "hi\n" + ticked},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := gate.RerunTicked(tc.before, tc.after); got != tc.want {
+				t.Errorf("RerunTicked() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
 
 func TestProposalCommentBodies(t *testing.T) {
 	t.Parallel()
 
-	gh := &fakeGitHub{changed: []review.ChangedFile{{Path: "docs/s.md", Hunks: []review.LineRange{{Start: 1, End: 10}}}}}
+	gh := &fakeGitHub{changed: []review.ChangedFile{{Path: "docs/s.md", Hunks: []review.LineRange{{Start: 1, End: 10}}, Patch: "@@ -1 +1,10 @@"}}}
 	checkbox := review.Proposal{
 		DocPath: "docs/a.md", Section: "Usage", Reason: "flag renamed", Anchor: review.Anchor{File: "a.go", Line: 4},
 		Original: "## Usage\nold\n", Lines: review.LineRange{Start: 3, End: 4}, Content: "## Usage\nnew\n",

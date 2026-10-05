@@ -34,7 +34,15 @@ The agent and LLM packages know nothing about GitHub or the review domain; the i
 
 ## Limits
 
-A run has a step cap, a token budget, and a deadline that leaves room inside the 3-minute target for GitHub calls. They are checked every step. Hitting any of them is an analysis failure, not a result: the error names which limit, and no partial proposals are returned. The gate decides how to report the failure (see the neutral-check work tracked in the repo issues). The caps (12 steps, 120k tokens counting thinking tokens, 150 s) come from a Gemini free-tier spike where runs took 1–3 steps and under 50k tokens. Three empty replies in a row (Gemini's malformed function calls) also end the run.
+A run has a step cap, a token budget, and a deadline that leaves room inside the 3-minute target for GitHub calls. They are checked every step. Hitting any of them is an analysis failure, not a result: the error names which limit, and no partial proposals are returned. The gate ends the check neutral, titled "Analysis failed" (see [Proposal output](proposal-output.md)). The caps (12 steps, 120k tokens counting thinking tokens, 150 s) come from a Gemini free-tier spike where runs took 1–3 steps and under 50k tokens. Three empty replies in a row (Gemini's malformed function calls) also end the run.
+
+## Failure causes
+
+The runner classifies every failure once, at the point it starts, into a fixed cause: provider error, timeout, step or token limit, too many candidate docs, clone failure, or internal. The gate shows fixed text per cause and anything unclassified as a generic failure. Provider errors and model replies can carry model output or response bodies, so the cause never quotes them; the detail stays in the server log.
+
+## Size limits
+
+Before any LLM call or dispatch, the gate rejects a PR with more than 50 changed files or more than 1 MiB of patch text, for both runners; the check ends neutral "PR too large to analyze" naming the limit. A text file whose patch GitHub omitted (it reports changes but no patch) counts as over, since its size is unknown; a binary file has no patch and does not. Partial analysis of a large PR is not attempted. The file limit is one named constant so a per-plan value can replace it later; at 50 files the listing is far below GitHub's 3000-file cap, so a truncated listing cannot reach analysis.
 
 A newer push cancels the running job; the context reaches every model call and git command.
 

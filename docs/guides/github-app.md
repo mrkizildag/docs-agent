@@ -34,7 +34,7 @@ Nothing else.
 
 ## Events
 
-Subscribe to: Pull request, Pull request review comment, Issue comment, Check run, Workflow run (tells the backend a dispatched analysis run finished).
+Subscribe to: Pull request, Pull request review comment, Issue comment (a ticked "Re-run analysis" box on the summary comment), Check run (GitHub's Re-run on the `pollux-agent` check), Workflow run (tells the backend a dispatched analysis run finished). No extra permission is needed for Re-run.
 
 ## Installation scope
 

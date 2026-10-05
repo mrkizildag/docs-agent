@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -309,12 +310,96 @@ func TestEnqueueDeadlineJobsIsIdempotent(t *testing.T) {
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(&blockingGitHub{}, store, gate.Runners{})), slog.New(slog.DiscardHandler), 1)
 	jobs := &countingEnqueuer{next: worker}
 
-	for _, now := range []time.Time{deadline.Add(-time.Second), deadline.Add(time.Second), deadline.Add(time.Minute)} {
+	for _, now := range []time.Time{deadline.Add(-time.Second), deadline.Add(time.Second), deadline.Add(2 * time.Second)} {
 		if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, jobs, now); err != nil {
 			t.Fatalf("EnqueueDeadlineJobs(%v) = %v", now, err)
 		}
 	}
 	if jobs.enqueued != 1 {
-		t.Errorf("deadline jobs enqueued = %d, want 1 across a not-yet-due sweep and two overdue sweeps", jobs.enqueued)
+		t.Errorf("deadline jobs enqueued = %d, want 1 across a not-yet-due sweep and two overdue sweeps in one minute", jobs.enqueued)
+	}
+}
+
+// failOnceConcludeGitHub rejects the first UpdateCheckRun and records the rest.
+type failOnceConcludeGitHub struct {
+	blockingGitHub
+
+	mu        sync.Mutex
+	attempts  int
+	concluded chan gate.CheckRun
+}
+
+func (f *failOnceConcludeGitHub) UpdateCheckRun(_ context.Context, _ int64, _, _ string, _ int64, run gate.CheckRun) error {
+	f.mu.Lock()
+	f.attempts++
+	first := f.attempts == 1
+	f.mu.Unlock()
+	if first {
+		return errors.New("github rejected the conclude write")
+	}
+	f.concluded <- run
+	return nil
+}
+
+func TestDeadlineJobFailedConcludeIsRetriedByLaterSweep(t *testing.T) {
+	t.Parallel()
+
+	store := openStore(t, filepath.Join(t.TempDir(), "db"))
+	t.Cleanup(func() { _ = store.Close() })
+	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	state := gate.PRState{
+		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1", CheckRunID: 5,
+		Run: &gate.AwaitingRun{RunID: 9, Nonce: "n1", Deadline: deadline},
+	}
+	if err := store.SavePR(t.Context(), state); err != nil {
+		t.Fatalf("SavePR() = %v", err)
+	}
+
+	gh := &failOnceConcludeGitHub{concluded: make(chan gate.CheckRun, 1)}
+	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, store, gate.Runners{})), slog.New(slog.DiscardHandler), 1)
+	stop := runWorker(worker)
+	t.Cleanup(func() {
+		if err := stop(); err != nil {
+			t.Errorf("worker.Run() = %v", err)
+		}
+	})
+
+	now := deadline.Add(time.Second)
+	if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, worker, now); err != nil {
+		t.Fatalf("EnqueueDeadlineJobs() = %v", err)
+	}
+	waitFor(t, "the first conclude attempt", func() bool {
+		gh.mu.Lock()
+		defer gh.mu.Unlock()
+		return gh.attempts == 1
+	})
+
+	for i := 1; ; i++ {
+		select {
+		case run := <-gh.concluded:
+			if run.Conclusion != gate.ConclusionNeutral {
+				t.Errorf("conclusion = %q, want %q", run.Conclusion, gate.ConclusionNeutral)
+			}
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+		if i > 100 {
+			t.Fatal("timed out waiting for the retried conclude write")
+		}
+		if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, worker, now.Add(time.Duration(i)*time.Minute)); err != nil {
+			t.Fatalf("EnqueueDeadlineJobs() = %v", err)
+		}
+	}
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for !cond() {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", what)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
