@@ -1,6 +1,8 @@
 package gate_test
 
 import (
+	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -34,7 +36,7 @@ func TestProposalCommentBodies(t *testing.T) {
 	if cb.Path != "a.go" || cb.Line != 4 || cb.CommitSHA != "abc123" {
 		t.Errorf("checkbox comment anchored at %s:%d on %s, want a.go:4 on abc123", cb.Path, cb.Line, cb.CommitSHA)
 	}
-	for _, want := range []string{"flag renamed", "`docs/a.md`", `"Usage"`, "```diff\n-## Usage\n-old\n+## Usage\n+new\n```", "- [ ] Apply this change"} {
+	for _, want := range []string{"flag renamed", "`docs/a.md`", "section `Usage`", "```diff\n-## Usage\n-old\n+## Usage\n+new\n```", "- [ ] Apply this change"} {
 		if !strings.Contains(cb.Body, want) {
 			t.Errorf("checkbox body missing %q:\n%s", want, cb.Body)
 		}
@@ -62,7 +64,7 @@ func TestProposalCommentBodies(t *testing.T) {
 	}
 
 	summary := gh.comments[0].Body
-	for i, want := range []string{"| `docs/a.md` | Usage |", "| `docs/b.md` | (new doc) |", "| `docs/s.md` | Run |"} {
+	for i, want := range []string{"| `docs/a.md` | `Usage` |", "| `docs/b.md` | (new doc) |", "| `docs/s.md` | `Run` |"} {
 		row := want + " [view](" + gh.comments[i+1].URL + ") | open |"
 		if !strings.Contains(summary, row) {
 			t.Errorf("summary missing row %q:\n%s", row, summary)
@@ -224,5 +226,286 @@ func TestSummaryRendering(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+const injectedReason = "Docs drift. @acme/security see ![](https://evil.example/px.png) [x](https://evil.example) <!-- <details>"
+
+// renderedProposal publishes p as a proposal and returns its review comment
+// body, the summary comment body and the check run summary.
+func renderedProposal(t *testing.T, p review.Proposal) (comment, summary, check string) {
+	t.Helper()
+
+	gh := &fakeGitHub{}
+	proposalService(t, gh, &fakeStore{}, review.Proposals{p})
+	if len(gh.reviewComments) != 1 || len(gh.comments) < 2 || len(gh.updates) != 1 {
+		t.Fatalf("review comments = %d, comments = %d, check updates = %d, want 1, 2 and 1", len(gh.reviewComments), len(gh.comments), len(gh.updates))
+	}
+	return gh.reviewComments[0].Body, gh.comments[0].Body, gh.updates[0].run.Summary
+}
+
+func TestProseModelTextIsInert(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/a.md", "A")
+	p.Reason = injectedReason
+	comment, _, check := renderedProposal(t, p)
+
+	for name, text := range map[string]string{
+		"comment":   strings.TrimPrefix(comment, strings.SplitN(comment, "\n", 2)[0]),
+		"check run": check,
+	} {
+		for _, bad := range []string{"@acme", "![", "](", "<!--", "<details>", "://"} {
+			if strings.Contains(text, bad) {
+				t.Errorf("%s = %q, want no %q", name, text, bad)
+			}
+		}
+		if !strings.Contains(text, "@\u200bacme/security see") || !strings.Contains(text, "Docs drift.") {
+			t.Errorf("%s = %q, want the reason's words intact", name, text)
+		}
+	}
+	if got := strings.Count(comment, "- [ ] Apply this change"); got != 1 {
+		t.Errorf("comment has %d Apply boxes, want 1:\n%s", got, comment)
+	}
+	if !strings.Contains(comment, "```diff") {
+		t.Errorf("comment = %q, want the diff", comment)
+	}
+}
+
+func TestProseForgedApplyBoxIsNotACheckboxInCheckRun(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/a.md", "A")
+	p.Reason = "- [ ] Apply this change"
+	_, _, check := renderedProposal(t, p)
+
+	if strings.Contains(check, "- [ ]") {
+		t.Errorf("check run summary = %q, want no checkbox", check)
+	}
+}
+
+func TestProseDropsBidiAndControlCharacters(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/a.md", "A\u202eB\x00C")
+	p.Reason = "ok\u202e evil\x00 fam\u200d\u200fily \u2066x"
+	comment, summary, check := renderedProposal(t, p)
+
+	for name, text := range map[string]string{"summary": summary, "check run": check} {
+		for _, bad := range []string{"\u202e", "\x00", "\u200f", "\u2066"} {
+			if strings.Contains(text, bad) {
+				t.Errorf("%s = %q, want no %q", name, text, bad)
+			}
+		}
+	}
+	if !strings.Contains(check, "ok evil fam\u200dily x") {
+		t.Errorf("check run = %q, want the words kept and the ZWJ intact", check)
+	}
+	if !strings.Contains(comment, "\n\nok evil fam\u200dily x\n\n") {
+		t.Errorf("comment = %q, want the reason line cleaned", comment)
+	}
+	if !strings.Contains(summary, "`ABC`") {
+		t.Errorf("summary = %q, want the section as `ABC`", summary)
+	}
+}
+
+func TestProseBlockStartRule(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/a.md", "A")
+	p.Reason = "___"
+	comment, _, check := renderedProposal(t, p)
+
+	if !strings.Contains(comment, "\n\n\\___\n\n") || !strings.Contains(check, ": \\___") {
+		t.Errorf("comment = %q, check = %q, want the reason as \\___", comment, check)
+	}
+}
+
+func TestProseLongReasonIsCapped(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/a.md", "A")
+	p.Reason = strings.Repeat("word ", 20000) + "`<img src=x>`"
+	comment, _, check := renderedProposal(t, p)
+
+	for name, text := range map[string]string{"comment": comment, "check run": check} {
+		if strings.Contains(text, "<img") {
+			t.Errorf("%s contains <img", name)
+		}
+		if len(text) > 5000 {
+			t.Errorf("%s is %d bytes, want the reason capped", name, len(text))
+		}
+	}
+	if !strings.Contains(check, "…") {
+		t.Errorf("check run = %q, want an ellipsis", check)
+	}
+}
+
+func TestSummaryManyLongReasonsStayWithinLimit(t *testing.T) {
+	t.Parallel()
+
+	var ps review.Proposals
+	for i := range 200 {
+		p := proposal(fmt.Sprintf("docs/%d.md", i), "A")
+		p.Reason = strings.Repeat("x", 900) + " `<img src=x>` " + strings.Repeat("<", 40)
+		ps = append(ps, p)
+	}
+	gh := &fakeGitHub{}
+	proposalService(t, gh, &fakeStore{}, ps)
+	if len(gh.updates) != 1 {
+		t.Fatalf("check run updates = %d, want 1", len(gh.updates))
+	}
+	got := gh.updates[0].run.Summary
+	if len(got) > 65535 {
+		t.Errorf("summary is %d bytes, want at most 65535", len(got))
+	}
+	if !regexp.MustCompile(`\n- … and \d+ more$`).MatchString(got) {
+		t.Errorf("summary ends %q, want the more line", got[max(0, len(got)-80):])
+	}
+	if strings.Contains(strings.ReplaceAll(got, "`<img src=x>`", ""), "<img") {
+		t.Error("summary has a raw <img outside a code span")
+	}
+}
+
+func TestProseNoImpactReasonIsOneInertLine(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{}
+	proposalService(t, gh, &fakeStore{}, review.NoImpact{Reason: "Nothing to do.\n\n" + injectedReason + "\n- [ ] Apply this change\r\n"})
+	if len(gh.updates) != 1 {
+		t.Fatalf("check run updates = %d, want 1", len(gh.updates))
+	}
+	got := gh.updates[0].run.Summary
+	if strings.Contains(got, "\n") {
+		t.Errorf("summary = %q, want one line", got)
+	}
+	for _, bad := range []string{"@acme", "![", "](", "<!--", "<details>", "- [ ]", "://"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("summary = %q, want no %q", got, bad)
+		}
+	}
+	if !strings.HasPrefix(got, "Nothing to do. Docs drift.") || !strings.Contains(got, "Apply this change") {
+		t.Errorf("summary = %q, want the words intact", got)
+	}
+}
+
+func TestProseOrdinaryReasonRenders(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct{ name, reason, want string }{
+		{name: "inline code span", reason: "Update `make run` in setup.", want: "Update `make run` in setup."},
+		{name: "double backtick span", reason: "Use ``a ` b`` here.", want: "Use ``a ` b`` here."},
+		{name: "span contents untouched", reason: "Run `a <b> @c [d]`.", want: "Run `a <b> @c [d]`."},
+		{name: "unbalanced backtick", reason: "Odd ` tick and ``` fence", want: "Odd \\` tick and \\`\\`\\` fence"},
+		{name: "whitespace collapses", reason: "a\n\tb   c", want: "a b c"},
+		{name: "leading heading", reason: "# Title", want: "\\# Title"},
+		{name: "leading quote", reason: "> quote", want: "\\> quote"},
+		{name: "leading numbered list", reason: "1. first", want: "1\\. first"},
+		{name: "backslash before bracket", reason: `\[x](u)`, want: `\\\[x\]\(u)`},
+		{name: "html", reason: "use <b>bold</b>", want: "use &lt;b>bold&lt;/b>"},
+		{name: "bare urls", reason: "see https://evil.example and WWW.evil.example", want: "see https:\u200b//evil.example and WWW\u200b.evil.example"},
+		{name: "entity mention", reason: "ping &#64;acme", want: "ping &amp;#\u200b64;acme"},
+		{name: "issue references", reason: "fixes #12, other/repo#3, gh-4 and GH-x", want: "fixes #\u200b12, other/repo#\u200b3, gh\u200b-4 and GH-x"},
+		{name: "leading issue reference", reason: "#12 done", want: "\\#\u200b12 done"},
+		{name: "dropped bidi mark before heading", reason: "\u202e # x", want: "\\# x"},
+		{name: "dropped controls before list", reason: "\x00 \x00 - item", want: "\\- item"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := proposal("docs/a.md", "A")
+			p.Reason = tc.reason
+			comment, _, check := renderedProposal(t, p)
+			if !strings.Contains(comment, "\n\n"+tc.want+"\n\n") {
+				t.Errorf("comment = %q, want the reason line %q", comment, tc.want)
+			}
+			if !strings.Contains(check, ": "+tc.want) {
+				t.Errorf("check summary = %q, want %q", check, tc.want)
+			}
+		})
+	}
+}
+
+func TestSpanModelIdentifiersAreOneCodeSpan(t *testing.T) {
+	t.Parallel()
+
+	const hostile = "``a`` | @team <!-- [l](u)"
+
+	checkbox := proposal("docs/a.md", hostile)
+	checkbox.IndexEntry = hostile
+	comment, summary, check := renderedProposal(t, checkbox)
+
+	wantSpan := "``` ``a`` | @team <!-- [l](u) ```"
+	if want := "`docs/a.md`, section " + wantSpan; !strings.Contains(comment, want) {
+		t.Errorf("comment = %q, want %q", comment, want)
+	}
+	if want := "Index entry: " + wantSpan + "\n"; !strings.Contains(comment, want) {
+		t.Errorf("comment = %q, want %q", comment, want)
+	}
+
+	var row string
+	for l := range strings.SplitSeq(summary, "\n") {
+		if strings.HasPrefix(l, "| `docs/a.md`") {
+			row = l
+		}
+	}
+	if row == "" {
+		t.Fatalf("summary = %q, want a table row", summary)
+	}
+	if want := "``` ``a`` \\| @team <!-- [l](u) ```"; !strings.Contains(row, want) {
+		t.Errorf("row = %q, want %q", row, want)
+	}
+	if cells := strings.Count(strings.ReplaceAll(row, `\|`, ""), "|"); cells != 5 {
+		t.Errorf("row = %q has %d pipes, want 5 (4 cells)", row, cells)
+	}
+	if !strings.Contains(check, "`docs/a.md`") {
+		t.Errorf("check summary = %q, want the doc path in a code span", check)
+	}
+}
+
+func TestSpanPipeAfterBackslashStaysInOneCell(t *testing.T) {
+	t.Parallel()
+
+	state := gate.PRState{Proposals: []gate.ProposalState{{DocPath: "docs/a.md", Section: `a\|[x](https://e.example)|b`, State: gate.ProposalOpen}}}
+	row := ""
+	for l := range strings.SplitSeq(renderedSummary(t, state), "\n") {
+		if strings.HasPrefix(l, "| `docs/a.md`") {
+			row = l
+		}
+	}
+	if row == "" {
+		t.Fatal("summary has no table row")
+	}
+	// A scanner that pairs a backslash with any next character, the stricter
+	// reading of GFM's cell rule.
+	cells, pipes := 0, 0
+	for i := 0; i < len(row); i++ {
+		switch row[i] {
+		case '\\':
+			i++
+		case '|':
+			pipes++
+		}
+	}
+	cells = pipes - 1
+	if cells != 4 {
+		t.Errorf("row = %q has %d cells, want 4", row, cells)
+	}
+	if !strings.Contains(row, "[x](https://e.example)") || strings.Count(row, "`") != 4 {
+		t.Errorf("row = %q, want the link text inside one code span", row)
+	}
+}
+
+func TestSpanDocPathIsLiteralInCheckSummary(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/*a_[b]<c>.md", "A")
+	comment, summary, check := renderedProposal(t, p)
+
+	for name, text := range map[string]string{"comment": comment, "summary": summary, "check run": check} {
+		if !strings.Contains(text, "`docs/*a_[b]<c>.md`") {
+			t.Errorf("%s = %q, want the doc path in a code span", name, text)
+		}
 	}
 }

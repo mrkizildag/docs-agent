@@ -3,6 +3,7 @@ package gate
 import (
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
@@ -51,7 +52,7 @@ func renderSuggestion(id string, p review.Proposal) string {
 	blank := max(len(strings.TrimPrefix(p.Original, original))-1, 0)
 	content := strings.TrimRight(p.Content, "\n") + "\n" + strings.Repeat("\n", blank)
 	fence := fenceFor(content)
-	return proposalMarker(id) + "\n\n" + p.Reason + "\n\n" + fence + "suggestion\n" + content + fence + "\n"
+	return proposalMarker(id) + "\n\n" + inertProse(p.Reason) + "\n\n" + fence + "suggestion\n" + content + fence + "\n"
 }
 
 // renderOutdated keeps the old comment body readable under an outdated notice,
@@ -79,14 +80,14 @@ func renderCheckbox(id string, p review.Proposal, fork bool) string {
 	var b strings.Builder
 	b.WriteString(proposalMarker(id))
 	b.WriteString("\n\n")
-	b.WriteString(p.Reason)
+	b.WriteString(inertProse(p.Reason))
 	b.WriteString("\n\n")
 	b.WriteString(proposalTarget(p))
 	b.WriteString("\n\n")
 	fence := fenceFor(diff.String())
 	b.WriteString(fence + "diff\n" + diff.String() + fence + "\n")
 	if p.IndexEntry != "" {
-		fmt.Fprintf(&b, "\nIndex entry: `%s`\n", p.IndexEntry)
+		fmt.Fprintf(&b, "\nIndex entry: %s\n", codeSpan(p.IndexEntry))
 	}
 	if fork {
 		b.WriteString("\nApply is not available: this pull request comes from a fork the bot cannot push to.\n")
@@ -131,9 +132,9 @@ func withoutCheckbox(body, label string) string {
 
 func proposalTarget(p review.Proposal) string {
 	if p.Section == "" {
-		return fmt.Sprintf("New doc: `%s`", p.DocPath)
+		return "New doc: " + codeSpan(p.DocPath)
 	}
-	return fmt.Sprintf("`%s`, section %q", p.DocPath, p.Section)
+	return codeSpan(p.DocPath) + ", section " + codeSpan(p.Section)
 }
 
 func writePrefixed(b *strings.Builder, prefix, text string) {
@@ -145,16 +146,183 @@ func writePrefixed(b *strings.Builder, prefix, text string) {
 // fenceFor returns a backtick fence longer than any backtick run in body, so
 // proposed content containing code fences cannot close the diff block early.
 func fenceFor(body string) string {
-	longest, run := 0, 0
-	for _, r := range body {
-		if r == '`' {
-			run++
-			longest = max(longest, run)
-		} else {
-			run = 0
+	return strings.Repeat("`", max(3, longestBacktickRun(body)+1))
+}
+
+func longestBacktickRun(body string) int {
+	longest := 0
+	for i := 0; i < len(body); {
+		if body[i] != '`' {
+			i++
+			continue
 		}
+		n := backtickRunAt(body, i)
+		longest = max(longest, n)
+		i += n
 	}
-	return strings.Repeat("`", max(3, longest+1))
+	return longest
+}
+
+// maxProseRunes caps a model-written reason before it is escaped.
+const maxProseRunes = 1000
+
+// oneLine collapses whitespace to single spaces and drops control, bidi and
+// zero-width-space characters, which can reorder or hide the text around them.
+// Dropping them before the collapse keeps them from leaving a leading space.
+func oneLine(s string) string {
+	return strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return ' '
+		}
+		if unicode.IsControl(r) || r == '\u200b' || r == '\u200e' || r == '\u200f' || r >= '\u202a' && r <= '\u202e' || r >= '\u2066' && r <= '\u2069' {
+			return -1
+		}
+		return r
+	}, s)), " ")
+}
+
+// codeSpan renders model-written identifier text as one inline code span: one
+// line, delimited by a backtick run longer than any inside it, so nothing in it
+// is interpreted as Markdown.
+func codeSpan(text string) string {
+	text = oneLine(text)
+	if strings.HasPrefix(text, "`") || strings.HasSuffix(text, "`") {
+		text = " " + text + " "
+	}
+	delim := strings.Repeat("`", longestBacktickRun(text)+1)
+	return delim + text + delim
+}
+
+// tableCodeSpan is codeSpan for a table cell, where GFM splits cells on `|`
+// before it parses code spans. A zero-width space between a backslash and the
+// pipe's escape keeps the pipe escaped even under a scanner that pairs `\\`.
+func tableCodeSpan(text string) string {
+	span := codeSpan(text)
+	var b strings.Builder
+	for i := 0; i < len(span); i++ {
+		if span[i] == '|' {
+			if i > 0 && span[i-1] == '\\' {
+				b.WriteString("\u200b")
+			}
+			b.WriteByte('\\')
+		}
+		b.WriteByte(span[i])
+	}
+	return b.String()
+}
+
+// inertProse renders model-written prose as one line of Markdown that cannot
+// mention, link or autolink, embed an image, open HTML, decode an entity or
+// start a block, or link an issue or pull request (#N, GH-N). Balanced inline code spans stay as written; every other
+// backtick is escaped.
+func inertProse(text string) string {
+	text = oneLine(text)
+	if r := []rune(text); len(r) > maxProseRunes {
+		text = strings.TrimSpace(string(r[:maxProseRunes-1])) + "…"
+	}
+	var b strings.Builder
+	for i := 0; i < len(text); {
+		n := 1
+		switch c := text[i]; c {
+		case '`':
+			n = backtickRunAt(text, i)
+			if end := closingBacktickRun(text, i+n, n); end >= 0 {
+				b.WriteString(text[i : end+n])
+				n = end + n - i
+			} else {
+				b.WriteString(strings.Repeat("\\`", n))
+			}
+		case '<':
+			b.WriteString("&lt;")
+		case '&':
+			b.WriteString("&amp;")
+		case '@':
+			b.WriteString("@\u200b")
+		case ':':
+			if strings.HasPrefix(text[i:], "://") {
+				b.WriteString(":\u200b")
+			} else {
+				b.WriteByte(c)
+			}
+		case 'w', 'W':
+			if len(text) >= i+4 && strings.EqualFold(text[i:i+4], "www.") {
+				b.WriteString(text[i:i+3] + "\u200b")
+				n = 3
+			} else {
+				b.WriteByte(c)
+			}
+		case '#':
+			b.WriteByte(c)
+			if i+1 < len(text) && isDigit(text[i+1]) {
+				b.WriteString("\u200b")
+			}
+		case 'G', 'g':
+			if len(text) > i+3 && strings.EqualFold(text[i:i+3], "gh-") && isDigit(text[i+3]) {
+				b.WriteString(text[i:i+2] + "\u200b")
+				n = 2
+			} else {
+				b.WriteByte(c)
+			}
+		case '(':
+			if i > 0 && text[i-1] == ']' {
+				b.WriteString("\\(")
+			} else {
+				b.WriteByte(c)
+			}
+		case '\\', '[', ']':
+			b.WriteString("\\" + string(c))
+		default:
+			b.WriteByte(c)
+		}
+		i += n
+	}
+	return escapeBlockStart(b.String())
+}
+
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+func backtickRunAt(text string, i int) int {
+	n := 0
+	for i+n < len(text) && text[i+n] == '`' {
+		n++
+	}
+	return n
+}
+
+// closingBacktickRun returns the index of the first backtick run of exactly n
+// at or after from, or -1.
+func closingBacktickRun(text string, from, n int) int {
+	for j := from; j < len(text); {
+		if text[j] != '`' {
+			j++
+			continue
+		}
+		m := backtickRunAt(text, j)
+		if m == n {
+			return j
+		}
+		j += m
+	}
+	return -1
+}
+
+// escapeBlockStart keeps a line from opening as a heading, quote, list item,
+// checkbox, rule or fence.
+func escapeBlockStart(line string) string {
+	if line == "" {
+		return line
+	}
+	if strings.IndexByte("#>-+*=~_", line[0]) >= 0 {
+		return "\\" + line
+	}
+	d := 0
+	for d < len(line) && isDigit(line[d]) {
+		d++
+	}
+	if d > 0 && d < len(line) && (line[d] == '.' || line[d] == ')') {
+		return line[:d] + "\\" + line[d:]
+	}
+	return line
 }
 
 // renderSummary is the summary comment body: a heading (the failure cause when
@@ -190,7 +358,7 @@ func renderSummary(state PRState) string {
 	for _, p := range state.Proposals {
 		section := "(new doc)"
 		if p.Section != "" {
-			section = strings.ReplaceAll(p.Section, "|", `\|`)
+			section = tableCodeSpan(p.Section)
 		}
 		status := string(p.State)
 		if p.State == ProposalApplied {
@@ -200,7 +368,7 @@ func renderSummary(state PRState) string {
 		if p.CommentURL != "" {
 			link = fmt.Sprintf("[view](%s)", p.CommentURL)
 		}
-		fmt.Fprintf(&b, "| `%s` | %s | %s | %s |\n", strings.ReplaceAll(p.DocPath, "|", `\|`), section, link, status)
+		fmt.Fprintf(&b, "| %s | %s | %s | %s |\n", tableCodeSpan(p.DocPath), section, link, status)
 	}
 
 	if len(state.Proposals) > 0 {
@@ -226,7 +394,7 @@ func renderSummary(state PRState) string {
 	}
 
 	if active != nil {
-		fmt.Fprintf(&b, "\nSkipped by @%s for this %s: %s\n", active.User, active.Scope.noun(), active.Reason)
+		fmt.Fprintf(&b, "\nSkipped by @%s for this %s: %s\n", active.User, active.Scope.noun(), inertProse(active.Reason))
 	}
 	if state.PendingSkip != nil {
 		fmt.Fprintf(&b, "\nWaiting for @%s to reply with a reason.\n", state.PendingSkip.User)

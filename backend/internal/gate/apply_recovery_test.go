@@ -155,7 +155,23 @@ func TestHandleCommentRefusesARejectedCommitWithItsReason(t *testing.T) {
 	if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)
 	}
-	want := "GitHub rejected the commit: the branch is protected; nothing was committed."
+	want := "GitHub rejected the commit: `the branch is protected`; nothing was committed."
+	if len(comments.replies) != 1 || !strings.Contains(comments.replies[0].body, want) {
+		t.Errorf("replies = %v, want one containing %q", comments.replies, want)
+	}
+}
+
+func TestHandleCommentRejectedCommitReasonKeepsDocPathInert(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{stored: openState(), live: true}
+	comments := &fakeCommentGitHub{canWrite: true, files: baseFiles(), commitErr: &gate.CommitRejectedError{Reason: "docs/@acme <img src=x>.md is a symlink or submodule"}}
+	svc := gate.NewService(apiWithComments(), comments, store, gate.Runners{}, nil, nil)
+
+	if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
+		t.Fatalf("HandleComment() = %v, want nil", err)
+	}
+	want := "GitHub rejected the commit: `docs/@acme <img src=x>.md is a symlink or submodule`; nothing was committed."
 	if len(comments.replies) != 1 || !strings.Contains(comments.replies[0].body, want) {
 		t.Errorf("replies = %v, want one containing %q", comments.replies, want)
 	}

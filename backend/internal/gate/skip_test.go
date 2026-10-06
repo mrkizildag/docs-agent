@@ -163,6 +163,21 @@ func TestHandleCommentSkipWithReason(t *testing.T) {
 	}
 }
 
+func TestHandleCommentSkipRedeliveryMatchesAnOlderStoredReason(t *testing.T) {
+	t.Parallel()
+
+	state := skipBase()
+	state.Skip = &gate.Skip{User: "dev", Scope: gate.SkipCommit, Reason: "ping @\u200bbob", HeadSHA: "head1"}
+	svc, gh, store := skipService(state)
+
+	if err := svc.HandleComment(t.Context(), skipEvent(gate.CommentKindIssue, "", "/pollux-agent skip ping @bob")); err != nil {
+		t.Fatalf("HandleComment() = %v, want nil", err)
+	}
+	if len(store.saveCalls) != 0 || len(gh.updates) != 0 {
+		t.Errorf("saves = %d, check run updates = %d, want 0 and 0: the skip is already recorded", len(store.saveCalls), len(gh.updates))
+	}
+}
+
 func TestHandleCommentSkipReason(t *testing.T) {
 	t.Parallel()
 
@@ -347,14 +362,63 @@ func TestHandleCommentSkipReasonIsMadeSafeToEcho(t *testing.T) {
 	}
 
 	reason := store.saved.Skip.Reason
-	if strings.ContainsAny(reason, "\n\r") || strings.Contains(reason, "@octocat") || strings.Contains(reason, "- [") {
-		t.Errorf("reason = %q, want one line without a live mention or checkbox", reason)
+	if strings.ContainsAny(reason, "\n\r") || strings.Contains(reason, "\u200b") {
+		t.Errorf("reason = %q, want one stored line without rendering escapes", reason)
 	}
 	if n := utf8.RuneCountInString(reason); n > 500 || !strings.HasSuffix(reason, "…") {
 		t.Errorf("reason has %d runes and ends %q, want at most 500 and a cut mark", n, reason[len(reason)-4:])
 	}
 	if len(gh.updates) != 1 || strings.Contains(gh.updates[0].run.Summary, "@octocat") {
 		t.Errorf("check run updates = %+v, want one without the live mention", gh.updates)
+	}
+}
+
+func skipRendered(t *testing.T, body string) (summary, checkRun string) {
+	t.Helper()
+
+	state := skipBase()
+	gh := &fakeGitHub{}
+	for len(gh.comments) < int(state.SummaryCommentID) {
+		gh.addComment(gate.CommentKindIssue, "old summary")
+	}
+	svc := gate.NewService(gh, &fakeCommentGitHub{canWrite: true}, &fakeStore{stored: state}, gate.Runners{}, nil, nil)
+	if err := svc.HandleComment(t.Context(), skipEvent(gate.CommentKindIssue, "", body)); err != nil {
+		t.Fatalf("HandleComment() = %v, want nil", err)
+	}
+	if len(gh.updates) != 1 {
+		t.Fatalf("check run updates = %d, want 1", len(gh.updates))
+	}
+	return gh.comments[state.SummaryCommentID-1].Body, gh.updates[0].run.Summary
+}
+
+func TestHandleCommentSkipReasonRendersInert(t *testing.T) {
+	t.Parallel()
+
+	summary, run := skipRendered(t, "/pollux-agent skip see [x](https://e.example) ![](https://e.example/p.png) <b>hi</b> @team")
+	for name, text := range map[string]string{"summary comment": summary, "check run summary": run} {
+		for _, bad := range []string{"](", "![", "<b>", "://", "@team"} {
+			if strings.Contains(text, bad) {
+				t.Errorf("%s contains %q:\n%s", name, bad, text)
+			}
+		}
+		for _, word := range []string{"see", "hi", "team"} {
+			if !strings.Contains(text, word) {
+				t.Errorf("%s lacks the word %q:\n%s", name, word, text)
+			}
+		}
+	}
+}
+
+func TestHandleCommentSkipReasonBreaksIssueReferences(t *testing.T) {
+	t.Parallel()
+
+	summary, run := skipRendered(t, "/pollux-agent skip fixes #12, see other/repo#3 and GH-4")
+	for name, text := range map[string]string{"summary comment": summary, "check run summary": run} {
+		for _, bad := range []string{"#1", "#3", "GH-4"} {
+			if strings.Contains(text, bad) {
+				t.Errorf("%s contains %q:\n%s", name, bad, text)
+			}
+		}
 	}
 }
 
