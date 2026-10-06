@@ -522,6 +522,153 @@ func TestRequeueRunning(t *testing.T) {
 	}
 }
 
+func finishNext(t *testing.T, store *sqlite.Store, state jobqueue.State) {
+	t.Helper()
+	claimed, ok, err := store.Claim(t.Context())
+	if err != nil || !ok {
+		t.Fatalf("Claim() = (%+v, %v, %v), want ok", claimed, ok, err)
+	}
+	if err := store.Finish(t.Context(), claimed.ID, state, ""); err != nil {
+		t.Fatalf("Finish(%d, %s) = %v, want nil error", claimed.ID, state, err)
+	}
+}
+
+func prune(t *testing.T, store *sqlite.Store, before time.Time) (jobs, deliveries int) {
+	t.Helper()
+	jobs, deliveries, err := store.Prune(t.Context(), before)
+	if err != nil {
+		t.Fatalf("Prune(%v) = %v, want nil error", before, err)
+	}
+	return jobs, deliveries
+}
+
+func TestPrune_FinishedJobsAndTheirDeliveriesByAge(t *testing.T) {
+	t.Parallel()
+
+	for _, state := range []jobqueue.State{jobqueue.StateDone, jobqueue.StateFailed, jobqueue.StateSuperseded} {
+		t.Run(string(state), func(t *testing.T) {
+			t.Parallel()
+
+			store, _ := open(t)
+
+			enqueue(t, store, "d1", "owner/repo#1", "pull_request", false)
+			finishNext(t, store, state)
+
+			if j, d := prune(t, store, time.Now().Add(-time.Hour)); j != 0 || d != 0 {
+				t.Errorf("Prune(recent cutoff) = (%d, %d), want (0, 0)", j, d)
+			}
+			if j, d := prune(t, store, time.Now().Add(time.Hour)); j != 1 || d != 1 {
+				t.Errorf("Prune(old cutoff) = (%d, %d), want (1, 1)", j, d)
+			}
+			if j, d := prune(t, store, time.Now().Add(time.Hour)); j != 0 || d != 0 {
+				t.Errorf("second Prune(old cutoff) = (%d, %d), want (0, 0)", j, d)
+			}
+		})
+	}
+}
+
+func TestPrune_KeepsPendingAndRunningJobsAndTheirDeliveries(t *testing.T) {
+	t.Parallel()
+
+	store, _ := open(t)
+
+	enqueue(t, store, "running", "owner/repo#1", "pull_request", false)
+	enqueue(t, store, "pending", "owner/repo#1", "pull_request", false)
+	claimed, ok, err := store.Claim(t.Context())
+	if err != nil || !ok {
+		t.Fatalf("Claim() = (%+v, %v, %v), want ok", claimed, ok, err)
+	}
+
+	if j, d := prune(t, store, time.Now().Add(time.Hour)); j != 0 || d != 0 {
+		t.Errorf("Prune(old cutoff) = (%d, %d), want (0, 0)", j, d)
+	}
+	if ok, _ := enqueueJob(t, store, "running", "owner/repo#1", "pull_request", false); ok {
+		t.Errorf("Enqueue(running) after prune = true, want false")
+	}
+	if ok, _ := enqueueJob(t, store, "pending", "owner/repo#1", "pull_request", false); ok {
+		t.Errorf("Enqueue(pending) after prune = true, want false")
+	}
+}
+
+func TestPrune_RecentCutoffKeepsDedupAndFailedRetry(t *testing.T) {
+	t.Parallel()
+
+	store, _ := open(t)
+
+	enqueue(t, store, "done", "owner/repo#1", "pull_request", false)
+	finishNext(t, store, jobqueue.StateDone)
+	enqueue(t, store, "failed", "owner/repo#2", "pull_request", false)
+	finishNext(t, store, jobqueue.StateFailed)
+
+	if j, d := prune(t, store, time.Now().Add(-time.Hour)); j != 0 || d != 0 {
+		t.Fatalf("Prune(recent cutoff) = (%d, %d), want (0, 0)", j, d)
+	}
+	if ok, _ := enqueueJob(t, store, "done", "owner/repo#1", "pull_request", false); ok {
+		t.Errorf("Enqueue(done) after prune = true, want false")
+	}
+	if ok, _ := enqueueJob(t, store, "failed", "owner/repo#2", "pull_request", false); !ok {
+		t.Errorf("Enqueue(failed) after prune = false, want true")
+	}
+}
+
+func TestPrune_RedeliveryAfterPruneRunsAgain(t *testing.T) {
+	t.Parallel()
+
+	store, _ := open(t)
+
+	enqueue(t, store, "d1", "owner/repo#1", "pull_request", false)
+	finishNext(t, store, jobqueue.StateDone)
+
+	if j, d := prune(t, store, time.Now().Add(time.Hour)); j != 1 || d != 1 {
+		t.Fatalf("Prune(old cutoff) = (%d, %d), want (1, 1)", j, d)
+	}
+	if ok, _ := enqueueJob(t, store, "d1", "owner/repo#1", "pull_request", false); !ok {
+		t.Errorf("Enqueue(d1) after prune = false, want true")
+	}
+}
+
+func TestPrune_KeepsDeliveryWhoseRedeliveredJobIsPending(t *testing.T) {
+	t.Parallel()
+
+	store, _ := open(t)
+
+	enqueue(t, store, "d1", "owner/repo#1", "pull_request", false)
+	finishNext(t, store, jobqueue.StateFailed)
+	if ok, _ := enqueueJob(t, store, "d1", "owner/repo#1", "pull_request", false); !ok {
+		t.Fatalf("Enqueue(d1) redelivery = false, want true")
+	}
+
+	if j, d := prune(t, store, time.Now().Add(time.Hour)); j != 1 || d != 0 {
+		t.Errorf("Prune(old cutoff) = (%d, %d), want (1, 0)", j, d)
+	}
+	if ok, _ := enqueueJob(t, store, "d1", "owner/repo#1", "pull_request", false); ok {
+		t.Errorf("Enqueue(d1) while its job is pending = true, want false")
+	}
+}
+
+func TestPrune_OldFailedJobGoneButLaterDoneJobKeepsDeliveryDeduped(t *testing.T) {
+	t.Parallel()
+
+	store, _ := open(t)
+
+	enqueue(t, store, "d1", "owner/repo#1", "pull_request", false)
+	finishNext(t, store, jobqueue.StateFailed)
+	time.Sleep(5 * time.Millisecond)
+	cutoff := time.Now()
+	time.Sleep(5 * time.Millisecond)
+	if ok, _ := enqueueJob(t, store, "d1", "owner/repo#1", "pull_request", false); !ok {
+		t.Fatalf("Enqueue(d1) redelivery = false, want true")
+	}
+	finishNext(t, store, jobqueue.StateDone)
+
+	if j, d := prune(t, store, cutoff); j != 1 || d != 0 {
+		t.Errorf("Prune(between failed and done) = (%d, %d), want (1, 0)", j, d)
+	}
+	if ok, _ := enqueueJob(t, store, "d1", "owner/repo#1", "pull_request", false); ok {
+		t.Errorf("Enqueue(d1) after its failed job was pruned and done job kept = true, want false")
+	}
+}
+
 func TestData_SurvivesCloseAndOpen(t *testing.T) {
 	t.Parallel()
 
@@ -555,24 +702,7 @@ func TestData_SurvivesCloseAndOpen(t *testing.T) {
 	}
 }
 
-func enqueue(t *testing.T, store *sqlite.Store, deliveryID, key, kind string, supersedes bool) {
-	t.Helper()
-	ok, _, err := store.Enqueue(t.Context(), jobqueue.NewJob{
-		DeliveryID: deliveryID,
-		Key:        key,
-		Kind:       kind,
-		Payload:    []byte("payload"),
-		Supersedes: supersedes,
-	})
-	if err != nil {
-		t.Fatalf("Enqueue(%q) = %v, want nil error", deliveryID, err)
-	}
-	if !ok {
-		t.Fatalf("Enqueue(%q) = false, want true", deliveryID)
-	}
-}
-
-func enqueueWithResult(t *testing.T, store *sqlite.Store, deliveryID, key, kind string, supersedes bool) []int64 {
+func enqueueJob(t *testing.T, store *sqlite.Store, deliveryID, key, kind string, supersedes bool) (bool, []int64) {
 	t.Helper()
 	ok, superseded, err := store.Enqueue(t.Context(), jobqueue.NewJob{
 		DeliveryID: deliveryID,
@@ -584,6 +714,19 @@ func enqueueWithResult(t *testing.T, store *sqlite.Store, deliveryID, key, kind 
 	if err != nil {
 		t.Fatalf("Enqueue(%q) = %v, want nil error", deliveryID, err)
 	}
+	return ok, superseded
+}
+
+func enqueue(t *testing.T, store *sqlite.Store, deliveryID, key, kind string, supersedes bool) {
+	t.Helper()
+	if ok, _ := enqueueJob(t, store, deliveryID, key, kind, supersedes); !ok {
+		t.Fatalf("Enqueue(%q) = false, want true", deliveryID)
+	}
+}
+
+func enqueueWithResult(t *testing.T, store *sqlite.Store, deliveryID, key, kind string, supersedes bool) []int64 {
+	t.Helper()
+	ok, superseded := enqueueJob(t, store, deliveryID, key, kind, supersedes)
 	if !ok {
 		t.Fatalf("Enqueue(%q) = false, want true", deliveryID)
 	}
