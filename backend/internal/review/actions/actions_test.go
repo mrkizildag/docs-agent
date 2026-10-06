@@ -59,11 +59,14 @@ func (f *fakeAPI) FileAtRef(_ context.Context, _ int64, _, _, path, ref string) 
 func TestStart(t *testing.T) {
 	t.Parallel()
 
-	api := &fakeAPI{runID: 99}
+	api := &fakeAPI{runID: 99, docsAt: map[string]fstest.MapFS{"base": {}}}
 	runner := actions.New(api, 10*time.Minute)
 
 	before := time.Now()
-	started, err := runner.Start(t.Context(), review.Request{InstallationID: 1, Owner: "o", Repo: "r", Number: 7, BaseSHA: "base", HeadSHA: "abc"})
+	started, err := runner.Start(t.Context(), review.Request{
+		InstallationID: 1, Owner: "o", Repo: "r", Number: 7, BaseSHA: "base", HeadSHA: "abc",
+		ChangedFiles: []review.ChangedFile{{Path: "main.go"}},
+	})
 	if err != nil {
 		t.Fatalf("Start() = %v, want nil", err)
 	}
@@ -124,7 +127,7 @@ func TestStartDispatchesBaseCandidates(t *testing.T) {
 		}
 	})
 
-	t.Run("no covering doc still dispatches with an empty list", func(t *testing.T) {
+	t.Run("only uncovered files dispatch with the uncovered list and no docs", func(t *testing.T) {
 		t.Parallel()
 		api := &fakeAPI{runID: 1, docsAt: map[string]fstest.MapFS{"base": {"docs/a.md": coverDoc("[other.go]")}}}
 		started, err := actions.New(api, time.Minute).Start(t.Context(), startRequest(main))
@@ -133,6 +136,28 @@ func TestStartDispatchesBaseCandidates(t *testing.T) {
 		}
 		if _, ok := started.(review.Pending); !ok || len(api.dispatched.Docs) != 0 {
 			t.Errorf("Start() = %T with Docs %v, want Pending with no docs", started, api.dispatched.Docs)
+		}
+		if diff := cmp.Diff([]string{"main.go"}, api.dispatched.Uncovered); diff != "" {
+			t.Errorf("dispatched Uncovered (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("nothing candidate or uncovered concludes no impact without dispatching", func(t *testing.T) {
+		t.Parallel()
+		api := &fakeAPI{runID: 1, docsAt: map[string]fstest.MapFS{"base": {"docs/a.md": coverDoc("[other.go]")}}}
+		started, err := actions.New(api, time.Minute).Start(t.Context(), startRequest(
+			review.ChangedFile{Path: "docs/new.md", Hunks: []review.LineRange{{Start: 1, End: 2}}},
+			review.ChangedFile{Path: "gone.go", Removed: true},
+		))
+		if err != nil {
+			t.Fatalf("Start() = %v, want nil", err)
+		}
+		want := review.Result{Runner: "actions", Verdict: review.NoImpact{Reason: basedocs.NothingToReview}}
+		if diff := cmp.Diff(review.Started(want), started); diff != "" {
+			t.Errorf("Start() (-want +got):\n%s", diff)
+		}
+		if api.dispatched.Nonce != "" {
+			t.Errorf("Dispatch was called with %+v, want no dispatch", api.dispatched)
 		}
 	})
 
@@ -319,6 +344,52 @@ func TestCollect(t *testing.T) {
 			}
 			if diff := cmp.Diff(tc.want, got); diff != "" {
 				t.Errorf("Collect() (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestCollectNewDoc(t *testing.T) {
+	t.Parallel()
+
+	newDoc := func(covers string) map[string]any {
+		return map[string]any{
+			"doc_path": "docs/new.md", "section": "", "anchor": map[string]any{"file": "main.go", "line": 3},
+			"reason": "new feature", "content": "---\ntitle: T\nsummary: S\ncovers: " + covers + "\n---\n# T\n",
+			"index_entry": "New feature",
+		}
+	}
+	changed := []review.ChangedFile{{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 5}}}}
+	base := map[string]fstest.MapFS{"base": {"docs/a.md": coverDoc("[other.go]")}}
+
+	tests := []struct {
+		name        string
+		covers      string
+		baseSHA     string
+		wantInvalid bool
+	}{
+		{name: "covers an uncovered file", covers: "[main.go]", baseSHA: "base"},
+		{name: "covers nothing uncovered", covers: "[other.go]", baseSHA: "base", wantInvalid: true},
+		{name: "no stored base refuses a new doc", covers: "[main.go]", baseSHA: "", wantInvalid: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			raw := artifact(t, "abc", "n1", map[string]any{
+				"structured_output": map[string]any{"proposals": []any{newDoc(tc.covers)}},
+			})
+			api := &fakeAPI{artifact: raw, changed: changed, docsAt: base}
+			c := review.Completion{Owner: "o", Repo: "r", HeadSHA: "abc", BaseSHA: tc.baseSHA, RunID: 99, Nonce: "n1"}
+
+			got, err := actions.New(api, time.Minute).Collect(t.Context(), c)
+
+			var invalid *review.InvalidResultError
+			if errors.As(err, &invalid) != tc.wantInvalid || (err != nil) != tc.wantInvalid {
+				t.Fatalf("Collect() error = %v, want InvalidResultError = %v", err, tc.wantInvalid)
+			}
+			if _, ok := got.Verdict.(review.Proposals); ok == tc.wantInvalid {
+				t.Errorf("Collect() verdict = %#v, want proposals = %v", got.Verdict, !tc.wantInvalid)
 			}
 		})
 	}
@@ -515,5 +586,32 @@ func TestCollectScaffold(t *testing.T) {
 				t.Fatalf("CollectScaffold() = %v, want *InvalidResultError containing %q", err, tc.wantInvalid)
 			}
 		})
+	}
+}
+
+func TestCollectNewDocAlreadyAtHead(t *testing.T) {
+	t.Parallel()
+
+	proposal := map[string]any{
+		"doc_path": "docs/new.md", "section": "", "anchor": map[string]any{"file": "main.go", "line": 3},
+		"reason": "new feature", "content": "---\ntitle: T\nsummary: S\ncovers: [main.go]\n---\n# T\n",
+		"index_entry": "New feature",
+	}
+	raw := artifact(t, "abc", "n1", map[string]any{
+		"structured_output": map[string]any{"proposals": []any{proposal}},
+	})
+	api := &fakeAPI{
+		artifact: raw,
+		changed:  []review.ChangedFile{{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 5}}}},
+		files:    map[string][]byte{"docs/new.md": []byte("# existing\n")},
+		docsAt:   map[string]fstest.MapFS{"base": {"docs/a.md": coverDoc("[other.go]")}},
+	}
+	c := review.Completion{Owner: "o", Repo: "r", HeadSHA: "abc", BaseSHA: "base", RunID: 99, Nonce: "n1"}
+
+	_, err := actions.New(api, time.Minute).Collect(t.Context(), c)
+
+	var invalid *review.InvalidResultError
+	if !errors.As(err, &invalid) || !strings.Contains(err.Error(), "already exists at head") {
+		t.Fatalf("Collect() error = %v, want InvalidResultError naming an existing new doc", err)
 	}
 }

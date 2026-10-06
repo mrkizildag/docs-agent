@@ -129,9 +129,9 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	if len(selection.Restores) > 0 {
 		return review.Result{Runner: runnerName, Model: "", Verdict: review.Proposals(selection.Restores)}, nil
 	}
-	candidates := selection.Candidates
-	if len(candidates) == 0 {
-		return r.noImpact("no doc covers the changed files"), nil
+	candidates, uncovered := selection.Candidates, selection.Uncovered
+	if selection.Empty() {
+		return r.noImpact(basedocs.NothingToReview), nil
 	}
 	if len(candidates) > basedocs.MaxCandidates {
 		return review.Result{}, fmt.Errorf("%w: %d candidate docs exceed the cap of %d", errTooManyCandidates, len(candidates), basedocs.MaxCandidates)
@@ -176,11 +176,32 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		}
 	}
 
-	if len(impacted) == 0 {
-		return r.noImpact(oneLine("no candidate doc is affected: "+strings.Join(reasons, "; "), maxReasonLen)), nil
+	allowNewDoc := false
+	if len(uncovered) > 0 {
+		readme, err := headReadme(root)
+		if err != nil {
+			return review.Result{}, fmt.Errorf("read docs/README.md of %s: %w", req.HeadSHA, err)
+		}
+		needed, why, err := r.decideNewDoc(ctx, budget, fence, string(readme), uncovered, patch)
+		if err != nil {
+			return review.Result{}, fmt.Errorf("decide new doc: %w", err)
+		}
+		if needed {
+			allowNewDoc = true
+		} else {
+			reasons = append(reasons, "no doc covers "+strings.Join(uncovered, ", ")+"; no new doc needed: "+why)
+		}
 	}
 
-	proposals, err := r.draft(ctx, root, index, budget, fence, req, impacted, patch)
+	if len(impacted) == 0 && !allowNewDoc {
+		prefix := ""
+		if len(candidates) > 0 {
+			prefix = "no candidate doc is affected: "
+		}
+		return r.noImpact(oneLine(prefix+strings.Join(reasons, "; "), maxReasonLen)), nil
+	}
+
+	proposals, err := r.draft(ctx, root, index, budget, fence, req, selection, impacted, allowNewDoc, patch)
 	if err != nil {
 		return review.Result{}, err
 	}
@@ -236,6 +257,31 @@ func headDoc(root *os.Root, docPath string) (docs.Doc, error) {
 	return docs.ParseBody(docPath, src), nil
 }
 
+// headReadme reads docs/README.md from the head clone, empty when it is
+// unreachable or not a regular file. It never reads through a symlink.
+func headReadme(root *os.Root) (string, error) {
+	const readmePath = "docs/README.md"
+	info, err := root.Lstat(readmePath)
+	if err != nil {
+		return "", nil //nolint:nilerr // the README only feeds the prompt; any unreachable path counts as absent
+	}
+	if !info.Mode().IsRegular() {
+		return "", nil
+	}
+
+	f, err := root.Open(readmePath)
+	if err != nil {
+		return "", fmt.Errorf("open %s at head: %w", readmePath, err)
+	}
+	defer func() { _ = f.Close() }() // read-only handle
+
+	src, err := io.ReadAll(io.LimitReader(f, maxDocBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read %s at head: %w", readmePath, err)
+	}
+	return string(src), nil
+}
+
 const maxReasonLen = 300
 
 // oneLine collapses s onto a single line and truncates it to max bytes.
@@ -256,6 +302,11 @@ type docIndex map[string]docs.Doc
 type triageVerdict struct {
 	Impacted *bool  `json:"impacted"`
 	Reason   string `json:"reason"`
+}
+
+type newDocVerdict struct {
+	Needed *bool  `json:"needed"`
+	Reason string `json:"reason"`
 }
 
 type verifyVerdict struct {
@@ -309,6 +360,20 @@ func (r *Runner) triage(ctx context.Context, index docIndex, budget *agent.Budge
 		return false, "", fmt.Errorf("%w: triage verdict has no \"impacted\" field in reply %q", errProvider, oneLine(reply, 200))
 	}
 	return *v.Impacted, v.Reason, nil
+}
+
+// decideNewDoc runs one small-model call on whether the PR's diff adds
+// behavior that needs a new doc because no existing doc can hold it.
+func (r *Runner) decideNewDoc(ctx context.Context, budget *agent.Budget, f fence, readme string, uncovered []string, patch string) (needed bool, reason string, err error) {
+	var v newDocVerdict
+	reply, err := r.ask(ctx, budget, r.triageModel, newDocSystemPrompt, newDocUserPrompt(f, readme, uncovered, patch), &v)
+	if err != nil {
+		return false, "", err
+	}
+	if v.Needed == nil {
+		return false, "", fmt.Errorf("%w: new-doc verdict has no \"needed\" field in reply %q", errProvider, oneLine(reply, 200))
+	}
+	return *v.Needed, v.Reason, nil
 }
 
 // verify asks the triage model whether p is supported by the patch, given the
@@ -382,8 +447,10 @@ type submitProposalsArgs struct {
 	Proposals []review.Proposal `json:"proposals"`
 }
 
-// draft runs the agent loop that drafts proposals for the impacted docs.
-func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budget *agent.Budget, f fence, req review.Request, impacted []string, patch string) ([]review.Proposal, error) {
+// draft runs the agent loop that drafts proposals for the impacted docs. It
+// may propose a new doc only when allowNewDoc, the new-doc decision for
+// sel.Uncovered, is true.
+func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budget *agent.Budget, f fence, req review.Request, sel basedocs.Selection, impacted []string, allowNewDoc bool, patch string) ([]review.Proposal, error) {
 	finish, err := submitProposalsTool()
 	if err != nil {
 		return nil, err
@@ -394,10 +461,15 @@ func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budge
 		impactedDocs[i] = index[p]
 	}
 
+	var newDocFiles []string
+	if allowNewDoc {
+		newDocFiles = sel.Uncovered
+	}
+
 	task := agent.Task{
 		Model:  r.model,
 		System: draftSystemPrompt,
-		Prompt: draftUserPrompt(f, impactedDocs, req.ChangedFiles, patch),
+		Prompt: draftUserPrompt(f, impactedDocs, newDocFiles, req.ChangedFiles, patch),
 		Root:   root,
 		Finish: finish,
 		Accept: func(args json.RawMessage) error {
@@ -406,13 +478,22 @@ func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budge
 				return fmt.Errorf("decode submit_proposals arguments: %w", err)
 			}
 			for _, p := range parsed.Proposals {
-				if err := p.Validate(req.ChangedFiles); err != nil {
+				p.Section = normalizeSection(p.Section)
+				if p.Section == "" {
+					if !allowNewDoc {
+						return fmt.Errorf("proposal %s: a new doc is not allowed here; use \"section\" to replace a section of an impacted doc", p.DocPath)
+					}
+					if _, exists := index[p.DocPath]; exists {
+						return fmt.Errorf("proposal %s: %s already exists at head; pick a new doc_path or use \"section\" to replace a section of it", p.DocPath, p.DocPath)
+					}
+				}
+				if err := sel.ValidateProposal(p, req.ChangedFiles); err != nil {
 					return fmt.Errorf("proposal %s: %w", p.DocPath, err)
 				}
 				if p.Section == "" {
 					continue
 				}
-				if err := checkSection(index, p.DocPath, normalizeSection(p.Section)); err != nil {
+				if err := checkSection(index, p.DocPath, p.Section); err != nil {
 					return fmt.Errorf("proposal %s: %w", p.DocPath, err)
 				}
 			}

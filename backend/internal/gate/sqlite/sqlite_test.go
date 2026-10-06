@@ -140,7 +140,7 @@ func TestSavePR_RoundTripRunAndProposalsAndPRForRun(t *testing.T) {
 		CheckRunID:       555,
 		HeadRef:          "feature",
 		ProposalsSHA:     "sha1",
-		Run:              &gate.AwaitingRun{RunID: 99, Nonce: "n1", Deadline: time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)},
+		Run:              &gate.AwaitingRun{RunID: 99, Nonce: "n1", Deadline: time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC), BaseSHA: "mb1"},
 		SummaryCommentID: 99,
 		Proposals: []gate.ProposalState{
 			{ID: "aaa", DocPath: "docs/a.md", Section: "Usage", CommentID: 11, CommentURL: "https://x/11", State: gate.ProposalOpen},

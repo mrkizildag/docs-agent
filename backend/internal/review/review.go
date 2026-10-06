@@ -30,6 +30,7 @@ type Completion struct {
 	Repo           string
 	Number         int
 	HeadSHA        string
+	BaseSHA        string // merge base the run was started at
 	RunID          int64
 	Nonce          string
 }

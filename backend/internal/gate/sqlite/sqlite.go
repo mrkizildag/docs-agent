@@ -145,6 +145,7 @@ func migrations() []string {
 			linked INTEGER NOT NULL DEFAULT 0,
 			UNIQUE (owner, repo, check_run_id)
 		)`,
+		`ALTER TABLE pull_requests ADD COLUMN run_base_sha TEXT NOT NULL DEFAULT ''`,
 	}
 }
 

@@ -89,6 +89,8 @@ func (p Proposal) ValidateTarget() error {
 	}
 	if err := validateSingleLine("section", p.Section); err != nil {
 		errs = append(errs, err)
+	} else if p.Section != "" && strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(p.Section), "#")) == "" {
+		errs = append(errs, errors.New("section: must name a heading"))
 	}
 	if err := validateSingleLine("index_entry", p.IndexEntry); err != nil {
 		errs = append(errs, err)

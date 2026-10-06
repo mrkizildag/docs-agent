@@ -45,7 +45,7 @@ No other config. Once the workflow exists on the default branch, the repo uses t
 
 ## Docs scaffold
 
-The same workflow writes a repo's starting `docs/` when the PR has none: the server dispatches it with `pr_number` "0" and the default branch tip as `head_sha`, and the action runs in scaffold mode. No workflow change is needed. Because installed workflows use `action@main`, merge the action change to `main` before deploying a server that dispatches scaffolds. See [Docs scaffold](../features/scaffold.md).
+The same workflow writes a repo's starting `docs/` when the PR has none: the server dispatches it with `pr_number` "0" and the default branch tip as `head_sha`, and the action runs in scaffold mode. No workflow change is needed. Because installed workflows use `action@main`, merge the action change to `main` before deploying a server that dispatches scaffolds. Keep `@main`: pinning the action to an older ref breaks reviews whenever the server changes the shape of an input. See [Docs scaffold](../features/scaffold.md).
 
 ## Subscription terms
 
