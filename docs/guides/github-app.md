@@ -17,7 +17,7 @@ Use the StartMunich org for production. For local development, create a separate
 
 GitHub needs a reachable HTTPS URL to deliver events to `POST /webhook`. For local dev, expose the backend with `tailscale funnel 8080` and use the resulting Tailscale Funnel hostname: `https://<host>/webhook`. For production, the URL is `https://<host>.<tailnet>.ts.net/webhook` from the Funnel set up in [Deploy](deploy.md).
 
-Generate the webhook secret with `openssl rand -hex 32`. Set the same value in the App's webhook secret field and in `GITHUB_WEBHOOK_SECRET` (see [Setup](setup.md)). The backend rejects any delivery whose `X-Hub-Signature-256` doesn't match this secret.
+Generate the webhook secret with `openssl rand -hex 32`. Set the same value in the App's webhook secret field and in `GITHUB_WEBHOOK_SECRET` (see [Setup](setup.md)). `POST /webhook` applies a global and per-client-IP rate limit before reading the body; over-limit requests get `429` and the body is not read. After that, the backend rejects any delivery whose `X-Hub-Signature-256` doesn't match this secret with `401`. GitHub does not automatically retry failed webhook deliveries.
 
 ## Permissions
 
