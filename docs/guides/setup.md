@@ -24,7 +24,7 @@ Requires Go (version in `backend/go.mod`) and golangci-lint v2. To run it in pro
 
 ## Configuration
 
-Only `backend/internal/config` reads the environment (a lint rule enforces it). Copy `backend/.env.example` for the variables. Secret variables load into `config.Secret`, which prints and logs as `[redacted]`; call `Reveal()` only in `cmd/server` where the value is handed to its consumer.
+Only `backend/internal/config` reads the environment (forbidigo enforces it). The one exemption is the server runner's `git` subprocess, which forwards `PATH` from the server's environment (see [Server runner](../features/server-runner.md)). Copy `backend/.env.example` for the variables. Secret variables load into `config.Secret`, which prints and logs as `[redacted]`; call `Reveal()` only in `cmd/server` where the value is handed to its consumer.
 
 | Variable                      | Default  | Meaning                                                        |
 |-------------------------------|----------|-----------------------------------------------------------------|

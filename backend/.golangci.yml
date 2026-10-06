@@ -36,10 +36,7 @@ linters:
             - "!$test"
           allow:
             - $gostd
-            - github.com/mrkizildag/pollux-agent/backend/internal/review
-          deny:
-            - pkg: github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner
-              desc: gate imports only internal/review from this module
+            - github.com/mrkizildag/pollux-agent/backend/internal/review$
         review-contracts:
           files:
             - "**/internal/review/*.go"
@@ -54,13 +51,13 @@ linters:
           deny:
             - pkg: github.com/mrkizildag/pollux-agent/backend/internal
               desc: internal/docs imports no other internal package
-        actions-runner:
+        runners:
           files:
-            - "**/internal/review/actions/**"
+            - "**/internal/review/*/**"
             - "!$test"
           deny:
             - pkg: github.com/mrkizildag/pollux-agent/backend/internal/github
-              desc: the Actions runner reaches GitHub only through its own WorkflowAPI
+              desc: runners reach GitHub only through their own interfaces or a token func from cmd/server
         llm-agent-leaf:
           files:
             - "**/internal/llm/**"
@@ -73,7 +70,7 @@ linters:
     forbidigo:
       analyze-types: true
       forbid:
-        - pattern: ^os\.(Getenv|LookupEnv)$
+        - pattern: ^(os\.(Getenv|LookupEnv|Environ|ExpandEnv)|syscall\.(Getenv|Environ))$
           msg: read the environment only in internal/config
         - pattern: ^(os\.Exit|log\.Fatal.*)$
           msg: only main exits
@@ -93,7 +90,7 @@ linters:
     rules:
       - path: internal/config/
         linters: [forbidigo]
-        text: os\.(Getenv|LookupEnv)
+        text: read the environment only in internal/config
       - path: cmd/
         linters: [forbidigo]
         text: os\.Exit
