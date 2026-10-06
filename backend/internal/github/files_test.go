@@ -71,7 +71,8 @@ func TestListChangedFiles(t *testing.T) {
 		]`, multiPatch),
 		"2": `[
 			{"filename":"removed.go","status":"removed","patch":"@@ -1,2 +0,0 @@\n-a\n-b"},
-			{"filename":"big.bin","status":"modified","changes":12000}
+			{"filename":"big.bin","status":"modified","changes":12000},
+			{"filename":"copy.go","previous_filename":"orig.go","status":"copied"}
 		]`,
 	}
 
@@ -101,8 +102,9 @@ func TestListChangedFiles(t *testing.T) {
 			Changes: 5,
 		},
 		{Path: "new/name.go", PreviousPath: "old/name.go", Hunks: []review.LineRange{{Start: 5, End: 7}}, Patch: "@@ -5,2 +5,3 @@\n x"},
-		{Path: "removed.go", Patch: "@@ -1,2 +0,0 @@\n-a\n-b"},
+		{Path: "removed.go", Removed: true, Patch: "@@ -1,2 +0,0 @@\n-a\n-b"},
 		{Path: "big.bin", Changes: 12000},
+		{Path: "copy.go"},
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("ListChangedFiles() (-want +got):\n%s", diff)

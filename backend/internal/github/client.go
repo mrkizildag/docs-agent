@@ -6,6 +6,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,6 +36,8 @@ type Client struct {
 	installationTransports map[int64]*ghinstallation.Transport
 	cloneTransports        map[cloneKey]*ghinstallation.Transport
 	botLogin               string // "<app-slug>[bot]"; "" until resolved
+
+	blobs blobCache
 }
 
 // cloneKey identifies a token narrowed to one repository of an installation.
@@ -184,6 +187,15 @@ func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo
 		return 0, fmt.Errorf("dispatch workflow %s/%s: %w", owner, repo, err)
 	}
 
+	docPaths := in.Docs
+	if docPaths == nil {
+		docPaths = []string{}
+	}
+	docsJSON, err := json.Marshal(docPaths)
+	if err != nil {
+		return 0, fmt.Errorf("dispatch workflow %s/%s: encode docs: %w", owner, repo, err)
+	}
+
 	r, _, err := client.Repositories.Get(ctx, owner, repo)
 	if err != nil {
 		return 0, fmt.Errorf("dispatch workflow %s/%s: get repository: %w", owner, repo, err)
@@ -196,6 +208,7 @@ func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo
 				"head_sha":  in.HeadSHA,
 				"pr_number": strconv.Itoa(in.PRNumber),
 				"nonce":     in.Nonce,
+				"docs":      string(docsJSON),
 			},
 			ReturnRunDetails: new(true),
 		})

@@ -17,7 +17,7 @@ With the Actions runner, your repo runs the analysis in its own GitHub Actions u
    ```yaml
    on:
      workflow_dispatch:
-       inputs: {head_sha: {required: true}, pr_number: {required: true}, nonce: {required: true}}
+       inputs: {head_sha: {required: true}, pr_number: {required: true}, nonce: {required: true}, docs: {required: true}}
    permissions: {contents: read}
    jobs:
      pollux-agent:
@@ -28,6 +28,7 @@ With the Actions runner, your repo runs the analysis in its own GitHub Actions u
              head_sha: ${{ inputs.head_sha }}
              pr_number: ${{ inputs.pr_number }}
              nonce: ${{ inputs.nonce }}
+             docs: ${{ inputs.docs }}
              claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
              anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
    ```
@@ -37,6 +38,8 @@ With the Actions runner, your repo runs the analysis in its own GitHub Actions u
    - `ANTHROPIC_API_KEY`: an Anthropic API key.
 
 ## Detection
+
+If you set up the workflow before the `docs` input existed, copy it again: GitHub rejects a dispatch with an input the workflow doesn't declare, so the old copy fails every review.
 
 No other config. Once the workflow exists on the default branch, the repo uses this runner and never the server runner. A workflow that exists only on a PR branch does nothing: the gate always dispatches the default branch's copy.
 

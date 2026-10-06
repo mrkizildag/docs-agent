@@ -25,7 +25,7 @@ Grant only what the bot uses:
 
 - **Actions**: read & write — dispatches the pollux-agent workflow in repos that use the [Actions runner](actions-runner.md), reads its run, and downloads its result artifact.
 - **Checks**: read & write — sets the `pollux-agent` check run.
-- **Contents**: read & write — clones the PR head for the server runner (with a token narrowed to that repo and `contents: read`), detects the `.github/workflows/pollux-agent.yml` workflow, commits doc edits, creates the scaffold branch.
+- **Contents**: read & write — fetches the PR head and merge base for the server runner (with a token narrowed to that repo and `contents: read`), reads `docs/` at the merge base for the Actions runner, detects the `.github/workflows/pollux-agent.yml` workflow, commits doc edits, creates the scaffold branch.
 - **Pull requests**: read & write — lists the PR's changed files and patches; review comments and suggestions; opens the docs scaffold PR.
 - **Issues**: read & write — the PR conversation comment and summary comment use the issues API.
 - **Metadata**: read-only — mandatory for every App.

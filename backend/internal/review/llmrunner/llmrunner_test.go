@@ -79,6 +79,7 @@ func testRequest(headSHA string) review.Request {
 		Repo:           "r",
 		Number:         1,
 		HeadSHA:        headSHA,
+		BaseSHA:        headSHA,
 		ChangedFiles: []review.ChangedFile{
 			{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 3}}, Patch: "@@ -1,2 +1,3 @@\n func main() {}\n"},
 		},
@@ -174,6 +175,7 @@ func TestStart_ImpactedDocProducesProposal(t *testing.T) {
 		Repo:           "r",
 		Number:         1,
 		HeadSHA:        headSHA,
+		BaseSHA:        headSHA,
 		ChangedFiles: []review.ChangedFile{
 			{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 3}}, Patch: "@@ -1,2 +1,3 @@\n func main() {}\n"},
 		},
@@ -218,6 +220,7 @@ func TestStart_AllTriageNoIsNoImpact(t *testing.T) {
 		Repo:           "r",
 		Number:         1,
 		HeadSHA:        headSHA,
+		BaseSHA:        headSHA,
 		ChangedFiles: []review.ChangedFile{
 			{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 3}}, Patch: "@@ -1,2 +1,3 @@\n func main() {}\n"},
 		},

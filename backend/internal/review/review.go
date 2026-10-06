@@ -133,15 +133,17 @@ type Request struct {
 	Owner          string
 	Repo           string
 	Number         int
-	BaseSHA        string
-	HeadSHA        string
-	ChangedFiles   []ChangedFile
+	// BaseSHA is the merge base of the PR's base branch and head: the commit the PR's diff starts from.
+	BaseSHA      string
+	HeadSHA      string
+	ChangedFiles []ChangedFile
 }
 
 // ChangedFile is a file in the PR diff and the head-side line ranges its hunks cover.
 type ChangedFile struct {
 	Path         string
 	PreviousPath string // old path of a renamed or moved file; empty otherwise.
+	Removed      bool   // the PR deletes this file.
 	Hunks        []LineRange
 	Patch        string // unified diff text for Path, as GitHub returns it; empty when GitHub omits it.
 	// Changes is GitHub's count of added and deleted lines in the file. A file

@@ -65,6 +65,21 @@ func ParseDoc(path string, src []byte) (Doc, error) {
 	}, nil
 }
 
+// ParseBody is ParseDoc without the frontmatter requirement: it keeps Path and
+// Source and builds Sections from the headings after a leading "---" block,
+// well-formed or not. Title, Summary, and Covers are left empty.
+func ParseBody(path string, src []byte) Doc {
+	bodyStart := 0
+
+	if _, body, err := splitFrontmatter(src); err == nil {
+		bodyStart = body
+	} else if first, _ := cutLine(bytes.TrimPrefix(src, []byte(utf8BOM))); isDelimiter(first) {
+		bodyStart = len(src)
+	}
+
+	return Doc{Path: path, Source: src, Sections: parseSections(src, bodyStart)}
+}
+
 // CheckScaffoldDoc reports why src is not a usable scaffold doc: it must parse
 // and carry a title, a summary and a covers key (an empty list is a value).
 func CheckScaffoldDoc(path string, src []byte) error {

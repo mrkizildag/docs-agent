@@ -1,6 +1,8 @@
 // Package llmrunner implements review.Runner for the server: a small-model
 // triage call per candidate doc, then an agent loop that drafts proposals
-// over a depth-1 clone of the pull request's head commit.
+// over a depth-1 clone of the pull request's head commit. Candidates are the
+// docs whose covers at the base commit match the changed files, so a PR can't
+// opt a doc out by editing its own covers.
 package llmrunner
 
 import (
@@ -8,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -16,6 +19,7 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/docs"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/basedocs"
 )
 
 const runnerName = "llmrunner"
@@ -26,9 +30,6 @@ const (
 	stepCap         = 12
 	tokenBudget     = 120_000
 	analysisTimeout = 150 * time.Second
-
-	// maxCandidateDocs bounds the triage calls one PR can trigger.
-	maxCandidateDocs = 10
 )
 
 // Runner implements review.Runner by triaging candidate docs with a small
@@ -109,35 +110,52 @@ func (r *Runner) noImpact(reason string) review.Result {
 }
 
 func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result, error) {
-	root, cleanup, err := r.openClone(ctx, req.InstallationID, req.Owner, req.Repo, req.HeadSHA)
+	c, cleanup, err := r.openClone(ctx, req.InstallationID, req.Owner, req.Repo, req.HeadSHA, req.BaseSHA)
 	if err != nil {
 		return review.Result{}, err
 	}
 	defer cleanup()
+	root := c.root
 
-	tree, err := docs.Parse(root.FS())
+	baseFS, err := c.docsAt(ctx, req.BaseSHA)
 	if err != nil {
-		return review.Result{}, fmt.Errorf("parse docs of %s: %w", req.HeadSHA, err)
+		return review.Result{}, fmt.Errorf("%w: %w", errClone, err)
 	}
-	changed := make([]string, 0, len(req.ChangedFiles))
-	for _, f := range req.ChangedFiles {
-		changed = append(changed, f.Path)
-		if f.PreviousPath != "" {
-			changed = append(changed, f.PreviousPath)
-		}
+
+	selection, err := basedocs.Select(baseFS, req.ChangedFiles)
+	if err != nil {
+		return review.Result{}, fmt.Errorf("base docs of %s: %w", req.BaseSHA, err)
 	}
-	candidates := tree.Match(changed)
+	if len(selection.Restores) > 0 {
+		return review.Result{Runner: runnerName, Model: "", Verdict: review.Proposals(selection.Restores)}, nil
+	}
+	candidates := selection.Candidates
 	if len(candidates) == 0 {
 		return r.noImpact("no doc covers the changed files"), nil
 	}
-	if len(candidates) > maxCandidateDocs {
-		return review.Result{}, fmt.Errorf("%w: %d candidate docs exceed the cap of %d", errTooManyCandidates, len(candidates), maxCandidateDocs)
+	if len(candidates) > basedocs.MaxCandidates {
+		return review.Result{}, fmt.Errorf("%w: %d candidate docs exceed the cap of %d", errTooManyCandidates, len(candidates), basedocs.MaxCandidates)
 	}
 
-	index := make(docIndex, len(tree.Docs))
-	for _, d := range tree.Docs {
+	headTree, err := docs.Parse(root.FS())
+	if err != nil {
+		return review.Result{}, fmt.Errorf("parse docs of %s: %w", req.HeadSHA, err)
+	}
+	index := make(docIndex, len(headTree.Docs))
+	for _, d := range headTree.Docs {
 		index[d.Path] = d
 	}
+	for _, docPath := range candidates {
+		if _, ok := index[docPath]; ok {
+			continue
+		}
+		d, err := headDoc(root, docPath)
+		if err != nil {
+			return review.Result{}, err
+		}
+		index[docPath] = d
+	}
+
 	fence, err := newFence()
 	if err != nil {
 		return review.Result{}, err
@@ -190,6 +208,34 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	return review.Result{Runner: runnerName, Model: r.model, Verdict: review.Proposals(kept)}, nil
 }
 
+// headDoc reads docPath from the head clone for a candidate that docs.Parse
+// left out, such as one with broken frontmatter, so a PR can't opt a doc out of
+// triage by breaking it. It never reads through a symlink.
+func headDoc(root *os.Root, docPath string) (docs.Doc, error) {
+	info, err := root.Lstat(docPath)
+	if err != nil {
+		return docs.Doc{}, fmt.Errorf("candidate doc %s is missing at head: %w", docPath, err)
+	}
+	if !info.Mode().IsRegular() {
+		return docs.Doc{}, fmt.Errorf("candidate doc %s at head is not a regular file (mode %s)", docPath, info.Mode())
+	}
+
+	f, err := root.Open(docPath)
+	if err != nil {
+		return docs.Doc{}, fmt.Errorf("open %s at head: %w", docPath, err)
+	}
+	defer func() { _ = f.Close() }() // read-only handle
+
+	src, err := io.ReadAll(io.LimitReader(f, docs.MaxDocBytes+1))
+	if err != nil {
+		return docs.Doc{}, fmt.Errorf("read %s at head: %w", docPath, err)
+	}
+	if len(src) > docs.MaxDocBytes {
+		return docs.Doc{}, fmt.Errorf("candidate doc %s at head exceeds %d bytes", docPath, docs.MaxDocBytes)
+	}
+	return docs.ParseBody(docPath, src), nil
+}
+
 const maxReasonLen = 300
 
 // oneLine collapses s onto a single line and truncates it to max bytes.
@@ -201,7 +247,8 @@ func oneLine(s string, max int) string {
 	return s
 }
 
-// docIndex maps a repo-relative doc path to its parsed doc at the head commit.
+// docIndex maps a repo-relative doc path to its parsed doc at the head commit;
+// candidates are chosen from the base commit's covers, but docs are read here.
 type docIndex map[string]docs.Doc
 
 // The verdict flags are pointers so a reply that omits them is an error, not

@@ -5,14 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/basedocs"
 )
 
 type fakeAPI struct {
@@ -24,6 +27,11 @@ type fakeAPI struct {
 	changedErr error
 	files      map[string][]byte
 	fileReads  map[string]int
+	docsAt     map[string]fstest.MapFS
+}
+
+func (f *fakeAPI) DocsAtRef(_ context.Context, _ int64, _, _, ref string) (fs.FS, error) {
+	return f.docsAt[ref], f.err
 }
 
 func (f *fakeAPI) Dispatch(_ context.Context, _ int64, _, _ string, in actions.DispatchInputs) (int64, error) {
@@ -55,7 +63,7 @@ func TestStart(t *testing.T) {
 	runner := actions.New(api, 10*time.Minute)
 
 	before := time.Now()
-	started, err := runner.Start(t.Context(), review.Request{InstallationID: 1, Owner: "o", Repo: "r", Number: 7, HeadSHA: "abc"})
+	started, err := runner.Start(t.Context(), review.Request{InstallationID: 1, Owner: "o", Repo: "r", Number: 7, BaseSHA: "base", HeadSHA: "abc"})
 	if err != nil {
 		t.Fatalf("Start() = %v, want nil", err)
 	}
@@ -72,6 +80,131 @@ func TestStart(t *testing.T) {
 	}
 	if api.dispatched.HeadSHA != "abc" || api.dispatched.PRNumber != 7 {
 		t.Errorf("Dispatch inputs = %+v, want head abc, PR 7", api.dispatched)
+	}
+}
+
+func coverDoc(covers string) *fstest.MapFile {
+	return &fstest.MapFile{Data: []byte("---\ntitle: T\nsummary: S\ncovers: " + covers + "\n---\n# T\n")}
+}
+
+func startRequest(files ...review.ChangedFile) review.Request {
+	return review.Request{InstallationID: 1, Owner: "o", Repo: "r", Number: 7, BaseSHA: "base", HeadSHA: "head", ChangedFiles: files}
+}
+
+func TestStartDispatchesBaseCandidates(t *testing.T) {
+	t.Parallel()
+
+	main := review.ChangedFile{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 2}}}
+
+	t.Run("a doc whose head copy dropped its covers is still a candidate", func(t *testing.T) {
+		t.Parallel()
+		api := &fakeAPI{runID: 1, docsAt: map[string]fstest.MapFS{
+			"base": {"docs/a.md": coverDoc("[main.go]")},
+			"head": {"docs/a.md": coverDoc("[]")},
+		}}
+		if _, err := actions.New(api, time.Minute).Start(t.Context(), startRequest(main)); err != nil {
+			t.Fatalf("Start() = %v, want nil", err)
+		}
+		if diff := cmp.Diff([]string{"docs/a.md"}, api.dispatched.Docs); diff != "" {
+			t.Errorf("dispatched Docs (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("a doc the PR adds is not a candidate", func(t *testing.T) {
+		t.Parallel()
+		api := &fakeAPI{runID: 1, docsAt: map[string]fstest.MapFS{
+			"base": {"docs/a.md": coverDoc("[main.go]")},
+			"head": {"docs/a.md": coverDoc("[main.go]"), "docs/new.md": coverDoc("[main.go]")},
+		}}
+		if _, err := actions.New(api, time.Minute).Start(t.Context(), startRequest(main)); err != nil {
+			t.Fatalf("Start() = %v, want nil", err)
+		}
+		if diff := cmp.Diff([]string{"docs/a.md"}, api.dispatched.Docs); diff != "" {
+			t.Errorf("dispatched Docs (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("no covering doc still dispatches with an empty list", func(t *testing.T) {
+		t.Parallel()
+		api := &fakeAPI{runID: 1, docsAt: map[string]fstest.MapFS{"base": {"docs/a.md": coverDoc("[other.go]")}}}
+		started, err := actions.New(api, time.Minute).Start(t.Context(), startRequest(main))
+		if err != nil {
+			t.Fatalf("Start() = %v, want nil", err)
+		}
+		if _, ok := started.(review.Pending); !ok || len(api.dispatched.Docs) != 0 {
+			t.Errorf("Start() = %T with Docs %v, want Pending with no docs", started, api.dispatched.Docs)
+		}
+	})
+
+	t.Run("a renamed candidate is dispatched at its new path", func(t *testing.T) {
+		t.Parallel()
+		api := &fakeAPI{runID: 1, docsAt: map[string]fstest.MapFS{"base": {"docs/a.md": coverDoc("[main.go]")}}}
+		req := startRequest(main, review.ChangedFile{Path: "docs/b.md", PreviousPath: "docs/a.md"})
+		started, err := actions.New(api, time.Minute).Start(t.Context(), req)
+		if err != nil {
+			t.Fatalf("Start() = %v, want nil", err)
+		}
+		if _, ok := started.(review.Pending); !ok {
+			t.Fatalf("Start() = %T, want Pending", started)
+		}
+		if diff := cmp.Diff([]string{"docs/b.md"}, api.dispatched.Docs); diff != "" {
+			t.Errorf("dispatched Docs (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("more candidates than the cap fail without dispatching", func(t *testing.T) {
+		t.Parallel()
+		base := fstest.MapFS{}
+		for i := range basedocs.MaxCandidates + 1 {
+			base[fmt.Sprintf("docs/d%02d.md", i)] = coverDoc("[main.go]")
+		}
+		api := &fakeAPI{runID: 1, docsAt: map[string]fstest.MapFS{"base": base}}
+		_, err := actions.New(api, time.Minute).Start(t.Context(), startRequest(main))
+		var failed *review.FailedError
+		if !errors.As(err, &failed) || failed.Cause != review.CauseTooManyCandidates {
+			t.Fatalf("Start() = %v, want FailedError with cause %q", err, review.CauseTooManyCandidates)
+		}
+		if api.dispatched.Nonce != "" {
+			t.Errorf("Dispatch was called with %+v, want no dispatch", api.dispatched)
+		}
+	})
+}
+
+func TestStartRestoresDeletedCandidate(t *testing.T) {
+	t.Parallel()
+
+	api := &fakeAPI{runID: 1, docsAt: map[string]fstest.MapFS{"base": {"docs/a.md": coverDoc("[main.go]")}}}
+	req := startRequest(
+		review.ChangedFile{Path: "main.go", Hunks: []review.LineRange{{Start: 4, End: 6}}},
+		review.ChangedFile{Path: "docs/a.md", Removed: true},
+	)
+
+	started, err := actions.New(api, time.Minute).Start(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Start() = %v, want nil", err)
+	}
+	result, ok := started.(review.Result)
+	if !ok {
+		t.Fatalf("Start() = %T, want review.Result", started)
+	}
+	proposals, ok := result.Verdict.(review.Proposals)
+	if !ok || len(proposals) != 1 || proposals[0].DocPath != "docs/a.md" {
+		t.Fatalf("verdict = %#v, want one restore of docs/a.md", result.Verdict)
+	}
+	if result.Model != "" {
+		t.Errorf("Model = %q, want empty", result.Model)
+	}
+	if api.dispatched.Nonce != "" {
+		t.Errorf("Dispatch was called with %+v, want no dispatch", api.dispatched)
+	}
+}
+
+func TestStartDocsError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("boom")
+	if _, err := actions.New(&fakeAPI{err: wantErr}, time.Minute).Start(t.Context(), review.Request{}); !errors.Is(err, wantErr) {
+		t.Fatalf("Start() = %v, want wrapping %v", err, wantErr)
 	}
 }
 
