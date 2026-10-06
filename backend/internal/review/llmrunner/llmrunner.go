@@ -91,17 +91,17 @@ func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started,
 
 	res, err := r.analyze(ctx, req)
 	if err != nil {
-		return nil, failed(fmt.Errorf("start analysis %s/%s#%d: %w", req.Owner, req.Repo, req.Number, err))
+		return nil, failed(ctx, fmt.Errorf("start analysis %s/%s#%d: %w", req.Owner, req.Repo, req.Number, err))
 	}
 	return res, nil
 }
 
-// failed classifies err into the *review.FailedError a runner returns.
-func failed(err error) *review.FailedError {
-	// A provider HTTP timeout also matches DeadlineExceeded, but it is a model
-	// failure, not the run's deadline.
-	if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, agent.ErrDeadline) &&
-		!errors.Is(err, agent.ErrModel) && !errors.Is(err, errProvider) {
+// failed classifies err from a run whose context is ctx into the
+// *review.FailedError a runner returns. The run's own deadline decides a
+// timeout: a provider HTTP timeout also matches DeadlineExceeded while the run
+// still has time, and that is a provider failure.
+func failed(ctx context.Context, err error) *review.FailedError {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) && !errors.Is(err, agent.ErrDeadline) {
 		err = fmt.Errorf("%w: %w", agent.ErrDeadline, err)
 	}
 	return &review.FailedError{Cause: classify(err), Err: err}

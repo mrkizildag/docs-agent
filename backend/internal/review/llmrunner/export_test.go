@@ -1,6 +1,7 @@
 package llmrunner
 
 import (
+	"context"
 	"log/slog"
 	"time"
 
@@ -30,9 +31,9 @@ func (r *Runner) SetLogger(l *slog.Logger) {
 	r.log = l
 }
 
-// Failed exposes the runner's error classification.
-func Failed(err error) *review.FailedError {
-	return failed(err)
+// Failed exposes the runner's error classification for a run with context ctx.
+func Failed(ctx context.Context, err error) *review.FailedError {
+	return failed(ctx, err)
 }
 
 // AllowedProtocols exposes the git protocol allow-list for a clone token.

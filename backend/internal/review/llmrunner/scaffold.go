@@ -29,7 +29,7 @@ func (r *Runner) StartScaffold(ctx context.Context, req review.ScaffoldRequest) 
 
 	res, err := r.scaffold(ctx, req)
 	if err != nil {
-		return nil, failed(fmt.Errorf("start scaffold %s/%s: %w", req.Owner, req.Repo, err))
+		return nil, failed(ctx, fmt.Errorf("start scaffold %s/%s: %w", req.Owner, req.Repo, err))
 	}
 	return res, nil
 }

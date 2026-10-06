@@ -73,16 +73,18 @@ func TestFailed_ClassifiesEachAgentCauseSeparately(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name string
-		err  error
-		want review.FailureCause
+		name    string
+		err     error
+		expired bool // the run's own deadline had passed
+		want    review.FailureCause
 	}{
 		{name: "model failure", err: fmt.Errorf("step 1: %w: %w", agent.ErrModel, errors.New("500")), want: review.CauseProvider},
 		{name: "malformed replies", err: fmt.Errorf("%w: %w", agent.ErrModel, agent.ErrMalformed), want: review.CauseProvider},
 		{name: "step limit", err: fmt.Errorf("draft: %w", agent.ErrStepLimit), want: review.CauseLimit},
 		{name: "token budget", err: fmt.Errorf("draft: %w", agent.ErrTokenBudget), want: review.CauseLimit},
 		{name: "agent deadline", err: fmt.Errorf("draft: %w", agent.ErrDeadline), want: review.CauseTimeout},
-		{name: "context deadline", err: fmt.Errorf("draft: %w", context.DeadlineExceeded), want: review.CauseTimeout},
+		{name: "run deadline", err: fmt.Errorf("draft: %w", context.DeadlineExceeded), expired: true, want: review.CauseTimeout},
+		{name: "model call cut by the run deadline", err: fmt.Errorf("triage: %w: %w", agent.ErrModel, context.DeadlineExceeded), expired: true, want: review.CauseTimeout},
 		{name: "provider http timeout", err: fmt.Errorf("step 1: %w: %w", agent.ErrModel, context.DeadlineExceeded), want: review.CauseProvider},
 		{name: "unclassified", err: errors.New("boom"), want: review.CauseInternal},
 	}
@@ -90,7 +92,13 @@ func TestFailed_ClassifiesEachAgentCauseSeparately(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := llmrunner.Failed(tc.err).Cause; got != tc.want {
+			ctx := t.Context()
+			if tc.expired {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				defer cancel()
+			}
+			if got := llmrunner.Failed(ctx, tc.err).Cause; got != tc.want {
 				t.Errorf("Failed(%v).Cause = %q, want %q", tc.err, got, tc.want)
 			}
 		})
