@@ -16,6 +16,7 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
 	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
 	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/jobs"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
@@ -151,7 +152,7 @@ func TestWebhookToServerRunnerChain(t *testing.T) {
 	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{Server: runner}, nil, nil)
 
 	logger := slog.New(slog.DiscardHandler)
-	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
+	worker := jobqueue.NewWorker(store, jobs.HandleJob(gateSvc), logger, 8)
 
 	workerCtx, cancelWorker := context.WithCancel(t.Context())
 	workerDone := make(chan error, 1)

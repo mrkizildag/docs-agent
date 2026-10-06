@@ -645,3 +645,80 @@ func TestPRsForHead(t *testing.T) {
 		t.Errorf("PRsForHead(unknown head) = %v, %v, want none", got, err)
 	}
 }
+
+func TestEnqueue_SupersedesAcrossKindsInTheSameGroup(t *testing.T) {
+	t.Parallel()
+
+	store := sqlitetest.Open(t)
+	ctx := t.Context()
+
+	ok, _, err := store.Enqueue(ctx, jobqueue.NewJob{DeliveryID: "d1", Key: "owner/repo#1", Kind: "rerun", Group: "pull_request", Payload: []byte("p")})
+	if err != nil || !ok {
+		t.Fatalf("Enqueue(rerun) = (%v, %v), want ok", ok, err)
+	}
+	ok, _, err = store.Enqueue(ctx, jobqueue.NewJob{DeliveryID: "d2", Key: "owner/repo#1", Kind: "pull_request", Group: "pull_request", Payload: []byte("p"), Supersedes: true})
+	if err != nil || !ok {
+		t.Fatalf("Enqueue(pull_request) = (%v, %v), want ok", ok, err)
+	}
+
+	claimed, ok, err := store.Claim(ctx)
+	if err != nil || !ok {
+		t.Fatalf("Claim() = (%+v, %v, %v), want ok", claimed, ok, err)
+	}
+	if claimed.Kind != "pull_request" {
+		t.Errorf("Claim() kind = %q, want pull_request: the rerun in the same group must be superseded", claimed.Kind)
+	}
+	if _, ok, err := store.Claim(ctx); err != nil || ok {
+		t.Errorf("second Claim() = (%v, %v), want nothing left", ok, err)
+	}
+}
+
+func TestOpen_BackfillsTheSupersedeGroupOfQueuedJobsToTheirKind(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := sqlite.Open(t.Context(), path)
+	if err != nil {
+		t.Fatalf("Open() = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+
+	// Rewind to the schema before the supersede_group migration, with a job queued then.
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open() = %v", err)
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE jobs DROP COLUMN supersede_group`,
+		`INSERT INTO jobs (key, kind, payload, state, created_at, updated_at, delivery_id)
+		 VALUES ('owner/repo#1', 'pull_request', 'old', 'pending', 't', 't', 'old')`,
+		`PRAGMA user_version = 9`,
+	} {
+		if _, err := db.ExecContext(t.Context(), stmt); err != nil {
+			t.Fatalf("exec %q = %v", stmt, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+
+	store, err = sqlite.Open(t.Context(), path)
+	if err != nil {
+		t.Fatalf("reopen = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	enqueue(t, store, "d2", "owner/repo#1", "pull_request", true)
+	claimed, ok, err := store.Claim(t.Context())
+	if err != nil || !ok {
+		t.Fatalf("Claim() = (%+v, %v, %v), want ok", claimed, ok, err)
+	}
+	if claimed.DeliveryID != "d2" {
+		t.Errorf("Claim() delivery = %q, want d2: the job queued before the migration must be superseded", claimed.DeliveryID)
+	}
+	if _, ok, err := store.Claim(t.Context()); err != nil || ok {
+		t.Errorf("second Claim() = (%v, %v), want nothing left", ok, err)
+	}
+}

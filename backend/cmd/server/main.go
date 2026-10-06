@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/github"
 	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
 	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/jobs"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
@@ -25,6 +27,9 @@ import (
 const (
 	maxParallelJobs   = 8
 	actionsRunTimeout = 10 * time.Minute
+	githubHTTPTimeout = 20 * time.Second
+	// shutdownTimeout must fit within compose's stop_grace_period (20s).
+	shutdownTimeout = 10 * time.Second
 )
 
 func main() {
@@ -54,7 +59,7 @@ func run(ctx context.Context) error {
 		}
 	}()
 
-	ghHTTPClient := &http.Client{Timeout: 20 * time.Second}
+	ghHTTPClient := &http.Client{Timeout: githubHTTPTimeout}
 	ghClient, err := github.NewClient(ghHTTPClient, cfg.GitHubAppID, []byte(cfg.GitHubPrivateKey.Reveal()), "")
 	if err != nil {
 		return fmt.Errorf("create GitHub client: %w", err)
@@ -63,27 +68,14 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("build analysis runners: %w", err)
 	}
-	gateSvc := gate.NewService(ghClient, ghClient, store, runners, ghClient, httpapi.NewScaffoldQueue(store))
 
-	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, maxParallelJobs)
-	workerCtx, cancelWorker := context.WithCancel(context.WithoutCancel(ctx))
-	defer cancelWorker()
-
-	workerErr := make(chan error, 1)
-	go func() {
-		workerErr <- worker.Run(workerCtx)
-	}()
-
-	sweepCtx, cancelSweep := context.WithCancel(context.WithoutCancel(ctx))
-	sweepDone := make(chan struct{})
-	go func() {
-		defer close(sweepDone)
-		sweepDeadlines(sweepCtx, store, worker, logger)
-	}()
-	defer func() {
-		cancelSweep()
-		<-sweepDone
-	}()
+	// The gate enqueues scaffold jobs through the worker, and the worker's handler
+	// is the gate, so the handler reads gateSvc once the gate is built.
+	var gateSvc *gate.Service
+	worker := jobqueue.NewWorker(store, func(ctx context.Context, job jobqueue.Job) error {
+		return jobs.HandleJob(gateSvc)(ctx, job)
+	}, logger, maxParallelJobs)
+	gateSvc = gate.NewService(ghClient, ghClient, store, runners, ghClient, jobs.NewScaffoldQueue(worker))
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -93,59 +85,64 @@ func run(ctx context.Context) error {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+	return serve(ctx, logger, srv, worker, store)
+}
 
-	serveErr := make(chan error, 1) // buffered so the goroutine can exit if run already returned
+// serve runs the HTTP server, the worker, and the deadline sweep until ctx is
+// done or one of the server and the worker fails. It then shuts the server
+// down first, so no new job arrives, and drains the sweep and the worker.
+func serve(ctx context.Context, logger *slog.Logger, srv *http.Server, worker *jobqueue.Worker, overdue jobs.OverdueSource) error {
+	// Background work outlives ctx so in-flight jobs finish during shutdown.
+	workerCtx, cancelWorker := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelWorker()
+	workerErr := make(chan error, 1) // buffered so the goroutine can exit if serve already returned
+	go func() { workerErr <- worker.Run(workerCtx) }()
+
+	sweepCtx, cancelSweep := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelSweep()
+	sweepDone := make(chan struct{})
 	go func() {
-		logger.Info("listening", "addr", cfg.Addr)
+		defer close(sweepDone)
+		jobs.SweepDeadlines(sweepCtx, overdue, worker, logger)
+	}()
+
+	serveErr := make(chan error, 1)
+	go func() {
+		logger.Info("listening", "addr", srv.Addr)
 		serveErr <- srv.ListenAndServe()
 	}()
 
+	var errs []error
+	serverExited, workerExited := false, false
 	select {
 	case err := <-serveErr:
-		cancelWorker()
-		<-workerErr
-		return fmt.Errorf("serve %s: %w", cfg.Addr, err)
+		serverExited = true
+		errs = append(errs, fmt.Errorf("serve %s: %w", srv.Addr, err))
 	case err := <-workerErr:
-		shutdownErr := shutdownServer(ctx, srv)
-		return errors.Join(fmt.Errorf("run worker: %w", err), shutdownErr)
+		workerExited = true
+		errs = append(errs, fmt.Errorf("run worker: %w", err))
 	case <-ctx.Done():
 	}
 
-	if err := shutdownServer(ctx, srv); err != nil {
-		cancelWorker()
-		<-workerErr
-		return err
-	}
-	if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
-		cancelWorker()
-		<-workerErr
-		return fmt.Errorf("serve %s: %w", cfg.Addr, err)
-	}
-
-	cancelWorker()
-	if err := <-workerErr; err != nil {
-		return fmt.Errorf("run worker: %w", err)
-	}
-	return nil
-}
-
-// sweepDeadlines enqueues deadline jobs for overdue runs until ctx is done.
-func sweepDeadlines(ctx context.Context, src httpapi.OverdueSource, jobs httpapi.Enqueuer, logger *slog.Logger) {
-	ticker := time.NewTicker(httpapi.DeadlineSweepEvery)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case now := <-ticker.C:
-			if err := httpapi.EnqueueDeadlineJobs(ctx, src, jobs, logger, now); err != nil {
-				logger.Error("sweep deadlines", "err", err)
-			}
+	errs = append(errs, shutdownServer(ctx, srv))
+	if !serverExited {
+		if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
+			errs = append(errs, fmt.Errorf("serve %s: %w", srv.Addr, err))
 		}
 	}
+
+	cancelSweep()
+	<-sweepDone
+	cancelWorker()
+	if !workerExited {
+		if err := <-workerErr; err != nil {
+			errs = append(errs, fmt.Errorf("run worker: %w", err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
-// llmHTTPTimeout is longer than the GitHub client's 20s: chat completions
+// llmHTTPTimeout is longer than githubHTTPTimeout: chat completions
 // take longer than a REST call.
 const llmHTTPTimeout = 60 * time.Second
 
@@ -157,6 +154,10 @@ func buildRunners(cfg config.Config, ghClient *github.Client) (gate.Runners, err
 		return gate.Runners{Actions: actionsRunner}, nil
 	}
 
+	if _, err := exec.LookPath("git"); err != nil {
+		return gate.Runners{}, fmt.Errorf("LLM_PROVIDER is set, so the server runner needs git on PATH: %w", err)
+	}
+
 	var model llm.Model
 	switch cfg.LLM.Provider {
 	case config.LLMProviderOpenAI:
@@ -164,7 +165,7 @@ func buildRunners(cfg config.Config, ghClient *github.Client) (gate.Runners, err
 	case config.LLMProviderAnthropic:
 		model = llm.NewAnthropic(&http.Client{Timeout: llmHTTPTimeout}, cfg.LLM.BaseURL, cfg.LLM.APIKey.Reveal())
 	default:
-		return gate.Runners{}, fmt.Errorf("LLM_PROVIDER: unknown provider %q", cfg.LLM.Provider)
+		return gate.Runners{}, errors.New("unreachable: config validated the LLM provider")
 	}
 
 	runner := llmrunner.New(model, ghClient.InstallationToken, cfg.LLM.TriageModel, cfg.LLM.Model)
@@ -172,7 +173,7 @@ func buildRunners(cfg config.Config, ghClient *github.Client) (gate.Runners, err
 }
 
 func shutdownServer(ctx context.Context, srv *http.Server) error {
-	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)

@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -29,6 +30,7 @@ import (
 	ghclient "github.com/mrkizildag/pollux-agent/backend/internal/github"
 	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
 	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/jobs"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
 )
@@ -131,7 +133,7 @@ func (f *e2eGitHub) UpdateCheckRun(context.Context, int64, string, string, int64
 	return nil
 }
 
-const baseGreetingDoc = "---\ntitle: Greeting\nsummary: Greets users.\ncovers:\n  - \"src/**\"\n---\n# Greeting\n\n## Greeting\n\nHi.\n"
+const baseGreetingDoc = "---\ntitle: Greeting\nsummary: Greets users.\ncovers:\n  - \"src/**\"\n---\n# Greetings\n\n## Greeting\n\nHi.\n"
 
 func e2ePullRequestBody(t *testing.T, number int, sha string) []byte {
 	t.Helper()
@@ -210,7 +212,7 @@ func TestWebhookToCheckRunEndToEnd(t *testing.T) {
 	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)
 
 	logger := slog.New(slog.DiscardHandler)
-	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
+	worker := jobqueue.NewWorker(store, jobs.HandleJob(gateSvc), logger, 8)
 
 	workerCtx, cancelWorker := context.WithCancel(t.Context())
 	workerDone := make(chan error, 1)
@@ -358,6 +360,10 @@ func (f *fakeActionsGitHub) handler() http.Handler {
 	mux.HandleFunc("GET /repos/acme/widgets/contents/.github/workflows/pollux-agent.yml", func(w http.ResponseWriter, _ *http.Request) {
 		f.json(w, http.StatusOK, `{"type":"file","name":"pollux-agent.yml","path":".github/workflows/pollux-agent.yml"}`)
 	})
+	mux.HandleFunc("GET /repos/acme/widgets/contents/docs/features/greeting.md", func(w http.ResponseWriter, _ *http.Request) {
+		content := base64.StdEncoding.EncodeToString([]byte(baseGreetingDoc))
+		f.json(w, http.StatusOK, fmt.Sprintf(`{"type":"file","encoding":"base64","size":%d,"path":"docs/features/greeting.md","content":%q}`, len(baseGreetingDoc), content))
+	})
 	mux.HandleFunc("GET /repos/acme/widgets/contents/docs", func(w http.ResponseWriter, _ *http.Request) {
 		f.json(w, http.StatusOK, `[{"type":"file","name":"README.md","path":"docs/README.md"}]`)
 	})
@@ -469,7 +475,7 @@ func TestActionsRunnerEndToEnd(t *testing.T) {
 
 	gateSvc := gate.NewService(client, unusedCommentGitHub{}, store, gate.Runners{Actions: actions.New(client, 10*time.Minute)}, nil, nil)
 	logger := slog.New(slog.DiscardHandler)
-	worker := jobqueue.NewWorker(baseStore, httpapi.HandleJob(gateSvc), logger, 8)
+	worker := jobqueue.NewWorker(baseStore, jobs.HandleJob(gateSvc), logger, 8)
 
 	workerCtx, cancelWorker := context.WithCancel(t.Context())
 	workerDone := make(chan error, 1)
@@ -633,7 +639,7 @@ func TestWebhookToProposalCommentsEndToEnd(t *testing.T) {
 	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{Server: runner}, nil, nil)
 
 	logger := slog.New(slog.DiscardHandler)
-	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
+	worker := jobqueue.NewWorker(store, jobs.HandleJob(gateSvc), logger, 8)
 	workerCtx, cancelWorker := context.WithCancel(t.Context())
 	workerDone := make(chan error, 1)
 	go func() { workerDone <- worker.Run(workerCtx) }()
@@ -990,7 +996,7 @@ func newPushHarness(t *testing.T, outcomes ...any) *pushHarness {
 	gateSvc := gate.NewService(gh, gh, store, gate.Runners{Actions: scriptedRunner{outcomes: queued}, Server: scriptedRunner{outcomes: queued}}, nil, nil)
 
 	logger := slog.New(slog.DiscardHandler)
-	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
+	worker := jobqueue.NewWorker(store, jobs.HandleJob(gateSvc), logger, 8)
 	workerCtx, cancelWorker := context.WithCancel(t.Context())
 	workerDone := make(chan error, 1)
 	go func() { workerDone <- worker.Run(workerCtx) }()

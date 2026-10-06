@@ -10,17 +10,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/google/go-cmp/cmp"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
 	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
 	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/jobs"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
@@ -179,7 +177,7 @@ func TestWebhookRedeliveryAfterFailedJobEnqueuesNewJob(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close() })
 
 	gh := newFailThenSucceedGitHub()
-	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)), slog.New(slog.DiscardHandler), 8)
+	worker := jobqueue.NewWorker(store, jobs.HandleJob(gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)), slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	t.Cleanup(func() { _ = stop() })
 	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store)
@@ -225,7 +223,7 @@ func TestWebhookSecondSynchronizeCancelsFirst(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close() })
 
 	gh := newBlockingGitHub("sha1")
-	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)), slog.New(slog.DiscardHandler), 8)
+	worker := jobqueue.NewWorker(store, jobs.HandleJob(gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)), slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	t.Cleanup(func() { _ = stop() })
 	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store)
@@ -258,7 +256,7 @@ func TestWebhookPendingJobRunsAfterRestartAndDuplicateStaysNoOp(t *testing.T) {
 	// Process 1 accepts the webhook but dies before any worker runs it.
 	store1 := openStore(t, path)
 	gh1 := newBlockingGitHub("")
-	worker1 := jobqueue.NewWorker(store1, httpapi.HandleJob(gate.NewService(gh1, unusedCommentGitHub{}, store1, gate.Runners{}, nil, nil)), logger, 8)
+	worker1 := jobqueue.NewWorker(store1, jobs.HandleJob(gate.NewService(gh1, unusedCommentGitHub{}, store1, gate.Runners{}, nil, nil)), logger, 8)
 	h1 := httpapi.NewHandler(logger, secret, worker1, store1)
 	if code := postSigned(t, h1, secret, "d1", prBody(t, "opened", 1, "sha1")); code != http.StatusAccepted {
 		t.Fatalf("POST = %d, want 202", code)
@@ -271,7 +269,7 @@ func TestWebhookPendingJobRunsAfterRestartAndDuplicateStaysNoOp(t *testing.T) {
 	store2 := openStore(t, path)
 	t.Cleanup(func() { _ = store2.Close() })
 	gh2 := newBlockingGitHub("")
-	worker2 := jobqueue.NewWorker(store2, httpapi.HandleJob(gate.NewService(gh2, unusedCommentGitHub{}, store2, gate.Runners{}, nil, nil)), logger, 8)
+	worker2 := jobqueue.NewWorker(store2, jobs.HandleJob(gate.NewService(gh2, unusedCommentGitHub{}, store2, gate.Runners{}, nil, nil)), logger, 8)
 	stop := runWorker(worker2)
 	t.Cleanup(func() { _ = stop() })
 	if got := waitString(t, gh2.created); got != "sha1" {
@@ -297,7 +295,7 @@ func TestWebhookPendingJobRunsAfterRestartAndDuplicateStaysNoOp(t *testing.T) {
 }
 
 type countingEnqueuer struct {
-	next     httpapi.Enqueuer
+	next     jobs.Enqueuer
 	enqueued int
 }
 
@@ -326,16 +324,16 @@ func TestEnqueueDeadlineJobsIsIdempotent(t *testing.T) {
 		t.Fatalf("SavePR() = %v", err)
 	}
 
-	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(&blockingGitHub{}, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)), slog.New(slog.DiscardHandler), 1)
-	jobs := &countingEnqueuer{next: worker}
+	worker := jobqueue.NewWorker(store, jobs.HandleJob(gate.NewService(&blockingGitHub{}, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)), slog.New(slog.DiscardHandler), 1)
+	counter := &countingEnqueuer{next: worker}
 
 	for _, now := range []time.Time{deadline.Add(-time.Second), deadline.Add(time.Second), deadline.Add(2 * time.Second)} {
-		if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, jobs, slog.New(slog.DiscardHandler), now); err != nil {
+		if err := jobs.EnqueueDeadlineJobs(t.Context(), store, counter, slog.New(slog.DiscardHandler), now); err != nil {
 			t.Fatalf("EnqueueDeadlineJobs(%v) = %v", now, err)
 		}
 	}
-	if jobs.enqueued != 1 {
-		t.Errorf("deadline jobs enqueued = %d, want 1 across a not-yet-due sweep and two overdue sweeps in one minute", jobs.enqueued)
+	if counter.enqueued != 1 {
+		t.Errorf("deadline jobs enqueued = %d, want 1 across a not-yet-due sweep and two overdue sweeps in one minute", counter.enqueued)
 	}
 }
 
@@ -375,7 +373,7 @@ func TestDeadlineJobFailedConcludeIsRetriedByLaterSweep(t *testing.T) {
 	}
 
 	gh := &failOnceConcludeGitHub{concluded: make(chan gate.CheckRun, 1)}
-	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)), slog.New(slog.DiscardHandler), 1)
+	worker := jobqueue.NewWorker(store, jobs.HandleJob(gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)), slog.New(slog.DiscardHandler), 1)
 	stop := runWorker(worker)
 	t.Cleanup(func() {
 		if err := stop(); err != nil {
@@ -384,7 +382,7 @@ func TestDeadlineJobFailedConcludeIsRetriedByLaterSweep(t *testing.T) {
 	})
 
 	now := deadline.Add(time.Second)
-	if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, worker, slog.New(slog.DiscardHandler), now); err != nil {
+	if err := jobs.EnqueueDeadlineJobs(t.Context(), store, worker, slog.New(slog.DiscardHandler), now); err != nil {
 		t.Fatalf("EnqueueDeadlineJobs() = %v", err)
 	}
 	waitFor(t, "the first conclude attempt", func() bool {
@@ -405,10 +403,21 @@ func TestDeadlineJobFailedConcludeIsRetriedByLaterSweep(t *testing.T) {
 		if i > 100 {
 			t.Fatal("timed out waiting for the retried conclude write")
 		}
-		if err := httpapi.EnqueueDeadlineJobs(t.Context(), store, worker, slog.New(slog.DiscardHandler), now.Add(time.Duration(i)*time.Minute)); err != nil {
+		if err := jobs.EnqueueDeadlineJobs(t.Context(), store, worker, slog.New(slog.DiscardHandler), now.Add(time.Duration(i)*time.Minute)); err != nil {
 			t.Fatalf("EnqueueDeadlineJobs() = %v", err)
 		}
 	}
+}
+
+// newServiceWorker builds the gate service newService returns and the worker
+// that runs its jobs; the service enqueues scaffold jobs through the worker.
+func newServiceWorker(store jobqueue.Store, newService func(gate.ScaffoldQueue) *gate.Service, logger *slog.Logger, maxParallel int) (*gate.Service, *jobqueue.Worker) {
+	var svc *gate.Service
+	worker := jobqueue.NewWorker(store, func(ctx context.Context, job jobqueue.Job) error {
+		return jobs.HandleJob(svc)(ctx, job)
+	}, logger, maxParallel)
+	svc = newService(jobs.NewScaffoldQueue(worker))
+	return svc, worker
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -420,78 +429,5 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 			t.Fatalf("timed out waiting for %s", what)
 		case <-time.After(10 * time.Millisecond):
 		}
-	}
-}
-
-type fakeOverdueSource []gate.OverdueRun
-
-func (f fakeOverdueSource) OverdueRuns(context.Context, time.Time) ([]gate.OverdueRun, error) {
-	return f, nil
-}
-
-func TestEnqueueDeadlineJobsBacksOffExponentiallyAndStopsAfterADay(t *testing.T) {
-	t.Parallel()
-
-	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	src := fakeOverdueSource{{PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}, Nonce: "n1", Deadline: deadline}}
-	jobs := newFakeEnqueuer()
-	jobs.result = true
-
-	var retriedAt []int
-	seen := map[string]bool{}
-	for minute := range 24*60 + 10 {
-		before := len(jobs.jobs)
-		now := deadline.Add(time.Duration(minute)*time.Minute + time.Second)
-		if err := httpapi.EnqueueDeadlineJobs(t.Context(), src, jobs, slog.New(slog.DiscardHandler), now); err != nil {
-			t.Fatalf("EnqueueDeadlineJobs(+%dm) = %v", minute, err)
-		}
-		if minute > 24*60 && len(jobs.jobs) != before {
-			t.Errorf("job enqueued %dm past the deadline, want none after 24h", minute)
-		}
-		for _, job := range jobs.jobs[before:] {
-			if !seen[job.DeliveryID] {
-				seen[job.DeliveryID] = true
-				retriedAt = append(retriedAt, minute)
-			}
-		}
-	}
-
-	want := []int{0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1264}
-	if diff := cmp.Diff(want, retriedAt); diff != "" {
-		t.Errorf("minutes overdue at which a new job is enqueued (-want +got):\n%s", diff)
-	}
-}
-
-func TestEnqueueDeadlineJobsLogsGivingUpOnce(t *testing.T) {
-	t.Parallel()
-
-	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	src := fakeOverdueSource{{PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}, Nonce: "n1", Deadline: deadline}}
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logs, nil))
-
-	for now := deadline.Add(24*time.Hour - time.Minute + 10*time.Second); now.Before(deadline.Add(24*time.Hour + 3*time.Minute)); now = now.Add(30 * time.Second) {
-		if err := httpapi.EnqueueDeadlineJobs(t.Context(), src, newFakeEnqueuer(), logger, now); err != nil {
-			t.Fatalf("EnqueueDeadlineJobs(%v) = %v", now, err)
-		}
-	}
-	if got := strings.Count(logs.String(), "giving up on overdue run"); got != 1 {
-		t.Errorf("give-up warnings = %d, want 1 across sweeps every 30s:\n%s", got, logs.String())
-	}
-}
-
-func TestEnqueueDeadlineJobsNamesScaffoldRunsByScaffoldKey(t *testing.T) {
-	t.Parallel()
-
-	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	src := fakeOverdueSource{{PRRef: gate.PRRef{Owner: "acme", Repo: "widgets"}, Scaffold: true, Nonce: "n1", Deadline: deadline}}
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logs, nil))
-
-	if err := httpapi.EnqueueDeadlineJobs(t.Context(), src, newFakeEnqueuer(), logger, deadline.Add(24*time.Hour+time.Second)); err != nil {
-		t.Fatalf("EnqueueDeadlineJobs() = %v", err)
-	}
-	if got := logs.String(); !strings.Contains(got, "acme/widgets#scaffold") || strings.Contains(got, "#0") {
-		t.Errorf("give-up log = %q, want the scaffold key acme/widgets#scaffold and no #0", got)
 	}
 }

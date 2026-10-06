@@ -26,7 +26,6 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
 	ghclient "github.com/mrkizildag/pollux-agent/backend/internal/github"
 	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
-	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
@@ -290,9 +289,10 @@ func newActionsScaffoldHarness(t *testing.T, server gate.ServerRunner) *actionsS
 		t.Fatalf("NewClient() error = %v", err)
 	}
 
-	gateSvc := gate.NewService(client, client, store, gate.Runners{Actions: actions.New(client, 10*time.Minute), Server: server}, client, httpapi.NewScaffoldQueue(baseStore))
 	logger := slog.New(slog.DiscardHandler)
-	worker := jobqueue.NewWorker(baseStore, httpapi.HandleJob(gateSvc), logger, 8)
+	_, worker := newServiceWorker(baseStore, func(q gate.ScaffoldQueue) *gate.Service {
+		return gate.NewService(client, client, store, gate.Runners{Actions: actions.New(client, 10*time.Minute), Server: server}, client, q)
+	}, logger, 8)
 	workerCtx, cancelWorker := context.WithCancel(t.Context())
 	workerDone := make(chan error, 1)
 	go func() { workerDone <- worker.Run(workerCtx) }()

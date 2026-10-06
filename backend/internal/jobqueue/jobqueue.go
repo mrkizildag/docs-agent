@@ -27,9 +27,10 @@ var errSuperseded = errors.New("job superseded by a newer job")
 type NewJob struct {
 	DeliveryID string // dedup key; a DeliveryID already seen is a no-op
 	Key        string // jobs with the same Key run one at a time
-	Kind       string
+	Kind       string // what the job carries; the handler dispatches on it
+	Group      string // supersede scope within a Key; empty means Kind
 	Payload    []byte
-	Supersedes bool // cancel older pending and running jobs with the same Key and Kind
+	Supersedes bool // cancel older pending and running jobs with the same Key and Group
 }
 
 // Job is a unit of work claimed from the Store.
@@ -45,7 +46,7 @@ type Job struct {
 type Store interface {
 	// Enqueue records the delivery and the job in one transaction. A seen DeliveryID returns
 	// enqueued=false and changes nothing. With Supersedes, older pending jobs of the same Key
-	// and Kind become superseded, and the IDs of running ones are returned for cancellation.
+	// and Group become superseded, and the IDs of running ones are returned for cancellation.
 	Enqueue(ctx context.Context, job NewJob) (enqueued bool, supersededRunning []int64, err error)
 	// Claim marks the oldest pending job whose Key has no running job as running and returns it.
 	Claim(ctx context.Context) (job Job, ok bool, err error)

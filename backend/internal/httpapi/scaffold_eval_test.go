@@ -15,7 +15,6 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
 	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
-	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
@@ -76,8 +75,9 @@ type evalEnv struct {
 func startEvalEnv(t *testing.T, store *sqlite.Store, gh gateScaffoldGitHub, model llm.Model) evalEnv {
 	t.Helper()
 	noToken := func(context.Context, int64, string) (string, error) { return "", nil }
-	svc := gate.NewService(gh, gh, store, gate.Runners{Server: llmrunner.New(model, noToken, "triage", "draft")}, gh, httpapi.NewScaffoldQueue(store))
-	worker := jobqueue.NewWorker(store, httpapi.HandleJob(svc), slog.New(slog.DiscardHandler), 8)
+	_, worker := newServiceWorker(store, func(q gate.ScaffoldQueue) *gate.Service {
+		return gate.NewService(gh, gh, store, gate.Runners{Server: llmrunner.New(model, noToken, "triage", "draft")}, gh, q)
+	}, slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	var once sync.Once
 	var stopErr error
