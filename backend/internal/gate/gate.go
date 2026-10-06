@@ -70,6 +70,8 @@ type GitHub interface {
 	// WorkflowExists reports whether the repo's default branch has the
 	// pollux-agent Actions workflow.
 	WorkflowExists(ctx context.Context, installationID int64, owner, repo string) (bool, error)
+	// MergeBase returns the merge base commit of base and head, the commit the pull request's diff starts from.
+	MergeBase(ctx context.Context, installationID int64, owner, repo, base, head string) (string, error)
 	// DocsExist reports whether an entry named docs exists at ref, be it a
 	// directory, a file or a submodule.
 	DocsExist(ctx context.Context, installationID int64, owner, repo, ref string) (bool, error)
@@ -1341,12 +1343,17 @@ func (s *Service) start(ctx context.Context, runner review.Runner, pr PullReques
 		return nil, nil, &tooLargeError{limit: limit}
 	}
 
+	mergeBase, err := s.gh.MergeBase(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.BaseSHA, pr.HeadSHA)
+	if err != nil {
+		return nil, nil, fmt.Errorf("find merge base: %w", err)
+	}
+
 	started, err := runner.Start(ctx, review.Request{
 		InstallationID: pr.InstallationID,
 		Owner:          pr.Owner,
 		Repo:           pr.Repo,
 		Number:         pr.Number,
-		BaseSHA:        pr.BaseSHA,
+		BaseSHA:        mergeBase,
 		HeadSHA:        pr.HeadSHA,
 		ChangedFiles:   changed,
 	})

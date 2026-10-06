@@ -28,6 +28,9 @@ type fakeGitHub struct {
 	noDocs         bool
 	changed        []review.ChangedFile
 	changedErr     error
+	mergeBase      string
+	mergeBaseErr   error
+	mergeBaseArgs  [][2]string
 	changedCalls   int
 	pullRequest    gate.PullRequest
 	pullRequestErr error
@@ -94,6 +97,11 @@ func (f *fakeGitHub) GetPullRequest(_ context.Context, installationID int64, own
 
 func (f *fakeGitHub) WorkflowExists(_ context.Context, _ int64, _, _ string) (bool, error) {
 	return f.workflowExists, f.workflowErr
+}
+
+func (f *fakeGitHub) MergeBase(_ context.Context, _ int64, _, _, base, head string) (string, error) {
+	f.mergeBaseArgs = append(f.mergeBaseArgs, [2]string{base, head})
+	return f.mergeBase, f.mergeBaseErr
 }
 
 func (f *fakeGitHub) DocsExist(context.Context, int64, string, string, string) (bool, error) {
@@ -397,6 +405,26 @@ func TestHandlePullRequestProposals(t *testing.T) {
 	}
 }
 
+func TestHandlePullRequestActionsResultConcludesWithoutAnArmedRun(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{workflowExists: true, checkRunID: 555}
+	runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{{DocPath: "docs/a.md", Reason: "restored"}}}}
+	store := &fakeStore{}
+	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil)
+
+	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
+		t.Fatalf("HandlePullRequest() = %v, want nil", err)
+	}
+
+	if len(gh.updates) != 1 || gh.updates[0].id != 555 || gh.updates[0].run.Conclusion != gate.ConclusionActionRequired {
+		t.Errorf("UpdateCheckRun calls = %+v, want one action_required conclusion of check run 555", gh.updates)
+	}
+	if got := store.saveCalls[len(store.saveCalls)-1]; got.Run != nil {
+		t.Errorf("final saved Run = %+v, want nil so the deadline sweep has nothing to conclude", got.Run)
+	}
+}
+
 func TestHandlePullRequestWorkflowExistsError(t *testing.T) {
 	t.Parallel()
 
@@ -407,6 +435,45 @@ func TestHandlePullRequestWorkflowExistsError(t *testing.T) {
 	err := svc.HandlePullRequest(t.Context(), testPR())
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("HandlePullRequest() = %v, want wrapping %v", err, wantErr)
+	}
+}
+
+func TestHandlePullRequestMergeBase(t *testing.T) {
+	t.Parallel()
+
+	pr := testPR()
+	gh := &fakeGitHub{mergeBase: "mb1"}
+	runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
+	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: runner}, nil, nil)
+
+	if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
+		t.Fatalf("HandlePullRequest() = %v, want nil", err)
+	}
+	if diff := cmp.Diff([][2]string{{pr.BaseSHA, pr.HeadSHA}}, gh.mergeBaseArgs); diff != "" {
+		t.Errorf("MergeBase (base, head) args (-want +got):\n%s", diff)
+	}
+	if len(runner.calls) != 1 || runner.calls[0].BaseSHA != "mb1" || runner.calls[0].HeadSHA != pr.HeadSHA {
+		t.Errorf("runner calls = %+v, want one with BaseSHA mb1 and HeadSHA %s", runner.calls, pr.HeadSHA)
+	}
+}
+
+func TestHandlePullRequestMergeBaseError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("boom")
+	gh := &fakeGitHub{mergeBaseErr: wantErr}
+	runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
+	svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: runner}, nil, nil)
+
+	err := svc.HandlePullRequest(t.Context(), testPR())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("HandlePullRequest() = %v, want wrapping %v", err, wantErr)
+	}
+	if len(gh.calls) != 1 || len(gh.updates) != 1 || gh.updates[0].run.Conclusion != gate.ConclusionNeutral {
+		t.Errorf("check run calls = %+v, updates = %+v, want one created and concluded neutral", gh.calls, gh.updates)
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("runner calls = %d, want 0", len(runner.calls))
 	}
 }
 
@@ -1971,7 +2038,7 @@ func TestHandleRerun(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			gh := &fakeGitHub{pullRequest: gate.PullRequest{BaseSHA: "base1", HeadSHA: "new222", Open: true}}
+			gh := &fakeGitHub{pullRequest: gate.PullRequest{BaseSHA: "tip1", HeadSHA: "new222", Open: true}, mergeBase: "base1"}
 			runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
 			svc := gate.NewService(gh, nil, &fakeStore{stored: stored}, gate.Runners{Server: runner}, nil, nil)
 
@@ -1985,7 +2052,7 @@ func TestHandleRerun(t *testing.T) {
 				return
 			}
 			if len(runner.calls) != 1 || runner.calls[0].HeadSHA != "new222" || runner.calls[0].BaseSHA != "base1" {
-				t.Errorf("runner calls = %+v, want one on the current head new222", runner.calls)
+				t.Errorf("runner calls = %+v, want one on the current head new222 and merge base base1, not the base tip", runner.calls)
 			}
 			if len(gh.calls) != 1 || gh.calls[0].run.HeadSHA != "new222" || len(gh.updates) != 1 {
 				t.Errorf("check runs = %+v, updates = %+v, want a new check run on new222, concluded", gh.calls, gh.updates)

@@ -5,6 +5,7 @@ covers:
   - backend/internal/gate/**
   - backend/internal/review/review.go
   - backend/internal/github/comments.go
+  - backend/internal/review/basedocs/**
 ---
 
 # Proposal output

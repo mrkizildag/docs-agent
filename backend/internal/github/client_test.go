@@ -363,14 +363,14 @@ func TestDispatch(t *testing.T) {
 	})
 	client := newTestClient(t, mux)
 
-	runID, err := client.Dispatch(t.Context(), 99, "o", "r", actions.DispatchInputs{HeadSHA: "abc", PRNumber: 7, Nonce: "n1"})
+	runID, err := client.Dispatch(t.Context(), 99, "o", "r", actions.DispatchInputs{HeadSHA: "abc", PRNumber: 7, Nonce: "n1", Docs: []string{"docs/a.md"}})
 	if err != nil || runID != 4242 {
 		t.Fatalf("Dispatch() = %d, %v, want 4242, nil", runID, err)
 	}
 
 	want := map[string]any{
 		"ref":                "trunk",
-		"inputs":             map[string]any{"head_sha": "abc", "pr_number": "7", "nonce": "n1"},
+		"inputs":             map[string]any{"head_sha": "abc", "pr_number": "7", "nonce": "n1", "docs": `["docs/a.md"]`},
 		"return_run_details": true,
 	}
 	if diff := cmp.Diff(want, got); diff != "" {

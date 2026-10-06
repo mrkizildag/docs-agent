@@ -56,7 +56,7 @@ func TestStart_GlobCoveredNestedFileTriagesOnlyItsDoc(t *testing.T) {
 
 	const patch = "@@ -1,2 +1,3 @@\n package deep\n+func X() {}\n"
 	req := review.Request{
-		InstallationID: 1, Owner: "o", Repo: "r", Number: 1, HeadSHA: headSHA,
+		InstallationID: 1, Owner: "o", Repo: "r", Number: 1, HeadSHA: headSHA, BaseSHA: headSHA,
 		ChangedFiles: []review.ChangedFile{{Path: "src/pkg/deep/x.go", Hunks: []review.LineRange{{Start: 1, End: 3}}, Patch: patch}},
 	}
 
