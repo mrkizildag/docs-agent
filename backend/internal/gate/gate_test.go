@@ -656,7 +656,7 @@ func TestHandleRunCompleted(t *testing.T) {
 			conclusion:     "success",
 			runner:         &fakeRunner{result: review.Result{Verdict: proposals}},
 			wantConclusion: gate.ConclusionActionRequired,
-			wantSummary:    "- docs/a.md: endpoint changed",
+			wantSummary:    "- `docs/a.md`: endpoint changed",
 			wantCollected:  true,
 		},
 		{

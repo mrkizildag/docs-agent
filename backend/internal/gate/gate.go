@@ -459,7 +459,7 @@ func concludeUncapped(state PRState, outcome Outcome) (PRState, CheckRun) {
 	case outcome.Result != nil:
 		switch v := outcome.Result.Verdict.(type) {
 		case review.NoImpact:
-			run.Conclusion, run.Title, run.Summary = ConclusionSuccess, "No doc impact", v.Reason
+			run.Conclusion, run.Title, run.Summary = ConclusionSuccess, "No doc impact", inertProse(v.Reason)
 			return state, run
 		case review.Proposals:
 			pending := unapplied(state, v)
@@ -1374,7 +1374,7 @@ func proposalsSummary(proposals review.Proposals) string {
 		if summary != "" {
 			summary += "\n"
 		}
-		summary += fmt.Sprintf("- %s: %s", p.DocPath, p.Reason)
+		summary += fmt.Sprintf("- %s: %s", codeSpan(p.DocPath), inertProse(p.Reason))
 	}
 	return summary
 }

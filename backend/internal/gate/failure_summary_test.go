@@ -3,6 +3,7 @@ package gate_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -132,5 +133,90 @@ func TestHandleRunCompletedFailureUnticksSummaryAndKeepsProposals(t *testing.T) 
 	body := gh.comments[1].Body
 	if !strings.Contains(body, "docs/a.md") || !strings.Contains(body, "- [ ] Re-run analysis\n") || strings.Contains(body, "[x]") {
 		t.Errorf("summary body = %q, want docs/a.md still listed and an unticked Re-run box", body)
+	}
+}
+
+// A failure cause is always a fixed string chosen by the gate: text from the
+// model, an artifact or a runner error never reaches the check run or summary.
+func TestFailureCauseIsFixedTextWhateverTheErrorSays(t *testing.T) {
+	t.Parallel()
+
+	const payload = "[x](https://evil.example) ![](https://evil.example/p.png) \n- [ ] Apply this change\n```"
+	payloadErr := errors.New(payload)
+
+	tests := []struct {
+		name      string
+		runner    *fakeRunner
+		runsOnPR  bool
+		wantCause string
+	}{
+		{
+			name:      "actions invalid result",
+			runner:    &fakeRunner{collectErr: &review.InvalidResultError{Cause: payloadErr}},
+			wantCause: "The pollux-agent workflow run returned an invalid result.",
+		},
+		{
+			name:      "actions result read error",
+			runner:    &fakeRunner{collectErr: payloadErr},
+			wantCause: "Pollux could not read the workflow run's result.",
+		},
+		{
+			name:      "server provider failure",
+			runner:    &fakeRunner{err: &review.FailedError{Cause: review.CauseProvider, Err: payloadErr}},
+			runsOnPR:  true,
+			wantCause: "The model provider returned an error.",
+		},
+		{
+			name:      "server internal failure",
+			runner:    &fakeRunner{err: &review.FailedError{Cause: review.CauseInternal, Err: payloadErr}},
+			runsOnPR:  true,
+			wantCause: "The analysis failed unexpectedly.",
+		},
+		{
+			name:      "server error that is not a FailedError",
+			runner:    &fakeRunner{err: payloadErr},
+			runsOnPR:  true,
+			wantCause: "The analysis failed unexpectedly.",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			gh := &fakeGitHub{checkRunID: 555}
+			if tc.runsOnPR {
+				svc := gate.NewService(gh, nil, &fakeStore{}, gate.Runners{Server: tc.runner}, nil, nil)
+				_ = svc.HandlePullRequest(t.Context(), testPR()) // the detail error is for the job log
+			} else {
+				svc := gate.NewService(gh, nil, &fakeStore{stored: awaitingState()}, gate.Runners{Actions: tc.runner}, nil, nil).WithCollectBackoff(0)
+				_ = svc.HandleRunCompleted(t.Context(), completedRun("success")) // as above
+			}
+
+			if len(gh.updates) != 1 || len(gh.comments) != 1 {
+				t.Fatalf("updates = %+v, comments = %+v, want one each", gh.updates, gh.comments)
+			}
+			check, body := gh.updates[0].run.Summary, gh.comments[0].Body
+			if check != tc.wantCause {
+				t.Errorf("check summary = %q, want %q", check, tc.wantCause)
+			}
+			if !strings.Contains(body, tc.wantCause) {
+				t.Errorf("summary comment = %q, want it to state %q", body, tc.wantCause)
+			}
+			for _, text := range []string{check, body} {
+				if strings.Contains(text, "evil.example") || strings.Contains(text, "```") {
+					t.Errorf("text = %q, want no model-controlled content", text)
+				}
+			}
+			var boxes []string
+			for line := range strings.SplitSeq(body, "\n") {
+				if strings.HasPrefix(line, "- [") {
+					boxes = append(boxes, line)
+				}
+			}
+			want := []string{"- [ ] Skip this commit", "- [ ] Skip this PR", "- [ ] Re-run analysis"}
+			if !slices.Equal(boxes, want) {
+				t.Errorf("checkbox lines = %q, want only the standard boxes %q", boxes, want)
+			}
+		})
 	}
 }

@@ -51,7 +51,7 @@ func renderSuggestion(id string, p review.Proposal) string {
 	blank := max(len(strings.TrimPrefix(p.Original, original))-1, 0)
 	content := strings.TrimRight(p.Content, "\n") + "\n" + strings.Repeat("\n", blank)
 	fence := fenceFor(content)
-	return proposalMarker(id) + "\n\n" + p.Reason + "\n\n" + fence + "suggestion\n" + content + fence + "\n"
+	return proposalMarker(id) + "\n\n" + inertProse(p.Reason) + "\n\n" + fence + "suggestion\n" + content + fence + "\n"
 }
 
 // renderOutdated keeps the old comment body readable under an outdated notice,
@@ -79,14 +79,14 @@ func renderCheckbox(id string, p review.Proposal, fork bool) string {
 	var b strings.Builder
 	b.WriteString(proposalMarker(id))
 	b.WriteString("\n\n")
-	b.WriteString(p.Reason)
+	b.WriteString(inertProse(p.Reason))
 	b.WriteString("\n\n")
 	b.WriteString(proposalTarget(p))
 	b.WriteString("\n\n")
 	fence := fenceFor(diff.String())
 	b.WriteString(fence + "diff\n" + diff.String() + fence + "\n")
 	if p.IndexEntry != "" {
-		fmt.Fprintf(&b, "\nIndex entry: `%s`\n", p.IndexEntry)
+		fmt.Fprintf(&b, "\nIndex entry: %s\n", codeSpan(p.IndexEntry))
 	}
 	if fork {
 		b.WriteString("\nApply is not available: this pull request comes from a fork the bot cannot push to.\n")
@@ -131,9 +131,9 @@ func withoutCheckbox(body, label string) string {
 
 func proposalTarget(p review.Proposal) string {
 	if p.Section == "" {
-		return fmt.Sprintf("New doc: `%s`", p.DocPath)
+		return "New doc: " + codeSpan(p.DocPath)
 	}
-	return fmt.Sprintf("`%s`, section %q", p.DocPath, p.Section)
+	return codeSpan(p.DocPath) + ", section " + codeSpan(p.Section)
 }
 
 func writePrefixed(b *strings.Builder, prefix, text string) {
@@ -145,6 +145,10 @@ func writePrefixed(b *strings.Builder, prefix, text string) {
 // fenceFor returns a backtick fence longer than any backtick run in body, so
 // proposed content containing code fences cannot close the diff block early.
 func fenceFor(body string) string {
+	return strings.Repeat("`", max(3, longestBacktickRun(body)+1))
+}
+
+func longestBacktickRun(body string) int {
 	longest, run := 0, 0
 	for _, r := range body {
 		if r == '`' {
@@ -154,7 +158,123 @@ func fenceFor(body string) string {
 			run = 0
 		}
 	}
-	return strings.Repeat("`", max(3, longest+1))
+	return longest
+}
+
+// codeSpan renders model-written identifier text as one inline code span: one
+// line, delimited by a backtick run longer than any inside it, so nothing in it
+// is interpreted as Markdown.
+func codeSpan(text string) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if strings.HasPrefix(text, "`") || strings.HasSuffix(text, "`") {
+		text = " " + text + " "
+	}
+	delim := strings.Repeat("`", longestBacktickRun(text)+1)
+	return delim + text + delim
+}
+
+// tableCodeSpan is codeSpan for a table cell, where GFM splits cells on `|`
+// before it parses code spans.
+func tableCodeSpan(text string) string {
+	return strings.ReplaceAll(codeSpan(text), "|", `\|`)
+}
+
+// inertProse renders model-written prose as one line of Markdown that cannot
+// mention, link or autolink, embed an image, open HTML, decode an entity or
+// start a block. Balanced inline code spans stay as written; every other
+// backtick is escaped.
+func inertProse(text string) string {
+	text = strings.Join(strings.Fields(text), " ")
+	var b strings.Builder
+	for i := 0; i < len(text); {
+		switch c := text[i]; c {
+		case '`':
+			n := backtickRunAt(text, i)
+			if end := closingBacktickRun(text, i+n, n); end >= 0 {
+				b.WriteString(text[i : end+n])
+				i = end + n
+			} else {
+				b.WriteString(strings.Repeat("\\`", n))
+				i += n
+			}
+			continue
+		case '<':
+			b.WriteString("&lt;")
+		case '&':
+			b.WriteString("&amp;")
+		case '@':
+			b.WriteString("@\u200b")
+		case ':':
+			if strings.HasPrefix(text[i:], "://") {
+				b.WriteString(":\u200b")
+			} else {
+				b.WriteByte(c)
+			}
+		case 'w', 'W':
+			if len(text) >= i+4 && strings.EqualFold(text[i:i+4], "www.") {
+				b.WriteString(text[i:i+3] + "\u200b")
+				i += 3
+				continue
+			}
+			b.WriteByte(c)
+		case '(':
+			if i > 0 && text[i-1] == ']' {
+				b.WriteString("\\(")
+			} else {
+				b.WriteByte(c)
+			}
+		case '\\', '[', ']':
+			b.WriteString("\\" + string(c))
+		default:
+			b.WriteByte(c)
+		}
+		i++
+	}
+	return escapeBlockStart(b.String())
+}
+
+func backtickRunAt(text string, i int) int {
+	n := 0
+	for i+n < len(text) && text[i+n] == '`' {
+		n++
+	}
+	return n
+}
+
+// closingBacktickRun returns the index of the first backtick run of exactly n
+// at or after from, or -1.
+func closingBacktickRun(text string, from, n int) int {
+	for j := from; j < len(text); {
+		if text[j] != '`' {
+			j++
+			continue
+		}
+		m := backtickRunAt(text, j)
+		if m == n {
+			return j
+		}
+		j += m
+	}
+	return -1
+}
+
+// escapeBlockStart keeps a line from opening as a heading, quote, list item,
+// checkbox, rule or fence.
+func escapeBlockStart(line string) string {
+	if line == "" {
+		return line
+	}
+	if strings.IndexByte("#>-+*=~", line[0]) >= 0 {
+		return "\\" + line
+	}
+	d := 0
+	for d < len(line) && line[d] >= '0' && line[d] <= '9' {
+		d++
+	}
+	if d > 0 && d < len(line) && (line[d] == '.' || line[d] == ')') {
+		return line[:d] + "\\" + line[d:]
+	}
+	return line
 }
 
 // renderSummary is the summary comment body: a heading (the failure cause when
@@ -190,7 +310,7 @@ func renderSummary(state PRState) string {
 	for _, p := range state.Proposals {
 		section := "(new doc)"
 		if p.Section != "" {
-			section = strings.ReplaceAll(p.Section, "|", `\|`)
+			section = tableCodeSpan(p.Section)
 		}
 		status := string(p.State)
 		if p.State == ProposalApplied {
@@ -200,7 +320,7 @@ func renderSummary(state PRState) string {
 		if p.CommentURL != "" {
 			link = fmt.Sprintf("[view](%s)", p.CommentURL)
 		}
-		fmt.Fprintf(&b, "| `%s` | %s | %s | %s |\n", strings.ReplaceAll(p.DocPath, "|", `\|`), section, link, status)
+		fmt.Fprintf(&b, "| %s | %s | %s | %s |\n", tableCodeSpan(p.DocPath), section, link, status)
 	}
 
 	if len(state.Proposals) > 0 {
