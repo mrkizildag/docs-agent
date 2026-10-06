@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
-	"github.com/mrkizildag/pollux-agent/backend/internal/docs"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/basedocs"
 )
 
 // Caps on one scaffold run, which reads the whole repo rather than one diff.
@@ -68,7 +68,7 @@ func (r *Runner) scaffold(ctx context.Context, req review.ScaffoldRequest) (revi
 	if err := json.Unmarshal(raw, &submitted); err != nil {
 		return review.Scaffold{}, fmt.Errorf("decode accepted submit_docs arguments: %w", err)
 	}
-	return review.Scaffold{Runner: runnerName, Model: r.model, Index: submitted.Index, Architecture: submitted.Architecture, Setup: submitted.Setup}, nil
+	return review.Scaffold{Runner: runnerName, Model: r.model, ScaffoldDocs: submitted}, nil
 }
 
 // checkSubmittedDocs is the finishing tool's Accept.
@@ -77,12 +77,7 @@ func checkSubmittedDocs(args json.RawMessage) error {
 	if err := json.Unmarshal(args, &d); err != nil {
 		return fmt.Errorf("decode submit_docs arguments: %w", err)
 	}
-	files := d.Files()
-	scaffold := make([]docs.ScaffoldFile, len(files))
-	for i, f := range files {
-		scaffold[i] = docs.ScaffoldFile(f)
-	}
-	if err := docs.CheckScaffold(scaffold, review.IndexPath, review.IndexHeading); err != nil {
+	if err := basedocs.CheckScaffold(d); err != nil {
 		return fmt.Errorf("submit_docs: %w", err)
 	}
 	return nil

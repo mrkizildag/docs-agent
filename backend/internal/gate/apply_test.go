@@ -624,10 +624,10 @@ func TestHandleCommentIgnoredReactsToNothing(t *testing.T) {
 	}
 }
 
-func TestHandleCommentApplyRefusesWhenAFileCannotBeRead(t *testing.T) {
+func TestHandleCommentApplyRefusesWhenAFileIsTooLargeToRead(t *testing.T) {
 	t.Parallel()
 
-	tooLarge := fmt.Errorf("docs/README.md: %w", review.ErrFileTooLarge)
+	tooLarge := fmt.Errorf("read: %w", review.ErrFileTooLarge)
 	for _, path := range []string{review.IndexPath, "docs/a.md", "docs/c.md"} {
 		t.Run(path, func(t *testing.T) {
 			t.Parallel()
@@ -637,9 +637,19 @@ func TestHandleCommentApplyRefusesWhenAFileCannotBeRead(t *testing.T) {
 			gh.FileErrs = map[string]error{path: tooLarge}
 			svc := newService(gh, store, gate.Runners{}, nil)
 
-			err := svc.HandleComment(t.Context(), issueComment("/pollux-agent apply"))
-			if !errors.Is(err, review.ErrFileTooLarge) {
-				t.Fatalf("HandleComment() = %v, want wrapping review.ErrFileTooLarge", err)
+			ev := summaryTick("Apply all")
+			if err := svc.HandleComment(t.Context(), ev); err != nil {
+				t.Fatalf("HandleComment() = %v, want nil", err)
+			}
+			comments := gh.Comments()
+			if last := comments[len(comments)-1]; !strings.Contains(last.Body, path+" is too large to edit; nothing was committed.") {
+				t.Errorf("reply = %q, want the too-large refusal naming %s", last.Body, path)
+			}
+			if summary := comments[summaryID-1].Body; strings.Contains(summary, "[x]") {
+				t.Errorf("summary = %q, want the Apply all box unticked", summary)
+			}
+			if diff := cmp.Diff([]gate.Reaction{gate.ReactionRefused}, gh.Reactions(ev.Kind, ev.CommentID)); diff != "" {
+				t.Errorf("reactions (-want +got):\n%s", diff)
 			}
 			if commits := gh.Committed(); len(commits) != 0 {
 				t.Errorf("commits = %+v, want none", commits)

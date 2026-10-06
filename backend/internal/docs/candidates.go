@@ -1,7 +1,6 @@
 package docs
 
 import (
-	"path"
 	"slices"
 	"strings"
 )
@@ -15,7 +14,7 @@ type Change struct {
 
 // Candidates returns the docs of t, the base tree, whose covers match the
 // changes, in path order. A doc the PR renamed is reported at its new path;
-// a doc the PR removes, or renames out of docs/ or to a non-.md path, is
+// a doc the PR removes, or renames out of docs/ or to a non-doc path, is
 // reported in deleted instead.
 func (t Tree) Candidates(changes []Change) (candidates, deleted []string) {
 	changed := make([]string, 0, len(changes))
@@ -49,5 +48,5 @@ func (t Tree) Candidates(changes []Change) (candidates, deleted []string) {
 }
 
 func isDocPath(p string) bool {
-	return strings.HasPrefix(p, "docs/") && path.Ext(p) == ".md"
+	return strings.HasPrefix(p, "docs/") && isDocFile(p)
 }

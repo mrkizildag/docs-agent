@@ -328,12 +328,44 @@ func TestRun_DeadlineIsErrDeadline(t *testing.T) {
 
 	t.Run("from Complete", func(t *testing.T) {
 		t.Parallel()
+		ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(time.Hour))
+		defer cancel()
+		model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
+			func(llm.Request) (llm.Response, error) {
+				cancel()
+				return llm.Response{}, context.DeadlineExceeded
+			},
+		}}
+		_, _, err := agent.Run(ctx, model, task, agent.NewBudget(1000))
+		if errors.Is(err, agent.ErrDeadline) {
+			t.Errorf("Run() err = %v, want no ErrDeadline for a canceled run", err)
+		}
+	})
+
+	t.Run("unrelated model error at the deadline", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+		model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
+			func(llm.Request) (llm.Response, error) {
+				<-ctx.Done()
+				return llm.Response{}, errors.New("connection reset")
+			},
+		}}
+		_, _, err := agent.Run(ctx, model, task, agent.NewBudget(1000))
+		if !errors.Is(err, agent.ErrDeadline) {
+			t.Errorf("Run() err = %v, want ErrDeadline", err)
+		}
+	})
+
+	t.Run("provider timeout with a live context", func(t *testing.T) {
+		t.Parallel()
 		model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 			func(llm.Request) (llm.Response, error) { return llm.Response{}, context.DeadlineExceeded },
 		}}
 		_, _, err := agent.Run(t.Context(), model, task, agent.NewBudget(1000))
-		if !errors.Is(err, agent.ErrDeadline) || !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("Run() err = %v, want ErrDeadline wrapping DeadlineExceeded", err)
+		if errors.Is(err, agent.ErrDeadline) || !errors.Is(err, agent.ErrModel) {
+			t.Errorf("Run() err = %v, want ErrModel and not ErrDeadline", err)
 		}
 	})
 
@@ -359,10 +391,15 @@ func TestRun_CancelIsNotErrDeadline(t *testing.T) {
 
 	t.Run("from Complete", func(t *testing.T) {
 		t.Parallel()
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
 		model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
-			func(llm.Request) (llm.Response, error) { return llm.Response{}, context.Canceled },
+			func(llm.Request) (llm.Response, error) {
+				cancel()
+				return llm.Response{}, context.Canceled
+			},
 		}}
-		_, _, err := agent.Run(t.Context(), model, task, agent.NewBudget(1000))
+		_, _, err := agent.Run(ctx, model, task, agent.NewBudget(1000))
 		if errors.Is(err, agent.ErrDeadline) || !errors.Is(err, context.Canceled) {
 			t.Errorf("Run() err = %v, want Canceled and not ErrDeadline", err)
 		}

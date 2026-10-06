@@ -30,7 +30,7 @@ func (h *pushHarness) waitRerun(id int64) (gate.CheckRun, gate.PRState) {
 	state := h.waitState(fmt.Sprintf("check run %d to finish", id), func(s gate.PRState) bool { return s.CheckRunID == id && s.Run == nil })
 	var run gate.CheckRun
 	waitFor(h.t, fmt.Sprintf("check run %d to conclude", id), func() bool {
-		cr, ok := h.checkRun(id)
+		cr, ok := h.gh.CheckRun(id)
 		run = cr.Latest()
 		return ok && run.Status == gate.StatusCompleted
 	})
@@ -128,7 +128,7 @@ func TestRerunAndPushTogetherEndOnNewestHead(t *testing.T) {
 	var state gate.PRState
 	h.waitState("the newest head to finish", func(s gate.PRState) bool {
 		state = s
-		cr, ok := h.checkRun(s.CheckRunID)
+		cr, ok := h.gh.CheckRun(s.CheckRunID)
 		ids := h.updatedIDs()
 		return s.HeadSHA == "sha2" && s.Run == nil && s.CheckRunID > 1 && ok && cr.Latest().Status == gate.StatusCompleted && ids[len(ids)-1] == s.CheckRunID
 	})
@@ -221,7 +221,7 @@ func TestSupersededServerAnalysisIsNotReportedFailed(t *testing.T) {
 	waitClosed(t, started, "the first analysis to start")
 	h.push("sha2")
 
-	first, ok := h.checkRun(1)
+	first, ok := h.gh.CheckRun(1)
 	if ids := h.updatedIDs(); !slices.Equal(ids, []int64{1, 2}) || !ok || first.Latest().Title != "Superseded" {
 		t.Fatalf("updated check runs = %v, check run 1 = %+v, want check run 1 superseded, then check run 2", ids, first.Latest())
 	}
@@ -266,7 +266,7 @@ func TestPushSupersedesQueuedRerun(t *testing.T) {
 	state := h.waitState("the newest head to finish", func(s gate.PRState) bool { return s.HeadSHA == "sha2" && s.Run == nil && s.CheckRunID > 1 })
 	var last gate.CheckRun
 	waitFor(t, "the newest check run to conclude", func() bool {
-		cr, ok := h.checkRun(state.CheckRunID)
+		cr, ok := h.gh.CheckRun(state.CheckRunID)
 		last = cr.Latest()
 		return ok && last.Status == gate.StatusCompleted
 	})

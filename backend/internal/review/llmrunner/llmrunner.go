@@ -98,7 +98,10 @@ func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started,
 
 // failed classifies err into the *review.FailedError a runner returns.
 func failed(err error) *review.FailedError {
-	if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, agent.ErrDeadline) {
+	// A provider HTTP timeout also matches DeadlineExceeded, but it is a model
+	// failure, not the run's deadline.
+	if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, agent.ErrDeadline) &&
+		!errors.Is(err, agent.ErrModel) && !errors.Is(err, errProvider) {
 		err = fmt.Errorf("%w: %w", agent.ErrDeadline, err)
 	}
 	return &review.FailedError{Cause: classify(err), Err: err}
@@ -266,7 +269,7 @@ const maxReasonLen = 300
 
 // oneLine collapses s onto a single line and truncates it to max bytes.
 func oneLine(s string, max int) string {
-	return review.Truncate(strings.Join(strings.Fields(s), " "), max)
+	return review.Truncate(strings.Join(strings.Fields(s), " "), max, "...")
 }
 
 // docIndex maps a repo-relative doc path to its parsed doc at the head commit;
@@ -352,15 +355,16 @@ func (r *Runner) verify(ctx context.Context, budget *agent.Budget, f fence, p re
 	return *v.Supported, v.Reason, nil
 }
 
-// checkSection reports why p, whose Section is normalized, cannot replace a
-// section of its doc: the doc is not in the index, or Section does not name
-// exactly one heading of it.
-func checkSection(index docIndex, p review.Proposal) error {
+// fillSection sets p.Original and p.Lines from the doc p replaces a section of.
+// p.Section is normalized. It reports why p cannot replace a section of its
+// doc: the doc is not in the index, or Section does not name exactly one
+// heading of it.
+func fillSection(index docIndex, p *review.Proposal) error {
 	doc, ok := index[p.DocPath]
 	if !ok {
 		return fmt.Errorf("section %q: %s is not an existing doc; leave section empty to create a new doc", p.Section, p.DocPath)
 	}
-	if err := basedocs.FillOriginal(&p, doc); err != nil {
+	if err := basedocs.FillOriginal(p, doc); err != nil {
 		return fmt.Errorf("check section of %s: %w", p.DocPath, err)
 	}
 	return nil
@@ -378,6 +382,7 @@ func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budge
 		impactedDocs[i] = index[p]
 	}
 
+	var accepted []review.Proposal
 	task := agent.Task{
 		Model:  r.model,
 		System: draftSystemPrompt,
@@ -389,7 +394,8 @@ func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budge
 			if err := json.Unmarshal(args, &parsed); err != nil {
 				return fmt.Errorf("decode submit_proposals arguments: %w", err)
 			}
-			for _, p := range parsed.Proposals {
+			for i := range parsed.Proposals {
+				p := &parsed.Proposals[i]
 				p.Section = review.NormalizeSection(p.Section)
 				if err := p.Validate(req.ChangedFiles); err != nil {
 					return fmt.Errorf("proposal %s: %w", p.DocPath, err)
@@ -397,34 +403,22 @@ func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budge
 				if p.Section == "" {
 					continue
 				}
-				if err := checkSection(index, p); err != nil {
+				if err := fillSection(index, p); err != nil {
 					return fmt.Errorf("proposal %s: %w", p.DocPath, err)
 				}
 			}
+			accepted = parsed.Proposals
 			return nil
 		},
 		MaxSteps: r.analysisLimits.steps,
 	}
 
-	raw, stats, err := agent.Run(ctx, r.m, task, budget)
+	_, stats, err := agent.Run(ctx, r.m, task, budget)
 	r.logStats(ctx, "draft", stats)
 	if err != nil {
 		return nil, fmt.Errorf("draft proposals: %w", err)
 	}
-
-	var parsed review.ProposalsArgs
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, fmt.Errorf("decode accepted submit_proposals arguments: %w", err)
-	}
-
-	for i := range parsed.Proposals {
-		p := &parsed.Proposals[i]
-		p.Section = review.NormalizeSection(p.Section)
-		if err := basedocs.FillOriginal(p, index[p.DocPath]); err != nil {
-			return nil, fmt.Errorf("accepted proposal %s: %w", p.DocPath, err)
-		}
-	}
-	return parsed.Proposals, nil
+	return accepted, nil
 }
 
 func (r *Runner) logStats(ctx context.Context, what string, stats agent.Stats) {

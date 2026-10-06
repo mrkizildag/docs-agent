@@ -3,7 +3,6 @@ package gate
 import (
 	"fmt"
 	"time"
-	"unicode/utf8"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
@@ -102,19 +101,6 @@ const (
 // deadline sweep concludes its check run. Every runner's own timeout must be
 // shorter.
 const AnalysisDeadline = 10 * time.Minute
-
-// truncate cuts s to at most max bytes on a UTF-8 boundary, ending in a marker
-// when it cut anything.
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	cut := max - len(truncatedMark)
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut] + truncatedMark
-}
 
 // shortSHA is the 7-character abbreviation of sha.
 func shortSHA(sha string) string { return sha[:min(7, len(sha))] }

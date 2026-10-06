@@ -157,14 +157,11 @@ func buildRunners(cfg config.Config, ghClient *github.Client) (gate.Runners, err
 		return gate.Runners{}, fmt.Errorf("LLM_PROVIDER is set, so the server runner needs git on PATH: %w", err)
 	}
 
-	var model llm.Model
-	switch cfg.LLM.Provider {
-	case config.LLMProviderOpenAI:
-		model = llm.NewOpenAI(&http.Client{Timeout: llmHTTPTimeout}, cfg.LLM.BaseURL, cfg.LLM.APIKey.Reveal())
-	case config.LLMProviderAnthropic:
-		model = llm.NewAnthropic(&http.Client{Timeout: llmHTTPTimeout}, cfg.LLM.BaseURL, cfg.LLM.APIKey.Reveal())
-	default:
-		return gate.Runners{}, errors.New("unreachable: config validated the LLM provider")
+	// config.Load admits only the two providers, so anything but OpenAI is Anthropic.
+	httpClient := &http.Client{Timeout: llmHTTPTimeout}
+	var model llm.Model = llm.NewAnthropic(httpClient, cfg.LLM.BaseURL, cfg.LLM.APIKey.Reveal())
+	if cfg.LLM.Provider == config.LLMProviderOpenAI {
+		model = llm.NewOpenAI(httpClient, cfg.LLM.BaseURL, cfg.LLM.APIKey.Reveal())
 	}
 
 	runner := llmrunner.New(model, ghClient.InstallationToken, cfg.LLM.TriageModel, cfg.LLM.Model)

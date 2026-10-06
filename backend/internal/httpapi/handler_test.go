@@ -20,6 +20,7 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
 	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/jobs"
 )
 
 const (
@@ -208,13 +209,13 @@ func pullRequestPayload(t *testing.T, action string) []byte {
 	return body
 }
 
-func postWebhook(t *testing.T, secret []byte, jobs httpapi.Enqueuer, event string, deliveryID string, body []byte) *httptest.ResponseRecorder {
+func postWebhook(t *testing.T, secret []byte, jobs jobs.Enqueuer, event string, deliveryID string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 
 	return postWebhookWithLookup(t, secret, jobs, fakeRunLookup{}, event, deliveryID, body)
 }
 
-func postWebhookWithLookup(t *testing.T, secret []byte, jobs httpapi.Enqueuer, runs httpapi.RunLookup, event string, deliveryID string, body []byte) *httptest.ResponseRecorder {
+func postWebhookWithLookup(t *testing.T, secret []byte, jobs jobs.Enqueuer, runs httpapi.RunLookup, event string, deliveryID string, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 
 	logger := slog.New(slog.DiscardHandler)
@@ -406,7 +407,7 @@ func workflowRunBody(t *testing.T, action, path string, runID int64) []byte {
 	return body
 }
 
-func postWorkflowRun(t *testing.T, runs httpapi.RunLookup, jobs httpapi.Enqueuer, body []byte) *httptest.ResponseRecorder {
+func postWorkflowRun(t *testing.T, runs httpapi.RunLookup, jobs jobs.Enqueuer, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 
 	secret := []byte("test-secret")
@@ -870,5 +871,34 @@ func TestWebhookWorkflowRunOfScaffold(t *testing.T) {
 	want := []jobqueue.NewJob{{DeliveryID: "d-run", Key: "acme/widgets#scaffold", Kind: "scaffold_run", Payload: wantPayload}}
 	if diff := cmp.Diff(want, jobs.jobs); diff != "" {
 		t.Errorf("Enqueue calls (-want +got):\n%s", diff)
+	}
+}
+
+type failingReader struct{ t *testing.T }
+
+func (r failingReader) Read([]byte) (int, error) {
+	r.t.Error("handler read the body of an unsigned request")
+	return 0, errors.New("body read")
+}
+
+func TestWebhookRejectsMalformedSignatureBeforeReadingBody(t *testing.T) {
+	t.Parallel()
+
+	for _, signature := range []string{"", "sha256=", "sha256=" + strings.Repeat("0", 63), "sha256=" + strings.Repeat("z", 64), "sha1=" + strings.Repeat("0", 64)} {
+		t.Run(signature, func(t *testing.T) {
+			t.Parallel()
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", failingReader{t})
+			if signature != "" {
+				req.Header.Set("X-Hub-Signature-256", signature)
+			}
+			rec := httptest.NewRecorder()
+
+			httpapi.NewHandler(slog.New(slog.DiscardHandler), []byte("s"), newFakeEnqueuer(), fakeRunLookup{}).ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("POST /webhook = %d, want %d", rec.Code, http.StatusUnauthorized)
+			}
+		})
 	}
 }

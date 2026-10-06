@@ -3,7 +3,7 @@
   "properties": {
     "index": {
       "type": "string",
-      "description": "Full markdown of docs/README.md, frontmatter included."
+      "description": "Full markdown of docs/README.md, frontmatter included. Link the other two docs under a '## Index' heading."
     },
     "architecture": {
       "type": "string",

@@ -136,8 +136,9 @@ func CheckScaffold(files []ScaffoldFile, indexPath, indexHeading string) error {
 		return fmt.Errorf("check scaffold doc %s: %w", index.Path, err)
 	}
 
-	if _, _, _, ok := doc.SectionSpan(indexHeading); !ok {
-		return fmt.Errorf("check scaffold doc %s: the index must have exactly one %q section", index.Path, indexHeading)
+	level := len(indexHeading) - len(strings.TrimLeft(indexHeading, "#"))
+	if section, ok := doc.findSection(indexHeading); !ok || section.Level != level {
+		return fmt.Errorf("check scaffold doc %s: the index must have exactly one %q section at that level", index.Path, indexHeading)
 	}
 
 	for _, f := range files {
@@ -153,28 +154,13 @@ func CheckScaffold(files []ScaffoldFile, indexPath, indexHeading string) error {
 	return nil
 }
 
-// SectionSpan returns the text of the section titled heading (leading "#"s and
-// surrounding space ignored) and its 1-based inclusive line range, from the
+// SectionSpan returns the text of the section titled heading (a leading ATX
+// marker and surrounding space ignored) and its 1-based inclusive line range, from the
 // heading line through the section's last line. ok is false when no heading
 // matches or when several do, since a span for the wrong one would be edited.
 func (d Doc) SectionSpan(heading string) (text string, start, end int, ok bool) {
-	want := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(heading), "#"))
-
-	var found *Section
-
-	for i, s := range d.Sections {
-		if s.Level == 0 || s.Heading != want {
-			continue
-		}
-
-		if found != nil {
-			return "", 0, 0, false
-		}
-
-		found = &d.Sections[i]
-	}
-
-	if found == nil {
+	found, ok := d.findSection(heading)
+	if !ok {
 		return "", 0, 0, false
 	}
 
@@ -183,6 +169,39 @@ func (d Doc) SectionSpan(heading string) (text string, start, end int, ok bool) 
 	end = start + strings.Count(strings.TrimSuffix(text, "\n"), "\n")
 
 	return text, start, end, true
+}
+
+// findSection returns the one titled section whose heading is heading with its
+// ATX marker and surrounding space ignored; ok is false for none or several.
+func (d Doc) findSection(heading string) (found *Section, ok bool) {
+	want := normalizeHeading(heading)
+
+	for i, s := range d.Sections {
+		if s.Level == 0 || s.Heading != want {
+			continue
+		}
+
+		if found != nil {
+			return nil, false
+		}
+
+		found = &d.Sections[i]
+	}
+
+	return found, found != nil
+}
+
+// normalizeHeading is review.NormalizeSection, which this package cannot
+// import; a test in review/basedocs pins them together.
+func normalizeHeading(heading string) string {
+	for {
+		heading = strings.TrimSpace(heading)
+		hashes := len(heading) - len(strings.TrimLeft(heading, "#"))
+		if hashes < 1 || hashes > 6 || (hashes < len(heading) && heading[hashes] != ' ' && heading[hashes] != '\t') {
+			return heading
+		}
+		heading = heading[hashes:]
+	}
 }
 
 func validateCovers(covers []string) error {

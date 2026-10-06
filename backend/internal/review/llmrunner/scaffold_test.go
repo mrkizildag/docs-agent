@@ -68,7 +68,7 @@ func TestStartScaffold_BrokenIndexIsReturnedToModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartScaffold() = %v, want nil", err)
 	}
-	want := review.Scaffold{Runner: "llmrunner", Model: "m", Index: goodIndex, Architecture: scaffoldFrontmatter, Setup: scaffoldFrontmatter}
+	want := review.Scaffold{Runner: "llmrunner", Model: "m", ScaffoldDocs: review.ScaffoldDocs{Index: goodIndex, Architecture: scaffoldFrontmatter, Setup: scaffoldFrontmatter}}
 	got, ok := started.(review.Scaffold)
 	if !ok {
 		t.Fatalf("StartScaffold() = %T, want review.Scaffold", started)

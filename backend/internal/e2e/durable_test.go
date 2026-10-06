@@ -21,7 +21,7 @@ func TestWebhookRedeliveryAfterFailedJobEnqueuesNewJob(t *testing.T) {
 	t.Parallel()
 
 	gh := repoGitHub()
-	gh.Before = func(c gatetest.Call) error {
+	gh.Before = func(_ context.Context, c gatetest.Call) error {
 		if c.Method == "CreateCheckRun" && c.N == 1 {
 			return errors.New("create check run: boom")
 		}
@@ -51,7 +51,7 @@ func TestWebhookSecondSynchronizeCancelsFirst(t *testing.T) {
 
 	cancelled := make(chan struct{})
 	gh := repoGitHub()
-	gh.BeforeContext = func(ctx context.Context, c gatetest.Call) error {
+	gh.Before = func(ctx context.Context, c gatetest.Call) error {
 		if c.Method != "CreateCheckRun" || c.N != 1 {
 			return nil
 		}
@@ -175,7 +175,7 @@ func TestDeadlineJobFailedConcludeIsRetriedByLaterSweep(t *testing.T) {
 	awaitingRun(t, store, deadline)
 
 	gh := repoGitHub()
-	gh.Before = func(c gatetest.Call) error {
+	gh.Before = func(_ context.Context, c gatetest.Call) error {
 		if c.Method == "UpdateCheckRun" && c.N == 1 {
 			return errors.New("github rejected the conclude write")
 		}

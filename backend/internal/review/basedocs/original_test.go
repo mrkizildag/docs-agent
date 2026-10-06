@@ -76,6 +76,13 @@ func TestDocExtensionsAgree(t *testing.T) {
 		if walked != valid {
 			t.Errorf("extension %q: docs.Parse accepts = %v, review accepts = %v", ext, walked, valid)
 		}
+
+		base := docs.Tree{Docs: []docs.Doc{{Path: "docs/old.md", Covers: []string{"src/*.go"}}}}
+		candidates, deleted := base.Candidates([]docs.Change{{Path: "src/x.go"}, {Path: p, PreviousPath: "docs/old.md"}})
+		renamed := len(candidates) == 1 && candidates[0] == p && len(deleted) == 0
+		if renamed != valid {
+			t.Errorf("extension %q: Candidates treats a rename to it as a doc = %v, review accepts = %v", ext, renamed, valid)
+		}
 	}
 }
 
@@ -84,11 +91,12 @@ func TestDocExtensionsAgree(t *testing.T) {
 func TestSectionSpanNormalizesLikeReview(t *testing.T) {
 	t.Parallel()
 
-	doc := docs.ParseBody("docs/a.md", []byte("# Title\n\n## Setup\ntext\n"))
-	for _, in := range []string{"Setup", "## Setup", "  ### Setup  ", "#Setup", "Set up", "setup"} {
+	doc := docs.ParseBody("docs/a.md", []byte("# Title\n\n## Setup\ntext\n\n## #channels\nmore\n"))
+	for _, in := range []string{"Setup", "## Setup", "  ### Setup  ", "#Setup", "Set up", "setup", "#channels", "## #channels", "channels", "####### Setup"} {
 		_, _, _, found := doc.SectionSpan(in)
-		if want := review.NormalizeSection(in) == "Setup"; found != want {
-			t.Errorf("SectionSpan(%q) found = %v, want %v (NormalizeSection = %q)", in, found, want, review.NormalizeSection(in))
+		norm := review.NormalizeSection(in)
+		if want := norm == "Setup" || norm == "#channels"; found != want {
+			t.Errorf("SectionSpan(%q) found = %v, want %v (NormalizeSection = %q)", in, found, want, norm)
 		}
 	}
 }

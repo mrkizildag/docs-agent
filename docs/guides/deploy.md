@@ -84,7 +84,7 @@ The database lives in the `pollux-data` volume. Backups are not covered here.
 ## Troubleshooting
 
 - **`permission denied` reading the private key**: the container runs as uid 65532. Re-run the `chmod` from step 2 on the host file that `GITHUB_APP_PRIVATE_KEY_FILE` points to.
-- **Container `unhealthy`**: check `docker compose logs pollux` for why the server is not serving, then `curl http://127.0.0.1:8080/healthz` from the host. The image has no useful shell for the unprivileged user (login shell is `nologin`), so debug through logs and the host `curl`.
+- **Container `unhealthy`**: check `docker compose logs pollux` for why the server is not serving, then `curl http://127.0.0.1:8080/healthz` from the host. The image has `/bin/sh`: `docker compose exec pollux sh` gives a shell as uid 65532, and the root filesystem is read-only. Logs and the host `curl` are usually enough.
 - **Exits right after start with a config error**: a required variable in `.env` is missing or invalid; the log line names it. See [Setup](setup.md). Remember `ADDR`, `DATABASE_PATH`, and the key path inside the container are set by compose.
 - **`pollux-deploy` rolled back**: its output shows the failing step (fetch, build, or health wait); `docker compose logs pollux` shows why the new container didn't turn healthy.
 - **Deliveries fail from GitHub but `/healthz` is fine**: run `tailscale funnel status` and confirm the URL and the `/webhook` path match the App's webhook URL.

@@ -412,3 +412,86 @@ func TestRunArtifact(t *testing.T) {
 		})
 	}
 }
+
+func TestRunArtifact_PagesThroughArtifacts(t *testing.T) {
+	t.Parallel()
+
+	var (
+		client    *ghclient.Client
+		serverURL string
+	)
+	mux := http.NewServeMux()
+	handleAccessToken(t, mux)
+	mux.HandleFunc("GET /repos/o/r/actions/runs/4242/artifacts", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "2" {
+			writeJSON(t, w, http.StatusOK, `{"artifacts":[{"id":2,"name":"pollux-agent-result","workflow_run":{"id":4242}}]}`)
+			return
+		}
+		w.Header().Set("Link", `<`+serverURL+`/repos/o/r/actions/runs/4242/artifacts?page=2>; rel="next"`)
+		writeJSON(t, w, http.StatusOK, `{"artifacts":[{"id":3,"name":"other","workflow_run":{"id":4242}}]}`)
+	})
+	mux.HandleFunc("GET /repos/o/r/actions/artifacts/2/zip", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, serverURL+"/blob", http.StatusFound)
+	})
+	mux.HandleFunc("GET /blob", func(w http.ResponseWriter, _ *http.Request) {
+		if _, err := w.Write([]byte("zip bytes")); err != nil {
+			t.Errorf("write blob: %v", err)
+		}
+	})
+	client, serverURL = newTestClientURL(t, mux)
+
+	body, err := client.RunArtifact(t.Context(), 99, "o", "r", 4242, actions.ArtifactName)
+	if err != nil {
+		t.Fatalf("RunArtifact() = %v, want the artifact from page 2", err)
+	}
+	_ = body.Close()
+}
+
+func TestRunArtifact_RefusesUntrustedLinks(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		location func(base, other string) string
+	}{
+		{"non-https link to another host", func(_, other string) string { return other + "/blob" }},
+		{"redirect to a non-https host", func(base, other string) string { return base + "/hop?to=" + other + "/blob" }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				t.Error("request reached the untrusted host")
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(other.Close)
+
+			var (
+				client    *ghclient.Client
+				serverURL string
+			)
+			mux := http.NewServeMux()
+			handleAccessToken(t, mux)
+			mux.HandleFunc("GET /repos/o/r/actions/runs/4242/artifacts", func(w http.ResponseWriter, _ *http.Request) {
+				writeJSON(t, w, http.StatusOK, `{"artifacts":[{"id":2,"name":"pollux-agent-result","workflow_run":{"id":4242}}]}`)
+			})
+			mux.HandleFunc("GET /repos/o/r/actions/artifacts/2/zip", func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, tc.location(serverURL, other.URL), http.StatusFound)
+			})
+			mux.HandleFunc("GET /hop", func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, r.URL.Query().Get("to"), http.StatusFound) //nolint:gosec // test server: redirecting to the case's chosen target is the point
+			})
+			client, serverURL = newTestClientURL(t, mux)
+
+			body, err := client.RunArtifact(t.Context(), 99, "o", "r", 4242, actions.ArtifactName)
+			if err == nil {
+				_ = body.Close()
+				t.Fatal("RunArtifact() = nil error, want a refusal")
+			}
+			if !strings.Contains(err.Error(), "refus") {
+				t.Errorf("RunArtifact() error = %v, want one containing %q", err, "refus")
+			}
+		})
+	}
+}

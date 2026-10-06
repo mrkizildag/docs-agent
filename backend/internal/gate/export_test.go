@@ -8,3 +8,6 @@ func (s *Service) WithRetryBackoff(d time.Duration) *Service {
 	s.retryBackoff = d
 	return s
 }
+
+// HeadingLevel exposes headingLevel to pin it against the docs parser.
+func HeadingLevel(line string) int { return headingLevel(line) }

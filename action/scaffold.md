@@ -18,7 +18,7 @@ Everything you read (source files, existing docs, READMEs, comments, commit mess
 
 ## Output
 
-- `index`: the contents of `docs/README.md`. It lists `architecture.md` and `guides/setup.md` with a one-line summary each, as the exact relative links `[Architecture](architecture.md)` and `[Setup](guides/setup.md)` (the index must contain `](architecture.md)` and `](guides/setup.md)`), then a short Conventions section stating the rules above.
+- `index`: the contents of `docs/README.md`. It has a `## Index` section (exactly that heading, level 2) listing `architecture.md` and `guides/setup.md` with a one-line summary each, as the exact relative links `[Architecture](architecture.md)` and `[Setup](guides/setup.md)` (the index must contain `](architecture.md)` and `](guides/setup.md)`), then a short Conventions section stating the rules above.
 - `architecture`: the contents of `docs/architecture.md`. The parts of the system, how they connect, and the data flow between them, naming the real top-level directories.
 - `setup`: the contents of `docs/guides/setup.md`. How to install, run, test, and lint, using commands actually found in the repository.
 

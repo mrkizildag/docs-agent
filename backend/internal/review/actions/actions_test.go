@@ -1,7 +1,6 @@
 package actions_test
 
 import (
-	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -50,16 +49,8 @@ func (f *fakeAPI) RunArtifact(_ context.Context, _ int64, _, _ string, _ int64, 
 	if name != actions.ArtifactName {
 		return nil, fmt.Errorf("unexpected artifact %q", name)
 	}
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
-	w, err := zw.Create(actions.ResultFileName)
-	if err == nil {
-		_, err = w.Write(f.artifact)
-	}
-	if err == nil {
-		err = zw.Close()
-	}
-	return io.NopCloser(&buf), err
+	archive, err := zipBytes(actions.ResultFileName, f.artifact)
+	return io.NopCloser(bytes.NewReader(archive)), err
 }
 
 func (f *fakeAPI) ListChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {
@@ -469,8 +460,6 @@ func TestCollectRejectsSectionThatDoesNotResolveAtHead(t *testing.T) {
 	ambiguous["section"] = "Dup"
 	missingDoc := validProposal()
 	missingDoc["doc_path"] = "docs/gone.md"
-	brokenDoc := validProposal()
-	brokenDoc["doc_path"] = "docs/broken.md"
 
 	tests := []struct {
 		name     string
@@ -480,13 +469,12 @@ func TestCollectRejectsSectionThatDoesNotResolveAtHead(t *testing.T) {
 		{name: "no such heading lists the headings", proposal: missingSection, wantErr: `headings are: "A", "Usage", "Other", "Dup", "Dup"`},
 		{name: "duplicate heading", proposal: ambiguous, wantErr: "not exactly one"},
 		{name: "doc missing at head", proposal: missingDoc, wantErr: "does not exist at head"},
-		{name: "doc does not parse", proposal: brokenDoc, wantErr: "does not parse"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			api := &fakeAPI{files: map[string][]byte{"docs/a.md": []byte(sectionsDoc), "docs/broken.md": []byte("no frontmatter")}}
+			api := &fakeAPI{files: map[string][]byte{"docs/a.md": []byte(sectionsDoc)}}
 			_, err := collectProposals(t, api, tc.proposal)
 
 			var invalid *review.InvalidResultError
@@ -494,6 +482,20 @@ func TestCollectRejectsSectionThatDoesNotResolveAtHead(t *testing.T) {
 				t.Fatalf("Collect() = %v, want *review.InvalidResultError containing %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestCollectToleratesBrokenFrontmatterAtHead(t *testing.T) {
+	t.Parallel()
+
+	api := &fakeAPI{files: map[string][]byte{"docs/a.md": []byte("---\ntitle: [\n---\n# A\n\n## Usage\nold usage\n")}}
+	got, err := collectProposals(t, api, validProposal())
+	if err != nil {
+		t.Fatalf("Collect() = %v, want nil", err)
+	}
+	proposals, ok := got.Verdict.(review.Proposals)
+	if !ok || len(proposals) != 1 || !strings.Contains(proposals[0].Original, "old usage") {
+		t.Fatalf("Verdict = %#v, want one proposal with Original filled", got.Verdict)
 	}
 }
 
@@ -603,11 +605,13 @@ func TestCollectScaffold(t *testing.T) {
 					t.Fatalf("CollectScaffold() = %v, want nil", err)
 				}
 				want := review.Scaffold{
-					Runner:       "actions",
-					Model:        "m1",
-					Index:        scaffoldFrontmatter + "## Index\n[a](architecture.md) [s](guides/setup.md)\n",
-					Architecture: scaffoldFrontmatter,
-					Setup:        scaffoldFrontmatter,
+					Runner: "actions",
+					Model:  "m1",
+					ScaffoldDocs: review.ScaffoldDocs{
+						Index:        scaffoldFrontmatter + "## Index\n[a](architecture.md) [s](guides/setup.md)\n",
+						Architecture: scaffoldFrontmatter,
+						Setup:        scaffoldFrontmatter,
+					},
 				}
 				if diff := cmp.Diff(want, got); diff != "" {
 					t.Errorf("Scaffold (-want +got):\n%s", diff)

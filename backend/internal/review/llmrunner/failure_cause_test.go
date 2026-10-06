@@ -83,6 +83,7 @@ func TestFailed_ClassifiesEachAgentCauseSeparately(t *testing.T) {
 		{name: "token budget", err: fmt.Errorf("draft: %w", agent.ErrTokenBudget), want: review.CauseLimit},
 		{name: "agent deadline", err: fmt.Errorf("draft: %w", agent.ErrDeadline), want: review.CauseTimeout},
 		{name: "context deadline", err: fmt.Errorf("draft: %w", context.DeadlineExceeded), want: review.CauseTimeout},
+		{name: "provider http timeout", err: fmt.Errorf("step 1: %w: %w", agent.ErrModel, context.DeadlineExceeded), want: review.CauseProvider},
 		{name: "unclassified", err: errors.New("boom"), want: review.CauseInternal},
 	}
 	for _, tc := range tests {

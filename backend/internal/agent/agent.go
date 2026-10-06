@@ -98,8 +98,8 @@ func Run(ctx context.Context, m llm.Model, t Task, b *Budget) (json.RawMessage, 
 			Tools:    tools,
 		})
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				return nil, stats, ctxError(step+1, err)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, stats, ctxError(step+1, ctxErr)
 			}
 			return nil, stats, fmt.Errorf("agent: step %d: %w: %w", step+1, ErrModel, err)
 		}
@@ -156,7 +156,8 @@ func Run(ctx context.Context, m llm.Model, t Task, b *Budget) (json.RawMessage, 
 	return nil, stats, fmt.Errorf("agent: after %d steps: %w", stats.Steps, ErrStepLimit)
 }
 
-// ctxError wraps err from step n, adding ErrDeadline when a deadline passed.
+// ctxError wraps the run context's error from step n, adding ErrDeadline when
+// its deadline passed.
 func ctxError(n int, err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("agent: step %d: %w: %w", n, ErrDeadline, err)

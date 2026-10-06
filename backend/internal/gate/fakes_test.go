@@ -218,30 +218,10 @@ func writeOrder(gh *gatetest.GitHub) []string {
 	return order
 }
 
-// failNth is a gatetest Before hook that fails the nth call of method, once.
-func failNth(method string, n int) func(gatetest.Call) error {
-	return func(c gatetest.Call) error {
-		if c.Method == method && c.N == n {
-			return errors.New(method + " failed")
-		}
-		return nil
-	}
-}
-
-// failFirst is a gatetest Before hook that fails the first n calls of method.
-func failFirst(method string, n int) func(gatetest.Call) error {
-	return func(c gatetest.Call) error {
-		if c.Method == method && c.N <= n {
-			return errors.New(method + " failed")
-		}
-		return nil
-	}
-}
-
 // failUpdateOnce is a gatetest Before hook that fails the first UpdateCheckRun of check run id.
-func failUpdateOnce(id int64) func(gatetest.Call) error {
+func failUpdateOnce(id int64) func(context.Context, gatetest.Call) error {
 	failed := false
-	return func(c gatetest.Call) error {
+	return func(_ context.Context, c gatetest.Call) error {
 		if c.Method == "UpdateCheckRun" && c.ID == id && !failed {
 			failed = true
 			return errors.New("github unavailable")
@@ -255,16 +235,6 @@ func scaffoldFiles() []gate.FileChange {
 	return []gate.FileChange{{Path: "docs/README.md", Content: "i"}, {Path: "docs/architecture.md", Content: "a"}, {Path: "docs/guides/setup.md", Content: "s"}}
 }
 
-// checkRunByID is the fake's check run id, zero when it has not seen one.
-func checkRunByID(gh *gatetest.GitHub, id int64) gatetest.CheckRun {
-	for _, cr := range gh.CheckRuns() {
-		if cr.ID == id {
-			return cr
-		}
-	}
-	return gatetest.CheckRun{}
-}
-
 // updateCount is how many check run updates the fake has received in all.
 func updateCount(gh *gatetest.GitHub) int {
 	n := 0
@@ -272,4 +242,22 @@ func updateCount(gh *gatetest.GitHub) int {
 		n += len(cr.Updates)
 	}
 	return n
+}
+
+// mustCheckRun is the fake's check run id, failing the test when it has not seen one.
+func mustCheckRun(t *testing.T, gh *gatetest.GitHub, id int64) gatetest.CheckRun {
+	t.Helper()
+
+	cr, ok := gh.CheckRun(id)
+	if !ok {
+		t.Fatalf("check run %d not seen; check runs = %+v", id, gh.CheckRuns())
+	}
+	return cr
+}
+
+// theCheckRunID is the ID of the only check run the fake has seen.
+func theCheckRunID(t *testing.T, gh *gatetest.GitHub) int64 {
+	t.Helper()
+
+	return theCheckRun(t, gh).ID
 }

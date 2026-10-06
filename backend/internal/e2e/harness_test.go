@@ -191,20 +191,11 @@ func (h *pushHarness) waitConcluded(sha string) (gate.CheckRun, gate.PRState) {
 		if state.HeadSHA != sha || state.Run != nil || !h.commentIDsSaved(state) {
 			return false
 		}
-		cr, ok := h.checkRun(state.CheckRunID)
+		cr, ok := h.gh.CheckRun(state.CheckRunID)
 		run = cr.Latest()
 		return ok && cr.Created.HeadSHA == sha && run.Status == gate.StatusCompleted
 	})
 	return run, state
-}
-
-func (h *pushHarness) checkRun(id int64) (gatetest.CheckRun, bool) {
-	for _, cr := range h.gh.CheckRuns() {
-		if cr.ID == id {
-			return cr, true
-		}
-	}
-	return gatetest.CheckRun{}, false
 }
 
 // lastRun is the check run GitHub shows for the newest check run created.

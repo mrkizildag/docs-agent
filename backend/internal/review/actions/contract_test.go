@@ -11,6 +11,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
 )
 
@@ -124,4 +125,16 @@ func TestWorkflowContract(t *testing.T) {
 			t.Errorf("action.yml writes envelope fields %v, actions.Artifact has JSON tags %v", written, tags)
 		}
 	})
+}
+
+func TestScaffoldPromptNamesIndexHeading(t *testing.T) {
+	t.Parallel()
+
+	text, err := os.ReadFile(filepath.Join(actionDir, "scaffold.md"))
+	if err != nil {
+		t.Fatalf("read scaffold.md: %v", err)
+	}
+	if !strings.Contains(string(text), review.IndexHeading) {
+		t.Errorf("action/scaffold.md does not contain %q, which docs.CheckScaffold requires of the index", review.IndexHeading)
+	}
 }

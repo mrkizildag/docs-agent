@@ -12,6 +12,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 )
@@ -219,7 +220,11 @@ func grep(ctx context.Context, root *os.Root, raw json.RawMessage) (string, erro
 				continue
 			}
 			if len(line) > maxGrepLineLen {
-				line = line[:maxGrepLineLen] + "..."
+				cut := maxGrepLineLen
+				for cut > 0 && !utf8.RuneStart(line[cut]) {
+					cut--
+				}
+				line = line[:cut] + "..."
 			}
 			entry := fmt.Sprintf("%s:%d: %s\n", p, i+1, line)
 			if matches >= maxGrepMatches || out.Len()+len(entry) > maxGrepBytes {

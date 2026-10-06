@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 // skipActive reports whether a skip covers the head state reports on.
@@ -27,7 +29,7 @@ func skipRun(s PRState) CheckRun {
 		Status:     StatusCompleted,
 		Conclusion: ConclusionSuccess,
 		Title:      fmt.Sprintf("Skipped by @%s", sk.User),
-		Summary:    truncate(fmt.Sprintf("@%s skipped the docs check for this %s: %s", sk.User, sk.Scope.noun(), sk.Reason), maxSummaryBytes),
+		Summary:    review.Truncate(fmt.Sprintf("@%s skipped the docs check for this %s: %s", sk.User, sk.Scope.noun(), sk.Reason), maxSummaryBytes, truncatedMark),
 	}
 }
 
@@ -40,8 +42,8 @@ func OnSkip(s PRState, sk Skip) (PRState, CheckRun) {
 	return s, skipRun(s)
 }
 
-// maxReasonRunes caps a skip reason, which is echoed in the summary and the check run.
-const maxReasonRunes = 500
+// maxReasonBytes caps a skip reason, which is echoed in the summary and the check run.
+const maxReasonBytes = 500
 
 // cleanReason makes a user-written skip reason safe to echo: one line, capped,
 // with @mentions and checkbox markup broken so it can notify nobody and cannot
@@ -50,10 +52,7 @@ func cleanReason(reason string) string {
 	reason = strings.Join(strings.Fields(reason), " ")
 	reason = strings.ReplaceAll(reason, "@", "@\u200b")
 	reason = strings.ReplaceAll(reason, "- [", "-\u200b [")
-	if r := []rune(reason); len(r) > maxReasonRunes {
-		reason = strings.TrimSpace(string(r[:maxReasonRunes-1])) + "…"
-	}
-	return reason
+	return review.Truncate(reason, maxReasonBytes, "…")
 }
 
 // handleSkip acts on a skip intent from a sender already allowed to write.

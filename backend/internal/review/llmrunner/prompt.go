@@ -137,7 +137,7 @@ const scaffoldSystemPrompt = `You write the starting documentation for a reposit
 	`"architecture" (docs/architecture.md) and "setup" (docs/guides/setup.md). Conventions, all required: ` +
 	`every document starts with YAML frontmatter holding "title", "summary" (one line) and "covers" (a list of repo-root-relative globs of the code it describes, ` +
 	`for example "cmd/**" or "internal/**"; never a leading "/" or "./"). ` +
-	`The index has a "## Index" section listing the other two documents as relative markdown links with a one-line summary each, ` +
+	`The index has a "` + review.IndexHeading + `" section listing the other two documents as relative markdown links with a one-line summary each, ` +
 	`exactly [Architecture](architecture.md) and [Setup](guides/setup.md). ` +
 	`Document what the code cannot say: why the parts exist, how data flows between them, invariants, external contracts, ` +
 	`and the commands that actually work. Name real directories, files and commands you found; never invent any. ` +

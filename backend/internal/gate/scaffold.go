@@ -177,6 +177,13 @@ func noRunnerRun(headSHA string) CheckRun {
 	return neutral(run, noDocsTitle, "No scaffold can be written until an analysis runner is set up: "+setupGuideURL)
 }
 
+// noAnalysisRunnerRun is the neutral check run of a PR whose head has docs/
+// when no analysis runner is configured.
+func noAnalysisRunnerRun(headSHA string) CheckRun {
+	run := CheckRun{Name: CheckName, HeadSHA: headSHA, Status: StatusCompleted}
+	return neutral(run, "No analysis runner configured", "Set up an analysis runner: "+setupGuideURL)
+}
+
 // noDocsRun is the neutral check run of a PR whose head has no docs/ folder
 // while a runner is available. Its summary links the scaffold PR once s is
 // Opened and says to add docs/ by hand once s has GaveUp.
@@ -209,19 +216,20 @@ func docsPresentRun(headSHA string) CheckRun {
 	return neutral(run, noDocsTitle, "The default branch already has a docs/ folder, so Pollux wrote no scaffold. Merge or rebase the default branch into this pull request to have its docs analyzed.")
 }
 
-// concludeNoDocs reports the neutral check run of a PR without docs/ when no
-// runner could write a scaffold.
-func (s *Service) concludeNoDocs(ctx context.Context, state PRState, pr PullRequest) error {
-	id, err := s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, noRunnerRun(pr.HeadSHA))
-	if err != nil {
-		return fmt.Errorf("create check run: %w", err)
-	}
-	next := OnPush(state, pr)
-	next.CheckRunID = id
-	if err := s.store.SavePR(ctx, next); err != nil {
+// saveScaffold saves state within a write budget that survives a cancelled ctx.
+func (s *Service) saveScaffold(ctx context.Context, state ScaffoldState) error {
+	ctx, cancel := writeContext(ctx)
+	defer cancel()
+	if err := s.store.SaveScaffold(ctx, state); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}
 	return nil
+}
+
+// concludeNoDocs reports the neutral check run of a PR without docs/ when no
+// runner could write a scaffold.
+func (s *Service) concludeNoDocs(ctx context.Context, state PRState, pr PullRequest) error {
+	return s.concludeWithRun(ctx, OnPush(state, pr), noRunnerRun(pr.HeadSHA))
 }
 
 // requestScaffold reports the neutral check run of a PR without docs/ and asks
@@ -318,12 +326,9 @@ func (s *Service) handleScaffoldRun(ctx context.Context, rc RunCompleted) error 
 		return err
 	}
 
-	writeCtx, cancel := writeContext(ctx)
 	state = OnScaffoldWritten(state, files)
-	err = s.store.SaveScaffold(writeCtx, state)
-	cancel()
-	if err != nil {
-		return fmt.Errorf("save state: %w", err)
+	if err := s.saveScaffold(ctx, state); err != nil {
+		return err
 	}
 	if err := s.advanceScaffold(ctx, state); err != nil {
 		return s.healWaiters(ctx, RepoRef{Owner: rc.Owner, Repo: rc.Repo}, err)
@@ -466,12 +471,7 @@ func (s *Service) proposeScaffold(ctx context.Context, state ScaffoldState) (Sca
 		return state, err
 	}
 	state = OnScaffoldOpened(state, pr)
-	writeCtx, cancel := writeContext(ctx)
-	defer cancel()
-	if err := s.store.SaveScaffold(writeCtx, state); err != nil {
-		return state, fmt.Errorf("save state: %w", err)
-	}
-	return state, nil
+	return state, s.saveScaffold(ctx, state)
 }
 
 // concludeDocsPresent frees the scaffold for a later request, then tells the
@@ -480,11 +480,8 @@ func (s *Service) proposeScaffold(ctx context.Context, state ScaffoldState) (Sca
 // *waitersError, and a job for the saved state finds the waiters still unlinked.
 func (s *Service) concludeDocsPresent(ctx context.Context, state ScaffoldState) (ScaffoldState, error) {
 	done := OnScaffoldDocsPresent(state)
-	writeCtx, cancel := writeContext(ctx)
-	err := s.store.SaveScaffold(writeCtx, done)
-	cancel()
-	if err != nil {
-		return state, fmt.Errorf("save state: %w", err)
+	if err := s.saveScaffold(ctx, done); err != nil {
+		return state, err
 	}
 	if err := s.concludeWaiters(ctx, done, docsPresentRun("")); err != nil {
 		return done, &waitersError{err}
@@ -532,12 +529,7 @@ func (s *Service) startScaffold(ctx context.Context, state ScaffoldState, tip st
 	default:
 		return state, fmt.Errorf("write scaffold: unexpected review.ScaffoldStarted %T", started)
 	}
-	writeCtx, cancel := writeContext(ctx)
-	defer cancel()
-	if err := s.store.SaveScaffold(writeCtx, state); err != nil {
-		return state, fmt.Errorf("save state: %w", err)
-	}
-	return state, nil
+	return state, s.saveScaffold(ctx, state)
 }
 
 // concludeNoRunner frees the scaffold for a later request when no runner can
@@ -606,10 +598,8 @@ func (s *Service) openScaffoldPR(ctx context.Context, state ScaffoldState, base 
 			return state, ScaffoldPR{}, fmt.Errorf("commit scaffold to %s: %w", scaffoldBranch, err)
 		}
 		state.CommitSHA = sha
-		writeCtx, cancel := writeContext(ctx)
-		defer cancel()
-		if err := s.store.SaveScaffold(writeCtx, state); err != nil {
-			return state, ScaffoldPR{}, fmt.Errorf("save state: %w", err)
+		if err := s.saveScaffold(ctx, state); err != nil {
+			return state, ScaffoldPR{}, err
 		}
 	}
 

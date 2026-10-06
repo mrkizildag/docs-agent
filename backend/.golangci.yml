@@ -181,6 +181,42 @@ linters:
           deny:
             - pkg: github.com/mrkizildag/pollux-agent/backend/internal/llm
               desc: only agent and llmrunner (and cmd/server) may import internal/llm
+        only-tests-gatetest:
+          files:
+            - "**/internal/**"
+            - "**/cmd/**"
+            - "!**/internal/gate/gatetest/**"
+            - "!$test"
+          deny:
+            - pkg: github.com/mrkizildag/pollux-agent/backend/internal/gate/gatetest
+              desc: test support, imported only by tests
+        only-tests-sqlitetest:
+          files:
+            - "**/internal/**"
+            - "**/cmd/**"
+            - "!**/internal/gate/sqlite/sqlitetest/**"
+            - "!$test"
+          deny:
+            - pkg: github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite/sqlitetest
+              desc: test support, imported only by tests
+        only-tests-llmtest:
+          files:
+            - "**/internal/**"
+            - "**/cmd/**"
+            - "!**/internal/llm/llmtest/**"
+            - "!$test"
+          deny:
+            - pkg: github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest
+              desc: test support, imported only by tests
+        only-tests-gitfixture:
+          files:
+            - "**/internal/**"
+            - "**/cmd/**"
+            - "!**/internal/gitfixture/**"
+            - "!$test"
+          deny:
+            - pkg: github.com/mrkizildag/pollux-agent/backend/internal/gitfixture
+              desc: test support, imported only by tests
     forbidigo:
       analyze-types: true
       forbid:

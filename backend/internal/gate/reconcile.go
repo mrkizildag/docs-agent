@@ -148,11 +148,12 @@ func withHeading(p review.Proposal) review.Proposal {
 	return p
 }
 
-// headingLevel is the ATX level of line ("## x" is 2), or 0 when it is not a heading.
+// headingLevel is the ATX level of line ("## x" is 2), or 0 when it is not a
+// heading: 1-6 '#'s followed by a space, a tab, or the end of the line.
 func headingLevel(line string) int {
 	line = strings.TrimSpace(line)
 	level := len(line) - len(strings.TrimLeft(line, "#"))
-	if level == 0 || level > 6 || (len(line) > level && line[level] != ' ') {
+	if level == 0 || level > 6 || (len(line) > level && line[level] != ' ' && line[level] != '\t') {
 		return 0
 	}
 	return level

@@ -37,15 +37,16 @@ type ScaffoldStarted interface{ isScaffoldStarted() }
 // Scaffold is the three docs of the default structure. Fixed fields make any
 // other path inexpressible.
 type Scaffold struct {
-	Runner       string
-	Model        string
-	Index        string
-	Architecture string
-	Setup        string
+	Runner string
+	Model  string
+	ScaffoldDocs
 }
 
-// Paths of the scaffold's files; the index is IndexPath.
+// Paths of the scaffold's files. IndexHeading is the section of the index that
+// lists the docs, where Apply adds a new doc's entry.
 const (
+	IndexPath        = "docs/README.md"
+	IndexHeading     = "## Index"
 	ArchitecturePath = "docs/architecture.md"
 	SetupPath        = "docs/guides/setup.md"
 )
@@ -56,24 +57,19 @@ type ScaffoldFile struct {
 	Content string
 }
 
-// Files returns the scaffold's files with their paths: the one place those
-// paths are defined for writing.
-func (s Scaffold) Files() []ScaffoldFile {
-	return ScaffoldDocs{Index: s.Index, Architecture: s.Architecture, Setup: s.Setup}.Files()
-}
-
 func (Pending) isScaffoldStarted()  {}
 func (Scaffold) isScaffoldStarted() {}
 
 // ScaffoldDocs is what the Actions runner's Claude Code run returns as
 // structured_output when it writes the starting docs.
 type ScaffoldDocs struct {
-	Index        string `json:"index" jsonschema:"Full markdown of docs/README.md, frontmatter included."`
+	Index        string `json:"index" jsonschema:"Full markdown of docs/README.md, frontmatter included. Link the other two docs under a '## Index' heading."`
 	Architecture string `json:"architecture" jsonschema:"Full markdown of docs/architecture.md, frontmatter included."`
 	Setup        string `json:"setup" jsonschema:"Full markdown of docs/guides/setup.md, frontmatter included."`
 }
 
-// Files returns the docs with their paths.
+// Files returns the docs with their paths: the one place those paths are
+// defined for writing.
 func (d ScaffoldDocs) Files() []ScaffoldFile {
 	return []ScaffoldFile{
 		{Path: IndexPath, Content: d.Index},

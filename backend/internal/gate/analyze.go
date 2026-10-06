@@ -111,7 +111,7 @@ func (s *Service) analyze(ctx context.Context, state PRState, pr PullRequest) er
 	}
 
 	if next := OnPush(state, pr); next.Skip != nil && next.Skip.Scope == SkipPR {
-		return s.concludeSkipped(ctx, next, pr)
+		return s.concludeWithRun(ctx, next, skipRun(next))
 	}
 
 	docsExist, err := s.gh.DocsExist(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.HeadSHA)
@@ -143,27 +143,13 @@ func (s *Service) analyze(ctx context.Context, state PRState, pr PullRequest) er
 	case runnerNone:
 	}
 
-	run := CheckRun{
-		Name:       CheckName,
-		HeadSHA:    pr.HeadSHA,
-		Status:     StatusCompleted,
-		Conclusion: ConclusionNeutral,
-		Title:      "No analysis runner configured",
-		Summary:    "Set up an analysis runner: " + setupGuideURL,
-	}
-	if _, err := s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, run); err != nil {
-		return fmt.Errorf("create check run: %w", err)
-	}
-	if err := s.store.SavePR(ctx, OnPush(state, pr)); err != nil {
-		return fmt.Errorf("save state: %w", err)
-	}
-	return nil
+	return s.concludeWithRun(ctx, OnPush(state, pr), noAnalysisRunnerRun(pr.HeadSHA))
 }
 
-// concludeSkipped reports the active PR skip as the check run for the new head
-// without starting any analysis.
-func (s *Service) concludeSkipped(ctx context.Context, next PRState, pr PullRequest) error {
-	id, err := s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, skipRun(next))
+// concludeWithRun creates the completed check run for next's head, records its
+// ID in next, and saves next. No analysis starts.
+func (s *Service) concludeWithRun(ctx context.Context, next PRState, run CheckRun) error {
+	id, err := s.gh.CreateCheckRun(ctx, next.InstallationID, next.Owner, next.Repo, run)
 	if err != nil {
 		return fmt.Errorf("create check run: %w", err)
 	}
@@ -242,8 +228,9 @@ func (s *Service) startRun(ctx context.Context, state PRState, pr PullRequest, r
 }
 
 // failRun concludes the check run neutral for cause, reports it in the summary
-// comment, and saves the concluded state. It returns cause, as a
-// *reportedFailure when those steps succeeded, else joined with their error.
+// comment, and saves the concluded state. When those steps succeeded it returns
+// nil for an unusable result, which a retry would only reproduce, else cause as
+// a *reportedFailure; when they failed it returns cause joined with their error.
 func (s *Service) failRun(ctx context.Context, state PRState, pr PullRequest, cause error) error {
 	outcome := failedOutcome(failureCause(cause))
 	var large *tooLargeError
@@ -256,6 +243,9 @@ func (s *Service) failRun(ctx context.Context, state PRState, pr PullRequest, ca
 	}
 	if err := s.concludeFailed(ctx, state, pr, outcome); err != nil {
 		return errors.Join(cause, err)
+	}
+	if unusable != nil {
+		return nil //nolint:nilerr // the unusable result is reported on the check; a retry would get the same result
 	}
 	return &reportedFailure{cause}
 }
@@ -520,15 +510,4 @@ func (s *Service) start(ctx context.Context, runner review.Runner, pr PullReques
 		return nil, nil, fmt.Errorf("start analysis: %w", err)
 	}
 	return started, changed, nil
-}
-
-func proposalsSummary(proposals review.Proposals) string {
-	summary := ""
-	for _, p := range proposals {
-		if summary != "" {
-			summary += "\n"
-		}
-		summary += fmt.Sprintf("- %s: %s", p.DocPath, p.Reason)
-	}
-	return summary
 }

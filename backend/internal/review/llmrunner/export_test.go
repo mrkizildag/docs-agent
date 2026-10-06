@@ -8,7 +8,7 @@ import (
 )
 
 // SetRemote overrides the clone's remote URL. Tests use it to clone a local
-// git repository instead of a real GitHub repo.
+// git repository or server instead of a real GitHub repo.
 func (r *Runner) SetRemote(remote string) {
 	r.remote = remote
 }
@@ -34,3 +34,6 @@ func (r *Runner) SetLogger(l *slog.Logger) {
 func Failed(err error) *review.FailedError {
 	return failed(err)
 }
+
+// AllowedProtocols exposes the git protocol allow-list for a clone token.
+func AllowedProtocols(token string) string { return allowedProtocols(token) }

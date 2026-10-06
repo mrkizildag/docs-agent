@@ -22,11 +22,6 @@ import (
 
 const maxWebhookBodyBytes = 25 << 20 // GitHub's webhook payload cap
 
-// Enqueuer accepts a durable job for later processing by a worker.
-type Enqueuer interface {
-	Enqueue(ctx context.Context, job jobqueue.NewJob) (bool, error)
-}
-
 // RunLookup finds stored pull requests: the one an analysis workflow run was
 // dispatched for, and those at a head commit.
 type RunLookup interface {
@@ -36,7 +31,7 @@ type RunLookup interface {
 	ScaffoldForRun(ctx context.Context, owner, repo string, runID int64) (bool, error)
 }
 
-func NewHandler(logger *slog.Logger, webhookSecret []byte, enqueuer Enqueuer, runs RunLookup) *http.ServeMux {
+func NewHandler(logger *slog.Logger, webhookSecret []byte, enqueuer jobs.Enqueuer, runs RunLookup) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -188,9 +183,16 @@ func missingFields(event string) error {
 	return &badRequestError{reason: event + " payload missing fields"}
 }
 
-func webhookHandler(logger *slog.Logger, webhookSecret []byte, enqueuer Enqueuer, runs RunLookup) http.HandlerFunc {
+func webhookHandler(logger *slog.Logger, webhookSecret []byte, enqueuer jobs.Enqueuer, runs RunLookup) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		deliveryID := r.Header.Get("X-GitHub-Delivery")
+		signature := r.Header.Get("X-Hub-Signature-256")
+
+		// Reject before buffering a body an unauthenticated client chose the size of.
+		if !wellFormedSignature(signature) {
+			rejectSignature(logger, w, deliveryID)
+			return
+		}
 
 		r.Body = http.MaxBytesReader(w, r.Body, maxWebhookBodyBytes)
 		body, err := io.ReadAll(r.Body)
@@ -205,12 +207,8 @@ func webhookHandler(logger *slog.Logger, webhookSecret []byte, enqueuer Enqueuer
 			return
 		}
 
-		if !validSignature(webhookSecret, body, r.Header.Get("X-Hub-Signature-256")) {
-			logger.Warn("invalid webhook signature", "delivery_id", deliveryID)
-			w.WriteHeader(http.StatusUnauthorized)
-			if _, err := w.Write([]byte("invalid signature")); err != nil {
-				logger.Warn("write webhook response", "delivery_id", deliveryID, "err", err)
-			}
+		if !validSignature(webhookSecret, body, signature) {
+			rejectSignature(logger, w, deliveryID)
 			return
 		}
 
@@ -480,6 +478,24 @@ func handleWorkflowRunEvent(ctx context.Context, runs RunLookup, deliveryID stri
 		return nil, err
 	}
 	return []jobqueue.NewJob{job}, nil
+}
+
+func rejectSignature(logger *slog.Logger, w http.ResponseWriter, deliveryID string) {
+	logger.Warn("invalid webhook signature", "delivery_id", deliveryID)
+	w.WriteHeader(http.StatusUnauthorized)
+	if _, err := w.Write([]byte("invalid signature")); err != nil {
+		logger.Warn("write webhook response", "delivery_id", deliveryID, "err", err)
+	}
+}
+
+// wellFormedSignature reports whether header is "sha256=" and 64 hex digits.
+func wellFormedSignature(header string) bool {
+	digest, ok := strings.CutPrefix(header, "sha256=")
+	if !ok || len(digest) != hex.EncodedLen(sha256.Size) {
+		return false
+	}
+	_, err := hex.DecodeString(digest)
+	return err == nil
 }
 
 func validSignature(secret, body []byte, header string) bool {

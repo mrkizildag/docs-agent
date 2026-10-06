@@ -40,17 +40,32 @@ func Select(baseFS fs.FS, files []review.ChangedFile) (Selection, error) {
 		changes[i] = docs.Change{Path: f.Path, PreviousPath: f.PreviousPath, Removed: f.Removed}
 	}
 	candidates, deleted := baseTree.Candidates(changes)
+	selection := Selection{Candidates: candidates, Problems: baseTree.Problems}
 	if len(deleted) == 0 {
-		return Selection{Candidates: candidates, Problems: baseTree.Problems}, nil
+		return selection, nil
 	}
 	restores, err := restores(baseFS, baseTree, deleted, files)
 	if err != nil {
 		return Selection{}, err
 	}
 	if len(restores) > 0 {
-		return Selection{Restores: restores, Problems: baseTree.Problems}, nil
+		selection.Candidates, selection.Restores = nil, restores
 	}
-	return Selection{Candidates: candidates, Problems: baseTree.Problems}, nil
+	return selection, nil
+}
+
+// CheckScaffold reports why docs are not a usable starting docs folder; both
+// runners apply it to the docs a model submits.
+func CheckScaffold(d review.ScaffoldDocs) error {
+	files := d.Files()
+	scaffold := make([]docs.ScaffoldFile, len(files))
+	for i, f := range files {
+		scaffold[i] = docs.ScaffoldFile(f)
+	}
+	if err := docs.CheckScaffold(scaffold, review.IndexPath, review.IndexHeading); err != nil {
+		return fmt.Errorf("scaffold docs: %w", err)
+	}
+	return nil
 }
 
 // restores proposes recreating each deleted base doc from its text at the base
@@ -60,9 +75,9 @@ func Select(baseFS fs.FS, files []review.ChangedFile) (Selection, error) {
 // for a doc when every covered file is deleted too: the feature and its doc
 // went together.
 func restores(baseFS fs.FS, baseTree docs.Tree, deleted []string, files []review.ChangedFile) ([]review.Proposal, error) {
-	readme, err := fs.ReadFile(baseFS, "docs/README.md")
+	readme, err := fs.ReadFile(baseFS, review.IndexPath)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, fmt.Errorf("read base docs/README.md: %w", err)
+		return nil, fmt.Errorf("read base %s: %w", review.IndexPath, err)
 	}
 
 	var proposals []review.Proposal

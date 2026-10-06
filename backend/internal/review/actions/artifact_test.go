@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -26,19 +27,28 @@ func (z *zipAPI) RunArtifact(context.Context, int64, string, string, int64, stri
 func zipOf(t *testing.T, name string, content []byte) []byte {
 	t.Helper()
 
+	archive, err := zipBytes(name, content)
+	if err != nil {
+		t.Fatalf("zip %s: %v", name, err)
+	}
+	return archive
+}
+
+// zipBytes is a zip holding one file.
+func zipBytes(name string, content []byte) ([]byte, error) {
 	var archive bytes.Buffer
 	zw := zip.NewWriter(&archive)
 	f, err := zw.Create(name)
 	if err != nil {
-		t.Fatalf("create zip entry: %v", err)
+		return nil, fmt.Errorf("create zip entry: %w", err)
 	}
 	if _, err := f.Write(content); err != nil {
-		t.Fatalf("write zip entry: %v", err)
+		return nil, fmt.Errorf("write zip entry: %w", err)
 	}
 	if err := zw.Close(); err != nil {
-		t.Fatalf("close zip: %v", err)
+		return nil, fmt.Errorf("close zip: %w", err)
 	}
-	return archive.Bytes()
+	return archive.Bytes(), nil
 }
 
 func TestCollectArtifactZip(t *testing.T) {

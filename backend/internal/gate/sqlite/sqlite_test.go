@@ -15,21 +15,6 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 )
 
-func open(t *testing.T) (*sqlite.Store, string) {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "state.db")
-	store, err := sqlite.Open(t.Context(), path)
-	if err != nil {
-		t.Fatalf("Open(%q) = %v, want nil error", path, err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Errorf("Close() = %v, want nil error", err)
-		}
-	})
-	return store, path
-}
-
 func TestOpen_MigrationsIdempotentOnReopen(t *testing.T) {
 	t.Parallel()
 
@@ -526,7 +511,7 @@ func TestRequeueRunning(t *testing.T) {
 func TestData_SurvivesCloseAndOpen(t *testing.T) {
 	t.Parallel()
 
-	store, path := open(t)
+	store, path := sqlitetest.OpenPath(t)
 	ctx := t.Context()
 
 	if err := store.SavePR(ctx, gate.PRState{Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1"}); err != nil {

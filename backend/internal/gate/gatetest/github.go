@@ -89,12 +89,10 @@ type GitHub struct {
 	// Fail makes every call of a method fail with the error, by method name.
 	Fail map[string]error
 	// Before runs before each call is applied, outside the fake's lock; an
-	// error fails the call, and it may block. It is the hook for failing the
-	// nth call, a call naming one ID, or holding a call while the test acts.
-	Before func(Call) error
-	// BeforeContext is Before with the call's context, so a hook can hold a
-	// call until the job running it is cancelled. It runs after Before.
-	BeforeContext func(context.Context, Call) error
+	// error fails the call, and it may block on ctx. It is the hook for failing
+	// the nth call (FailNth), a call naming one ID, or holding a call while the
+	// test acts.
+	Before func(context.Context, Call) error
 
 	mu          sync.Mutex
 	counts      map[string]int
@@ -153,6 +151,16 @@ func (g *GitHub) CheckRuns() []CheckRun {
 		runs[i].Updates = slices.Clone(runs[i].Updates)
 	}
 	return runs
+}
+
+// CheckRun returns the check run with id, and whether the fake has seen it.
+func (g *GitHub) CheckRun(id int64) (CheckRun, bool) {
+	for _, cr := range g.CheckRuns() {
+		if cr.ID == id {
+			return cr, true
+		}
+	}
+	return CheckRun{}, false
 }
 
 // Comments returns the pull request's comments as they stand now, bodies edited.
@@ -259,7 +267,7 @@ func (g *GitHub) begin(ctx context.Context, method string, installationID, id in
 	g.counts[method]++
 	call := Call{Method: method, N: g.counts[method], InstallationID: installationID, ID: id}
 	g.calls = append(g.calls, call)
-	fail, before, beforeCtx := g.Fail[method], g.Before, g.BeforeContext
+	fail, before := g.Fail[method], g.Before
 	g.mu.Unlock()
 
 	if err := ctx.Err(); err != nil {
@@ -269,14 +277,29 @@ func (g *GitHub) begin(ctx context.Context, method string, installationID, id in
 		return fail
 	}
 	if before != nil {
-		if err := before(call); err != nil {
-			return err
-		}
-	}
-	if beforeCtx != nil {
-		return beforeCtx(ctx, call)
+		return before(ctx, call)
 	}
 	return nil
+}
+
+// FailNth is a Before hook that fails the nth call of method with err, once.
+func FailNth(method string, n int, err error) func(context.Context, Call) error {
+	return func(_ context.Context, c Call) error {
+		if c.Method == method && c.N == n {
+			return err
+		}
+		return nil
+	}
+}
+
+// FailFirst is a Before hook that fails the first n calls of method with err.
+func FailFirst(method string, n int, err error) func(context.Context, Call) error {
+	return func(_ context.Context, c Call) error {
+		if c.Method == method && c.N <= n {
+			return err
+		}
+		return nil
+	}
 }
 
 func (g *GitHub) addComment(kind gate.CommentKind, body string) gate.Comment {

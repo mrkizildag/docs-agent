@@ -71,7 +71,7 @@ func (c *Client) CreateBranch(ctx context.Context, installationID int64, owner, 
 
 	if _, _, err := client.Git.CreateRef(ctx, owner, repo, github.CreateRef{Ref: branchRef(branch), SHA: sha}); err != nil {
 		var apiErr *github.ErrorResponse
-		if errors.As(err, &apiErr) && apiErr.Response != nil && apiErr.Response.StatusCode == http.StatusUnprocessableEntity &&
+		if hasStatus(err, http.StatusUnprocessableEntity) && errors.As(err, &apiErr) &&
 			strings.Contains(apiErr.Message, "Reference already exists") {
 			return fmt.Errorf("create branch %s of %s/%s: %w", branch, owner, repo, gate.ErrBranchExists)
 		}

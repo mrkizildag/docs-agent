@@ -210,8 +210,8 @@ func TestHandlePullRequestUnusableResultReportsFailureWithCause(t *testing.T) {
 			runner := &fakeRunner{started: review.Result{Verdict: verdict}}
 			svc := newService(gh, store, gate.Runners{Server: runner}, nil)
 
-			if err := svc.HandlePullRequest(t.Context(), testPR()); err == nil {
-				t.Fatal("HandlePullRequest() = nil, want the failure")
+			if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
+				t.Fatalf("HandlePullRequest() = %v, want nil: the failure is already reported", err)
 			}
 			cr := theCheckRun(t, gh)
 			if got := cr.Latest(); len(cr.Updates) != 1 || got.Conclusion != gate.ConclusionNeutral || got.Title != "Analysis failed" {
@@ -270,7 +270,7 @@ func TestHandlePullRequestSavesState(t *testing.T) {
 		t.Fatalf("HandlePullRequest() = %v, want nil", err)
 	}
 
-	want := gate.PRState{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123"}
+	want := gate.PRState{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123", CheckRunID: theCheckRunID(t, gh)}
 	if diff := cmp.Diff(want, loadPR(t, store, 7)); diff != "" {
 		t.Errorf("stored state (-want +got):\n%s", diff)
 	}
@@ -901,7 +901,7 @@ func TestHandleRunCompletedPostsComments(t *testing.T) {
 func TestHandleRunCompletedRetriesFailedPosts(t *testing.T) {
 	t.Parallel()
 
-	gh := &gatetest.GitHub{NextCheckRunID: 5, Before: failNth("CreateReviewComment", 2), Changed: []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 20}}}}}
+	gh := &gatetest.GitHub{NextCheckRunID: 5, Before: gatetest.FailNth("CreateReviewComment", 2, errors.New("CreateReviewComment failed")), Changed: []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 20}}}}}
 	runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A"), proposal("docs/b.md", "B")}}}
 	state := awaitingState()
 	state.CheckRunID = 5
@@ -1184,9 +1184,13 @@ func TestHandlePullRequestSkipCancellationNote(t *testing.T) {
 			})
 			var pendingAtNote *gate.SkipAsk
 			gh := &gatetest.GitHub{}
-			gh.Before = func(c gatetest.Call) error {
+			gh.Before = func(ctx context.Context, c gatetest.Call) error {
 				if c.Method == "CreateIssueComment" {
-					pendingAtNote = loadPR(t, store, 7).PendingSkip
+					state, err := store.LoadPR(ctx, "acme", "widgets", 7)
+					if err != nil {
+						return fmt.Errorf("load pr 7: %w", err)
+					}
+					pendingAtNote = state.PendingSkip
 				}
 				return nil
 			}
@@ -1318,6 +1322,23 @@ func TestHandleRerun(t *testing.T) {
 	}
 }
 
+func TestHandleRerunUnusableResultIsReportedNotRetried(t *testing.T) {
+	t.Parallel()
+
+	stored := gate.PRState{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "old111", SummaryCommentID: 3}
+	gh := &gatetest.GitHub{PullRequest: gate.PullRequest{BaseSHA: "tip1", HeadSHA: "new222", Open: true}}
+	runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{}}}
+	svc := newService(gh, newStore(t, stored), gate.Runners{Server: runner}, nil)
+
+	err := svc.HandleRerun(t.Context(), gate.RerunRequest{InstallationID: 42, PRRef: gate.PRRef{Owner: "acme", Repo: "widgets", Number: 7}, SummaryCommentID: 3})
+	if err != nil {
+		t.Fatalf("HandleRerun() = %v, want nil: the failure is already reported", err)
+	}
+	if got := theCheckRun(t, gh).Latest(); got.Conclusion != gate.ConclusionNeutral || got.Title != "Analysis failed" {
+		t.Errorf("check run = %+v, want neutral Analysis failed", got)
+	}
+}
+
 func TestHandleRerunSkips(t *testing.T) {
 	t.Parallel()
 
@@ -1382,7 +1403,7 @@ func TestHandleRerunSupersedesOverdueAnalysisOfSameHead(t *testing.T) {
 func TestHandlePullRequestServerRunnerRetriesFailedPosts(t *testing.T) {
 	t.Parallel()
 
-	gh := &gatetest.GitHub{Before: failNth("CreateReviewComment", 1), Changed: []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 20}}}}}
+	gh := &gatetest.GitHub{Before: gatetest.FailNth("CreateReviewComment", 1, errors.New("CreateReviewComment failed")), Changed: []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 20}}}}}
 	runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
 	store := newStore(t)
 	svc := newService(gh, store, gate.Runners{Server: runner}, nil).WithRetryBackoff(0)
@@ -1579,7 +1600,7 @@ func TestPostCommentsTransientFailureEndsConcluded(t *testing.T) {
 	t.Parallel()
 
 	gh := &gatetest.GitHub{Changed: []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 20}}, Patch: "@@"}}}
-	gh.Before = failFirst("CreateIssueComment", 1)
+	gh.Before = gatetest.FailFirst("CreateIssueComment", 1, errors.New("CreateIssueComment failed"))
 	runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
 	store := newStore(t, awaitingState())
 	svc := newService(gh, store, gate.Runners{Actions: runner}, nil).WithRetryBackoff(0)

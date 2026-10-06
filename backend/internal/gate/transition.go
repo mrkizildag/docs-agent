@@ -2,7 +2,9 @@ package gate
 
 import (
 	"cmp"
+	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
@@ -88,14 +90,14 @@ func MatchesRun(state PRState, rc RunCompleted) bool {
 func conclude(state PRState, outcome Outcome) (PRState, CheckRun) {
 	state.FailureCause = ""
 	if outcome.Failed != nil {
-		state.FailureCause = truncate(outcome.Failed.Cause, maxCauseBytes)
+		state.FailureCause = review.Truncate(outcome.Failed.Cause, maxCauseBytes, truncatedMark)
 	}
 	if skipActive(state) {
 		state.Run = nil
 		return state, skipRun(state)
 	}
 	state, run := concludeUncapped(state, outcome)
-	run.Summary = truncate(run.Summary, maxSummaryBytes)
+	run.Summary = review.Truncate(run.Summary, maxSummaryBytes, truncatedMark)
 	return state, run
 }
 
@@ -122,7 +124,7 @@ func concludeUncapped(state PRState, outcome Outcome) (PRState, CheckRun) {
 		}
 	case outcome.Failed != nil:
 		title := cmp.Or(outcome.Failed.Title, "Analysis failed")
-		return state, neutral(run, title, truncate(outcome.Failed.Cause, maxCauseBytes))
+		return state, neutral(run, title, review.Truncate(outcome.Failed.Cause, maxCauseBytes, truncatedMark))
 	default:
 		return state, neutral(run, "Analysis failed", "analysis ended without an outcome")
 	}
@@ -148,4 +150,12 @@ func appliedAs(ps ProposalState, p review.Proposal) bool {
 func neutral(run CheckRun, title, summary string) CheckRun {
 	run.Conclusion, run.Title, run.Summary = ConclusionNeutral, title, summary
 	return run
+}
+
+func proposalsSummary(proposals review.Proposals) string {
+	lines := make([]string, len(proposals))
+	for i, p := range proposals {
+		lines[i] = fmt.Sprintf("- %s: %s", p.DocPath, p.Reason)
+	}
+	return strings.Join(lines, "\n")
 }

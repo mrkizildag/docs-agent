@@ -45,16 +45,6 @@ func scaffoldGitHub(tip string) *gatetest.GitHub {
 	}
 }
 
-// failOnce makes the first call of method fail with err.
-func failOnce(method string, err error) func(gatetest.Call) error {
-	return func(c gatetest.Call) error {
-		if c.Method == method && c.N == 1 {
-			return err
-		}
-		return nil
-	}
-}
-
 // useRepo points the server runner's clones of acme/widgets at a local
 // repository with a Makefile and cmd/app, and returns its head SHA.
 func useRepo(t *testing.T, extra map[string]string) string {
@@ -344,7 +334,7 @@ func TestScaffoldCreatePRErrorRetriesOnNextEvent(t *testing.T) {
 	tip := useRepo(t, nil)
 	store := sqlitetest.Open(t)
 	gh := scaffoldGitHub(tip)
-	gh.Before = failOnce("CreatePullRequest", errors.New("github: 502"))
+	gh.Before = gatetest.FailNth("CreatePullRequest", 1, errors.New("github: 502"))
 	sys := start(t, store, gh, scaffoldRunners(scriptedModel(submitDocs(t, "1", scaffoldIndex), submitDocs(t, "2", scaffoldIndex))))
 
 	sys.deliverAs("d1", "pull_request", pullRequestBody(t, 1, tip, pushOpts{}))
@@ -366,7 +356,7 @@ func TestScaffoldCreatePRErrorRetriesOnNextEvent(t *testing.T) {
 func TestScaffoldLinkFailureIsHealedByNextEvent(t *testing.T) {
 	tip := useRepo(t, nil)
 	gh := scaffoldGitHub(tip)
-	gh.Before = failOnce("UpdateCheckRun", errors.New("github: 502"))
+	gh.Before = gatetest.FailNth("UpdateCheckRun", 1, errors.New("github: 502"))
 	sys := start(t, sqlitetest.Open(t), gh, scaffoldRunners(scriptedModel(submitDocs(t, "1", scaffoldIndex))))
 
 	sys.deliverAs("d1", "pull_request", pullRequestBody(t, 1, tip, pushOpts{}))

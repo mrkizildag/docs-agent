@@ -2,11 +2,7 @@ package github
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net/http"
-
-	"github.com/google/go-github/v92/github"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 )
@@ -60,13 +56,4 @@ func (c *Client) Unreact(ctx context.Context, installationID int64, owner, repo 
 		return fmt.Errorf("unreact %s/%s comment %d: unknown comment kind %q", owner, repo, id, kind)
 	}
 	return nil
-}
-
-func isNotFound(resp *github.Response) bool {
-	return resp != nil && resp.Response != nil && resp.StatusCode == http.StatusNotFound
-}
-
-func hasStatus(err error, code int) bool {
-	var apiErr *github.ErrorResponse
-	return errors.As(err, &apiErr) && apiErr.Response != nil && apiErr.Response.StatusCode == code
 }

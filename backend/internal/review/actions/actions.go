@@ -55,7 +55,7 @@ type WorkflowAPI interface {
 	// does not exist there. A file over docs.MaxDocBytes is an error wrapping
 	// review.ErrFileTooLarge.
 	FileAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (content []byte, ok bool, err error)
-	// DocsAtRef returns the .md files under docs/ at ref, rooted at the repo root.
+	// DocsAtRef returns the .md and .mdx files under docs/ at ref, rooted at the repo root.
 	DocsAtRef(ctx context.Context, installationID int64, owner, repo, ref string) (fs.FS, error)
 }
 
@@ -159,22 +159,11 @@ func (r *Runner) CollectScaffold(ctx context.Context, c review.Completion) (revi
 		return review.Scaffold{}, err
 	}
 
-	files := out.Files()
-	scaffold := make([]docs.ScaffoldFile, len(files))
-	for i, f := range files {
-		scaffold[i] = docs.ScaffoldFile(f)
-	}
-	if err := docs.CheckScaffold(scaffold, review.IndexPath, review.IndexHeading); err != nil {
-		return review.Scaffold{}, &review.InvalidResultError{Cause: errors.New(review.Truncate(err.Error(), maxCauseText))}
+	if err := basedocs.CheckScaffold(*out); err != nil {
+		return review.Scaffold{}, &review.InvalidResultError{Cause: errors.New(review.Truncate(err.Error(), maxCauseText, "..."))}
 	}
 
-	return review.Scaffold{
-		Runner:       runnerName,
-		Model:        model,
-		Index:        out.Index,
-		Architecture: out.Architecture,
-		Setup:        out.Setup,
-	}, nil
+	return review.Scaffold{Runner: runnerName, Model: model, ScaffoldDocs: *out}, nil
 }
 
 // collectOutput reads the run's result artifact and returns its structured
@@ -228,7 +217,7 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 	for i, p := range out.Proposals {
 		p.Section = review.NormalizeSection(p.Section)
 		if err := p.Validate(changed); err != nil {
-			return review.Result{}, &review.InvalidResultError{Cause: fmt.Errorf("proposal %d: %s", i, review.Truncate(err.Error(), maxCauseText))}
+			return review.Result{}, &review.InvalidResultError{Cause: fmt.Errorf("proposal %d: %s", i, review.Truncate(err.Error(), maxCauseText, "..."))}
 		}
 		proposals[i] = p
 	}
@@ -245,9 +234,8 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 
 // fillOriginals sets Original and Lines on each proposal that replaces a
 // section, from the doc at the completion's head. It returns
-// *review.InvalidResultError when the doc is missing there, does not parse, or
-// has no single heading matching the section. A doc over docs.MaxDocBytes
-// leaves both empty.
+// *review.InvalidResultError when the doc is missing there or has no single
+// heading matching the section. A doc over docs.MaxDocBytes leaves both empty.
 func (r *Runner) fillOriginals(ctx context.Context, c review.Completion, proposals review.Proposals) error {
 	parsed := map[string]*docs.Doc{}
 	for i := range proposals {
@@ -271,13 +259,14 @@ func (r *Runner) fillOriginals(ctx context.Context, c review.Completion, proposa
 			continue
 		}
 		if err := basedocs.FillOriginal(p, *doc); err != nil {
-			return &review.InvalidResultError{Cause: fmt.Errorf("proposal for %s: %s", p.DocPath, review.Truncate(err.Error(), maxCauseText))}
+			return &review.InvalidResultError{Cause: fmt.Errorf("proposal for %s: %s", p.DocPath, review.Truncate(err.Error(), maxCauseText, "..."))}
 		}
 	}
 	return nil
 }
 
-// headDoc parses docPath at the completion's head. readable is false when the
+// headDoc parses docPath at the completion's head, tolerating broken
+// frontmatter as the server runner does. readable is false when the
 // doc is too large to read.
 func (r *Runner) headDoc(ctx context.Context, c review.Completion, docPath string) (doc docs.Doc, readable bool, err error) {
 	src, ok, err := r.api.FileAtRef(ctx, c.InstallationID, c.Owner, c.Repo, docPath, c.HeadSHA)
@@ -290,11 +279,7 @@ func (r *Runner) headDoc(ctx context.Context, c review.Completion, docPath strin
 		return docs.Doc{}, false, &review.InvalidResultError{Cause: fmt.Errorf("proposal replaces a section of %s, which does not exist at head; leave section empty to create a new doc", docPath)}
 	}
 
-	doc, err = docs.ParseDoc(docPath, src)
-	if err != nil {
-		return docs.Doc{}, false, &review.InvalidResultError{Cause: fmt.Errorf("proposal replaces a section of %s, which does not parse: %s", docPath, review.Truncate(err.Error(), maxCauseText))}
-	}
-	return doc, true, nil
+	return docs.ParseBody(docPath, src), true, nil
 }
 
 // output returns the structured output of an artifact that belongs to c's
@@ -323,7 +308,7 @@ func (o ClaudeOutput[T]) failure() error {
 		status = strconv.Itoa(*o.APIErrorStatus)
 	}
 	return fmt.Errorf("claude code failed: api_error_status %s (terminal_reason %s, subtype %s)",
-		status, review.Truncate(o.TerminalReason, maxCauseText), review.Truncate(o.Subtype, maxCauseText))
+		status, review.Truncate(o.TerminalReason, maxCauseText, "..."), review.Truncate(o.Subtype, maxCauseText, "..."))
 }
 
 func (o ClaudeOutput[T]) model() string {

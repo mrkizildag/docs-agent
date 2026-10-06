@@ -162,6 +162,10 @@ func (s *Service) handleApply(ctx context.Context, state PRState, ev CommentEven
 	if errors.Is(err, errDocMismatch) {
 		return s.say(ctx, state, ev, "a proposal no longer matches the doc ("+err.Error()+"); nothing was committed.")
 	}
+	var large *fileTooLargeError
+	if errors.As(err, &large) {
+		return s.say(ctx, state, ev, large.Error()+"; nothing was committed.")
+	}
 	if err != nil {
 		return "", fmt.Errorf("prepare files: %w", err)
 	}
@@ -307,6 +311,13 @@ func (s *Service) finishApply(ctx context.Context, state PRState, tick []string,
 // errDocMismatch marks a proposal that cannot be applied to the doc at head.
 var errDocMismatch = errors.New("doc mismatch")
 
+// fileTooLargeError is a file the apply needs that is too large to read.
+type fileTooLargeError struct{ path string }
+
+func (e *fileTooLargeError) Error() string { return e.path + " is too large to edit" }
+
+func (e *fileTooLargeError) Unwrap() error { return review.ErrFileTooLarge }
+
 // applyFiles builds the file changes for the proposals at targets, reading
 // each doc once at the head. Section splices all run first; index entries for
 // new docs go in last so they cannot break a splice of the index itself. It
@@ -319,6 +330,9 @@ func (s *Service) applyFiles(ctx context.Context, state PRState, targets []int) 
 			return c, true, nil
 		}
 		b, ok, err := s.gh.FileAtRef(ctx, state.InstallationID, state.Owner, state.Repo, path, state.HeadSHA)
+		if errors.Is(err, review.ErrFileTooLarge) {
+			return "", false, &fileTooLargeError{path: path}
+		}
 		if err != nil {
 			return "", false, fmt.Errorf("read %s at %s: %w", path, shortSHA(state.HeadSHA), err)
 		}

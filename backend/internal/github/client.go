@@ -5,9 +5,11 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"sync"
@@ -221,20 +223,9 @@ func (c *Client) RunArtifact(ctx context.Context, installationID int64, owner, r
 		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: %w", runID, owner, repo, err)
 	}
 
-	list, _, err := client.Actions.ListWorkflowRunArtifacts(ctx, owner, repo, runID, &github.ListOptions{PerPage: 100})
+	artifactID, err := findArtifact(ctx, client, owner, repo, runID, name)
 	if err != nil {
-		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: list artifacts: %w", runID, owner, repo, err)
-	}
-
-	var artifactID int64
-	for _, a := range list.Artifacts {
-		if a.GetName() == name && !a.GetExpired() && a.GetWorkflowRun().GetID() == runID {
-			artifactID = a.GetID()
-			break
-		}
-	}
-	if artifactID == 0 {
-		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: no %s artifact", runID, owner, repo, name)
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: %w", runID, owner, repo, err)
 	}
 
 	archiveURL, _, err := client.Actions.DownloadArtifact(ctx, owner, repo, artifactID, 1)
@@ -242,12 +233,26 @@ func (c *Client) RunArtifact(ctx context.Context, installationID int64, owner, r
 		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: locate artifact %d: %w", runID, owner, repo, artifactID, err)
 	}
 
+	if !c.allowedDownload(archiveURL) {
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: download artifact: refusing non-https link to %s", runID, owner, repo, archiveURL.Host)
+	}
+
 	// The link is pre-signed and takes no installation token.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, archiveURL.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: download artifact: %w", runID, owner, repo, err)
 	}
-	resp, err := c.httpClient.Do(req)
+	download := *c.httpClient
+	download.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if len(via) >= maxDownloadRedirects {
+			return fmt.Errorf("stopped after %d redirects", maxDownloadRedirects)
+		}
+		if !c.allowedDownload(next.URL) {
+			return fmt.Errorf("refusing redirect to %s", next.URL.Redacted())
+		}
+		return nil
+	}
+	resp, err := download.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: download artifact: %w", runID, owner, repo, err)
 	}
@@ -256,6 +261,47 @@ func (c *Client) RunArtifact(ctx context.Context, installationID int64, owner, r
 		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: download artifact: status %s", runID, owner, repo, resp.Status)
 	}
 	return resp.Body, nil
+}
+
+const maxDownloadRedirects = 10
+
+// findArtifact pages through run runID's artifacts for the unexpired one called name.
+func findArtifact(ctx context.Context, client *github.Client, owner, repo string, runID int64, name string) (int64, error) {
+	opts := &github.ListOptions{PerPage: 100}
+	for {
+		list, resp, err := client.Actions.ListWorkflowRunArtifacts(ctx, owner, repo, runID, opts)
+		if err != nil {
+			return 0, fmt.Errorf("list artifacts: %w", err)
+		}
+		for _, a := range list.Artifacts {
+			if a.GetName() == name && !a.GetExpired() && a.GetWorkflowRun().GetID() == runID {
+				return a.GetID(), nil
+			}
+		}
+		if resp.NextPage == 0 {
+			return 0, fmt.Errorf("no %s artifact", name)
+		}
+		opts.Page = resp.NextPage
+	}
+}
+
+// allowedDownload reports whether u may be fetched: https, or the scheme and
+// host of the configured API base URL (a test server).
+func (c *Client) allowedDownload(u *url.URL) bool {
+	if u.Scheme == "https" {
+		return true
+	}
+	base, err := url.Parse(c.baseURL)
+	return err == nil && c.baseURL != "" && u.Scheme == base.Scheme && u.Host == base.Host
+}
+
+func isNotFound(resp *github.Response) bool {
+	return resp != nil && resp.Response != nil && resp.StatusCode == http.StatusNotFound
+}
+
+func hasStatus(err error, code int) bool {
+	var apiErr *github.ErrorResponse
+	return errors.As(err, &apiErr) && apiErr.Response != nil && apiErr.Response.StatusCode == code
 }
 
 func (c *Client) installationClient(installationID int64) (*github.Client, error) {

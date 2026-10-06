@@ -34,7 +34,7 @@ func TestSaveScaffold_RoundTrips(t *testing.T) {
 	want := gate.ScaffoldState{
 		Owner: "acme", Repo: "widgets", InstallationID: 9, Phase: gate.ScaffoldWritten, Attempt: 3, Failures: 2,
 		BaseSHA: "abc", Run: &gate.AwaitingRun{RunID: 5, Nonce: "n", Deadline: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)},
-		Files:     &review.Scaffold{Runner: "r", Model: "m", Index: "i", Architecture: "a", Setup: "s"},
+		Files:     &review.Scaffold{Runner: "r", Model: "m", ScaffoldDocs: review.ScaffoldDocs{Index: "i", Architecture: "a", Setup: "s"}},
 		CommitSHA: "c0ffee", PRNumber: 4, PRURL: "https://gh/pull/4",
 	}
 	if err := store.SaveScaffold(t.Context(), want); err != nil {

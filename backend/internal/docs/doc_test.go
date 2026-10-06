@@ -421,6 +421,7 @@ func TestCheckScaffold(t *testing.T) {
 		{name: "architecture over the byte cap", index: index, architecture: frontmatter + strings.Repeat("x", docs.MaxDocBytes), set: frontmatter, wantErr: "byte cap"},
 		{name: "index misses setup link", index: frontmatter + "## Index\n[a](architecture.md)\n", architecture: frontmatter, set: frontmatter, wantErr: "](guides/setup.md)"},
 		{name: "index without the Index heading", index: frontmatter + "## Docs\n[a](architecture.md) [s](guides/setup.md)\n", architecture: frontmatter, set: frontmatter, wantErr: `"## Index"`},
+		{name: "index heading at another level", index: frontmatter + "### Index\n[a](architecture.md) [s](guides/setup.md)\n", architecture: frontmatter, set: frontmatter, wantErr: "at that level"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -438,5 +439,16 @@ func TestCheckScaffold(t *testing.T) {
 				t.Errorf("CheckScaffold() error = %v, want containing %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestSectionSpanAcceptsAnAlreadyNormalizedSection(t *testing.T) {
+	t.Parallel()
+
+	doc := docs.ParseBody("docs/a.md", []byte("# A\n\n## #channels\ntext\n"))
+	for _, in := range []string{"## #channels", "#channels"} {
+		if _, _, _, ok := doc.SectionSpan(in); !ok {
+			t.Errorf("SectionSpan(%q) found = false, want true", in)
+		}
 	}
 }

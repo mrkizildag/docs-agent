@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
@@ -247,5 +248,26 @@ func TestGrep_StopsWhenContextCanceled(t *testing.T) {
 	}
 	if strings.Contains(res.Content, "needle") {
 		t.Errorf("grep = %q, want no matches searched after cancel", res.Content)
+	}
+}
+
+func TestGrep_TruncatesLongLinesAtRuneBoundary(t *testing.T) {
+	t.Parallel()
+
+	root := testRoot(t)
+	line := "x" + strings.Repeat("é", 200)
+	if err := root.WriteFile("long.txt", []byte(line+"\n"), 0o600); err != nil {
+		t.Fatalf("write long.txt: %v", err)
+	}
+
+	res := runTool(t, root, "grep", `{"pattern":"é"}`)
+	if res.IsError {
+		t.Fatalf("grep = %q, want success", res.Content)
+	}
+	if !utf8.ValidString(res.Content) {
+		t.Errorf("grep = %q, want valid UTF-8", res.Content)
+	}
+	if !strings.HasSuffix(res.Content, "...\n") {
+		t.Errorf("grep = %q, want a truncated line", res.Content)
 	}
 }
