@@ -75,6 +75,15 @@ linters:
             - "!$test"
           allow:
             - $gostd
+        gatetest-deps:
+          list-mode: strict
+          files:
+            - "**/internal/gate/gatetest/**"
+            - "!$test"
+          allow:
+            - $gostd
+            - github.com/mrkizildag/pollux-agent/backend/internal/gate$
+            - github.com/mrkizildag/pollux-agent/backend/internal/review$
         jobs-deps:
           list-mode: strict
           files:

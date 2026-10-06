@@ -9,6 +9,8 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/gatetest"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
@@ -20,10 +22,12 @@ func skipBase() gate.PRState {
 	}
 }
 
-func skipService(state gate.PRState) (*gate.Service, *fakeGitHub, *fakeStore) {
-	gh := &fakeGitHub{}
-	store := &fakeStore{stored: state}
-	svc := newService(gh, &fakeCommentGitHub{canWrite: true}, store, gate.Runners{}, nil, nil)
+func skipService(t *testing.T, state gate.PRState) (*gate.Service, *gatetest.GitHub, *sqlite.Store) {
+	t.Helper()
+
+	gh := &gatetest.GitHub{CanWrite: true}
+	store := newStore(t, state)
+	svc := newService(gh, store, gate.Runners{}, nil)
 	return svc, gh, store
 }
 
@@ -62,45 +66,48 @@ func TestOnSkip(t *testing.T) {
 func TestHandleCommentSkipAsk(t *testing.T) {
 	t.Parallel()
 
-	svc, gh, store := skipService(skipBase())
+	svc, gh, store := skipService(t, skipBase())
 	ev := skipEvent(gate.CommentKindIssue, "- [x] Skip this commit", "")
 
 	if err := svc.HandleComment(t.Context(), ev); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)
 	}
 
-	if store.saved == nil || store.saved.PendingSkip == nil || *store.saved.PendingSkip != (gate.SkipAsk{User: "dev", Scope: gate.SkipCommit}) {
-		t.Fatalf("saved state = %+v, want PendingSkip for dev at commit scope", store.saved)
+	saved := loadPR(t, store, 7)
+	if saved.PendingSkip == nil || *saved.PendingSkip != (gate.SkipAsk{User: "dev", Scope: gate.SkipCommit}) {
+		t.Fatalf("stored state = %+v, want PendingSkip for dev at commit scope", saved)
 	}
-	if len(gh.comments) != 1 || gh.comments[0].Body != "@dev, reply with the reason for skipping this commit; your next comment on this PR becomes the reason." {
-		t.Errorf("comments = %+v, want one ask for dev", gh.comments)
+	if c := gh.Comments(); len(c) != 1 || c[0].Body != "@dev, reply with the reason for skipping this commit; your next comment on this PR becomes the reason." {
+		t.Errorf("comments = %+v, want one ask for dev", c)
 	}
-	if gh.editIssue != 1 {
-		t.Errorf("summary edits = %d, want 1", gh.editIssue)
+	if n := gh.CallCount("EditIssueComment"); n != 1 {
+		t.Errorf("summary edits = %d, want 1", n)
 	}
-	if len(gh.updates) != 0 || store.saved.Skip != nil {
-		t.Errorf("check run updates = %d, Skip = %v, want a pending ask only", len(gh.updates), store.saved.Skip)
+	if runs := gh.CheckRuns(); len(runs) != 0 || saved.Skip != nil {
+		t.Errorf("check runs = %+v, Skip = %v, want a pending ask only", runs, saved.Skip)
 	}
 
-	store.stored = *store.saved
 	if err := svc.HandleComment(t.Context(), ev); err != nil {
 		t.Fatalf("HandleComment() redelivery = %v, want nil", err)
 	}
-	if gh.createIssue != 1 || len(store.saveCalls) != 1 {
-		t.Errorf("after redelivery: asks = %d, saves = %d, want 1 and 1", gh.createIssue, len(store.saveCalls))
+	if n := gh.CallCount("CreateIssueComment"); n != 1 {
+		t.Errorf("after redelivery: asks = %d, want 1", n)
+	}
+	if diff := cmp.Diff(saved, loadPR(t, store, 7)); diff != "" {
+		t.Errorf("stored state after redelivery (-want +got):\n%s", diff)
 	}
 }
 
 func TestHandleCommentSkipAskForPR(t *testing.T) {
 	t.Parallel()
 
-	svc, gh, _ := skipService(skipBase())
+	svc, gh, _ := skipService(t, skipBase())
 
 	if err := svc.HandleComment(t.Context(), skipEvent(gate.CommentKindIssue, "- [x] Skip this PR", "")); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)
 	}
-	if len(gh.comments) != 1 || !strings.Contains(gh.comments[0].Body, "skipping this PR;") {
-		t.Errorf("comments = %+v, want an ask naming this PR", gh.comments)
+	if c := gh.Comments(); len(c) != 1 || !strings.Contains(c[0].Body, "skipping this PR;") {
+		t.Errorf("comments = %+v, want an ask naming this PR", c)
 	}
 }
 
@@ -123,16 +130,16 @@ func TestHandleCommentSkipWithReason(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			svc, gh, store := skipService(tc.state())
-			gh.checkRunID = 777
+			svc, gh, store := skipService(t, tc.state())
+			gh.NextCheckRunID = 777
 
 			if err := svc.HandleComment(t.Context(), skipEvent(gate.CommentKindIssue, "", tc.body)); err != nil {
 				t.Fatalf("HandleComment() = %v, want nil", err)
 			}
 
-			got := store.saved
-			if got == nil || got.Skip == nil {
-				t.Fatalf("saved state = %+v, want an active skip", got)
+			got := loadPR(t, store, 7)
+			if got.Skip == nil {
+				t.Fatalf("stored state = %+v, want an active skip", got)
 			}
 			wantSkip := gate.Skip{User: "dev", Scope: tc.scope, Reason: "typo fix", HeadSHA: "head1"}
 			if *got.Skip != wantSkip {
@@ -141,23 +148,26 @@ func TestHandleCommentSkipWithReason(t *testing.T) {
 			if got.Run != nil {
 				t.Errorf("Run = %+v, want nil: the skip wins over the awaited run", got.Run)
 			}
+			cr := theCheckRun(t, gh)
 			if tc.wantCreate {
-				if len(gh.calls) != 1 || gh.calls[0].run.Conclusion != gate.ConclusionSuccess || got.CheckRunID != 777 {
-					t.Errorf("created check runs = %+v, CheckRunID = %d, want one success and 777", gh.calls, got.CheckRunID)
+				if cr.Created.Conclusion != gate.ConclusionSuccess || cr.ID != 777 || got.CheckRunID != 777 {
+					t.Errorf("check run = %+v, CheckRunID = %d, want one created as a success, 777", cr, got.CheckRunID)
 				}
-			} else if len(gh.updates) != 1 || gh.updates[0].id != 555 || gh.updates[0].run.Conclusion != gate.ConclusionSuccess || len(gh.calls) != 0 {
-				t.Errorf("check run updates = %+v, creates = %d, want one success update of 555", gh.updates, len(gh.calls))
+			} else if cr.ID != 555 || len(cr.Updates) != 1 || cr.Latest().Conclusion != gate.ConclusionSuccess || gh.CallCount("CreateCheckRun") != 0 {
+				t.Errorf("check run = %+v, creates = %d, want one success update of 555", cr, gh.CallCount("CreateCheckRun"))
 			}
-			if gh.editIssue != 1 {
-				t.Errorf("summary edits = %d, want 1", gh.editIssue)
+			if n := gh.CallCount("EditIssueComment"); n != 1 {
+				t.Errorf("summary edits = %d, want 1", n)
 			}
 
-			store.stored = *got
 			if err := svc.HandleComment(t.Context(), skipEvent(gate.CommentKindIssue, "", tc.body)); err != nil {
 				t.Fatalf("HandleComment() redelivery = %v, want nil", err)
 			}
-			if len(store.saveCalls) != 1 {
-				t.Errorf("saves after redelivery = %d, want 1", len(store.saveCalls))
+			if diff := cmp.Diff(got, loadPR(t, store, 7)); diff != "" {
+				t.Errorf("stored state after redelivery (-want +got):\n%s", diff)
+			}
+			if again := theCheckRun(t, gh); len(again.Updates) != len(cr.Updates) {
+				t.Errorf("check run after redelivery = %+v, want it concluded no more than before: %+v", again, cr)
 			}
 		})
 	}
@@ -171,34 +181,38 @@ func TestHandleCommentSkipReason(t *testing.T) {
 
 		state := skipBase()
 		state.PendingSkip = &gate.SkipAsk{User: "dev", Scope: gate.SkipPR}
-		svc, gh, store := skipService(state)
+		svc, gh, store := skipService(t, state)
 
 		if err := svc.HandleComment(t.Context(), skipEvent(gate.CommentKindIssue, "", "generated code")); err != nil {
 			t.Fatalf("HandleComment() = %v, want nil", err)
 		}
 
 		want := &gate.Skip{User: "dev", Scope: gate.SkipPR, Reason: "generated code", HeadSHA: "head1"}
-		if diff := cmp.Diff(want, store.saved.Skip); diff != "" {
+		saved := loadPR(t, store, 7)
+		if diff := cmp.Diff(want, saved.Skip); diff != "" {
 			t.Errorf("Skip (-want +got):\n%s", diff)
 		}
-		if store.saved.PendingSkip != nil {
-			t.Errorf("PendingSkip = %+v, want nil", store.saved.PendingSkip)
+		if saved.PendingSkip != nil {
+			t.Errorf("PendingSkip = %+v, want nil", saved.PendingSkip)
 		}
-		if len(gh.updates) != 1 || !strings.Contains(gh.updates[0].run.Summary, "generated code") {
-			t.Errorf("check run updates = %+v, want one naming the reason", gh.updates)
+		if cr := theCheckRun(t, gh); len(cr.Updates) != 1 || !strings.Contains(cr.Latest().Summary, "generated code") {
+			t.Errorf("check run = %+v, want one update naming the reason", cr)
 		}
 	})
 
 	t.Run("no pending ask does nothing", func(t *testing.T) {
 		t.Parallel()
 
-		svc, gh, store := skipService(skipBase())
+		svc, gh, store := skipService(t, skipBase())
 
 		if err := svc.HandleComment(t.Context(), skipEvent(gate.CommentKindIssue, "", "just a comment")); err != nil {
 			t.Fatalf("HandleComment() = %v, want nil", err)
 		}
-		if len(store.saveCalls) != 0 || len(gh.updates) != 0 || len(gh.comments) != 0 {
-			t.Errorf("saves = %d, updates = %d, comments = %d, want none", len(store.saveCalls), len(gh.updates), len(gh.comments))
+		if runs := gh.CheckRuns(); len(runs) != 0 || len(gh.Comments()) != 0 {
+			t.Errorf("check runs = %+v, comments = %+v, want none", runs, gh.Comments())
+		}
+		if diff := cmp.Diff(skipBase(), loadPR(t, store, 7)); diff != "" {
+			t.Errorf("stored state (-want +got):\n%s", diff)
 		}
 	})
 }
@@ -206,27 +220,28 @@ func TestHandleCommentSkipReason(t *testing.T) {
 func TestHandleCommentSkipUpdatesCheckRunFromPush(t *testing.T) {
 	t.Parallel()
 
-	gh := &fakeGitHub{checkRunID: 321}
-	store := &fakeStore{}
+	gh := &gatetest.GitHub{NextCheckRunID: 321, CanWrite: true}
+	store := newStore(t)
 	runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
-	svc := newService(gh, &fakeCommentGitHub{canWrite: true}, store, gate.Runners{Server: runner}, nil, nil)
+	svc := newService(gh, store, gate.Runners{Server: runner}, nil)
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
 		t.Fatalf("HandlePullRequest() = %v, want nil", err)
 	}
-	if store.saved == nil || store.saved.CheckRunID != 321 {
-		t.Fatalf("saved state = %+v, want CheckRunID 321", store.saved)
+	if saved := loadPR(t, store, 7); saved.CheckRunID != 321 {
+		t.Fatalf("stored state = %+v, want CheckRunID 321", saved)
 	}
 
 	if err := svc.HandleComment(t.Context(), skipEvent(gate.CommentKindIssue, "", "/pollux-agent skip typo fix")); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)
 	}
 
-	if len(gh.calls) != 1 {
-		t.Errorf("created check runs = %d, want 1: the skip must reuse the push's check run", len(gh.calls))
+	cr := theCheckRun(t, gh)
+	if n := gh.CallCount("CreateCheckRun"); n != 1 {
+		t.Errorf("created check runs = %d, want 1: the skip must reuse the push's check run", n)
 	}
-	if len(gh.updates) != 2 || gh.updates[1].id != 321 || gh.updates[1].run.Conclusion != gate.ConclusionSuccess {
-		t.Errorf("check run updates = %+v, want the push's conclusion then a success update of 321", gh.updates)
+	if cr.ID != 321 || len(cr.Updates) != 2 || cr.Latest().Conclusion != gate.ConclusionSuccess {
+		t.Errorf("check run = %+v, want 321 with the push's conclusion then a success update", cr)
 	}
 }
 
@@ -244,13 +259,13 @@ func TestHandleCommentSkipReactsDone(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			comments := &fakeCommentGitHub{canWrite: true}
-			svc := newService(&fakeGitHub{}, comments, &fakeStore{stored: skipBase()}, gate.Runners{}, nil, nil)
+			gh := &gatetest.GitHub{CanWrite: true}
+			svc := newService(gh, newStore(t, skipBase()), gate.Runners{}, nil)
 
 			if err := svc.HandleComment(t.Context(), tc.event); err != nil {
 				t.Fatalf("HandleComment() = %v, want nil", err)
 			}
-			if diff := cmp.Diff([]gate.Reaction{gate.ReactionDone}, comments.reactionsOn(tc.event.Kind, tc.event.CommentID)); diff != "" {
+			if diff := cmp.Diff([]gate.Reaction{gate.ReactionDone}, gh.Reactions(tc.event.Kind, tc.event.CommentID)); diff != "" {
 				t.Errorf("reactions (-want +got):\n%s", diff)
 			}
 		})
@@ -277,10 +292,9 @@ func TestHandleCommentRerun(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			gh := &fakeGitHub{pullRequest: gate.PullRequest{BaseSHA: "base1", HeadSHA: "new222", Open: true}}
+			gh := &gatetest.GitHub{PullRequest: gate.PullRequest{BaseSHA: "base1", HeadSHA: "new222", Open: true}, CanWrite: tc.canWrite}
 			runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
-			comments := &fakeCommentGitHub{canWrite: tc.canWrite}
-			svc := newService(gh, comments, &fakeStore{stored: failed}, gate.Runners{Server: runner}, nil, nil)
+			svc := newService(gh, newStore(t, failed), gate.Runners{Server: runner}, nil)
 			ev := skipEvent(gate.CommentKindIssue, "- [x] Re-run analysis", "")
 
 			if err := svc.HandleComment(t.Context(), ev); err != nil {
@@ -289,7 +303,7 @@ func TestHandleCommentRerun(t *testing.T) {
 			if len(runner.calls) != tc.wantStarts {
 				t.Errorf("analyses started = %d, want %d", len(runner.calls), tc.wantStarts)
 			}
-			if diff := cmp.Diff([]gate.Reaction{tc.wantReaction}, comments.reactionsOn(ev.Kind, ev.CommentID)); diff != "" {
+			if diff := cmp.Diff([]gate.Reaction{tc.wantReaction}, gh.Reactions(ev.Kind, ev.CommentID)); diff != "" {
 				t.Errorf("reactions (-want +got):\n%s", diff)
 			}
 		})
@@ -299,15 +313,14 @@ func TestHandleCommentRerun(t *testing.T) {
 func TestHandleCommentRerunInfraErrorKeepsSeen(t *testing.T) {
 	t.Parallel()
 
-	gh := &fakeGitHub{pullRequestErr: errors.New("boom")}
-	comments := &fakeCommentGitHub{canWrite: true}
-	svc := newService(gh, comments, &fakeStore{stored: skipBase()}, gate.Runners{Server: &fakeRunner{}}, nil, nil)
+	gh := &gatetest.GitHub{Fail: map[string]error{"GetPullRequest": errors.New("boom")}, CanWrite: true}
+	svc := newService(gh, newStore(t, skipBase()), gate.Runners{Server: &fakeRunner{}}, nil)
 	ev := skipEvent(gate.CommentKindIssue, "- [x] Re-run analysis", "")
 
 	if err := svc.HandleComment(t.Context(), ev); err == nil {
 		t.Fatal("HandleComment() = nil, want the pull request lookup error")
 	}
-	if diff := cmp.Diff([]gate.Reaction{gate.ReactionSeen}, comments.reactionsOn(ev.Kind, ev.CommentID)); diff != "" {
+	if diff := cmp.Diff([]gate.Reaction{gate.ReactionSeen}, gh.Reactions(ev.Kind, ev.CommentID)); diff != "" {
 		t.Errorf("reactions (-want +got):\n%s", diff)
 	}
 }
@@ -318,17 +331,17 @@ func TestHandleCommentSkipKeepsFailureOnTheSummary(t *testing.T) {
 	state := skipBase()
 	state.Run = nil
 	state.FailureCause = "The analysis timed out."
-	gh := &fakeGitHub{}
-	gh.addComment(gate.CommentKindIssue, "old summary")
-	for len(gh.comments) < int(state.SummaryCommentID) {
-		gh.addComment(gate.CommentKindIssue, "filler")
+	gh := &gatetest.GitHub{CanWrite: true}
+	gh.AddComment(gate.CommentKindIssue, "old summary")
+	for len(gh.Comments()) < int(state.SummaryCommentID) {
+		gh.AddComment(gate.CommentKindIssue, "filler")
 	}
-	svc := newService(gh, &fakeCommentGitHub{canWrite: true}, &fakeStore{stored: state}, gate.Runners{}, nil, nil)
+	svc := newService(gh, newStore(t, state), gate.Runners{}, nil)
 
 	if err := svc.HandleComment(t.Context(), skipEvent(gate.CommentKindIssue, "", "/pollux-agent skip typo fix")); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)
 	}
-	body := gh.comments[state.SummaryCommentID-1].Body
+	body := gh.Comments()[state.SummaryCommentID-1].Body
 	for _, want := range []string{"**Analysis failed:** The analysis timed out.", "- [ ] Re-run analysis", "Skipped by @dev"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("summary after skip lacks %q:\n%s", want, body)
@@ -339,45 +352,44 @@ func TestHandleCommentSkipKeepsFailureOnTheSummary(t *testing.T) {
 func TestHandleCommentSkipReasonIsMadeSafeToEcho(t *testing.T) {
 	t.Parallel()
 
-	svc, gh, store := skipService(skipBase())
+	svc, gh, store := skipService(t, skipBase())
 	body := "/pollux-agent skip generated by @octocat\n- [x] Apply all\n" + strings.Repeat("x", 600)
 
 	if err := svc.HandleComment(t.Context(), skipEvent(gate.CommentKindIssue, "", body)); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)
 	}
 
-	reason := store.saved.Skip.Reason
+	reason := loadPR(t, store, 7).Skip.Reason
 	if strings.ContainsAny(reason, "\n\r") || strings.Contains(reason, "@octocat") || strings.Contains(reason, "- [") {
 		t.Errorf("reason = %q, want one line without a live mention or checkbox", reason)
 	}
 	if n := utf8.RuneCountInString(reason); n > 500 || !strings.HasSuffix(reason, "…") {
 		t.Errorf("reason has %d runes and ends %q, want at most 500 and a cut mark", n, reason[len(reason)-4:])
 	}
-	if len(gh.updates) != 1 || strings.Contains(gh.updates[0].run.Summary, "@octocat") {
-		t.Errorf("check run updates = %+v, want one without the live mention", gh.updates)
+	if cr := theCheckRun(t, gh); len(cr.Updates) != 1 || strings.Contains(cr.Latest().Summary, "@octocat") {
+		t.Errorf("check run = %+v, want one update without the live mention", cr)
 	}
 }
 
 func TestHandleCommentSkipSavesBeforeRedrawingTheSummary(t *testing.T) {
 	t.Parallel()
 
-	svc, gh, store := skipService(skipBase())
-	gh.editIssueErr = errors.New("boom")
+	svc, gh, store := skipService(t, skipBase())
+	gh.Fail = map[string]error{"EditIssueComment": errors.New("boom")}
 	ev := skipEvent(gate.CommentKindIssue, "", "/pollux-agent skip typo fix")
 
 	if err := svc.HandleComment(t.Context(), ev); err == nil {
 		t.Fatal("HandleComment() = nil, want the summary edit error")
 	}
-	if store.saved == nil || store.saved.Skip == nil {
-		t.Fatalf("saved state = %+v, want the skip saved although the redraw failed", store.saved)
+	if saved := loadPR(t, store, 7); saved.Skip == nil {
+		t.Fatalf("stored state = %+v, want the skip saved although the redraw failed", saved)
 	}
 
-	gh.editIssueErr = nil
-	store.stored = *store.saved
+	gh.Fail = nil
 	if err := svc.HandleComment(t.Context(), ev); err != nil {
 		t.Fatalf("HandleComment() retry = %v, want nil", err)
 	}
-	if len(gh.updates) != 1 || gh.editIssue != 2 {
-		t.Errorf("check run updates = %d, summary edits = %d, want the check concluded once and the summary redrawn on the retry", len(gh.updates), gh.editIssue)
+	if cr, edits := theCheckRun(t, gh), gh.CallCount("EditIssueComment"); len(cr.Updates) != 1 || edits != 2 {
+		t.Errorf("check run updates = %d, summary edits = %d, want the check concluded once and the summary redrawn on the retry", len(cr.Updates), edits)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/gatetest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
@@ -36,9 +37,9 @@ func TestHandlePullRequestCancelledAnalysisStaysArmed(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(t.Context())
 	defer cancel(nil)
 	runner := &blockingRunner{started: make(chan struct{})}
-	gh := &fakeGitHub{checkRunID: 555}
-	store := &fakeStore{}
-	svc := newService(gh, nil, store, gate.Runners{Server: runner}, nil, nil)
+	gh := &gatetest.GitHub{NextCheckRunID: 555}
+	store := newStore(t)
+	svc := newService(gh, store, gate.Runners{Server: runner}, nil)
 
 	errc := make(chan error, 1)
 	go func() { errc <- svc.HandlePullRequest(ctx, testPR()) }()
@@ -48,11 +49,11 @@ func TestHandlePullRequestCancelledAnalysisStaysArmed(t *testing.T) {
 	if err := <-errc; err == nil {
 		t.Fatal("HandlePullRequest() = nil, want the interruption")
 	}
-	if len(gh.updates) != 0 || len(gh.comments) != 0 {
-		t.Errorf("updates = %+v, comments = %+v, want none", gh.updates, gh.comments)
+	if cr := theCheckRun(t, gh); len(cr.Updates) != 0 || len(gh.Comments()) != 0 {
+		t.Errorf("check run = %+v, comments = %+v, want no conclusion and no comment", cr, gh.Comments())
 	}
-	if store.saved == nil || store.saved.Run == nil || store.saved.CheckRunID != 555 {
-		t.Errorf("saved state = %+v, want the check run armed", store.saved)
+	if saved := loadPR(t, store, 7); saved.Run == nil || saved.CheckRunID != 555 {
+		t.Errorf("stored state = %+v, want the check run armed", saved)
 	}
 }
 
@@ -61,39 +62,40 @@ func TestHandleRunCompletedInvalidResultHidesDetail(t *testing.T) {
 	t.Parallel()
 
 	const injected = "@someone [link](http://x)"
-	gh := &fakeGitHub{}
+	gh := &gatetest.GitHub{}
 	runner := &fakeRunner{collectErr: &review.InvalidResultError{Cause: errors.New(injected)}}
-	svc := newService(gh, nil, &fakeStore{stored: awaitingState()}, gate.Runners{Actions: runner}, nil, nil)
+	svc := newService(gh, newStore(t, awaitingState()), gate.Runners{Actions: runner}, nil)
 
 	err := svc.HandleRunCompleted(t.Context(), completedRun("success"))
 	if err == nil || !strings.Contains(err.Error(), injected) {
 		t.Fatalf("HandleRunCompleted() = %v, want an error carrying the detail for the job log", err)
 	}
-	if len(gh.updates) != 1 || len(gh.comments) != 1 {
-		t.Fatalf("updates = %+v, comments = %+v, want one each", gh.updates, gh.comments)
+	cr := theCheckRun(t, gh)
+	if len(cr.Updates) != 1 {
+		t.Fatalf("check run = %+v, want one update", cr)
 	}
-	if strings.Contains(gh.updates[0].run.Summary, injected) || strings.Contains(gh.comments[0].Body, injected) {
-		t.Errorf("check = %q, summary = %q, want neither to contain the detail", gh.updates[0].run.Summary, gh.comments[0].Body)
+	if body := summaryBody(t, gh); strings.Contains(cr.Latest().Summary, injected) || strings.Contains(body, injected) {
+		t.Errorf("check = %q, summary = %q, want neither to contain the detail", cr.Latest().Summary, body)
 	}
 }
 
 func TestHandleRunCompletedUnusableResultWritesFailureSummary(t *testing.T) {
 	t.Parallel()
 
-	gh := &fakeGitHub{}
+	gh := &gatetest.GitHub{}
 	runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{}}}
-	svc := newService(gh, nil, &fakeStore{stored: awaitingState()}, gate.Runners{Actions: runner}, nil, nil)
+	svc := newService(gh, newStore(t, awaitingState()), gate.Runners{Actions: runner}, nil)
 
 	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
 		t.Fatalf("HandleRunCompleted() = %v, want nil", err)
 	}
-	if len(gh.updates) != 1 || gh.updates[0].run.Title != "Analysis failed" {
-		t.Fatalf("updates = %+v, want one Analysis failed", gh.updates)
+	cr := theCheckRun(t, gh)
+	if len(cr.Updates) != 1 || cr.Latest().Title != "Analysis failed" {
+		t.Fatalf("check run = %+v, want one Analysis failed update", cr)
 	}
-	cause := gh.updates[0].run.Summary
-	if len(gh.comments) != 1 || !strings.Contains(gh.comments[0].Body, cause) ||
-		!strings.Contains(gh.comments[0].Body, "- [ ] Re-run analysis\n") {
-		t.Errorf("comments = %+v, want one summary stating %q with an unticked Re-run box", gh.comments, cause)
+	cause := cr.Latest().Summary
+	if body := summaryBody(t, gh); !strings.Contains(body, cause) || !strings.Contains(body, "- [ ] Re-run analysis\n") {
+		t.Errorf("summary = %q, want it stating %q with an unticked Re-run box", body, cause)
 	}
 }
 
@@ -106,20 +108,20 @@ func TestHandleRunCompletedFailureWritesFailureSummary(t *testing.T) {
 		t.Run(conclusion, func(t *testing.T) {
 			t.Parallel()
 
-			gh := &fakeGitHub{}
-			store := &fakeStore{stored: awaitingState()}
-			svc := newService(gh, nil, store, gate.Runners{Actions: &fakeRunner{}}, nil, nil)
+			gh := &gatetest.GitHub{}
+			store := newStore(t, awaitingState())
+			svc := newService(gh, store, gate.Runners{Actions: &fakeRunner{}}, nil)
 
 			if err := svc.HandleRunCompleted(t.Context(), completedRun(conclusion)); err != nil {
 				t.Fatalf("HandleRunCompleted() = %v, want nil", err)
 			}
-			if len(gh.updates) != 1 || gh.updates[0].run.Conclusion != gate.ConclusionNeutral {
-				t.Fatalf("updates = %+v, want one neutral conclusion", gh.updates)
+			cr := theCheckRun(t, gh)
+			if len(cr.Updates) != 1 || cr.Latest().Conclusion != gate.ConclusionNeutral {
+				t.Fatalf("check run = %+v, want one neutral conclusion", cr)
 			}
-			cause := gh.updates[0].run.Summary
-			if len(gh.comments) != 1 || !strings.Contains(gh.comments[0].Body, cause) ||
-				!strings.Contains(gh.comments[0].Body, "- [ ] Re-run analysis\n") {
-				t.Errorf("comments = %+v, want one summary stating %q with an unticked Re-run box", gh.comments, cause)
+			cause := cr.Latest().Summary
+			if body := summaryBody(t, gh); !strings.Contains(body, cause) || !strings.Contains(body, "- [ ] Re-run analysis\n") {
+				t.Errorf("summary = %q, want it stating %q with an unticked Re-run box", body, cause)
 			}
 		})
 	}
@@ -130,25 +132,25 @@ func TestHandleRunCompletedFailureWritesFailureSummary(t *testing.T) {
 func TestHandleRunCompletedFailureUnticksSummaryAndKeepsProposals(t *testing.T) {
 	t.Parallel()
 
-	gh := &fakeGitHub{}
-	review := gh.addComment(gate.CommentKindReview, "proposal for docs/a.md")
-	summary := gh.addComment(gate.CommentKindIssue, "old summary\n- [x] Re-run analysis\n")
+	gh := &gatetest.GitHub{}
+	review := gh.AddComment(gate.CommentKindReview, "proposal for docs/a.md")
+	summary := gh.AddComment(gate.CommentKindIssue, "old summary\n- [x] Re-run analysis\n")
 	state := awaitingState()
 	state.SummaryCommentID = summary.ID
 	state.Proposals = []gate.ProposalState{{
 		ID: gate.ProposalID("docs/a.md", "A"), DocPath: "docs/a.md", Section: "A",
 		CommentID: review.ID, State: gate.ProposalOpen,
 	}}
-	store := &fakeStore{stored: state}
-	svc := newService(gh, nil, store, gate.Runners{Actions: &fakeRunner{}}, nil, nil)
+	store := newStore(t, state)
+	svc := newService(gh, store, gate.Runners{Actions: &fakeRunner{}}, nil)
 
 	if err := svc.HandleRunCompleted(t.Context(), completedRun("failure")); err != nil {
 		t.Fatalf("HandleRunCompleted() = %v, want nil", err)
 	}
-	if gh.editIssue != 1 || gh.createIssue != 0 {
-		t.Fatalf("summary writes = edits %d creates %d, want 1 edit", gh.editIssue, gh.createIssue)
+	if c := callsOf(gh); c.editIssue != 1 || c.createIssue != 0 {
+		t.Fatalf("summary writes = edits %d creates %d, want 1 edit", c.editIssue, c.createIssue)
 	}
-	body := gh.comments[1].Body
+	body := gh.Comments()[1].Body
 	if !strings.Contains(body, "docs/a.md") || !strings.Contains(body, "- [ ] Re-run analysis\n") || strings.Contains(body, "[x]") {
 		t.Errorf("summary body = %q, want docs/a.md still listed and an unticked Re-run box", body)
 	}

@@ -3,6 +3,7 @@ package gate_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/gatetest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
@@ -128,131 +130,30 @@ func TestHandlePullRequestWithoutDocs(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			gh := &fakeGitHub{noDocs: true, checkRunID: 7}
-			store := &fakeStore{}
+			gh := &gatetest.GitHub{NoDocs: true, NextCheckRunID: 7}
+			store := newStore(t)
 			queue := &fakeScaffoldQueue{}
-			svc := newService(gh, nil, store, tc.runners, nil, queue)
+			svc := newService(gh, store, tc.runners, queue)
 
 			if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
 				t.Fatalf("HandlePullRequest() = %v, want nil", err)
 			}
 
-			if len(gh.calls) != 1 {
-				t.Fatalf("created %d check runs, want 1", len(gh.calls))
-			}
-			got := gh.calls[0].run
+			got := theCheckRun(t, gh).Created
 			if got.Conclusion != gate.ConclusionNeutral || got.Title != "No docs/ folder" || !strings.Contains(got.Summary, tc.wantSummary) {
 				t.Errorf("check run = %+v, want neutral \"No docs/ folder\" mentioning %q", got, tc.wantSummary)
 			}
-			if gh.changedCalls != 0 {
-				t.Errorf("listed changed files %d times, want 0: no review analysis without docs/", gh.changedCalls)
+			if n := gh.CallCount("ListChangedFiles"); n != 0 {
+				t.Errorf("listed changed files %d times, want 0: no review analysis without docs/", n)
 			}
 			if len(queue.attempts) != tc.wantEnqueued {
 				t.Errorf("enqueued scaffold jobs = %v, want %d", queue.attempts, tc.wantEnqueued)
 			}
-			if store.saved == nil || store.saved.CheckRunID != 7 {
-				t.Errorf("saved state = %+v, want the check run id 7", store.saved)
+			if saved := loadPR(t, store, 7); saved.CheckRunID != 7 {
+				t.Errorf("stored state = %+v, want the check run id 7", saved)
 			}
 		})
 	}
-}
-
-// scaffoldStore is a fakeStore that remembers the scaffold state and its waiters.
-type scaffoldStore struct {
-	*fakeStore
-	state   gate.ScaffoldState
-	waiters []gate.ScaffoldWaiter
-	linked  map[int64]bool
-	saves   []gate.ScaffoldState
-}
-
-func (s *scaffoldStore) LoadScaffold(context.Context, string, string) (gate.ScaffoldState, error) {
-	return s.state, nil
-}
-
-func (s *scaffoldStore) SaveScaffold(_ context.Context, state gate.ScaffoldState) error {
-	s.saves = append(s.saves, state)
-	s.state = state
-	return nil
-}
-
-func (s *scaffoldStore) RequestScaffold(_ context.Context, _ int64, _, _ string, waiter gate.ScaffoldWaiter) (gate.ScaffoldState, error) {
-	s.waiters = append(s.waiters, waiter)
-	return s.state, nil
-}
-
-func (s *scaffoldStore) UnlinkedScaffoldWaiters(context.Context, string, string) ([]gate.ScaffoldWaiter, error) {
-	var unlinked []gate.ScaffoldWaiter
-	for _, w := range s.waiters {
-		if !s.linked[w.CheckRunID] {
-			unlinked = append(unlinked, w)
-		}
-	}
-	return unlinked, nil
-}
-
-func (s *scaffoldStore) MarkScaffoldWaiterLinked(_ context.Context, _, _ string, checkRunID int64) error {
-	if s.linked == nil {
-		s.linked = map[int64]bool{}
-	}
-	s.linked[checkRunID] = true
-	return nil
-}
-
-// failingUpdatesGitHub fails the first update of each check run in failFirst.
-type failingUpdatesGitHub struct {
-	*fakeGitHub
-	failFirst map[int64]bool
-}
-
-func (g *failingUpdatesGitHub) UpdateCheckRun(ctx context.Context, inst int64, owner, repo string, id int64, run gate.CheckRun) error {
-	if g.failFirst[id] {
-		delete(g.failFirst, id)
-		return errors.New("github unavailable")
-	}
-	return g.fakeGitHub.UpdateCheckRun(ctx, inst, owner, repo, id, run)
-}
-
-// scaffoldGitHub is a ScaffoldGitHub for a repo whose default branch is at "tip".
-type scaffoldGitHub struct {
-	branches map[string]string
-	resets   []string // "branch@sha" of every ResetBranch
-	prs      []gate.NewPullRequest
-	existing *gate.ScaffoldPR // the pull request FindPullRequest reports, if any
-}
-
-func (g *scaffoldGitHub) DefaultBranch(context.Context, int64, string, string) (string, string, error) {
-	return "main", "tip", nil
-}
-
-func (g *scaffoldGitHub) CreateBranch(_ context.Context, _ int64, _, _, branch, sha string) error {
-	if _, ok := g.branches[branch]; ok {
-		return gate.ErrBranchExists
-	}
-	g.branches[branch] = sha
-	return nil
-}
-
-func (g *scaffoldGitHub) ResetBranch(_ context.Context, _ int64, _, _, branch, sha string) error {
-	g.resets = append(g.resets, branch+"@"+sha)
-	g.branches[branch] = sha
-	return nil
-}
-
-func (g *scaffoldGitHub) BranchCommit(_ context.Context, _ int64, _, _, branch string) (gate.Commit, error) {
-	return gate.Commit{SHA: g.branches[branch]}, nil
-}
-
-func (g *scaffoldGitHub) CreatePullRequest(_ context.Context, _ int64, _, _ string, pr gate.NewPullRequest) (gate.ScaffoldPR, error) {
-	g.prs = append(g.prs, pr)
-	return gate.ScaffoldPR{Number: 9, URL: "https://gh/pull/9"}, nil
-}
-
-func (g *scaffoldGitHub) FindPullRequest(context.Context, int64, string, string, string) (gate.ScaffoldPR, bool, error) {
-	if g.existing == nil {
-		return gate.ScaffoldPR{}, false, nil
-	}
-	return *g.existing, true, nil
 }
 
 // scaffoldRunner is an Actions runner whose scaffold start and collect are scripted.
@@ -285,28 +186,26 @@ func TestHandleScaffold_StartsTheActionsRun(t *testing.T) {
 
 	deadline := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
 	runner := &scaffoldRunner{fakeRunner: &fakeRunner{}, started: review.Pending{RunID: 5, Nonce: "n", Deadline: deadline}}
-	gh := &fakeGitHub{noDocs: true, workflowExists: true}
-	sgh := &scaffoldGitHub{branches: map[string]string{}}
-	comments := &fakeCommentGitHub{}
-	store := &scaffoldStore{fakeStore: &fakeStore{}, state: gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldIdle, Attempt: 1}}
-	svc := newService(gh, comments, store, gate.Runners{Actions: runner}, sgh, &fakeScaffoldQueue{})
+	gh := &gatetest.GitHub{NoDocs: true, Workflow: true}
+	store := newScaffoldStore(t, gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldIdle, Attempt: 1})
+	svc := newService(gh, store, gate.Runners{Actions: runner}, nil)
 
 	if err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"}); err != nil {
 		t.Fatalf("HandleScaffold() = %v, want nil", err)
 	}
 
-	if diff := cmp.Diff(awaitingScaffold(deadline), store.state); diff != "" {
+	if diff := cmp.Diff(awaitingScaffold(deadline), loadScaffold(t, store)); diff != "" {
 		t.Errorf("state (-want +got):\n%s", diff)
 	}
-	if len(sgh.branches) != 0 || len(sgh.prs) != 0 || len(comments.commits) != 0 {
-		t.Errorf("branches %v, pull requests %v, commits %v, want none until the run completes", sgh.branches, sgh.prs, comments.commits)
+	if len(gh.Branches) != 0 || len(gh.PullRequests()) != 0 || len(gh.Committed()) != 0 {
+		t.Errorf("branches %v, pull requests %v, commits %v, want none until the run completes", gh.Branches, gh.PullRequests(), gh.Committed())
 	}
 
 	if err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"}); err != nil {
 		t.Fatalf("HandleScaffold() while awaiting = %v, want nil", err)
 	}
-	if len(store.saves) != 2 {
-		t.Errorf("saves = %d, want 2 (writing, awaiting) and none for a job that finds the run awaited", len(store.saves))
+	if diff := cmp.Diff(awaitingScaffold(deadline), loadScaffold(t, store)); diff != "" {
+		t.Errorf("state after a job that finds the run awaited (-want +got):\n%s", diff)
 	}
 }
 
@@ -324,7 +223,7 @@ func TestHandleScaffoldRun(t *testing.T) {
 		rc          gate.RunCompleted
 		collectErr  error
 		wantErr     bool
-		wantState   *gate.ScaffoldState // nil: the state is not saved
+		wantState   *gate.ScaffoldState // nil: the state is left as it was
 		wantCollect int
 		wantPR      bool
 	}{
@@ -360,11 +259,9 @@ func TestHandleScaffoldRun(t *testing.T) {
 			t.Parallel()
 
 			runner := &scaffoldRunner{fakeRunner: &fakeRunner{}, files: files, collectErr: tc.collectErr}
-			gh := &fakeGitHub{noDocs: true}
-			sgh := &scaffoldGitHub{branches: map[string]string{"pollux-agent/docs-scaffold": "tip"}}
-			comments := &fakeCommentGitHub{}
-			store := &scaffoldStore{fakeStore: &fakeStore{}, state: tc.state, waiters: []gate.ScaffoldWaiter{{CheckRunID: 11}}}
-			svc := newService(gh, comments, store, gate.Runners{Actions: runner}, sgh, &fakeScaffoldQueue{}).WithRetryBackoff(0)
+			gh := &gatetest.GitHub{NoDocs: true, Branches: map[string]gate.Commit{"pollux-agent/docs-scaffold": {SHA: "tip"}}}
+			store := newScaffoldStore(t, tc.state, 11)
+			svc := newService(gh, store, gate.Runners{Actions: runner}, nil).WithRetryBackoff(0)
 			tc.rc.Owner, tc.rc.Repo = "acme", "widgets"
 
 			err := svc.HandleScaffoldRun(t.Context(), tc.rc)
@@ -381,32 +278,36 @@ func TestHandleScaffoldRun(t *testing.T) {
 					t.Errorf("completion (-want +got):\n%s", diff)
 				}
 			}
+			state := loadScaffold(t, store)
 			switch {
 			case tc.wantPR:
-				if store.state.Phase != gate.ScaffoldOpened || store.state.PRURL != "https://gh/pull/9" || store.state.Run != nil || *store.state.Files != files {
-					t.Errorf("state = %+v, want Opened with the PR, the files and no run", store.state)
+				if state.Phase != gate.ScaffoldOpened || state.PRURL != "https://gh/pull/9" || state.Run != nil || state.Files == nil || *state.Files != files {
+					t.Errorf("state = %+v, want Opened with the PR, the files and no run", state)
 				}
-				if len(sgh.prs) != 1 {
-					t.Errorf("pull requests = %d, want 1", len(sgh.prs))
+				if prs := gh.PullRequests(); len(prs) != 1 {
+					t.Errorf("pull requests = %d, want 1", len(prs))
 				}
-				wantCommit := []gate.FileChange{{Path: "docs/README.md", Content: "i"}, {Path: "docs/architecture.md", Content: "a"}, {Path: "docs/guides/setup.md", Content: "s"}}
-				if diff := cmp.Diff([][]gate.FileChange{wantCommit}, comments.commits); diff != "" {
-					t.Errorf("commits (-want +got):\n%s", diff)
+				commits := gh.Committed()
+				if len(commits) != 1 {
+					t.Fatalf("commits = %+v, want one", commits)
 				}
-				if len(gh.updates) != 1 || gh.updates[0].id != 11 || !strings.Contains(gh.updates[0].run.Summary, "https://gh/pull/9") {
-					t.Errorf("check run updates = %+v, want check run 11 linking the pull request", gh.updates)
+				if diff := cmp.Diff(scaffoldFiles(), commits[0].Files); diff != "" {
+					t.Errorf("committed files (-want +got):\n%s", diff)
+				}
+				if cr := checkRunByID(gh, 11); len(cr.Updates) != 1 || !strings.Contains(cr.Latest().Summary, "https://gh/pull/9") {
+					t.Errorf("check run 11 = %+v, want one update linking the pull request", cr)
 				}
 			case tc.wantState != nil:
-				if diff := cmp.Diff(*tc.wantState, store.state); diff != "" {
+				if diff := cmp.Diff(*tc.wantState, state); diff != "" {
 					t.Errorf("state (-want +got):\n%s", diff)
 				}
 			default:
-				if len(store.saves) != 0 {
-					t.Errorf("saved %d states, want none", len(store.saves))
+				if diff := cmp.Diff(tc.state, state); diff != "" {
+					t.Errorf("state, want it left as it was (-want +got):\n%s", diff)
 				}
 			}
-			if !tc.wantPR && (len(sgh.prs) != 0 || len(comments.commits) != 0) {
-				t.Errorf("pull requests %v, commits %v, want none", sgh.prs, comments.commits)
+			if !tc.wantPR && (len(gh.PullRequests()) != 0 || len(gh.Committed()) != 0) {
+				t.Errorf("pull requests %v, commits %v, want none", gh.PullRequests(), gh.Committed())
 			}
 		})
 	}
@@ -434,20 +335,18 @@ func TestHandleScaffoldDeadline(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			store := &scaffoldStore{fakeStore: &fakeStore{}, state: tc.state}
-			svc := newService(&fakeGitHub{}, nil, store, gate.Runners{}, nil, &fakeScaffoldQueue{})
+			store := newScaffoldStore(t, tc.state)
+			svc := newService(&gatetest.GitHub{}, store, gate.Runners{}, nil)
 
 			if err := svc.HandleScaffoldDeadline(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"}, tc.nonce, tc.now); err != nil {
 				t.Fatalf("HandleScaffoldDeadline() = %v, want nil", err)
 			}
 
-			if tc.wantState == nil {
-				if len(store.saves) != 0 {
-					t.Errorf("saved %d states, want none", len(store.saves))
-				}
-				return
+			want := tc.state
+			if tc.wantState != nil {
+				want = *tc.wantState
 			}
-			if diff := cmp.Diff(*tc.wantState, store.state); diff != "" {
+			if diff := cmp.Diff(want, loadScaffold(t, store)); diff != "" {
 				t.Errorf("state (-want +got):\n%s", diff)
 			}
 		})
@@ -457,30 +356,26 @@ func TestHandleScaffoldDeadline(t *testing.T) {
 func TestHandleScaffold_DocsPresentTellsTheWaiters(t *testing.T) {
 	t.Parallel()
 
-	gh := &fakeGitHub{}
-	store := &scaffoldStore{
-		fakeStore: &fakeStore{},
-		state:     gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldIdle, Attempt: 1},
-		waiters:   []gate.ScaffoldWaiter{{CheckRunID: 11}, {CheckRunID: 12}},
-	}
-	svc := newService(gh, nil, store, gate.Runners{Server: &fakeRunner{}}, &scaffoldGitHub{branches: map[string]string{}}, &fakeScaffoldQueue{})
+	gh := &gatetest.GitHub{}
+	store := newScaffoldStore(t, gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldIdle, Attempt: 1}, 11, 12)
+	svc := newService(gh, store, gate.Runners{Server: &fakeRunner{}}, nil)
 
 	if err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"}); err != nil {
 		t.Fatalf("HandleScaffold() = %v, want nil", err)
 	}
 
-	if len(gh.updates) != 2 {
-		t.Fatalf("check run updates = %d, want 2", len(gh.updates))
+	if runs := gh.CheckRuns(); len(runs) != 2 || updateCount(gh) != 2 {
+		t.Fatalf("check runs = %+v, want 2 updated once each", runs)
 	}
-	for _, u := range gh.updates {
-		run := u.run
+	for _, cr := range gh.CheckRuns() {
+		run := cr.Latest()
 		if run.Conclusion != gate.ConclusionNeutral || run.Title != "No docs/ folder" ||
 			!strings.Contains(run.Summary, "already has a docs/ folder") || !strings.Contains(run.Summary, "Merge or rebase") || strings.Contains(run.Summary, "writing") {
-			t.Errorf("check run %d = %+v, want neutral \"No docs/ folder\" saying the default branch has docs/ and to merge or rebase", u.id, run)
+			t.Errorf("check run %d = %+v, want neutral \"No docs/ folder\" saying the default branch has docs/ and to merge or rebase", cr.ID, run)
 		}
 	}
-	if store.state.Phase != gate.ScaffoldIdle || store.state.Attempt != 2 {
-		t.Errorf("state = %+v, want Idle at attempt 2", store.state)
+	if state := loadScaffold(t, store); state.Phase != gate.ScaffoldIdle || state.Attempt != 2 {
+		t.Errorf("state = %+v, want Idle at attempt 2", state)
 	}
 }
 
@@ -491,34 +386,25 @@ func TestLinkWaiters_ContinuesPastAFailureAndTheNextRequestHeals(t *testing.T) {
 		Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldOpened, Attempt: 1,
 		BaseSHA: "tip", PRNumber: 9, PRURL: "https://gh/pull/9",
 	}
-	gh := &failingUpdatesGitHub{fakeGitHub: &fakeGitHub{noDocs: true, checkRunID: 13}, failFirst: map[int64]bool{11: true}}
-	store := &scaffoldStore{
-		fakeStore: &fakeStore{},
-		state:     opened,
-		waiters:   []gate.ScaffoldWaiter{{CheckRunID: 11}, {CheckRunID: 12}},
-	}
-	svc := newService(gh, &fakeCommentGitHub{}, store, gate.Runners{Server: &fakeRunner{}}, &scaffoldGitHub{branches: map[string]string{}}, &fakeScaffoldQueue{})
+	gh := &gatetest.GitHub{NoDocs: true, NextCheckRunID: 13, Before: failUpdateOnce(11)}
+	store := newScaffoldStore(t, opened, 11, 12)
+	svc := newService(gh, store, gate.Runners{Server: &fakeRunner{}}, nil)
 
 	if err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"}); err == nil {
 		t.Fatal("HandleScaffold() = nil, want the failed link update")
 	}
-	if len(gh.updates) != 1 || gh.updates[0].id != 12 {
-		t.Fatalf("check run updates = %+v, want check run 12 linked despite 11 failing", gh.updates)
+	if runs := gh.CheckRuns(); len(runs) != 1 || runs[0].ID != 12 || len(runs[0].Updates) != 1 {
+		t.Fatalf("check runs = %+v, want check run 12 linked despite 11 failing", runs)
 	}
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
 		t.Fatalf("HandlePullRequest() = %v, want nil", err)
 	}
 
-	var linked []int64
-	for _, u := range gh.updates {
-		if !strings.Contains(u.run.Summary, "https://gh/pull/9") {
-			t.Errorf("check run %d = %+v, want the scaffold PR linked", u.id, u.run)
+	for _, id := range []int64{11, 12, 13} {
+		if cr := checkRunByID(gh, id); !strings.Contains(cr.Latest().Summary, "https://gh/pull/9") {
+			t.Errorf("check run %d = %+v, want the scaffold PR linked", id, cr)
 		}
-		linked = append(linked, u.id)
-	}
-	if diff := cmp.Diff([]int64{12, 11, 13}, linked); diff != "" {
-		t.Errorf("linked check runs (-want +got):\n%s", diff)
 	}
 }
 
@@ -526,16 +412,16 @@ func TestRequestScaffold_SavesTheStateBeforeLinking(t *testing.T) {
 	t.Parallel()
 
 	opened := gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldOpened, Attempt: 1, BaseSHA: "tip", PRNumber: 9, PRURL: "https://gh/pull/9"}
-	gh := &failingUpdatesGitHub{fakeGitHub: &fakeGitHub{noDocs: true, checkRunID: 13}, failFirst: map[int64]bool{11: true}}
-	store := &scaffoldStore{fakeStore: &fakeStore{}, state: opened, waiters: []gate.ScaffoldWaiter{{CheckRunID: 11}}}
-	svc := newService(gh, nil, store, gate.Runners{Server: &fakeRunner{}}, nil, &fakeScaffoldQueue{})
+	gh := &gatetest.GitHub{NoDocs: true, NextCheckRunID: 13, Before: failUpdateOnce(11)}
+	store := newScaffoldStore(t, opened, 11)
+	svc := newService(gh, store, gate.Runners{Server: &fakeRunner{}}, nil)
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err == nil {
 		t.Fatal("HandlePullRequest() = nil, want the failed link update")
 	}
 
-	if store.saved == nil || store.saved.CheckRunID != 13 {
-		t.Errorf("saved state = %+v, want the check run id 13 saved despite the failing waiter", store.saved)
+	if saved := loadPR(t, store, 7); saved.CheckRunID != 13 {
+		t.Errorf("stored state = %+v, want the check run id 13 saved despite the failing waiter", saved)
 	}
 }
 
@@ -543,25 +429,24 @@ func TestHandlePullRequest_ClosedScaffoldPRIsNotReplaced(t *testing.T) {
 	t.Parallel()
 
 	opened := gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldOpened, Attempt: 1, BaseSHA: "tip", PRNumber: 9, PRURL: "https://gh/pull/9"}
-	gh := &fakeGitHub{noDocs: true, checkRunID: 13}
-	sgh := &scaffoldGitHub{branches: map[string]string{}}
-	comments := &fakeCommentGitHub{}
+	gh := &gatetest.GitHub{NoDocs: true, NextCheckRunID: 13}
 	queue := &fakeScaffoldQueue{}
-	store := &scaffoldStore{fakeStore: &fakeStore{}, state: opened}
-	svc := newService(gh, comments, store, gate.Runners{Server: &fakeRunner{}}, sgh, queue)
+	store := newScaffoldStore(t, opened)
+	svc := newService(gh, store, gate.Runners{Server: &fakeRunner{}}, queue)
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
 		t.Fatalf("HandlePullRequest() = %v, want nil", err)
 	}
 
-	if len(gh.calls) != 1 || !strings.Contains(gh.calls[0].run.Summary, "https://gh/pull/9") {
-		t.Errorf("created check runs = %+v, want one linking the original pull request", gh.calls)
+	cr := theCheckRun(t, gh)
+	if !strings.Contains(cr.Created.Summary, "https://gh/pull/9") {
+		t.Errorf("created check run = %+v, want one linking the original pull request", cr.Created)
 	}
-	if len(gh.updates) != 1 || gh.updates[0].id != 13 || !strings.Contains(gh.updates[0].run.Summary, "https://gh/pull/9") {
-		t.Errorf("check run updates = %+v, want check run 13 linking the original pull request", gh.updates)
+	if cr.ID != 13 || len(cr.Updates) != 1 || !strings.Contains(cr.Latest().Summary, "https://gh/pull/9") {
+		t.Errorf("check run = %+v, want check run 13 updated to link the original pull request", cr)
 	}
-	if len(queue.attempts) != 0 || len(sgh.prs) != 0 || len(sgh.branches) != 0 || len(comments.commits) != 0 {
-		t.Errorf("enqueued %v, pull requests %v, branches %v, commits %v, want none: one scaffold PR per repo, ever", queue.attempts, sgh.prs, sgh.branches, comments.commits)
+	if len(queue.attempts) != 0 || len(gh.PullRequests()) != 0 || len(gh.Branches) != 0 || len(gh.Committed()) != 0 {
+		t.Errorf("enqueued %v, pull requests %v, branches %v, commits %v, want none: one scaffold PR per repo, ever", queue.attempts, gh.PullRequests(), gh.Branches, gh.Committed())
 	}
 }
 
@@ -570,25 +455,26 @@ func TestHandleScaffold_ResetsAForeignBranch(t *testing.T) {
 
 	files := review.Scaffold{Index: "i", Architecture: "a", Setup: "s"}
 	written := gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldWritten, Attempt: 1, BaseSHA: "tip", Files: &files}
-	gh := &fakeGitHub{noDocs: true}
-	sgh := &scaffoldGitHub{branches: map[string]string{"pollux-agent/docs-scaffold": "stale"}}
-	comments := &fakeCommentGitHub{}
-	store := &scaffoldStore{fakeStore: &fakeStore{}, state: written}
-	svc := newService(gh, comments, store, gate.Runners{Server: &fakeRunner{}}, sgh, &fakeScaffoldQueue{})
+	gh := &gatetest.GitHub{NoDocs: true, Branches: map[string]gate.Commit{"pollux-agent/docs-scaffold": {SHA: "stale"}}}
+	store := newScaffoldStore(t, written)
+	svc := newService(gh, store, gate.Runners{Server: &fakeRunner{}}, nil)
 
 	if err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"}); err != nil {
 		t.Fatalf("HandleScaffold() = %v, want nil", err)
 	}
 
-	if diff := cmp.Diff([]string{"pollux-agent/docs-scaffold@tip"}, sgh.resets); diff != "" {
+	if diff := cmp.Diff([]string{"pollux-agent/docs-scaffold@tip"}, gh.Resets()); diff != "" {
 		t.Errorf("resets (-want +got):\n%s", diff)
 	}
-	wantCommit := []gate.FileChange{{Path: "docs/README.md", Content: "i"}, {Path: "docs/architecture.md", Content: "a"}, {Path: "docs/guides/setup.md", Content: "s"}}
-	if diff := cmp.Diff([][]gate.FileChange{wantCommit}, comments.commits); diff != "" {
-		t.Errorf("commits (-want +got):\n%s", diff)
+	commits := gh.Committed()
+	if len(commits) != 1 {
+		t.Fatalf("commits = %+v, want one", commits)
 	}
-	if len(sgh.prs) != 1 || store.state.Phase != gate.ScaffoldOpened {
-		t.Errorf("pull requests = %v, state = %+v, want one pull request and an Opened scaffold", sgh.prs, store.state)
+	if diff := cmp.Diff(scaffoldFiles(), commits[0].Files); diff != "" {
+		t.Errorf("committed files (-want +got):\n%s", diff)
+	}
+	if state := loadScaffold(t, store); len(gh.PullRequests()) != 1 || state.Phase != gate.ScaffoldOpened {
+		t.Errorf("pull requests = %v, state = %+v, want one pull request and an Opened scaffold", gh.PullRequests(), state)
 	}
 }
 
@@ -610,24 +496,24 @@ func TestHandleScaffold_ForeignBranchWithAPullRequest(t *testing.T) {
 
 			files := review.Scaffold{Index: "i", Architecture: "a", Setup: "s"}
 			written := gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldWritten, Attempt: 1, BaseSHA: "tip", Files: &files}
-			sgh := &scaffoldGitHub{branches: map[string]string{"pollux-agent/docs-scaffold": "stale"}, existing: &tc.existing}
-			comments := &fakeCommentGitHub{}
-			store := &scaffoldStore{fakeStore: &fakeStore{}, state: written}
-			svc := newService(&fakeGitHub{noDocs: true}, comments, store, gate.Runners{Server: &fakeRunner{}}, sgh, &fakeScaffoldQueue{})
+			gh := &gatetest.GitHub{NoDocs: true, Branches: map[string]gate.Commit{"pollux-agent/docs-scaffold": {SHA: "stale"}}, ExistingPR: &tc.existing}
+			store := newScaffoldStore(t, written)
+			svc := newService(gh, store, gate.Runners{Server: &fakeRunner{}}, nil)
 
 			err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"})
 
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("HandleScaffold() = %v, want error %v", err, tc.wantErr)
 			}
-			if len(sgh.resets) != 0 || len(comments.commits) != 0 || len(sgh.prs) != 0 {
-				t.Errorf("resets = %v, commits = %v, pull requests = %v, want none", sgh.resets, comments.commits, sgh.prs)
+			if len(gh.Resets()) != 0 || len(gh.Committed()) != 0 || len(gh.PullRequests()) != 0 {
+				t.Errorf("resets = %v, commits = %v, pull requests = %v, want none", gh.Resets(), gh.Committed(), gh.PullRequests())
 			}
-			if store.state.Phase != tc.wantPhase {
-				t.Errorf("phase = %q, want %q", store.state.Phase, tc.wantPhase)
+			state := loadScaffold(t, store)
+			if state.Phase != tc.wantPhase {
+				t.Errorf("phase = %q, want %q", state.Phase, tc.wantPhase)
 			}
-			if !tc.wantErr && (store.state.PRNumber != tc.existing.Number || store.state.PRURL != tc.existing.URL) {
-				t.Errorf("state = %+v, want the adopted pull request %+v", store.state, tc.existing)
+			if !tc.wantErr && (state.PRNumber != tc.existing.Number || state.PRURL != tc.existing.URL) {
+				t.Errorf("state = %+v, want the adopted pull request %+v", state, tc.existing)
 			}
 			if tc.wantErr && !strings.Contains(err.Error(), "not opened by pollux") {
 				t.Errorf("error = %v, want it to say the pull request was not opened by pollux", err)
@@ -642,20 +528,19 @@ func TestHandleScaffold_AdoptsAClosedBotPullRequestWithoutABranch(t *testing.T) 
 	files := review.Scaffold{Index: "i", Architecture: "a", Setup: "s"}
 	written := gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldWritten, Attempt: 1, BaseSHA: "tip", Files: &files}
 	closed := gate.ScaffoldPR{Number: 7, URL: "https://gh/pull/7", ByBot: true}
-	sgh := &scaffoldGitHub{branches: map[string]string{}, existing: &closed}
-	comments := &fakeCommentGitHub{}
-	store := &scaffoldStore{fakeStore: &fakeStore{}, state: written}
-	svc := newService(&fakeGitHub{noDocs: true}, comments, store, gate.Runners{Server: &fakeRunner{}}, sgh, &fakeScaffoldQueue{})
+	gh := &gatetest.GitHub{NoDocs: true, ExistingPR: &closed}
+	store := newScaffoldStore(t, written)
+	svc := newService(gh, store, gate.Runners{Server: &fakeRunner{}}, nil)
 
 	if err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"}); err != nil {
 		t.Fatalf("HandleScaffold() = %v, want nil", err)
 	}
 
-	if len(sgh.branches) != 0 || len(sgh.resets) != 0 || len(comments.commits) != 0 || len(sgh.prs) != 0 {
-		t.Errorf("branches = %v, resets = %v, commits = %v, pull requests = %v, want none", sgh.branches, sgh.resets, comments.commits, sgh.prs)
+	if len(gh.Branches) != 0 || len(gh.Resets()) != 0 || len(gh.Committed()) != 0 || len(gh.PullRequests()) != 0 {
+		t.Errorf("branches = %v, resets = %v, commits = %v, pull requests = %v, want none", gh.Branches, gh.Resets(), gh.Committed(), gh.PullRequests())
 	}
-	if store.state.Phase != gate.ScaffoldOpened || store.state.PRNumber != 7 || store.state.PRURL != closed.URL {
-		t.Errorf("state = %+v, want Opened with the adopted pull request %+v", store.state, closed)
+	if state := loadScaffold(t, store); state.Phase != gate.ScaffoldOpened || state.PRNumber != 7 || state.PRURL != closed.URL {
+		t.Errorf("state = %+v, want Opened with the adopted pull request %+v", state, closed)
 	}
 }
 
@@ -664,17 +549,16 @@ func TestHandleScaffold_ClosedHumanPullRequestDoesNotBlock(t *testing.T) {
 
 	files := review.Scaffold{Index: "i", Architecture: "a", Setup: "s"}
 	written := gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldWritten, Attempt: 1, BaseSHA: "tip", Files: &files}
-	sgh := &scaffoldGitHub{branches: map[string]string{}, existing: &gate.ScaffoldPR{Number: 8, URL: "https://gh/pull/8"}}
-	comments := &fakeCommentGitHub{}
-	store := &scaffoldStore{fakeStore: &fakeStore{}, state: written}
-	svc := newService(&fakeGitHub{noDocs: true}, comments, store, gate.Runners{Server: &fakeRunner{}}, sgh, &fakeScaffoldQueue{})
+	gh := &gatetest.GitHub{NoDocs: true, ExistingPR: &gate.ScaffoldPR{Number: 8, URL: "https://gh/pull/8"}}
+	store := newScaffoldStore(t, written)
+	svc := newService(gh, store, gate.Runners{Server: &fakeRunner{}}, nil)
 
 	if err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"}); err != nil {
 		t.Fatalf("HandleScaffold() = %v, want nil", err)
 	}
 
-	if len(sgh.prs) != 1 || len(comments.commits) != 1 || store.state.Phase != gate.ScaffoldOpened || store.state.PRNumber != 9 {
-		t.Errorf("pull requests = %v, commits = %v, state = %+v, want a new pull request 9 and an Opened scaffold", sgh.prs, comments.commits, store.state)
+	if state := loadScaffold(t, store); len(gh.PullRequests()) != 1 || len(gh.Committed()) != 1 || state.Phase != gate.ScaffoldOpened || state.PRNumber != 9 {
+		t.Errorf("pull requests = %v, commits = %v, state = %+v, want a new pull request 9 and an Opened scaffold", gh.PullRequests(), gh.Committed(), state)
 	}
 }
 
@@ -683,44 +567,38 @@ func TestHandleScaffold_KeepsItsOwnCommitOnRetry(t *testing.T) {
 
 	files := review.Scaffold{Index: "i", Architecture: "a", Setup: "s"}
 	written := gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldWritten, Attempt: 1, BaseSHA: "tip", Files: &files, CommitSHA: "mine"}
-	gh := &fakeGitHub{noDocs: true}
-	sgh := &scaffoldGitHub{branches: map[string]string{"pollux-agent/docs-scaffold": "mine"}}
-	comments := &fakeCommentGitHub{}
-	store := &scaffoldStore{fakeStore: &fakeStore{}, state: written}
-	svc := newService(gh, comments, store, gate.Runners{Server: &fakeRunner{}}, sgh, &fakeScaffoldQueue{})
+	gh := &gatetest.GitHub{NoDocs: true, Branches: map[string]gate.Commit{"pollux-agent/docs-scaffold": {SHA: "mine"}}}
+	store := newScaffoldStore(t, written)
+	svc := newService(gh, store, gate.Runners{Server: &fakeRunner{}}, nil)
 
 	if err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"}); err != nil {
 		t.Fatalf("HandleScaffold() = %v, want nil", err)
 	}
 
-	if len(sgh.resets) != 0 || len(comments.commits) != 0 {
-		t.Errorf("resets = %v, commits = %v, want neither", sgh.resets, comments.commits)
+	if len(gh.Resets()) != 0 || len(gh.Committed()) != 0 {
+		t.Errorf("resets = %v, commits = %v, want neither", gh.Resets(), gh.Committed())
 	}
-	if len(sgh.prs) != 1 || store.state.Phase != gate.ScaffoldOpened {
-		t.Errorf("pull requests = %v, state = %+v, want one pull request and an Opened scaffold", sgh.prs, store.state)
+	if state := loadScaffold(t, store); len(gh.PullRequests()) != 1 || state.Phase != gate.ScaffoldOpened {
+		t.Errorf("pull requests = %v, state = %+v, want one pull request and an Opened scaffold", gh.PullRequests(), state)
 	}
 }
 
 func TestHandleScaffold_DocsPresentKeepsItsStateWhenAWaiterFails(t *testing.T) {
 	t.Parallel()
 
-	gh := &failingUpdatesGitHub{fakeGitHub: &fakeGitHub{}, failFirst: map[int64]bool{11: true}}
-	store := &scaffoldStore{
-		fakeStore: &fakeStore{},
-		state:     gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldIdle, Attempt: 1},
-		waiters:   []gate.ScaffoldWaiter{{CheckRunID: 11}, {CheckRunID: 12}},
-	}
-	svc := newService(gh, nil, store, gate.Runners{Server: &fakeRunner{}}, &scaffoldGitHub{branches: map[string]string{}}, &fakeScaffoldQueue{})
+	gh := &gatetest.GitHub{Before: failUpdateOnce(11)}
+	store := newScaffoldStore(t, gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldIdle, Attempt: 1}, 11, 12)
+	svc := newService(gh, store, gate.Runners{Server: &fakeRunner{}}, nil)
 
 	if err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"}); err == nil {
 		t.Fatal("HandleScaffold() = nil, want the failed waiter update")
 	}
 
-	if len(store.saves) != 1 || store.state.Phase != gate.ScaffoldIdle || store.state.Attempt != 2 {
-		t.Errorf("saves = %+v, want one save of Idle at attempt 2 and no failed attempt on top", store.saves)
+	if state := loadScaffold(t, store); state.Phase != gate.ScaffoldIdle || state.Attempt != 2 || state.Failures != 0 {
+		t.Errorf("state = %+v, want Idle at attempt 2 and no failed attempt on top", state)
 	}
-	if store.linked[11] || !store.linked[12] {
-		t.Errorf("linked = %v, want only check run 12 done and 11 left for the retry", store.linked)
+	if diff := cmp.Diff([]int64{11}, unlinkedWaiters(t, store)); diff != "" {
+		t.Errorf("unlinked check runs (-want +got):\n%s\nwant only check run 12 done and 11 left for the retry", diff)
 	}
 }
 
@@ -728,10 +606,10 @@ func TestScaffoldGivenUp(t *testing.T) {
 	t.Parallel()
 
 	gaveUp := gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldGaveUp, Attempt: 3, Failures: 3, BaseSHA: "tip"}
-	gh := &fakeGitHub{noDocs: true, checkRunID: 13}
+	gh := &gatetest.GitHub{NoDocs: true, NextCheckRunID: 13}
 	queue := &fakeScaffoldQueue{}
-	store := &scaffoldStore{fakeStore: &fakeStore{}, state: gaveUp, waiters: []gate.ScaffoldWaiter{{CheckRunID: 11}}}
-	svc := newService(gh, &fakeCommentGitHub{}, store, gate.Runners{Server: &fakeRunner{}}, &scaffoldGitHub{branches: map[string]string{}}, queue)
+	store := newScaffoldStore(t, gaveUp, 11)
+	svc := newService(gh, store, gate.Runners{Server: &fakeRunner{}}, queue)
 
 	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
 		t.Fatalf("HandlePullRequest() = %v, want nil", err)
@@ -740,14 +618,18 @@ func TestScaffoldGivenUp(t *testing.T) {
 		t.Fatalf("HandleScaffold() = %v, want nil", err)
 	}
 
-	if len(queue.attempts) != 0 || len(store.saves) != 0 {
-		t.Errorf("enqueued %v, saved %d states, want none after giving up", queue.attempts, len(store.saves))
+	if diff := cmp.Diff(gaveUp, loadScaffold(t, store)); len(queue.attempts) != 0 || diff != "" {
+		t.Errorf("enqueued %v, state (-want +got):\n%s\nwant nothing after giving up", queue.attempts, diff)
 	}
-	if len(gh.calls) != 1 || !strings.Contains(gh.calls[0].run.Summary, "after 3 attempts") || !strings.Contains(gh.calls[0].run.Summary, "docs/guides/setup.md") {
-		t.Errorf("created check runs = %+v, want one saying the scaffold could not be written after 3 attempts and linking the setup guide", gh.calls)
+	created := checkRunByID(gh, 13).Created
+	if !strings.Contains(created.Summary, "after 3 attempts") || !strings.Contains(created.Summary, "docs/guides/setup.md") {
+		t.Errorf("created check run = %+v, want it saying the scaffold could not be written after 3 attempts and linking the setup guide", created)
 	}
-	if len(gh.updates) != 2 || !store.linked[11] {
-		t.Errorf("check run updates = %+v, linked = %v, want the waiting check runs concluded", gh.updates, store.linked)
+	if n := gh.CallCount("CreateCheckRun"); n != 1 {
+		t.Errorf("created check runs = %d, want 1", n)
+	}
+	if slices.Contains(unlinkedWaiters(t, store), 11) || updateCount(gh) != 2 {
+		t.Errorf("unlinked = %v, updates = %d, want the waiting check runs concluded", unlinkedWaiters(t, store), updateCount(gh))
 	}
 }
 
@@ -769,23 +651,24 @@ func TestScaffoldFailureTellsTheWaiters(t *testing.T) {
 
 			state := awaitingScaffold(deadline)
 			state.Attempt, state.Failures = tc.attempt, tc.attempt
-			gh := &failingUpdatesGitHub{fakeGitHub: &fakeGitHub{}, failFirst: map[int64]bool{11: true}}
-			store := &scaffoldStore{fakeStore: &fakeStore{}, state: state, waiters: []gate.ScaffoldWaiter{{CheckRunID: 11}, {CheckRunID: 12}}}
-			svc := newService(gh, nil, store, gate.Runners{}, nil, &fakeScaffoldQueue{})
+			gh := &gatetest.GitHub{Before: failUpdateOnce(11)}
+			store := newScaffoldStore(t, state, 11, 12)
+			svc := newService(gh, store, gate.Runners{}, nil)
 
 			err := svc.HandleScaffoldDeadline(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"}, "n", deadline.Add(time.Minute))
 
 			if err == nil {
 				t.Fatal("HandleScaffoldDeadline() = nil, want the failed waiter update")
 			}
-			if len(gh.updates) != 1 || gh.updates[0].id != 12 || !strings.Contains(gh.updates[0].run.Summary, tc.wantSummary) || gh.updates[0].run.Title != "No docs/ folder" {
-				t.Errorf("check run updates = %+v, want check run 12 titled \"No docs/ folder\" mentioning %q", gh.updates, tc.wantSummary)
+			if runs := gh.CheckRuns(); len(runs) != 1 || runs[0].ID != 12 || len(runs[0].Updates) != 1 ||
+				!strings.Contains(runs[0].Latest().Summary, tc.wantSummary) || runs[0].Latest().Title != "No docs/ folder" {
+				t.Errorf("check runs = %+v, want check run 12 titled \"No docs/ folder\" mentioning %q", runs, tc.wantSummary)
 			}
-			if len(store.linked) != 0 {
-				t.Errorf("linked = %v, want no waiter marked done by a failure", store.linked)
+			if diff := cmp.Diff([]int64{11, 12}, unlinkedWaiters(t, store)); diff != "" {
+				t.Errorf("unlinked check runs (-want +got):\n%s\nwant no waiter marked done by a failure", diff)
 			}
-			if store.state.Attempt != tc.attempt+1 {
-				t.Errorf("attempt = %d, want %d", store.state.Attempt, tc.attempt+1)
+			if got := loadScaffold(t, store).Attempt; got != tc.attempt+1 {
+				t.Errorf("attempt = %d, want %d", got, tc.attempt+1)
 			}
 		})
 	}
@@ -795,9 +678,9 @@ func TestHandleScaffoldRun_WaiterFailureDoesNotMaskTheRunFailure(t *testing.T) {
 	t.Parallel()
 
 	deadline := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
-	gh := &failingUpdatesGitHub{fakeGitHub: &fakeGitHub{}, failFirst: map[int64]bool{11: true}}
-	store := &scaffoldStore{fakeStore: &fakeStore{}, state: awaitingScaffold(deadline), waiters: []gate.ScaffoldWaiter{{CheckRunID: 11}}}
-	svc := newService(gh, nil, store, gate.Runners{Actions: &scaffoldRunner{fakeRunner: &fakeRunner{}}}, nil, &fakeScaffoldQueue{})
+	gh := &gatetest.GitHub{Before: failUpdateOnce(11)}
+	store := newScaffoldStore(t, awaitingScaffold(deadline), 11)
+	svc := newService(gh, store, gate.Runners{Actions: &scaffoldRunner{fakeRunner: &fakeRunner{}}}, nil)
 
 	err := svc.HandleScaffoldRun(t.Context(), gate.RunCompleted{Owner: "acme", Repo: "widgets", RunID: 5, Conclusion: "failure"})
 
@@ -822,12 +705,11 @@ func TestHandleScaffoldRun_WaiterFailureEnqueuesAJobToHealThem(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			gh := &failingUpdatesGitHub{fakeGitHub: &fakeGitHub{noDocs: tc.noDocs}, failFirst: map[int64]bool{11: true}}
-			sgh := &scaffoldGitHub{branches: map[string]string{}}
+			gh := &gatetest.GitHub{NoDocs: tc.noDocs, Before: failUpdateOnce(11)}
 			runner := &scaffoldRunner{fakeRunner: &fakeRunner{}, files: review.Scaffold{Index: "i", Architecture: "a", Setup: "s"}}
 			queue := &fakeScaffoldQueue{}
-			store := &scaffoldStore{fakeStore: &fakeStore{}, state: awaitingScaffold(deadline), waiters: []gate.ScaffoldWaiter{{CheckRunID: 11}}}
-			svc := newService(gh, &fakeCommentGitHub{}, store, gate.Runners{Actions: runner}, sgh, queue)
+			store := newScaffoldStore(t, awaitingScaffold(deadline), 11)
+			svc := newService(gh, store, gate.Runners{Actions: runner}, queue)
 
 			err := svc.HandleScaffoldRun(t.Context(), gate.RunCompleted{Owner: "acme", Repo: "widgets", RunID: 5, Conclusion: "success"})
 
@@ -841,16 +723,6 @@ func TestHandleScaffoldRun_WaiterFailureEnqueuesAJobToHealThem(t *testing.T) {
 	}
 }
 
-// openedSaveFailsStore fails the save of an Opened state.
-type openedSaveFailsStore struct{ *scaffoldStore }
-
-func (s *openedSaveFailsStore) SaveScaffold(ctx context.Context, state gate.ScaffoldState) error {
-	if state.Phase == gate.ScaffoldOpened {
-		return errors.New("disk full")
-	}
-	return s.scaffoldStore.SaveScaffold(ctx, state)
-}
-
 func TestHandleScaffold_FailedSaveOfOpenedIsNotAFailedAttempt(t *testing.T) {
 	t.Parallel()
 
@@ -858,21 +730,25 @@ func TestHandleScaffold_FailedSaveOfOpenedIsNotAFailedAttempt(t *testing.T) {
 		Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldWritten, Attempt: 1, BaseSHA: "tip",
 		Files: &review.Scaffold{Index: "i", Architecture: "a", Setup: "s"},
 	}
-	store := &openedSaveFailsStore{&scaffoldStore{fakeStore: &fakeStore{}, state: written, waiters: []gate.ScaffoldWaiter{{CheckRunID: 11}}}}
-	gh := &fakeGitHub{noDocs: true}
-	sgh := &scaffoldGitHub{branches: map[string]string{}}
-	svc := newService(gh, &fakeCommentGitHub{}, store, gate.Runners{Server: &fakeRunner{}}, sgh, &fakeScaffoldQueue{})
+	store := &hookStore{Store: newScaffoldStore(t, written, 11), saveScaffoldErr: func(s gate.ScaffoldState) error {
+		if s.Phase == gate.ScaffoldOpened {
+			return errors.New("disk full")
+		}
+		return nil
+	}}
+	gh := &gatetest.GitHub{NoDocs: true}
+	svc := newService(gh, store, gate.Runners{Server: &fakeRunner{}}, nil)
 
 	err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"})
 
 	if err == nil || !strings.Contains(err.Error(), "disk full") {
 		t.Fatalf("HandleScaffold() = %v, want the failed save", err)
 	}
-	if store.state.Failures != 0 || store.state.Attempt != 1 {
-		t.Errorf("state = %+v, want no failure counted once the pull request exists", store.state)
+	if state := loadScaffold(t, store); state.Failures != 0 || state.Attempt != 1 {
+		t.Errorf("state = %+v, want no failure counted once the pull request exists", state)
 	}
-	if len(gh.updates) != 0 {
-		t.Errorf("check run updates = %+v, want none telling the waiters the attempt failed", gh.updates)
+	if runs := gh.CheckRuns(); len(runs) != 0 {
+		t.Errorf("check runs = %+v, want none telling the waiters the attempt failed", runs)
 	}
 }
 
@@ -889,27 +765,24 @@ func TestOnScaffoldFailed_LeavesOpenedUnchanged(t *testing.T) {
 func TestHandleScaffold_NoRunnerIsNotAFailedAttempt(t *testing.T) {
 	t.Parallel()
 
-	gh := &fakeGitHub{noDocs: true}
-	store := &scaffoldStore{
-		fakeStore: &fakeStore{},
-		state:     gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldIdle, Attempt: 1},
-		waiters:   []gate.ScaffoldWaiter{{CheckRunID: 11}},
-	}
-	svc := newService(gh, &fakeCommentGitHub{}, store, gate.Runners{}, &scaffoldGitHub{branches: map[string]string{}}, &fakeScaffoldQueue{})
+	gh := &gatetest.GitHub{NoDocs: true}
+	store := newScaffoldStore(t, gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 42, Phase: gate.ScaffoldIdle, Attempt: 1}, 11)
+	svc := newService(gh, store, gate.Runners{}, nil)
 
 	for i := 1; i <= 3; i++ {
 		if err := svc.HandleScaffold(t.Context(), gate.RepoRef{Owner: "acme", Repo: "widgets"}); err != nil {
 			t.Fatalf("HandleScaffold() #%d = %v, want nil", i, err)
 		}
-		if store.state.Phase != gate.ScaffoldIdle || store.state.Failures != 0 || store.state.Attempt != 1+i {
-			t.Fatalf("state after #%d = %+v, want Idle, no failures, attempt %d", i, store.state, 1+i)
+		if state := loadScaffold(t, store); state.Phase != gate.ScaffoldIdle || state.Failures != 0 || state.Attempt != 1+i {
+			t.Fatalf("state after #%d = %+v, want Idle, no failures, attempt %d", i, state, 1+i)
 		}
 	}
 
-	if len(gh.updates) != 3 || !strings.Contains(gh.updates[2].run.Summary, "docs/guides/setup.md") {
-		t.Errorf("check run updates = %+v, want the no-runner text each time", gh.updates)
+	cr := checkRunByID(gh, 11)
+	if len(cr.Updates) != 3 || !strings.Contains(cr.Latest().Summary, "docs/guides/setup.md") {
+		t.Errorf("check run 11 = %+v, want the no-runner text each time", cr)
 	}
-	if len(store.linked) != 0 {
-		t.Errorf("linked = %v, want the waiter left unlinked", store.linked)
+	if diff := cmp.Diff([]int64{11}, unlinkedWaiters(t, store)); diff != "" {
+		t.Errorf("unlinked check runs (-want +got):\n%s\nwant the waiter left unlinked", diff)
 	}
 }

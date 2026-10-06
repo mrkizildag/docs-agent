@@ -7,17 +7,27 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
-// CommentWrite is a comment write Reconcile asks the Service to perform.
-// Summary writes target the summary comment; the Service renders its body from
-// the final state because it links comments created by earlier writes.
-// Otherwise Index is the proposal in State.Proposals. ID 0 means create (Review
-// holds the new review comment); else edit comment ID to Body.
-type CommentWrite struct {
+// CommentWrites are the comment writes Reconcile asks the Service to perform:
+// review comments to create and to edit, each for the proposal at Index in
+// State.Proposals, and whether to write the summary comment, which the Service
+// renders from the final state because it links the comments created before it.
+type CommentWrites struct {
+	Creates []ProposalCreate
+	Edits   []ProposalEdit
 	Summary bool
+}
+
+// ProposalCreate creates a new review comment for the proposal at Index.
+type ProposalCreate struct {
 	Index   int
-	ID      int64
-	Review  ReviewComment
-	Body    string
+	Comment ReviewComment
+}
+
+// ProposalEdit edits review comment ID of the proposal at Index to Body.
+type ProposalEdit struct {
+	Index int
+	ID    int64
+	Body  string
 }
 
 // Reconcile is the state transition for a finished run: pure, no I/O. It
@@ -27,7 +37,7 @@ type CommentWrite struct {
 // an outdated proposal keeps its current body. Created comments' IDs and URLs
 // belong in the returned state at the writes' Index. An applied proposal
 // stays applied, and gets no write, while the verdict repeats its Content.
-func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []review.ChangedFile, existing []Comment) (PRState, []CommentWrite) {
+func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []review.ChangedFile, existing []Comment) (PRState, CommentWrites) {
 	next := prev
 	next.Proposals = slices.Clone(prev.Proposals)
 	next.ProposalsSHA = pr.HeadSHA
@@ -38,7 +48,7 @@ func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []r
 		index[ps.ID] = i
 	}
 	current := make(map[string]bool, len(proposals))
-	var writes []CommentWrite
+	var writes CommentWrites
 
 	for _, p := range proposals {
 		id := ProposalID(p.DocPath, p.Section)
@@ -67,10 +77,10 @@ func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []r
 			if !sameAnchor(c, rc) {
 				rc.Body = renderCheckbox(id, p, pr.Fork)
 			}
-			writes = append(writes, CommentWrite{Index: i, ID: ps.CommentID, Body: rc.Body})
+			writes.Edits = append(writes.Edits, ProposalEdit{Index: i, ID: ps.CommentID, Body: rc.Body})
 		} else {
 			ps.CommentID, ps.CommentURL = 0, ""
-			writes = append(writes, CommentWrite{Index: i, Review: rc})
+			writes.Creates = append(writes.Creates, ProposalCreate{Index: i, Comment: rc})
 		}
 	}
 
@@ -82,25 +92,25 @@ func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []r
 		adoptMarked(ps, existing)
 		ps.State = ProposalOutdated
 		if c, ok := findComment(existing, CommentKindReview, ps.CommentID); ok {
-			writes = append(writes, CommentWrite{Index: i, ID: ps.CommentID, Body: renderOutdated(ps.ID, pr.HeadSHA, c.Body)})
+			writes.Edits = append(writes.Edits, ProposalEdit{Index: i, ID: ps.CommentID, Body: renderOutdated(ps.ID, pr.HeadSHA, c.Body)})
 		}
 	}
 
 	summaryLost := resolveSummary(&next, existing)
 	if next.SummaryCommentID != 0 || len(proposals) > 0 || summaryLost {
-		writes = append(writes, CommentWrite{Summary: true, ID: next.SummaryCommentID})
+		writes.Summary = true
 	}
 	return next, writes
 }
 
 // reconcileFailure is the state transition for a failed run: pure, no I/O. It
-// returns prev with only SummaryCommentID possibly changed, and the one summary
-// write that reports the failure. Proposals are left as they are, so earlier
-// ones stay listed.
-func reconcileFailure(prev PRState, existing []Comment) (PRState, CommentWrite) {
+// returns prev with only SummaryCommentID possibly changed; the summary write
+// that reports the failure is the caller's. Proposals are left as they are, so
+// earlier ones stay listed.
+func reconcileFailure(prev PRState, existing []Comment) PRState {
 	next := prev
 	resolveSummary(&next, existing)
-	return next, CommentWrite{Summary: true, ID: next.SummaryCommentID}
+	return next
 }
 
 // resolveSummary points next at our existing summary comment when state lacks

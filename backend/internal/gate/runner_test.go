@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/gatetest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
@@ -42,7 +43,7 @@ func TestHandlePullRequestRunnerSelection(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			gh := &fakeGitHub{workflowExists: tc.workflowExists}
+			gh := &gatetest.GitHub{Workflow: tc.workflowExists}
 			runners := gate.Runners{}
 			if tc.actions != nil {
 				runners.Actions = tc.actions
@@ -51,7 +52,7 @@ func TestHandlePullRequestRunnerSelection(t *testing.T) {
 				runners.Server = tc.server
 			}
 
-			svc := newService(gh, nil, &fakeStore{}, runners, nil, nil)
+			svc := newService(gh, newStore(t), runners, nil)
 			pr := testPR()
 			if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
 				t.Fatalf("HandlePullRequest(%+v) = %v, want nil", pr, err)
@@ -70,12 +71,10 @@ func TestHandlePullRequestRunnerSelection(t *testing.T) {
 				t.Errorf("server runner calls = %d, want 0", len(tc.server.calls))
 			}
 
-			if len(gh.calls) != 1 {
-				t.Fatalf("CreateCheckRun calls = %d, want 1", len(gh.calls))
-			}
+			cr := theCheckRun(t, gh)
 
 			if !tc.wantActions && !tc.wantServer {
-				got := gh.calls[0].run
+				got := cr.Created
 				if got.Conclusion != gate.ConclusionNeutral || got.Title != "No analysis runner configured" ||
 					!strings.Contains(got.Summary, "docs/guides/setup.md") {
 					t.Errorf("check run = %+v, want neutral no-runner-configured", got)

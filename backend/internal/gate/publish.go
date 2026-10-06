@@ -3,7 +3,6 @@ package gate
 import (
 	"context"
 	"fmt"
-	"slices"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
@@ -24,33 +23,31 @@ func (s *Service) postComments(ctx context.Context, prev PRState, pr PullRequest
 	next, writes := Reconcile(prev, pr, verdict, changed, existing)
 	// Saving before the first create means a run that stops after posting
 	// leaves state behind, so the next run lists comments and adopts them by marker.
-	if slices.ContainsFunc(writes, func(w CommentWrite) bool { return w.ID == 0 }) {
+	newSummary := writes.Summary && next.SummaryCommentID == 0
+	if len(writes.Creates) > 0 || newSummary {
 		if err := s.store.SavePR(ctx, next); err != nil {
 			return PRState{}, fmt.Errorf("save state before creating comments: %w", err)
 		}
 	}
 	// GitHub orders comments by creation time, so a new summary is created
 	// before the review comments to sit above them, then edited with their links.
-	if i := slices.IndexFunc(writes, func(w CommentWrite) bool { return w.Summary && w.ID == 0 }); i >= 0 && len(writes) > 1 {
-		first := writes[i]
-		writes = append(slices.Delete(slices.Clone(writes), i, i+1), CommentWrite{Summary: true})
-		if err := s.writeSummary(ctx, pr, &next, first); err != nil {
+	if newSummary && (len(writes.Creates) > 0 || len(writes.Edits) > 0) {
+		if err := s.writeSummary(ctx, pr, &next); err != nil {
 			return PRState{}, err
 		}
-		writes[len(writes)-1].ID = next.SummaryCommentID
 	}
-	for _, w := range writes {
-		switch {
-		case w.Summary:
-			err = s.writeSummary(ctx, pr, &next, w)
-		case w.ID == 0:
-			err = s.createProposalComment(ctx, pr, &next, w)
-		default:
-			if err = s.gh.EditReviewComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, w.ID, w.Body); err != nil {
-				err = fmt.Errorf("edit review comment for %s: %w", next.Proposals[w.Index].DocPath, err)
-			}
+	for _, w := range writes.Creates {
+		if err := s.createProposalComment(ctx, pr, &next, w); err != nil {
+			return PRState{}, err
 		}
-		if err != nil {
+	}
+	for _, w := range writes.Edits {
+		if err := s.gh.EditReviewComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, w.ID, w.Body); err != nil {
+			return PRState{}, fmt.Errorf("edit review comment for %s: %w", next.Proposals[w.Index].DocPath, err)
+		}
+	}
+	if writes.Summary {
+		if err := s.writeSummary(ctx, pr, &next); err != nil {
 			return PRState{}, err
 		}
 	}
@@ -63,16 +60,16 @@ func (s *Service) postFailureSummary(ctx context.Context, prev PRState, pr PullR
 	if err != nil {
 		return PRState{}, fmt.Errorf("list comments: %w", err)
 	}
-	next, w := reconcileFailure(prev, existing)
-	if err := s.writeSummary(ctx, pr, &next, w); err != nil {
+	next := reconcileFailure(prev, existing)
+	if err := s.writeSummary(ctx, pr, &next); err != nil {
 		return PRState{}, err
 	}
 	return next, nil
 }
 
-func (s *Service) createProposalComment(ctx context.Context, pr PullRequest, next *PRState, w CommentWrite) error {
+func (s *Service) createProposalComment(ctx context.Context, pr PullRequest, next *PRState, w ProposalCreate) error {
 	ps := &next.Proposals[w.Index]
-	c, err := s.gh.CreateReviewComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number, w.Review)
+	c, err := s.gh.CreateReviewComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number, w.Comment)
 	if err != nil {
 		return fmt.Errorf("create review comment for %s: %w", ps.DocPath, err)
 	}
@@ -80,10 +77,10 @@ func (s *Service) createProposalComment(ctx context.Context, pr PullRequest, nex
 	return nil
 }
 
-func (s *Service) writeSummary(ctx context.Context, pr PullRequest, next *PRState, w CommentWrite) error {
+func (s *Service) writeSummary(ctx context.Context, pr PullRequest, next *PRState) error {
 	body := renderSummary(*next)
-	if w.ID != 0 {
-		if err := s.gh.EditIssueComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, w.ID, body); err != nil {
+	if next.SummaryCommentID != 0 {
+		if err := s.gh.EditIssueComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, next.SummaryCommentID, body); err != nil {
 			return fmt.Errorf("edit summary comment: %w", err)
 		}
 		return nil

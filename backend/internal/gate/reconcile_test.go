@@ -27,9 +27,12 @@ func proposalIDs(state gate.PRState) map[string]gate.ProposalStatus {
 	return got
 }
 
-func countWrites(writes []gate.CommentWrite) (creates, edits int) {
-	for _, w := range writes {
-		if w.ID == 0 {
+// countWrites counts the comment creates and edits writes asks for, the summary
+// write among them: a create while the state has no summary comment, else an edit.
+func countWrites(writes gate.CommentWrites, state gate.PRState) (creates, edits int) {
+	creates, edits = len(writes.Creates), len(writes.Edits)
+	if writes.Summary {
+		if state.SummaryCommentID == 0 {
 			creates++
 		} else {
 			edits++
@@ -121,20 +124,20 @@ func TestReconcile(t *testing.T) {
 			t.Parallel()
 
 			state, writes := gate.Reconcile(tc.prev, pr, tc.verdict, nil, tc.existing)
-			creates, edits := countWrites(writes)
+			creates, edits := countWrites(writes, state)
 			if creates != tc.wantCreates || edits != tc.wantEdits {
 				t.Errorf("writes = %d creates, %d edits, want %d, %d", creates, edits, tc.wantCreates, tc.wantEdits)
 			}
 			if diff := cmp.Diff(tc.wantStates, proposalIDs(state)); diff != "" {
 				t.Errorf("states (-want +got):\n%s", diff)
 			}
-			hasSummary := len(writes) > 0 && writes[len(writes)-1].Summary
+			hasSummary := writes.Summary
 			if hasSummary != tc.wantSummary || state.SummaryCommentID != tc.wantSumID {
 				t.Errorf("summary write = %v id %d, want %v id %d", hasSummary, state.SummaryCommentID, tc.wantSummary, tc.wantSumID)
 			}
 			for _, want := range tc.wantOutdated {
 				found := false
-				for _, w := range writes {
+				for _, w := range writes.Edits {
 					found = found || (strings.Contains(w.Body, want) && strings.Contains(w.Body, "Outdated: no longer needed as of 0123456") && strings.Contains(w.Body, "<details>"))
 				}
 				if !found {
@@ -191,7 +194,7 @@ func TestReconcileVariants(t *testing.T) {
 			t.Parallel()
 
 			_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{tc.p}, tc.changed, nil)
-			rc := writes[0].Review
+			rc := writes.Creates[0].Comment
 			if rc.Path != tc.wantPath || rc.StartLine != tc.wantStart || rc.Line != tc.wantLine || rc.CommitSHA != "abc123" {
 				t.Errorf("comment = %+v, want %s %d-%d on abc123", rc, tc.wantPath, tc.wantStart, tc.wantLine)
 			}
@@ -205,7 +208,7 @@ func TestReconcileVariants(t *testing.T) {
 	}
 
 	_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{suggest}, diffFile("docs/a.md", review.LineRange{Start: 1, End: 20}), nil)
-	body := writes[0].Review.Body
+	body := writes.Creates[0].Comment.Body
 	want := "````suggestion\n## Mid\nnew ```go\nx\n```\n\n````\n"
 	if !strings.HasSuffix(body, want) {
 		t.Errorf("suggestion body = %q, want suffix %q (fence grown, trailing blank line kept)", body, want)
@@ -242,11 +245,11 @@ func TestReconcileEditKeepsVariantSafe(t *testing.T) {
 			t.Parallel()
 
 			_, writes := gate.Reconcile(prev, testPR(), review.Proposals{p}, tc.changed, []gate.Comment{tc.existing})
-			if writes[0].ID != 1 {
-				t.Fatalf("write = %+v, want an edit of comment 1", writes[0])
+			if len(writes.Edits) == 0 || writes.Edits[0].ID != 1 {
+				t.Fatalf("writes = %+v, want an edit of comment 1 first", writes)
 			}
-			if got := strings.Contains(writes[0].Body, "suggestion\n"); got != tc.wantSuggest {
-				t.Errorf("suggestion body = %v, want %v:\n%s", got, tc.wantSuggest, writes[0].Body)
+			if got := strings.Contains(writes.Edits[0].Body, "suggestion\n"); got != tc.wantSuggest {
+				t.Errorf("suggestion body = %v, want %v:\n%s", got, tc.wantSuggest, writes.Edits[0].Body)
 			}
 		})
 	}
@@ -273,7 +276,7 @@ func TestReconcileIgnoresForeignMarkers(t *testing.T) {
 			t.Parallel()
 
 			state, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{a}, nil, []gate.Comment{tc.existing})
-			creates, edits := countWrites(writes)
+			creates, edits := countWrites(writes, state)
 			if creates != 2 || edits != 0 || state.SummaryCommentID != 0 || state.Proposals[0].CommentID != 0 {
 				t.Errorf("writes = %d creates, %d edits, state = %+v, want 2 creates, nothing adopted", creates, edits, state)
 			}
@@ -293,7 +296,7 @@ func TestReconcileRecreatesStateCommentNotMine(t *testing.T) {
 	}
 
 	state, writes := gate.Reconcile(prev, testPR(), review.Proposals{a}, nil, existing)
-	creates, edits := countWrites(writes)
+	creates, edits := countWrites(writes, state)
 	if creates != 2 || edits != 0 || state.SummaryCommentID != 0 || state.Proposals[0].CommentID != 0 {
 		t.Errorf("writes = %d creates, %d edits, state = %+v, want 2 creates, no edits of foreign comments", creates, edits, state)
 	}
@@ -307,23 +310,23 @@ func TestReconcileRestoresOmittedHeading(t *testing.T) {
 	p.Content = "new text\n"
 
 	_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
-	if len(writes) == 0 {
-		t.Fatal("Reconcile() returned no writes, want a review comment create")
+	if len(writes.Creates) == 0 {
+		t.Fatal("Reconcile() returned no creates, want a review comment create")
 	}
 	want := "-## Behavior\n-\n-old text\n+## Behavior\n+\n+new text\n"
-	if body := writes[0].Review.Body; !strings.Contains(body, want) {
+	if body := writes.Creates[0].Comment.Body; !strings.Contains(body, want) {
 		t.Errorf("review comment body = %q, want diff %q", body, want)
 	}
 
 	p.Content = "### Install\n\nnew text\n"
 	_, writes = gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
 	want = "+## Behavior\n+\n+### Install\n+\n+new text\n"
-	if body := writes[0].Review.Body; !strings.Contains(body, want) {
+	if body := writes.Creates[0].Comment.Body; !strings.Contains(body, want) {
 		t.Errorf("subsection content: review comment body = %q, want diff %q", body, want)
 	}
 	p.Content = "## Behaviour\n\nnew text\n"
 	_, writes = gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
-	if body := writes[0].Review.Body; strings.Contains(body, "+## Behavior\n") || !strings.Contains(body, "+## Behaviour\n") {
+	if body := writes.Creates[0].Comment.Body; strings.Contains(body, "+## Behavior\n") || !strings.Contains(body, "+## Behaviour\n") {
 		t.Errorf("renamed heading: review comment body = %q, want the model's heading kept and no second heading", body)
 	}
 }
