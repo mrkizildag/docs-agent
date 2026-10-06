@@ -218,15 +218,21 @@ func isAbsoluteDocLink(target, repo string) bool {
 	if len(segs) < 2 || !strings.EqualFold(segs[0]+"/"+segs[1], repo) {
 		return false
 	}
+	// A ref may contain slashes, so a docs segment anywhere after the ref's
+	// first segment counts: /owner/repo/{blob,tree,raw,edit}/<ref>/.../docs/...
+	// on github.com, /owner/repo/<ref>/.../docs/... on raw.githubusercontent.com.
+	var afterRef []string
 	switch strings.TrimPrefix(strings.ToLower(u.Hostname()), "www.") {
 	case "github.com":
-		// /owner/repo/{blob,tree,raw,edit}/<ref>/docs/...
-		return len(segs) > 4 && slices.Contains([]string{"blob", "tree", "raw", "edit"}, segs[2]) && segs[4] == "docs"
+		if len(segs) > 4 && slices.Contains([]string{"blob", "tree", "raw", "edit"}, segs[2]) {
+			afterRef = segs[4:]
+		}
 	case "raw.githubusercontent.com":
-		// /owner/repo/<ref>/docs/...
-		return len(segs) > 3 && segs[3] == "docs"
+		if len(segs) > 3 {
+			afterRef = segs[3:]
+		}
 	}
-	return false
+	return slices.Contains(afterRef, "docs")
 }
 
 // CheckScaffold reports why index, architecture and setup are not a usable

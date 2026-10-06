@@ -429,7 +429,9 @@ func TestCheckNewDoc(t *testing.T) {
 		{name: "absolute link in code fence", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n```md\n[a](/docs/x.md)\n```\n"},
 		{name: "absolute link in inline code", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\nWrite `[a](/docs/x.md)` like so.\n"},
 		{name: "absolute link after a triple-backtick span", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n```a``` see [x](/docs/y.md) and `z`\n", wantErr: "must be relative"},
-		{name: "this repo's non-docs github paths", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](https://github.com/o/r/blob/docs/main.go) [b](https://github.com/o/r/tree/main/backend/docs/x)\n"},
+		{name: "this repo's non-docs github paths", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](https://github.com/o/r/blob/docs/main.go) [b](https://raw.githubusercontent.com/o/r/docs/main.go)\n"},
+		{name: "this repo's docs link on a slash ref", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](https://github.com/o/r/blob/feature/foo/docs/x.md)\n", wantErr: "must be relative"},
+		{name: "this repo's raw docs link on a slash ref", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](https://raw.githubusercontent.com/o/r/feature/foo/docs/x.md)\n", wantErr: "must be relative"},
 		{name: "root docs folder", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](/docs)\n", wantErr: "must be relative"},
 		{name: "absolute link after code fence", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n```\nx\n```\n[a](/docs/x.md)\n", wantErr: "must be relative"},
 	}
