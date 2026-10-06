@@ -58,6 +58,7 @@ func (r *Runner) scaffold(ctx context.Context, req review.ScaffoldRequest) (revi
 		Finish:   finish,
 		Accept:   checkSubmittedDocs,
 		MaxSteps: scaffoldStepCap,
+		Log:      r.log.With("repo", req.Owner+"/"+req.Repo, "scaffold_sha", req.BaseSHA),
 	}, agent.NewBudget(scaffoldTokenBudget))
 	if err != nil {
 		return review.Scaffold{}, fmt.Errorf("write docs: %w: %w", errProvider, err)

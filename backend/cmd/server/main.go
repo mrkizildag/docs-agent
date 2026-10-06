@@ -59,7 +59,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create GitHub client: %w", err)
 	}
-	runners, err := buildRunners(cfg, ghClient)
+	runners, err := buildRunners(cfg, ghClient, logger)
 	if err != nil {
 		return fmt.Errorf("build analysis runners: %w", err)
 	}
@@ -151,7 +151,7 @@ const llmHTTPTimeout = 60 * time.Second
 
 // buildRunners wires the Actions runner and, from cfg.LLM, the server runner. A nil cfg.LLM
 // leaves the server slot empty, so a repo must run the Actions workflow.
-func buildRunners(cfg config.Config, ghClient *github.Client) (gate.Runners, error) {
+func buildRunners(cfg config.Config, ghClient *github.Client, logger *slog.Logger) (gate.Runners, error) {
 	actionsRunner := actions.New(ghClient, actionsRunTimeout)
 	if cfg.LLM == nil {
 		return gate.Runners{Actions: actionsRunner}, nil
@@ -167,7 +167,7 @@ func buildRunners(cfg config.Config, ghClient *github.Client) (gate.Runners, err
 		return gate.Runners{}, fmt.Errorf("LLM_PROVIDER: unknown provider %q", cfg.LLM.Provider)
 	}
 
-	runner := llmrunner.New(model, ghClient.InstallationToken, cfg.LLM.TriageModel, cfg.LLM.Model)
+	runner := llmrunner.New(model, ghClient.InstallationToken, cfg.LLM.TriageModel, cfg.LLM.Model, logger)
 	return gate.Runners{Actions: actionsRunner, Server: runner}, nil
 }
 

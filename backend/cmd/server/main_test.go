@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/config"
@@ -23,7 +24,7 @@ func TestBuildRunners_ServerRunnerOnlyWithLLMProviderActionsAlways(t *testing.T)
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			runners, err := buildRunners(config.Config{LLM: tc.llm}, nil)
+			runners, err := buildRunners(config.Config{LLM: tc.llm}, nil, slog.New(slog.DiscardHandler))
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("buildRunners() error = %v, wantErr %t", err, tc.wantErr)
 			}

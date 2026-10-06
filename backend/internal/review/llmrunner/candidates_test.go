@@ -1,6 +1,7 @@
 package llmrunner_test
 
 import (
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,7 +52,7 @@ func TestStart_GlobCoveredNestedFileTriagesOnlyItsDoc(t *testing.T) {
 	headSHA := run("rev-parse", "HEAD")
 
 	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
-	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 	runner.SetRemote(dir)
 
 	const patch = "@@ -1,2 +1,3 @@\n package deep\n+func X() {}\n"
