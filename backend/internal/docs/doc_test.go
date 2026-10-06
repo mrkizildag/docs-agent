@@ -400,7 +400,7 @@ func TestParseBody(t *testing.T) {
 	}
 }
 
-func TestCheckScaffoldDoc(t *testing.T) {
+func TestCheckNewDoc(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -415,17 +415,37 @@ func TestCheckScaffoldDoc(t *testing.T) {
 		{name: "no summary", src: "---\ntitle: T\ncovers: []\n---\n", wantErr: "no summary"},
 		{name: "no covers key", src: "---\ntitle: T\nsummary: S\n---\n", wantErr: "no covers list"},
 		{name: "invalid glob", src: "---\ntitle: T\nsummary: S\ncovers:\n  - \"/abs\"\n---\n", wantErr: "must be repo-root relative"},
+		{name: "relative link", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](architecture.md) [b](../x.md#h)\n"},
+		{name: "external non-doc link", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](https://example.com/docs/x) [b](https://github.com/o/r/blob/main/main.go)\n"},
+		{name: "absolute github docs link", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](https://github.com/o/r/blob/main/docs/README.md)\n", wantErr: "must be relative"},
+		{name: "reference-style absolute docs link", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\nSee [idx].\n\n[idx]: https://github.com/o/r/blob/main/docs/README.md\n", wantErr: "must be relative"},
+		{name: "reference-style relative link", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\nSee [idx].\n\n[idx]: README.md\n"},
+		{name: "root-absolute docs link", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](/docs/README.md)\n", wantErr: "must be relative"},
+		{name: "other repo's github docs link", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](https://github.com/other/repo/blob/main/docs/README.md)\n"},
+		{name: "this repo's github docs link", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](https://github.com/o/r/blob/main/docs/README.md)\n", wantErr: "must be relative"},
+		{name: "this repo's github docs link, other case", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](https://raw.githubusercontent.com/O/R/main/docs/README.md)\n", wantErr: "must be relative"},
+		{name: "root-absolute non-docs link", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](/compose.yaml) ![b](/assets/x.png)\n"},
+		{name: "root-absolute docs path", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](/docs/x.md)\n", wantErr: "must be relative"},
+		{name: "absolute link in code fence", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n```md\n[a](/docs/x.md)\n```\n"},
+		{name: "absolute link in inline code", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\nWrite `[a](/docs/x.md)` like so.\n"},
+		{name: "absolute link after a triple-backtick span", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n```a``` see [x](/docs/y.md) and `z`\n", wantErr: "must be relative"},
+		{name: "this repo's non-docs github paths", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](https://github.com/o/r/blob/docs/main.go) [b](https://raw.githubusercontent.com/o/r/docs/main.go)\n"},
+		{name: "this repo's source files under a docs folder", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](https://github.com/o/r/blob/main/backend/internal/docs/doc.go) [b](https://github.com/o/r/tree/main/backend/internal/docs) [c](https://raw.githubusercontent.com/o/r/main/backend/internal/docs/doc.go)\n"},
+		{name: "this repo's docs link on a slash ref", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](https://github.com/o/r/blob/feature/foo/docs/x.md)\n", wantErr: "must be relative"},
+		{name: "this repo's raw docs link on a slash ref", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](https://raw.githubusercontent.com/o/r/feature/foo/docs/x.md)\n", wantErr: "must be relative"},
+		{name: "root docs folder", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n[a](/docs)\n", wantErr: "must be relative"},
+		{name: "absolute link after code fence", src: "---\ntitle: T\nsummary: S\ncovers: []\n---\n```\nx\n```\n[a](/docs/x.md)\n", wantErr: "must be relative"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := docs.CheckScaffoldDoc("docs/x.md", []byte(tc.src))
+			_, err := docs.CheckNewDoc("docs/x.md", []byte(tc.src), "o/r")
 			switch {
 			case tc.wantErr == "" && err != nil:
-				t.Errorf("CheckScaffoldDoc() error = %v, want nil", err)
+				t.Errorf("CheckNewDoc() error = %v, want nil", err)
 			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
-				t.Errorf("CheckScaffoldDoc() error = %v, want containing %q", err, tc.wantErr)
+				t.Errorf("CheckNewDoc() error = %v, want containing %q", err, tc.wantErr)
 			}
 		})
 	}
@@ -450,13 +470,14 @@ func TestCheckScaffold(t *testing.T) {
 		{name: "setup without title", index: index, architecture: frontmatter, set: "---\nsummary: S\ncovers: []\n---\n", wantErr: "docs/guides/setup.md"},
 		{name: "index misses architecture link", index: frontmatter + "[s](guides/setup.md)\n", architecture: frontmatter, set: frontmatter, wantErr: "](architecture.md)"},
 		{name: "architecture over the byte cap", index: index, architecture: frontmatter + strings.Repeat("x", docs.MaxDocBytes), set: frontmatter, wantErr: "byte cap"},
+		{name: "index links this repo's docs absolutely", index: index + "[x](https://github.com/o/r/blob/main/docs/x.md)\n", architecture: frontmatter, set: frontmatter, wantErr: "must be relative"},
 		{name: "index misses setup link", index: frontmatter + "[a](architecture.md)\n", architecture: frontmatter, set: frontmatter, wantErr: "](guides/setup.md)"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := docs.CheckScaffold(tc.index, tc.architecture, tc.set)
+			err := docs.CheckScaffold(tc.index, tc.architecture, tc.set, "o/r")
 			switch {
 			case tc.wantErr == "" && err != nil:
 				t.Errorf("CheckScaffold() error = %v, want nil", err)

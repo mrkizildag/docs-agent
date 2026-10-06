@@ -104,7 +104,7 @@ const (
 	deadlineTailFrom  = 1024
 	// DeadlineSweepEvery is how often cmd/server runs EnqueueDeadlineJobs; the
 	// give-up warn window matches it so the warn logs once.
-	DeadlineSweepEvery = 30 * time.Second
+	DeadlineSweepEvery = 10 * time.Second
 )
 
 // EnqueueDeadlineJobs enqueues deadline jobs for overdue runs. A run's jobs

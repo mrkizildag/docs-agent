@@ -46,7 +46,7 @@ func TestNewDocCoversOnlyCountsUncoveredChangedFiles(t *testing.T) {
 		t.Run(tc.covers, func(t *testing.T) {
 			t.Parallel()
 
-			err := sel.ValidateProposal(newDoc(tc.covers), changed)
+			err := sel.ValidateProposal(newDoc(tc.covers), changed, "o/r")
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("ValidateProposal(covers %q) = %v, wantErr %t", tc.covers, err, tc.wantErr)
 			}

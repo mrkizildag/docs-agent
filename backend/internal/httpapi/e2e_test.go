@@ -467,7 +467,7 @@ func TestActionsRunnerEndToEnd(t *testing.T) {
 		t.Fatalf("NewClient() error = %v", err)
 	}
 
-	gateSvc := gate.NewService(client, unusedCommentGitHub{}, store, gate.Runners{Actions: actions.New(client, 10*time.Minute)}, nil, nil)
+	gateSvc := gate.NewService(client, unusedCommentGitHub{}, store, gate.Runners{Actions: actions.New(client, 10*time.Minute, 10*time.Minute)}, nil, nil)
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(baseStore, httpapi.HandleJob(gateSvc), logger, 8)
 
@@ -1553,6 +1553,10 @@ func TestWebhookSkipCommitEndToEnd(t *testing.T) {
 	}
 	if summary := h.commentWith(e2eSummaryMarker).Body; !strings.Contains(summary, "Skipped by @dev for this commit: docs are generated for this one") {
 		t.Errorf("summary does not show the skip:\n%s", summary)
+	} else if !strings.Contains(summary, "proposed 2 doc updates; the check is skipped.") || strings.Contains(summary, "proposes") {
+		t.Errorf("summary heading claims open proposals under a skip:\n%s", summary)
+	} else if !strings.Contains(summary, "| skipped |") || strings.Contains(summary, "| open |") {
+		t.Errorf("summary rows do not read skipped:\n%s", summary)
 	}
 
 	h.drainRuns()

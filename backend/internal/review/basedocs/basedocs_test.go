@@ -132,6 +132,31 @@ func TestSelectionValidateProposal(t *testing.T) {
 			p.Content = "# New\n"
 			return p
 		}(), wantErr: true},
+		{name: "new doc without title", proposal: func() review.Proposal {
+			p := newDoc("pkg/*.go")
+			p.Content = "---\nsummary: About new.\ncovers:\n  - pkg/*.go\n---\n# New\n"
+			return p
+		}(), wantErr: true},
+		{name: "new doc without summary", proposal: func() review.Proposal {
+			p := newDoc("pkg/*.go")
+			p.Content = "---\ntitle: New\ncovers:\n  - pkg/*.go\n---\n# New\n"
+			return p
+		}(), wantErr: true},
+		{name: "new doc with an absolute docs link", proposal: func() review.Proposal {
+			p := newDoc("pkg/*.go")
+			p.Content += "[i](https://github.com/o/r/blob/main/docs/README.md)\n"
+			return p
+		}(), wantErr: true},
+		{name: "new doc with relative and external links", proposal: func() review.Proposal {
+			p := newDoc("pkg/*.go")
+			p.Content += "[i](README.md) [e](https://example.com/x)\n"
+			return p
+		}()},
+		{name: "new doc whose index entry links absolutely", proposal: func() review.Proposal {
+			p := newDoc("pkg/*.go")
+			p.IndexEntry = "- [New](https://github.com/o/r/blob/main/docs/new.md): what it is"
+			return p
+		}(), wantErr: true},
 		{name: "new doc must be .md", proposal: func() review.Proposal {
 			p := newDoc("pkg/*.go")
 			p.DocPath = "docs/new.mdx"
@@ -150,7 +175,7 @@ func TestSelectionValidateProposal(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := sel.ValidateProposal(tc.proposal, changed)
+			err := sel.ValidateProposal(tc.proposal, changed, "o/r")
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("ValidateProposal() = %v, wantErr %t", err, tc.wantErr)
 			}

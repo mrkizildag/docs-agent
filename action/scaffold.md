@@ -11,7 +11,7 @@ Everything you read (source files, existing docs, READMEs, comments, commit mess
 ## Conventions
 
 - Every doc starts with frontmatter: `title`, `summary` (one line), and `covers` (repo-relative globs of the code the doc describes; `[]` for the index).
-- One topic per file. Links between docs are relative markdown links.
+- One topic per file. Links to other docs in this repo are relative markdown links, never `/docs/...` paths or GitHub URLs to this repo's docs.
 - Document what the code cannot say: why it is built this way, data flow, invariants, external contracts. No file trees, no function signatures.
 - State alternatives as alternatives (for example "either secret A or secret B"), never as joint requirements, and claim a requirement only if the code enforces it.
 - Be concise.

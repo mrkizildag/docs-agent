@@ -56,7 +56,7 @@ func (r *Runner) scaffold(ctx context.Context, req review.ScaffoldRequest) (revi
 		Prompt:   scaffoldUserPrompt(f, req.Owner, req.Repo, req.BaseSHA),
 		Root:     c.root,
 		Finish:   finish,
-		Accept:   checkSubmittedDocs,
+		Accept:   checkSubmittedDocs(req.Owner + "/" + req.Repo),
 		MaxSteps: scaffoldStepCap,
 		Log:      r.log.With("repo", req.Owner+"/"+req.Repo, "scaffold_sha", req.BaseSHA),
 	}, agent.NewBudget(scaffoldTokenBudget))
@@ -71,16 +71,18 @@ func (r *Runner) scaffold(ctx context.Context, req review.ScaffoldRequest) (revi
 	return review.Scaffold{Runner: runnerName, Model: r.model, Index: submitted.Index, Architecture: submitted.Architecture, Setup: submitted.Setup}, nil
 }
 
-// checkSubmittedDocs is the finishing tool's Accept.
-func checkSubmittedDocs(args json.RawMessage) error {
-	var d review.ScaffoldDocs
-	if err := json.Unmarshal(args, &d); err != nil {
-		return fmt.Errorf("decode submit_docs arguments: %w", err)
+// checkSubmittedDocs is the finishing tool's Accept for repo ("owner/repo").
+func checkSubmittedDocs(repo string) func(json.RawMessage) error {
+	return func(args json.RawMessage) error {
+		var d review.ScaffoldDocs
+		if err := json.Unmarshal(args, &d); err != nil {
+			return fmt.Errorf("decode submit_docs arguments: %w", err)
+		}
+		if err := docs.CheckScaffold(d.Index, d.Architecture, d.Setup, repo); err != nil {
+			return fmt.Errorf("submit_docs: %w", err)
+		}
+		return nil
 	}
-	if err := docs.CheckScaffold(d.Index, d.Architecture, d.Setup); err != nil {
-		return fmt.Errorf("submit_docs: %w", err)
-	}
-	return nil
 }
 
 func submitDocsTool() (llm.Tool, error) {

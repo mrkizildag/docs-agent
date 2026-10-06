@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-var linkTarget = regexp.MustCompile(`\]\(([^)\s]+)\)`)
+var linkTarget = regexp.MustCompile(`\]\(\s*<?([^)\s>]+)`)
 
 // IndexEntry returns the list item of readme, the docs index, that links to
 // docPath, in the form a proposal's index entry takes ("- [Title](rel.md): ...").

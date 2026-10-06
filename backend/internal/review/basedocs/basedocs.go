@@ -65,10 +65,12 @@ func Select(baseFS fs.FS, files []review.ChangedFile) (Selection, error) {
 }
 
 // ValidateProposal checks p against the changed files and, for a new doc
-// (empty section), that it parses and its covers match an uncovered file.
+// (empty section), that it follows the docs conventions (title, summary, covers,
+// relative links to docs of repo, "owner/repo") and its covers match an
+// uncovered file.
 // Restores don't go through it: they recreate a base doc that already covered
 // its files.
-func (s Selection) ValidateProposal(p review.Proposal, changed []review.ChangedFile) error {
+func (s Selection) ValidateProposal(p review.Proposal, changed []review.ChangedFile, repo string) error {
 	if err := p.Validate(changed); err != nil {
 		return err //nolint:wrapcheck // the caller names the proposal.
 	}
@@ -78,12 +80,12 @@ func (s Selection) ValidateProposal(p review.Proposal, changed []review.ChangedF
 	if path.Ext(p.DocPath) != ".md" {
 		return fmt.Errorf("doc_path %q: a new doc must end in .md", p.DocPath)
 	}
-	if len(p.Content) > docs.MaxDocBytes {
-		return fmt.Errorf("content: %d bytes exceed the %d byte cap for a doc", len(p.Content), docs.MaxDocBytes)
-	}
-	doc, err := docs.ParseDoc(p.DocPath, []byte(p.Content))
+	doc, err := docs.CheckNewDoc(p.DocPath, []byte(p.Content), repo)
 	if err != nil {
-		return fmt.Errorf("parse new doc: %w", err)
+		return err //nolint:wrapcheck // CheckNewDoc names the doc.
+	}
+	if err := docs.CheckDocLinks([]byte(p.IndexEntry), repo); err != nil {
+		return fmt.Errorf("index_entry: %w", err)
 	}
 	if !slices.ContainsFunc(s.Uncovered, func(f string) bool { return doc.CoversAny(f) }) {
 		return fmt.Errorf("covers match none of the uncovered changed files %q", s.Uncovered)
