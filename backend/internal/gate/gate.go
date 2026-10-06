@@ -1375,13 +1375,21 @@ func reconciles(v review.Verdict) bool {
 	return false
 }
 
+// proposalsSummary lists one line per proposal, stopping before the check run
+// summary limit so truncate never cuts through a code span.
 func proposalsSummary(proposals review.Proposals) string {
-	summary := ""
-	for _, p := range proposals {
-		if summary != "" {
-			summary += "\n"
+	const moreRoom = 64
+	var b strings.Builder
+	for i, p := range proposals {
+		line := fmt.Sprintf("- %s: %s", codeSpan(p.DocPath), inertProse(p.Reason))
+		if b.Len()+len(line)+1 > maxSummaryBytes-moreRoom {
+			fmt.Fprintf(&b, "\n- … and %d more", len(proposals)-i)
+			break
 		}
-		summary += fmt.Sprintf("- %s: %s", codeSpan(p.DocPath), inertProse(p.Reason))
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(line)
 	}
-	return summary
+	return b.String()
 }

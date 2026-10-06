@@ -27,7 +27,7 @@ func skipRun(s PRState) CheckRun {
 		Status:     StatusCompleted,
 		Conclusion: ConclusionSuccess,
 		Title:      fmt.Sprintf("Skipped by @%s", sk.User),
-		Summary:    truncate(fmt.Sprintf("@%s skipped the docs check for this %s: %s", sk.User, sk.Scope.noun(), sk.Reason), maxSummaryBytes),
+		Summary:    truncate(fmt.Sprintf("@%s skipped the docs check for this %s: %s", sk.User, sk.Scope.noun(), inertProse(sk.Reason)), maxSummaryBytes),
 	}
 }
 
@@ -43,13 +43,10 @@ func OnSkip(s PRState, sk Skip) (PRState, CheckRun) {
 // maxReasonRunes caps a skip reason, which is echoed in the summary and the check run.
 const maxReasonRunes = 500
 
-// cleanReason makes a user-written skip reason safe to echo: one line, capped,
-// with @mentions and checkbox markup broken so it can notify nobody and cannot
-// pass for a box in the summary.
+// cleanReason is a user-written skip reason as stored: one line, capped. Every
+// render passes it through inertProse.
 func cleanReason(reason string) string {
-	reason = strings.Join(strings.Fields(reason), " ")
-	reason = strings.ReplaceAll(reason, "@", "@\u200b")
-	reason = strings.ReplaceAll(reason, "- [", "-\u200b [")
+	reason = oneLine(reason)
 	if r := []rune(reason); len(r) > maxReasonRunes {
 		reason = strings.TrimSpace(string(r[:maxReasonRunes-1])) + "…"
 	}
@@ -95,8 +92,13 @@ func (s *Service) askSkipReason(ctx context.Context, state PRState, ask SkipAsk,
 // skip concludes the check run as skipped. A skip already in state only redraws
 // the summary, which finishes a run that failed after saving.
 func (s *Service) skip(ctx context.Context, state PRState, sk Skip, op string) error {
-	if state.Skip != nil && *state.Skip == (Skip{User: sk.User, Scope: sk.Scope, Reason: sk.Reason, HeadSHA: state.HeadSHA}) {
-		return s.redrawSummary(ctx, state, op)
+	if state.Skip != nil {
+		stored := *state.Skip
+		// Older versions stored reasons with zero-width spaces; cleanReason drops them.
+		stored.Reason = cleanReason(stored.Reason)
+		if stored == (Skip{User: sk.User, Scope: sk.Scope, Reason: sk.Reason, HeadSHA: state.HeadSHA}) {
+			return s.redrawSummary(ctx, state, op)
+		}
 	}
 	state, run := OnSkip(state, sk)
 	if state.CheckRunID == 0 {

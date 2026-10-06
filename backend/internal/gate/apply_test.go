@@ -624,6 +624,37 @@ func TestHandleCommentSideEffects(t *testing.T) {
 	})
 }
 
+func TestHandleCommentMismatchReplyKeepsDocPathInert(t *testing.T) {
+	t.Parallel()
+
+	const path = "docs/@acme-[x](https:__e.example)-<b>.md"
+	state := threeState()
+	state.Proposals = []gate.ProposalState{
+		{ID: "p1", DocPath: path, Section: "Usage", CommentID: 1, State: gate.ProposalOpen, Original: "## Usage\nold\n", Content: "## Usage\nnew\n"},
+	}
+	gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
+	api := apiWithComments()
+	svc := gate.NewService(api, gh, &fakeStore{stored: state, live: true}, gate.Runners{}, nil, nil)
+
+	if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
+		t.Fatalf("HandleComment() error = %v", err)
+	}
+
+	var bodies []string
+	for _, r := range gh.replies {
+		bodies = append(bodies, r.body)
+	}
+	for _, c := range api.comments {
+		if c.Kind == gate.CommentKindIssue && c.ID > summaryID {
+			bodies = append(bodies, c.Body)
+		}
+	}
+	want := "(`doc mismatch: " + path + " does not exist at "
+	if got := strings.Join(bodies, "\n"); !strings.Contains(got, want) || strings.Count(got, "@acme") != 1 {
+		t.Errorf("replies = %q, want the doc path once, inside a code span starting %q", bodies, want)
+	}
+}
+
 func TestHandleCommentRefusalUnticks(t *testing.T) {
 	t.Parallel()
 

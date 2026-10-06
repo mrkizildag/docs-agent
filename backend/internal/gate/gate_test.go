@@ -1095,8 +1095,8 @@ func TestHandleRunCompletedCapsText(t *testing.T) {
 				t.Fatalf("HandleRunCompleted() = %v, want nil", err)
 			}
 			got := gh.updates[0].run.Summary
-			if len(got) > tt.maxBytes || !strings.HasSuffix(got, "… (truncated)") || !utf8.ValidString(got) {
-				t.Errorf("summary = %d bytes valid=%v, want <= %d, valid UTF-8, truncation marker", len(got), utf8.ValidString(got), tt.maxBytes)
+			if len(got) > tt.maxBytes || !strings.HasSuffix(got, "…") || !utf8.ValidString(got) {
+				t.Errorf("summary = %d bytes valid=%v, want <= %d, valid UTF-8, cut mark", len(got), utf8.ValidString(got), tt.maxBytes)
 			}
 		})
 	}

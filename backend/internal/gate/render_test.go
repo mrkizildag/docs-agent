@@ -1,6 +1,8 @@
 package gate_test
 
 import (
+	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -270,24 +272,98 @@ func TestProseModelTextIsInert(t *testing.T) {
 	}
 }
 
-func TestProseForgedApplyBoxIsText(t *testing.T) {
+func TestProseForgedApplyBoxIsNotACheckboxInCheckRun(t *testing.T) {
 	t.Parallel()
 
 	p := proposal("docs/a.md", "A")
 	p.Reason = "- [ ] Apply this change"
-	comment, _, check := renderedProposal(t, p)
+	_, _, check := renderedProposal(t, p)
 
-	lines := 0
-	for l := range strings.SplitSeq(comment, "\n") {
-		if strings.TrimSpace(l) == "- [ ] Apply this change" {
-			lines++
-		}
-	}
-	if lines != 1 {
-		t.Errorf("comment has %d lines equal to the Apply box, want 1:\n%s", lines, comment)
-	}
 	if strings.Contains(check, "- [ ]") {
 		t.Errorf("check run summary = %q, want no checkbox", check)
+	}
+}
+
+func TestProseDropsBidiAndControlCharacters(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/a.md", "A\u202eB\x00C")
+	p.Reason = "ok\u202e evil\x00 fam\u200d\u200fily \u2066x"
+	comment, summary, check := renderedProposal(t, p)
+
+	for name, text := range map[string]string{"summary": summary, "check run": check} {
+		for _, bad := range []string{"\u202e", "\x00", "\u200f", "\u2066"} {
+			if strings.Contains(text, bad) {
+				t.Errorf("%s = %q, want no %q", name, text, bad)
+			}
+		}
+	}
+	if !strings.Contains(check, "ok evil fam\u200dily x") {
+		t.Errorf("check run = %q, want the words kept and the ZWJ intact", check)
+	}
+	if !strings.Contains(comment, "\n\nok evil fam\u200dily x\n\n") {
+		t.Errorf("comment = %q, want the reason line cleaned", comment)
+	}
+	if !strings.Contains(summary, "`ABC`") {
+		t.Errorf("summary = %q, want the section as `ABC`", summary)
+	}
+}
+
+func TestProseBlockStartRule(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/a.md", "A")
+	p.Reason = "___"
+	comment, _, check := renderedProposal(t, p)
+
+	if !strings.Contains(comment, "\n\n\\___\n\n") || !strings.Contains(check, ": \\___") {
+		t.Errorf("comment = %q, check = %q, want the reason as \\___", comment, check)
+	}
+}
+
+func TestProseLongReasonIsCapped(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/a.md", "A")
+	p.Reason = strings.Repeat("word ", 20000) + "`<img src=x>`"
+	comment, _, check := renderedProposal(t, p)
+
+	for name, text := range map[string]string{"comment": comment, "check run": check} {
+		if strings.Contains(text, "<img") {
+			t.Errorf("%s contains <img", name)
+		}
+		if len(text) > 5000 {
+			t.Errorf("%s is %d bytes, want the reason capped", name, len(text))
+		}
+	}
+	if !strings.Contains(check, "…") {
+		t.Errorf("check run = %q, want an ellipsis", check)
+	}
+}
+
+func TestSummaryManyLongReasonsStayWithinLimit(t *testing.T) {
+	t.Parallel()
+
+	var ps review.Proposals
+	for i := range 200 {
+		p := proposal(fmt.Sprintf("docs/%d.md", i), "A")
+		p.Reason = strings.Repeat("x", 900) + " `<img src=x>` " + strings.Repeat("<", 40)
+		ps = append(ps, p)
+	}
+	gh := &fakeGitHub{}
+	proposalService(t, gh, &fakeStore{}, ps)
+	if len(gh.updates) != 1 {
+		t.Fatalf("check run updates = %d, want 1", len(gh.updates))
+	}
+	got := gh.updates[0].run.Summary
+	if len(got) > 65535 {
+		t.Errorf("summary is %d bytes, want at most 65535", len(got))
+	}
+	if !regexp.MustCompile(`\n- … and \d+ more$`).MatchString(got) {
+		t.Errorf("summary ends %q, want the more line", got[max(0, len(got)-80):])
+	}
+	if strings.Contains(strings.ReplaceAll(got, "`<img src=x>`", ""), "<img") {
+		t.Error("summary has a raw <img outside a code span")
 	}
 }
 
@@ -328,7 +404,11 @@ func TestProseOrdinaryReasonRenders(t *testing.T) {
 		{name: "backslash before bracket", reason: `\[x](u)`, want: `\\\[x\]\(u)`},
 		{name: "html", reason: "use <b>bold</b>", want: "use &lt;b>bold&lt;/b>"},
 		{name: "bare urls", reason: "see https://evil.example and WWW.evil.example", want: "see https:\u200b//evil.example and WWW\u200b.evil.example"},
-		{name: "entity mention", reason: "ping &#64;acme", want: "ping &amp;#64;acme"},
+		{name: "entity mention", reason: "ping &#64;acme", want: "ping &amp;#\u200b64;acme"},
+		{name: "issue references", reason: "fixes #12, other/repo#3, gh-4 and GH-x", want: "fixes #\u200b12, other/repo#\u200b3, gh\u200b-4 and GH-x"},
+		{name: "leading issue reference", reason: "#12 done", want: "\\#\u200b12 done"},
+		{name: "dropped bidi mark before heading", reason: "\u202e # x", want: "\\# x"},
+		{name: "dropped controls before list", reason: "\x00 \x00 - item", want: "\\- item"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -381,6 +461,39 @@ func TestSpanModelIdentifiersAreOneCodeSpan(t *testing.T) {
 	}
 	if !strings.Contains(check, "`docs/a.md`") {
 		t.Errorf("check summary = %q, want the doc path in a code span", check)
+	}
+}
+
+func TestSpanPipeAfterBackslashStaysInOneCell(t *testing.T) {
+	t.Parallel()
+
+	state := gate.PRState{Proposals: []gate.ProposalState{{DocPath: "docs/a.md", Section: `a\|[x](https://e.example)|b`, State: gate.ProposalOpen}}}
+	row := ""
+	for l := range strings.SplitSeq(renderedSummary(t, state), "\n") {
+		if strings.HasPrefix(l, "| `docs/a.md`") {
+			row = l
+		}
+	}
+	if row == "" {
+		t.Fatal("summary has no table row")
+	}
+	// A scanner that pairs a backslash with any next character, the stricter
+	// reading of GFM's cell rule.
+	cells, pipes := 0, 0
+	for i := 0; i < len(row); i++ {
+		switch row[i] {
+		case '\\':
+			i++
+		case '|':
+			pipes++
+		}
+	}
+	cells = pipes - 1
+	if cells != 4 {
+		t.Errorf("row = %q has %d cells, want 4", row, cells)
+	}
+	if !strings.Contains(row, "[x](https://e.example)") || strings.Count(row, "`") != 4 {
+		t.Errorf("row = %q, want the link text inside one code span", row)
 	}
 }
 

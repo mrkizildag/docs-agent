@@ -3,6 +3,7 @@ package gate
 import (
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
@@ -149,23 +150,42 @@ func fenceFor(body string) string {
 }
 
 func longestBacktickRun(body string) int {
-	longest, run := 0, 0
-	for _, r := range body {
-		if r == '`' {
-			run++
-			longest = max(longest, run)
-		} else {
-			run = 0
+	longest := 0
+	for i := 0; i < len(body); {
+		if body[i] != '`' {
+			i++
+			continue
 		}
+		n := backtickRunAt(body, i)
+		longest = max(longest, n)
+		i += n
 	}
 	return longest
+}
+
+// maxProseRunes caps a model-written reason before it is escaped.
+const maxProseRunes = 1000
+
+// oneLine collapses whitespace to single spaces and drops control, bidi and
+// zero-width-space characters, which can reorder or hide the text around them.
+// Dropping them before the collapse keeps them from leaving a leading space.
+func oneLine(s string) string {
+	return strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return ' '
+		}
+		if unicode.IsControl(r) || r == '\u200b' || r == '\u200e' || r == '\u200f' || r >= '\u202a' && r <= '\u202e' || r >= '\u2066' && r <= '\u2069' {
+			return -1
+		}
+		return r
+	}, s)), " ")
 }
 
 // codeSpan renders model-written identifier text as one inline code span: one
 // line, delimited by a backtick run longer than any inside it, so nothing in it
 // is interpreted as Markdown.
 func codeSpan(text string) string {
-	text = strings.Join(strings.Fields(text), " ")
+	text = oneLine(text)
 	if strings.HasPrefix(text, "`") || strings.HasSuffix(text, "`") {
 		text = " " + text + " "
 	}
@@ -174,30 +194,44 @@ func codeSpan(text string) string {
 }
 
 // tableCodeSpan is codeSpan for a table cell, where GFM splits cells on `|`
-// before it parses code spans.
+// before it parses code spans. A zero-width space between a backslash and the
+// pipe's escape keeps the pipe escaped even under a scanner that pairs `\\`.
 func tableCodeSpan(text string) string {
-	return strings.ReplaceAll(codeSpan(text), "|", `\|`)
+	span := codeSpan(text)
+	var b strings.Builder
+	for i := 0; i < len(span); i++ {
+		if span[i] == '|' {
+			if i > 0 && span[i-1] == '\\' {
+				b.WriteString("\u200b")
+			}
+			b.WriteByte('\\')
+		}
+		b.WriteByte(span[i])
+	}
+	return b.String()
 }
 
 // inertProse renders model-written prose as one line of Markdown that cannot
 // mention, link or autolink, embed an image, open HTML, decode an entity or
-// start a block. Balanced inline code spans stay as written; every other
+// start a block, or link an issue or pull request (#N, GH-N). Balanced inline code spans stay as written; every other
 // backtick is escaped.
 func inertProse(text string) string {
-	text = strings.Join(strings.Fields(text), " ")
+	text = oneLine(text)
+	if r := []rune(text); len(r) > maxProseRunes {
+		text = strings.TrimSpace(string(r[:maxProseRunes-1])) + "…"
+	}
 	var b strings.Builder
 	for i := 0; i < len(text); {
+		n := 1
 		switch c := text[i]; c {
 		case '`':
-			n := backtickRunAt(text, i)
+			n = backtickRunAt(text, i)
 			if end := closingBacktickRun(text, i+n, n); end >= 0 {
 				b.WriteString(text[i : end+n])
-				i = end + n
+				n = end + n - i
 			} else {
 				b.WriteString(strings.Repeat("\\`", n))
-				i += n
 			}
-			continue
 		case '<':
 			b.WriteString("&lt;")
 		case '&':
@@ -213,10 +247,22 @@ func inertProse(text string) string {
 		case 'w', 'W':
 			if len(text) >= i+4 && strings.EqualFold(text[i:i+4], "www.") {
 				b.WriteString(text[i:i+3] + "\u200b")
-				i += 3
-				continue
+				n = 3
+			} else {
+				b.WriteByte(c)
 			}
+		case '#':
 			b.WriteByte(c)
+			if i+1 < len(text) && isDigit(text[i+1]) {
+				b.WriteString("\u200b")
+			}
+		case 'G', 'g':
+			if len(text) > i+3 && strings.EqualFold(text[i:i+3], "gh-") && isDigit(text[i+3]) {
+				b.WriteString(text[i:i+2] + "\u200b")
+				n = 2
+			} else {
+				b.WriteByte(c)
+			}
 		case '(':
 			if i > 0 && text[i-1] == ']' {
 				b.WriteString("\\(")
@@ -228,10 +274,12 @@ func inertProse(text string) string {
 		default:
 			b.WriteByte(c)
 		}
-		i++
+		i += n
 	}
 	return escapeBlockStart(b.String())
 }
+
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 
 func backtickRunAt(text string, i int) int {
 	n := 0
@@ -264,11 +312,11 @@ func escapeBlockStart(line string) string {
 	if line == "" {
 		return line
 	}
-	if strings.IndexByte("#>-+*=~", line[0]) >= 0 {
+	if strings.IndexByte("#>-+*=~_", line[0]) >= 0 {
 		return "\\" + line
 	}
 	d := 0
-	for d < len(line) && line[d] >= '0' && line[d] <= '9' {
+	for d < len(line) && isDigit(line[d]) {
 		d++
 	}
 	if d > 0 && d < len(line) && (line[d] == '.' || line[d] == ')') {
@@ -346,7 +394,7 @@ func renderSummary(state PRState) string {
 	}
 
 	if active != nil {
-		fmt.Fprintf(&b, "\nSkipped by @%s for this %s: %s\n", active.User, active.Scope.noun(), active.Reason)
+		fmt.Fprintf(&b, "\nSkipped by @%s for this %s: %s\n", active.User, active.Scope.noun(), inertProse(active.Reason))
 	}
 	if state.PendingSkip != nil {
 		fmt.Fprintf(&b, "\nWaiting for @%s to reply with a reason.\n", state.PendingSkip.User)

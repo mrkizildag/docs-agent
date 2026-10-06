@@ -181,13 +181,13 @@ func (s *Service) handleApply(ctx context.Context, state PRState, ev CommentEven
 		p := state.Proposals[i]
 		target := review.Proposal{DocPath: p.DocPath, Section: p.Section, IndexEntry: p.IndexEntry}
 		if err := target.ValidateTarget(); err != nil {
-			return s.say(ctx, state, ev, "a stored proposal is not valid ("+strings.ReplaceAll(err.Error(), "\n", "; ")+"); nothing was committed.", op)
+			return s.say(ctx, state, ev, "a stored proposal is not valid ("+codeSpan(strings.ReplaceAll(err.Error(), "\n", "; "))+"); nothing was committed.", op)
 		}
 	}
 
 	files, err := s.applyFiles(ctx, state, targets)
 	if errors.Is(err, errDocMismatch) {
-		return s.say(ctx, state, ev, "a proposal no longer matches the doc ("+err.Error()+"); nothing was committed.", op)
+		return s.say(ctx, state, ev, "a proposal no longer matches the doc ("+codeSpan(err.Error())+"); nothing was committed.", op)
 	}
 	if err != nil {
 		return "", fmt.Errorf("%s: %w", op, err)
@@ -224,7 +224,7 @@ func (s *Service) handleApply(ctx context.Context, state PRState, ev CommentEven
 		}
 		text := "GitHub rejected the commit (a protected branch, or a symlink or submodule at a doc path); nothing was committed."
 		if rejected := (*CommitRejectedError)(nil); errors.As(err, &rejected) {
-			text = "GitHub rejected the commit: " + rejected.Reason + "; nothing was committed."
+			text = "GitHub rejected the commit: " + codeSpan(rejected.Reason) + "; nothing was committed."
 		}
 		return s.say(ctx, state, ev, text, op)
 	} else if err != nil {
