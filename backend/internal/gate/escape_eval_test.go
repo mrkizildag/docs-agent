@@ -65,3 +65,49 @@ func TestEvalProseBreaksEveryAutolinkForm(t *testing.T) {
 		}
 	}
 }
+
+// Added criterion (skip reason inert) edge: a skip reason using entities,
+// an HTML comment and a leading block marker stays inert and keeps its words.
+func TestEvalSkipReasonEntityCommentAndBlockStartAreInert(t *testing.T) {
+	t.Parallel()
+
+	summary, run := skipRendered(t, "/pollux-agent skip > ping &#64;acme <!-- hide --> <img src=x> www.evil.example")
+	summary = summary[strings.Index(summary, "Skipped by"):]
+	for name, text := range map[string]string{"summary comment": summary, "check run summary": run} {
+		for _, bad := range []string{"&#64;acme", "<!--", "<img", "www."} {
+			if strings.Contains(text, bad) {
+				t.Errorf("%s contains %q:\n%s", name, bad, text)
+			}
+		}
+		for _, word := range []string{"ping", "hide", "img src=x", "evil.example"} {
+			if !strings.Contains(text, word) {
+				t.Errorf("%s lacks %q:\n%s", name, word, text)
+			}
+		}
+	}
+	for l := range strings.SplitSeq(summary, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), ">") {
+			t.Errorf("summary line opens a quote: %q", l)
+		}
+	}
+}
+
+// Added criterion (issue references) edge: mixed case, a reference at the
+// start of a proposal reason and a no-impact reason, in comment and check run.
+func TestEvalReasonIssueReferencesMixedCaseAndLeading(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/a.md", "A")
+	p.Reason = "#5 then Gh-6 and acme/other#7."
+	comment, _, check := renderedProposal(t, p)
+	for name, text := range map[string]string{"comment": comment, "check run": check} {
+		for _, bad := range []string{"#5", "Gh-6", "#7"} {
+			if strings.Contains(text, bad) {
+				t.Errorf("%s contains %q:\n%s", name, bad, text)
+			}
+		}
+		if !strings.Contains(text, "acme/other#") || !strings.Contains(text, "then Gh") {
+			t.Errorf("%s = %q, want the words intact", name, text)
+		}
+	}
+}
