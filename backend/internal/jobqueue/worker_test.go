@@ -3,7 +3,6 @@ package jobqueue_test
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"path/filepath"
 	"sync"
@@ -18,7 +17,7 @@ import (
 const testTimeout = 5 * time.Second
 
 func testLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return slog.New(slog.DiscardHandler)
 }
 
 func newStore(t *testing.T) *sqlite.Store {
