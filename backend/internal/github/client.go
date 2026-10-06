@@ -1,6 +1,5 @@
-// Package github adapts the GitHub REST API to the gate package's GitHub,
-// CommentGitHub and ScaffoldGitHub interfaces and the actions package's
-// WorkflowAPI, authenticating as the pollux-agent GitHub App.
+// Package github adapts the GitHub REST API to the gate package's GitHub
+// interface and the actions package's WorkflowAPI, authenticating as the pollux-agent GitHub App.
 package github
 
 import (
@@ -22,8 +21,7 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
 )
 
-// Client implements gate.GitHub, gate.CommentGitHub, gate.ScaffoldGitHub and
-// actions.WorkflowAPI, authenticating per installation as the pollux-agent
+// Client implements gate.GitHub and actions.WorkflowAPI, authenticating per installation as the pollux-agent
 // GitHub App.
 type Client struct {
 	transport     http.RoundTripper
@@ -49,7 +47,6 @@ type cloneKey struct {
 
 var (
 	_ gate.GitHub         = (*Client)(nil)
-	_ gate.CommentGitHub  = (*Client)(nil)
 	_ actions.WorkflowAPI = (*Client)(nil)
 )
 

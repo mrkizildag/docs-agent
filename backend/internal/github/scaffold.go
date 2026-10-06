@@ -13,8 +13,6 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 )
 
-var _ gate.ScaffoldGitHub = (*Client)(nil)
-
 // DocsExist reports whether owner/repo has any entry named docs at ref: a
 // directory, a file, or a submodule. Only a missing path is false.
 func (c *Client) DocsExist(ctx context.Context, installationID int64, owner, repo, ref string) (bool, error) {
@@ -93,20 +91,6 @@ func (c *Client) ResetBranch(ctx context.Context, installationID int64, owner, r
 		return fmt.Errorf("reset branch %s of %s/%s: %w", branch, owner, repo, err)
 	}
 	return nil
-}
-
-// BranchSHA returns the commit branch points at.
-func (c *Client) BranchSHA(ctx context.Context, installationID int64, owner, repo, branch string) (string, error) {
-	client, err := c.installationClient(installationID)
-	if err != nil {
-		return "", fmt.Errorf("tip of %s/%s %s: %w", owner, repo, branch, err)
-	}
-
-	b, _, err := client.Repositories.GetBranch(ctx, owner, repo, branch, 0)
-	if err != nil {
-		return "", fmt.Errorf("tip of %s/%s %s: %w", owner, repo, branch, err)
-	}
-	return b.GetCommit().GetSHA(), nil
 }
 
 // CreatePullRequest opens a pull request from pr.Head into pr.Base.

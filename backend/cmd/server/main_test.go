@@ -4,7 +4,17 @@ import (
 	"testing"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/config"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
+
+func TestServerRunnerTimeoutIsBelowAnalysisDeadline(t *testing.T) {
+	t.Parallel()
+
+	if llmrunner.AnalysisTimeout >= gate.AnalysisDeadline {
+		t.Errorf("llmrunner.AnalysisTimeout = %s, want below gate.AnalysisDeadline = %s", llmrunner.AnalysisTimeout, gate.AnalysisDeadline)
+	}
+}
 
 func TestBuildRunners_ServerRunnerOnlyWithLLMProviderActionsAlways(t *testing.T) {
 	t.Parallel()

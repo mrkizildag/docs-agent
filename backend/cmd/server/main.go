@@ -26,7 +26,6 @@ import (
 
 const (
 	maxParallelJobs   = 8
-	actionsRunTimeout = 10 * time.Minute
 	githubHTTPTimeout = 20 * time.Second
 	// shutdownTimeout must fit within compose's stop_grace_period (20s).
 	shutdownTimeout = 10 * time.Second
@@ -75,7 +74,7 @@ func run(ctx context.Context) error {
 	worker := jobqueue.NewWorker(store, func(ctx context.Context, job jobqueue.Job) error {
 		return jobs.HandleJob(gateSvc)(ctx, job)
 	}, logger, maxParallelJobs)
-	gateSvc = gate.NewService(ghClient, ghClient, store, runners, ghClient, jobs.NewScaffoldQueue(worker))
+	gateSvc = gate.NewService(ghClient, store, runners, jobs.NewScaffoldQueue(worker))
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -149,7 +148,7 @@ const llmHTTPTimeout = 60 * time.Second
 // buildRunners wires the Actions runner and, from cfg.LLM, the server runner. A nil cfg.LLM
 // leaves the server slot empty, so a repo must run the Actions workflow.
 func buildRunners(cfg config.Config, ghClient *github.Client) (gate.Runners, error) {
-	actionsRunner := actions.New(ghClient, actionsRunTimeout)
+	actionsRunner := actions.New(ghClient, gate.AnalysisDeadline)
 	if cfg.LLM == nil {
 		return gate.Runners{Actions: actionsRunner}, nil
 	}

@@ -508,7 +508,7 @@ func TestHandleComment(t *testing.T) {
 			if tc.api != nil {
 				tc.api(api)
 			}
-			svc := gate.NewService(api, gh, store, gate.Runners{}, nil, nil)
+			svc := newService(api, gh, store, gate.Runners{}, nil, nil)
 
 			err := svc.HandleComment(t.Context(), tc.event)
 
@@ -600,7 +600,7 @@ func TestHandleCommentSideEffects(t *testing.T) {
 
 		gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
 		api := apiWithComments()
-		svc := gate.NewService(api, gh, &fakeStore{stored: threeState(), live: true}, gate.Runners{}, nil, nil)
+		svc := newService(api, gh, &fakeStore{stored: threeState(), live: true}, gate.Runners{}, nil, nil)
 
 		if err := svc.HandleComment(t.Context(), issueComment("thanks!")); err != nil {
 			t.Fatalf("HandleComment() error = %v", err)
@@ -615,7 +615,7 @@ func TestHandleCommentSideEffects(t *testing.T) {
 
 		store := &fakeStore{stored: threeState(), live: true}
 		gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
-		svc := gate.NewService(apiWithComments(), gh, store, gate.Runners{}, nil, nil)
+		svc := newService(apiWithComments(), gh, store, gate.Runners{}, nil, nil)
 
 		for range 2 {
 			if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
@@ -637,7 +637,7 @@ func TestHandleCommentRefusalUnticks(t *testing.T) {
 		gh := &fakeCommentGitHub{files: baseFiles()}
 		api := apiWithComments()
 		api.edit(1, "proposal\n- [x] Apply this change\n")
-		svc := gate.NewService(api, gh, &fakeStore{stored: threeState(), live: true}, gate.Runners{}, nil, nil)
+		svc := newService(api, gh, &fakeStore{stored: threeState(), live: true}, gate.Runners{}, nil, nil)
 
 		if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
 			t.Fatalf("HandleComment() error = %v", err)
@@ -658,7 +658,7 @@ func TestHandleCommentRefusalUnticks(t *testing.T) {
 		gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
 		api := apiWithComments()
 		api.edit(summaryID, "- [x] Apply all")
-		svc := gate.NewService(api, gh, &fakeStore{stored: state, live: true}, gate.Runners{}, nil, nil)
+		svc := newService(api, gh, &fakeStore{stored: state, live: true}, gate.Runners{}, nil, nil)
 
 		if err := svc.HandleComment(t.Context(), summaryTick("Apply all")); err != nil {
 			t.Fatalf("HandleComment() error = %v", err)
@@ -677,7 +677,7 @@ func TestHandleCommentRefusalUnticks(t *testing.T) {
 
 		gh := &fakeCommentGitHub{files: baseFiles()}
 		api := apiWithComments()
-		svc := gate.NewService(api, gh, &fakeStore{stored: threeState(), live: true}, gate.Runners{}, nil, nil)
+		svc := newService(api, gh, &fakeStore{stored: threeState(), live: true}, gate.Runners{}, nil, nil)
 
 		if err := svc.HandleComment(t.Context(), issueComment("/pollux-agent apply")); err != nil {
 			t.Fatalf("HandleComment() error = %v", err)
@@ -718,7 +718,7 @@ func TestHandleCommentIgnoredReactsToNothing(t *testing.T) {
 	t.Parallel()
 
 	gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
-	svc := gate.NewService(apiWithComments(), gh, &fakeStore{stored: threeState(), live: true}, gate.Runners{}, nil, nil)
+	svc := newService(apiWithComments(), gh, &fakeStore{stored: threeState(), live: true}, gate.Runners{}, nil, nil)
 
 	if err := svc.HandleComment(t.Context(), issueComment("looks good")); err != nil {
 		t.Fatalf("HandleComment() error = %v", err)
@@ -749,7 +749,7 @@ func TestHandleCommentApplyRefusesWhenAFileCannotBeRead(t *testing.T) {
 			store := &fakeStore{stored: threeState(), live: true}
 			api := apiWithComments()
 			comments := &fakeCommentGitHub{canWrite: true, files: baseFiles(), api: api, fileErrs: map[string]error{path: tooLarge}}
-			svc := gate.NewService(api, comments, store, gate.Runners{}, nil, nil)
+			svc := newService(api, comments, store, gate.Runners{}, nil, nil)
 
 			err := svc.HandleComment(t.Context(), issueComment("/pollux-agent apply"))
 			if !errors.Is(err, review.ErrFileTooLarge) {

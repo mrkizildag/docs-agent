@@ -193,7 +193,7 @@ func (s *Service) startRun(ctx context.Context, state PRState, pr PullRequest, r
 
 	next := OnPush(state, pr)
 	next.CheckRunID = id
-	next.Run = &AwaitingRun{Nonce: fmt.Sprintf("check-%d", id), Deadline: time.Now().Add(analysisDeadline)}
+	next.Run = &AwaitingRun{Nonce: fmt.Sprintf("check-%d", id), Deadline: time.Now().Add(AnalysisDeadline)}
 
 	var started review.Started
 	var changed []review.ChangedFile

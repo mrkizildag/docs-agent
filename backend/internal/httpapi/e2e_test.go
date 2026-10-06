@@ -47,7 +47,85 @@ type e2eGitHub struct {
 	calls chan e2eCheckRunCall
 }
 
-// unusedCommentGitHub is the CommentGitHub of tests that never act on comments.
+// checkGitHub is the part of gate.GitHub that reports check runs and posts
+// comments.
+type checkGitHub interface {
+	CreateCheckRun(ctx context.Context, installationID int64, owner, repo string, run gate.CheckRun) (int64, error)
+	GetPullRequest(ctx context.Context, installationID int64, owner, repo string, number int) (gate.PullRequest, error)
+	UpdateCheckRun(ctx context.Context, installationID int64, owner, repo string, id int64, run gate.CheckRun) error
+	WorkflowExists(ctx context.Context, installationID int64, owner, repo string) (bool, error)
+	MergeBase(ctx context.Context, installationID int64, owner, repo, base, head string) (string, error)
+	DocsExist(ctx context.Context, installationID int64, owner, repo, ref string) (bool, error)
+	ListChangedFiles(ctx context.Context, installationID int64, owner, repo string, number int) ([]review.ChangedFile, error)
+	ListComments(ctx context.Context, installationID int64, owner, repo string, number int) ([]gate.Comment, error)
+	CreateReviewComment(ctx context.Context, installationID int64, owner, repo string, number int, c gate.ReviewComment) (gate.Comment, error)
+	EditReviewComment(ctx context.Context, installationID int64, owner, repo string, id int64, body string) error
+	CreateIssueComment(ctx context.Context, installationID int64, owner, repo string, number int, body string) (gate.Comment, error)
+	EditIssueComment(ctx context.Context, installationID int64, owner, repo string, id int64, body string) error
+}
+
+// commentingGitHub is checkGitHub plus the calls that act on a comment.
+type commentingGitHub interface {
+	checkGitHub
+	Permission(ctx context.Context, installationID int64, owner, repo, user string) (bool, error)
+	FileAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) ([]byte, bool, error)
+	CommitFiles(ctx context.Context, installationID int64, owner, repo, branch, parentSHA string, files []gate.FileChange, message string) (string, error)
+	BranchCommit(ctx context.Context, installationID int64, owner, repo, branch string) (gate.Commit, error)
+	CommitAt(ctx context.Context, installationID int64, owner, repo, sha string) (gate.Commit, error)
+	React(ctx context.Context, installationID int64, owner, repo string, kind gate.CommentKind, id int64, reaction gate.Reaction) (int64, error)
+	Unreact(ctx context.Context, installationID int64, owner, repo string, kind gate.CommentKind, id, reactionID int64) error
+	ReplyToReviewComment(ctx context.Context, installationID int64, owner, repo string, number int, inReplyTo int64, body string) (gate.Comment, error)
+}
+
+// newGate is a gate over gh in which acting on comments and scaffolding fail.
+func newGate(gh checkGitHub, store gate.Store, runners gate.Runners) *gate.Service {
+	return gate.NewService(struct {
+		checkGitHub
+		unusedCommentGitHub
+		unusedScaffoldGitHub
+	}{gh, unusedCommentGitHub{}, unusedScaffoldGitHub{}}, store, runners, unusedScaffoldQueue{})
+}
+
+// newGateWithComments is a gate over gh in which scaffolding fails.
+func newGateWithComments(gh commentingGitHub, store gate.Store, runners gate.Runners) *gate.Service {
+	return gate.NewService(struct {
+		commentingGitHub
+		unusedScaffoldGitHub
+	}{gh, unusedScaffoldGitHub{}}, store, runners, unusedScaffoldQueue{})
+}
+
+var errUnusedScaffold = errors.New("scaffolding is not used by this test")
+
+// unusedScaffoldGitHub is the scaffold part of the port for tests that never scaffold.
+type unusedScaffoldGitHub struct{}
+
+func (unusedScaffoldGitHub) DefaultBranch(context.Context, int64, string, string) (string, string, error) {
+	return "", "", errUnusedScaffold
+}
+
+func (unusedScaffoldGitHub) CreateBranch(context.Context, int64, string, string, string, string) error {
+	return errUnusedScaffold
+}
+
+func (unusedScaffoldGitHub) ResetBranch(context.Context, int64, string, string, string, string) error {
+	return errUnusedScaffold
+}
+
+func (unusedScaffoldGitHub) CreatePullRequest(context.Context, int64, string, string, gate.NewPullRequest) (gate.ScaffoldPR, error) {
+	return gate.ScaffoldPR{}, errUnusedScaffold
+}
+
+func (unusedScaffoldGitHub) FindPullRequest(context.Context, int64, string, string, string) (gate.ScaffoldPR, bool, error) {
+	return gate.ScaffoldPR{}, false, errUnusedScaffold
+}
+
+type unusedScaffoldQueue struct{}
+
+func (unusedScaffoldQueue) EnqueueScaffold(context.Context, gate.RepoRef, int) error {
+	return errUnusedScaffold
+}
+
+// unusedCommentGitHub is the comment part of the port for tests that never act on comments.
 type unusedCommentGitHub struct{}
 
 var errUnusedComments = errors.New("comment access is not used by this test")
@@ -209,7 +287,7 @@ func TestWebhookToCheckRunEndToEnd(t *testing.T) {
 	})
 
 	gh := &e2eGitHub{calls: make(chan e2eCheckRunCall, 10)}
-	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)
+	gateSvc := newGate(gh, store, gate.Runners{})
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, jobs.HandleJob(gateSvc), logger, 8)
@@ -473,7 +551,7 @@ func TestActionsRunnerEndToEnd(t *testing.T) {
 		t.Fatalf("NewClient() error = %v", err)
 	}
 
-	gateSvc := gate.NewService(client, unusedCommentGitHub{}, store, gate.Runners{Actions: actions.New(client, 10*time.Minute)}, nil, nil)
+	gateSvc := newGate(client, store, gate.Runners{Actions: actions.New(client, 10*time.Minute)})
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(baseStore, jobs.HandleJob(gateSvc), logger, 8)
 
@@ -636,7 +714,7 @@ func TestWebhookToProposalCommentsEndToEnd(t *testing.T) {
 		{DocPath: "docs/a.md", Section: "Usage", Anchor: review.Anchor{File: "a.go", Line: 4}, Reason: "flag renamed", Original: "## Usage\nold\n", Lines: review.LineRange{Start: 3, End: 4}, Content: "## Usage\nnew\n"},
 		{DocPath: "docs/b.md", Anchor: review.Anchor{File: "b.go", Line: 9}, Reason: "new feature", Content: "# B\n", IndexEntry: "- [B](b.md)"},
 	}}
-	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{Server: runner}, nil, nil)
+	gateSvc := newGate(gh, store, gate.Runners{Server: runner})
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, jobs.HandleJob(gateSvc), logger, 8)
@@ -993,7 +1071,7 @@ func newPushHarness(t *testing.T, outcomes ...any) *pushHarness {
 		queued <- o
 	}
 	gh := &statefulGitHub{checkRuns: make(chan gate.CheckRun, len(outcomes)+8), files: map[string]string{}}
-	gateSvc := gate.NewService(gh, gh, store, gate.Runners{Actions: scriptedRunner{outcomes: queued}, Server: scriptedRunner{outcomes: queued}}, nil, nil)
+	gateSvc := newGateWithComments(gh, store, gate.Runners{Actions: scriptedRunner{outcomes: queued}, Server: scriptedRunner{outcomes: queued}})
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, jobs.HandleJob(gateSvc), logger, 8)

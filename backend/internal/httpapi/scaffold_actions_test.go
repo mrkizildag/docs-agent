@@ -291,7 +291,7 @@ func newActionsScaffoldHarness(t *testing.T, server gate.ServerRunner) *actionsS
 
 	logger := slog.New(slog.DiscardHandler)
 	_, worker := newServiceWorker(baseStore, func(q gate.ScaffoldQueue) *gate.Service {
-		return gate.NewService(client, client, store, gate.Runners{Actions: actions.New(client, 10*time.Minute), Server: server}, client, q)
+		return gate.NewService(client, store, gate.Runners{Actions: actions.New(client, 10*time.Minute), Server: server}, q)
 	}, logger, 8)
 	workerCtx, cancelWorker := context.WithCancel(t.Context())
 	workerDone := make(chan error, 1)

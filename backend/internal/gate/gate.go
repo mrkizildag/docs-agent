@@ -6,7 +6,7 @@
 // HandleScaffold and its siblings write and propose the docs scaffold of a repo
 // that has no docs/ folder. State transitions are pure functions over PRState and
 // ScaffoldState; the Service performs their I/O through the GitHub,
-// CommentGitHub, ScaffoldGitHub, ScaffoldQueue and Store ports it declares.
+// ScaffoldQueue and Store ports it declares.
 package gate
 
 import (
@@ -19,8 +19,9 @@ import (
 // setupGuideURL is linked from the neutral check when no runner is available.
 const setupGuideURL = "https://github.com/mrkizildag/pollux-agent/blob/main/docs/guides/setup.md"
 
-// GitHub creates check runs and inspects repository state on behalf of an
-// installation.
+// GitHub is everything the domain needs from GitHub on behalf of an
+// installation: check runs, pull request state and comments, repository files
+// and commits, and the branches and pull requests of a scaffold.
 type GitHub interface {
 	// CreateCheckRun returns the ID of the check run it created.
 	CreateCheckRun(ctx context.Context, installationID int64, owner, repo string, run CheckRun) (int64, error)
@@ -43,6 +44,35 @@ type GitHub interface {
 	EditReviewComment(ctx context.Context, installationID int64, owner, repo string, id int64, body string) error
 	CreateIssueComment(ctx context.Context, installationID int64, owner, repo string, number int, body string) (Comment, error)
 	EditIssueComment(ctx context.Context, installationID int64, owner, repo string, id int64, body string) error
+	// Permission reports whether user may write to the repository.
+	Permission(ctx context.Context, installationID int64, owner, repo, user string) (canWrite bool, err error)
+	// FileAtRef returns the file at ref; ok is false when it does not exist there.
+	// A file it will not read for its size is an error wrapping
+	// review.ErrFileTooLarge, never ok=false.
+	FileAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (content []byte, ok bool, err error)
+	// CommitFiles commits files on top of parentSHA and moves branch to the new
+	// commit without forcing. It returns ErrBranchMoved when branch is no longer at parentSHA.
+	CommitFiles(ctx context.Context, installationID int64, owner, repo, branch, parentSHA string, files []FileChange, message string) (sha string, err error)
+	// BranchCommit returns the commit branch points at.
+	BranchCommit(ctx context.Context, installationID int64, owner, repo, branch string) (Commit, error)
+	// CommitAt returns the commit sha.
+	CommitAt(ctx context.Context, installationID int64, owner, repo, sha string) (Commit, error)
+	// React adds reaction to comment id of kind and returns the reaction's ID;
+	// adding one that already exists returns the existing ID.
+	React(ctx context.Context, installationID int64, owner, repo string, kind CommentKind, id int64, reaction Reaction) (int64, error)
+	// Unreact removes reaction reactionID from comment id of kind.
+	Unreact(ctx context.Context, installationID int64, owner, repo string, kind CommentKind, id, reactionID int64) error
+	// ReplyToReviewComment posts a reply in the thread of review comment inReplyTo.
+	ReplyToReviewComment(ctx context.Context, installationID int64, owner, repo string, number int, inReplyTo int64, body string) (Comment, error)
+	// DefaultBranch returns the default branch's name and tip commit.
+	DefaultBranch(ctx context.Context, installationID int64, owner, repo string) (name, sha string, err error)
+	// CreateBranch creates branch at sha; it returns ErrBranchExists when branch exists.
+	CreateBranch(ctx context.Context, installationID int64, owner, repo, branch, sha string) error
+	// ResetBranch force-moves an existing branch to sha.
+	ResetBranch(ctx context.Context, installationID int64, owner, repo, branch, sha string) error
+	CreatePullRequest(ctx context.Context, installationID int64, owner, repo string, pr NewPullRequest) (ScaffoldPR, error)
+	// FindPullRequest returns the pull request opened from branch, preferring the bot's (open first), then an open one, over the rest.
+	FindPullRequest(ctx context.Context, installationID int64, owner, repo, branch string) (pr ScaffoldPR, ok bool, err error)
 }
 
 // Service decides and reports the pollux-agent check run for a pull request.
@@ -50,17 +80,14 @@ type Service struct {
 	gh            GitHub
 	store         Store
 	runners       Runners
-	comments      CommentGitHub
-	scaffoldGH    ScaffoldGitHub
 	scaffoldQueue ScaffoldQueue
 	// retryBackoff is the wait before the first retry of a Collect or a post; it doubles.
 	retryBackoff time.Duration
 }
 
-// NewService returns a Service that reports check runs through gh, acts on
-// comments through comments, persists state through store, selects among
-// runners for analysis, and writes scaffolds through scaffoldGH, scheduling
-// their jobs on scaffoldQueue.
-func NewService(gh GitHub, comments CommentGitHub, store Store, runners Runners, scaffoldGH ScaffoldGitHub, scaffoldQueue ScaffoldQueue) *Service {
-	return &Service{gh: gh, comments: comments, store: store, runners: runners, scaffoldGH: scaffoldGH, scaffoldQueue: scaffoldQueue, retryBackoff: time.Second}
+// NewService returns a Service that reaches GitHub through gh, persists state
+// through store, selects among runners for analysis, and schedules scaffold
+// jobs on scaffoldQueue. Every dependency is required.
+func NewService(gh GitHub, store Store, runners Runners, scaffoldQueue ScaffoldQueue) *Service {
+	return &Service{gh: gh, store: store, runners: runners, scaffoldQueue: scaffoldQueue, retryBackoff: time.Second}
 }

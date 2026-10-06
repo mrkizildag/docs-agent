@@ -118,10 +118,10 @@ func (f *scaffoldGitHub) ResetBranch(_ context.Context, _ int64, _, _, branch, s
 	return nil
 }
 
-func (f *scaffoldGitHub) BranchSHA(_ context.Context, _ int64, _, _, branch string) (string, error) {
+func (f *scaffoldGitHub) BranchCommit(_ context.Context, _ int64, _, _, branch string) (gate.Commit, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.branches[branch], nil
+	return gate.Commit{SHA: f.branches[branch]}, nil
 }
 
 func (f *scaffoldGitHub) CommitFiles(_ context.Context, _ int64, _, _, branch, parentSHA string, files []gate.FileChange, _ string) (string, error) {
@@ -223,7 +223,7 @@ func TestWebhookToScaffoldPullRequest(t *testing.T) {
 	model := &scaffoldModel{}
 	noToken := func(context.Context, int64, string) (string, error) { return "", nil }
 	_, worker := newServiceWorker(store, func(q gate.ScaffoldQueue) *gate.Service {
-		return gate.NewService(gh, gh, store, gate.Runners{Server: llmrunner.New(model, noToken, "triage", "draft")}, gh, q)
+		return gate.NewService(gh, store, gate.Runners{Server: llmrunner.New(model, noToken, "triage", "draft")}, q)
 	}, slog.New(slog.DiscardHandler), 8)
 	stopWorker := runWorker(worker)
 	var stopOnce sync.Once
@@ -336,7 +336,7 @@ func adoptBotScaffoldPullRequest(t *testing.T, branchTip string) {
 	model := &scaffoldModel{}
 	noToken := func(context.Context, int64, string) (string, error) { return "", nil }
 	_, worker := newServiceWorker(store, func(q gate.ScaffoldQueue) *gate.Service {
-		return gate.NewService(gh, gh, store, gate.Runners{Server: llmrunner.New(model, noToken, "triage", "draft")}, gh, q)
+		return gate.NewService(gh, store, gate.Runners{Server: llmrunner.New(model, noToken, "triage", "draft")}, q)
 	}, slog.New(slog.DiscardHandler), 8)
 	stopWorker := runWorker(worker)
 	var stopOnce sync.Once

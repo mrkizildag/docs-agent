@@ -60,7 +60,7 @@ func TestHandleCommentRerunSettlesAfterASlowAnalysis(t *testing.T) {
 			onStart: func() { time.Sleep(40 * time.Second) },
 		}
 		comments := &fakeCommentGitHub{canWrite: true}
-		svc := gate.NewService(newHeadGitHub(), comments, &fakeStore{stored: failedSummaryState()}, gate.Runners{Server: runner}, nil, nil)
+		svc := newService(newHeadGitHub(), comments, &fakeStore{stored: failedSummaryState()}, gate.Runners{Server: runner}, nil, nil)
 		ev := rerunEvent()
 
 		if err := svc.HandleComment(t.Context(), ev); err != nil {
@@ -92,7 +92,7 @@ func TestHandleCommentRerunWhoseAnalysisFailedIsDone(t *testing.T) {
 			gh := newHeadGitHub()
 			gh.updateErr = tc.updateErr
 			comments := &fakeCommentGitHub{canWrite: true}
-			svc := gate.NewService(gh, comments, &fakeStore{stored: failedSummaryState()}, gate.Runners{Server: &fakeRunner{err: failure}}, nil, nil)
+			svc := newService(gh, comments, &fakeStore{stored: failedSummaryState()}, gate.Runners{Server: &fakeRunner{err: failure}}, nil, nil)
 			ev := rerunEvent()
 
 			err := svc.HandleComment(t.Context(), ev)
@@ -117,7 +117,7 @@ func TestHandleCommentOnAPullRequestNeverAnalyzed(t *testing.T) {
 			gh := &fakeGitHub{}
 			store := &fakeStore{}
 			comments := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
-			svc := gate.NewService(gh, comments, store, gate.Runners{}, nil, nil)
+			svc := newService(gh, comments, store, gate.Runners{}, nil, nil)
 			ev := issueComment(body)
 
 			if err := svc.HandleComment(t.Context(), ev); err != nil {
@@ -144,7 +144,7 @@ func TestHandleCommentFromAReaderGetsNoSeenReaction(t *testing.T) {
 
 	comments := &fakeCommentGitHub{files: baseFiles()}
 	api := apiWithComments()
-	svc := gate.NewService(api, comments, &fakeStore{stored: threeState()}, gate.Runners{}, nil, nil)
+	svc := newService(api, comments, &fakeStore{stored: threeState()}, gate.Runners{}, nil, nil)
 
 	if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)
@@ -165,7 +165,7 @@ func TestHandleCommentSavesPendingApplyBeforeCommitting(t *testing.T) {
 
 		store := &fakeStore{stored: openState(), live: true}
 		comments := &fakeCommentGitHub{canWrite: true, files: baseFiles(), commitErr: errors.New("boom")}
-		svc := gate.NewService(apiWithComments(), comments, store, gate.Runners{}, nil, nil)
+		svc := newService(apiWithComments(), comments, store, gate.Runners{}, nil, nil)
 
 		if err := svc.HandleComment(t.Context(), reviewTick(1)); err == nil {
 			t.Fatal("HandleComment() = nil, want the commit error")
@@ -181,7 +181,7 @@ func TestHandleCommentSavesPendingApplyBeforeCommitting(t *testing.T) {
 
 		store := &fakeStore{stored: openState(), live: true}
 		comments := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
-		svc := gate.NewService(apiWithComments(), comments, store, gate.Runners{}, nil, nil)
+		svc := newService(apiWithComments(), comments, store, gate.Runners{}, nil, nil)
 
 		if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
 			t.Fatalf("HandleComment() = %v, want nil", err)
@@ -221,7 +221,7 @@ func TestHandlePullRequestAdoptsTheCommitOfACrashedApply(t *testing.T) {
 			gh.addComment(gate.CommentKindReview, "proposal\n- [ ] Apply this change\n")
 			comments := &fakeCommentGitHub{branch: tc.commit}
 			runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
-			svc := gate.NewService(gh, comments, store, gate.Runners{Server: runner}, nil, nil)
+			svc := newService(gh, comments, store, gate.Runners{Server: runner}, nil, nil)
 			pr := gate.PullRequest{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 3, BaseSHA: "base1", HeadSHA: "botbot1234", HeadRef: "feature"}
 
 			if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
@@ -252,7 +252,7 @@ func TestHandleCommentAppliedReply(t *testing.T) {
 		t.Parallel()
 
 		comments := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
-		svc := gate.NewService(apiWithComments(), comments, &fakeStore{stored: threeState(), live: true}, gate.Runners{}, nil, nil)
+		svc := newService(apiWithComments(), comments, &fakeStore{stored: threeState(), live: true}, gate.Runners{}, nil, nil)
 
 		if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
 			t.Fatalf("HandleComment() = %v, want nil", err)
@@ -271,7 +271,7 @@ func TestHandleCommentAppliedReply(t *testing.T) {
 		api := apiWithComments()
 		prior := api.addComment(gate.CommentKindReview, "✅ Applied in abcdef1\n\n<!-- pollux-agent:applied:p1:abcdef1234567 -->")
 		comments := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
-		svc := gate.NewService(api, comments, store, gate.Runners{}, nil, nil)
+		svc := newService(api, comments, store, gate.Runners{}, nil, nil)
 
 		if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
 			t.Fatalf("HandleComment() = %v, want nil", err)

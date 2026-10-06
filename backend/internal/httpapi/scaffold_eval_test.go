@@ -72,11 +72,11 @@ type evalEnv struct {
 	stop    func() error
 }
 
-func startEvalEnv(t *testing.T, store *sqlite.Store, gh gateScaffoldGitHub, model llm.Model) evalEnv {
+func startEvalEnv(t *testing.T, store *sqlite.Store, gh gate.GitHub, model llm.Model) evalEnv {
 	t.Helper()
 	noToken := func(context.Context, int64, string) (string, error) { return "", nil }
 	_, worker := newServiceWorker(store, func(q gate.ScaffoldQueue) *gate.Service {
-		return gate.NewService(gh, gh, store, gate.Runners{Server: llmrunner.New(model, noToken, "triage", "draft")}, gh, q)
+		return gate.NewService(gh, store, gate.Runners{Server: llmrunner.New(model, noToken, "triage", "draft")}, q)
 	}, slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	var once sync.Once
@@ -85,12 +85,6 @@ func startEvalEnv(t *testing.T, store *sqlite.Store, gh gateScaffoldGitHub, mode
 	t.Cleanup(func() { _ = stopFn() })
 	secret := []byte("test-secret")
 	return evalEnv{handler: httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store), secret: secret, stop: stopFn}
-}
-
-type gateScaffoldGitHub interface {
-	gate.GitHub
-	gate.CommentGitHub
-	gate.ScaffoldGitHub
 }
 
 func openEvalStore(t *testing.T) *sqlite.Store {

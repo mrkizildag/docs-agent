@@ -149,7 +149,7 @@ func TestWebhookToServerRunnerChain(t *testing.T) {
 	model := &chainModel{}
 	noToken := func(context.Context, int64, string) (string, error) { return "", nil }
 	runner := llmrunner.New(model, noToken, "triage", "draft")
-	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{Server: runner}, nil, nil)
+	gateSvc := newGate(gh, store, gate.Runners{Server: runner})
 
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(store, jobs.HandleJob(gateSvc), logger, 8)

@@ -105,24 +105,6 @@ func TestCreateBranch(t *testing.T) {
 	}
 }
 
-func TestBranchSHA(t *testing.T) {
-	t.Parallel()
-
-	mux := http.NewServeMux()
-	handleAccessToken(t, mux)
-	mux.HandleFunc("GET /repos/o/r/branches/{branch...}", func(w http.ResponseWriter, r *http.Request) {
-		if got := r.PathValue("branch"); got != "pollux-agent/docs-scaffold" {
-			t.Errorf("branch = %q", got)
-		}
-		writeJSON(t, w, http.StatusOK, `{"name":"x","commit":{"sha":"tip2"}}`)
-	})
-	client := newTestClient(t, mux)
-
-	if got, err := client.BranchSHA(t.Context(), 1, "o", "r", "pollux-agent/docs-scaffold"); err != nil || got != "tip2" {
-		t.Errorf("BranchSHA() = %q, %v; want tip2, nil", got, err)
-	}
-}
-
 func TestCreatePullRequest(t *testing.T) {
 	t.Parallel()
 

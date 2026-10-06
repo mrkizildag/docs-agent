@@ -28,9 +28,10 @@ const runnerName = "llmrunner"
 // Caps on one analysis run, sized from measured runs on the Gemini free tier
 // (1-3 steps, at most 46k tokens).
 const (
-	stepCap         = 12
-	tokenBudget     = 120_000
-	analysisTimeout = 150 * time.Second
+	stepCap     = 12
+	tokenBudget = 120_000
+	// AnalysisTimeout must stay below gate.AnalysisDeadline; cmd/server tests it.
+	AnalysisTimeout = 150 * time.Second
 )
 
 // limits caps one agent run: its steps, total tokens, and wall-clock time.
@@ -66,7 +67,7 @@ var (
 func New(m llm.Model, token func(ctx context.Context, installationID int64, repo string) (string, error), triageModel, model string) *Runner {
 	return &Runner{
 		m: m, token: token, triageModel: triageModel, model: model,
-		analysisLimits: limits{steps: stepCap, tokens: tokenBudget, timeout: analysisTimeout},
+		analysisLimits: limits{steps: stepCap, tokens: tokenBudget, timeout: AnalysisTimeout},
 		scaffoldLimits: limits{steps: scaffoldStepCap, tokens: scaffoldTokenBudget, timeout: scaffoldTimeout},
 		log:            slog.Default(),
 	}

@@ -180,7 +180,7 @@ func (s *Service) handleComment(ctx context.Context, ev CommentEvent) error {
 	}
 	state.InstallationID = cmp.Or(state.InstallationID, ev.InstallationID)
 
-	canWrite, err := s.comments.Permission(ctx, state.InstallationID, state.Owner, state.Repo, ev.Sender)
+	canWrite, err := s.gh.Permission(ctx, state.InstallationID, state.Owner, state.Repo, ev.Sender)
 	if err != nil {
 		return fmt.Errorf("check permission of %s: %w", ev.Sender, err)
 	}
@@ -192,7 +192,7 @@ func (s *Service) handleComment(ctx context.Context, ev CommentEvent) error {
 		return s.settle(ctx, state, ev, 0, final)
 	}
 
-	seen, err := s.comments.React(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, ReactionSeen)
+	seen, err := s.gh.React(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, ReactionSeen)
 	if err != nil {
 		return fmt.Errorf("react %s: %w", ReactionSeen, err)
 	}
@@ -238,14 +238,14 @@ func (s *Service) settle(ctx context.Context, state PRState, ev CommentEvent, se
 	ctx, cancel := writeContext(ctx)
 	defer cancel()
 	if seen != 0 {
-		if err := s.comments.Unreact(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, seen); err != nil {
+		if err := s.gh.Unreact(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, seen); err != nil {
 			return fmt.Errorf("remove %s reaction: %w", ReactionSeen, err)
 		}
 	}
 	if final == "" {
 		return nil
 	}
-	if _, err := s.comments.React(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, final); err != nil {
+	if _, err := s.gh.React(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, final); err != nil {
 		return fmt.Errorf("react %s: %w", final, err)
 	}
 	return nil
@@ -258,7 +258,7 @@ func (s *Service) say(ctx context.Context, state PRState, ev CommentEvent, text 
 	ctx, cancel := writeContext(ctx)
 	defer cancel()
 	if ev.Kind == CommentKindReview {
-		if _, err := s.comments.ReplyToReviewComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, ev.CommentID, "@"+ev.Sender+" "+text); err != nil {
+		if _, err := s.gh.ReplyToReviewComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, ev.CommentID, "@"+ev.Sender+" "+text); err != nil {
 			return "", fmt.Errorf("reply: %w", err)
 		}
 	} else if _, err := s.gh.CreateIssueComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, "@"+ev.Sender+" "+text); err != nil {

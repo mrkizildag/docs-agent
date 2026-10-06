@@ -25,7 +25,7 @@ const (
 		"Edit them freely; Pollux will keep them current in later pull requests. It opens this pull request once and does not update it."
 )
 
-// ErrBranchExists is returned by ScaffoldGitHub.CreateBranch when the branch already exists.
+// ErrBranchExists is returned by GitHub.CreateBranch when the branch already exists.
 var ErrBranchExists = errors.New("gate: branch exists")
 
 // RepoRef identifies a repository.
@@ -82,20 +82,6 @@ type NewPullRequest struct {
 	Body  string
 	Head  string
 	Base  string
-}
-
-// ScaffoldGitHub is what writing and proposing a scaffold needs from GitHub.
-type ScaffoldGitHub interface {
-	// DefaultBranch returns the default branch's name and tip commit.
-	DefaultBranch(ctx context.Context, installationID int64, owner, repo string) (name, sha string, err error)
-	// CreateBranch creates branch at sha; it returns ErrBranchExists when branch exists.
-	CreateBranch(ctx context.Context, installationID int64, owner, repo, branch, sha string) error
-	// ResetBranch force-moves an existing branch to sha.
-	ResetBranch(ctx context.Context, installationID int64, owner, repo, branch, sha string) error
-	BranchSHA(ctx context.Context, installationID int64, owner, repo, branch string) (string, error)
-	CreatePullRequest(ctx context.Context, installationID int64, owner, repo string, pr NewPullRequest) (ScaffoldPR, error)
-	// FindPullRequest returns the pull request opened from branch, preferring the bot's (open first), then an open one, over the rest.
-	FindPullRequest(ctx context.Context, installationID int64, owner, repo, branch string) (pr ScaffoldPR, ok bool, err error)
 }
 
 // ScaffoldQueue schedules the repo-keyed job that writes the scaffold; one
@@ -456,7 +442,7 @@ func (s *Service) collectScaffold(ctx context.Context, state ScaffoldState) (rev
 // which holds the files once they are written.
 func (s *Service) proposeScaffold(ctx context.Context, state ScaffoldState) (ScaffoldState, error) {
 	inst, owner, repo := state.InstallationID, state.Owner, state.Repo
-	base, tip, err := s.scaffoldGH.DefaultBranch(ctx, inst, owner, repo)
+	base, tip, err := s.gh.DefaultBranch(ctx, inst, owner, repo)
 	if err != nil {
 		return state, fmt.Errorf("find default branch: %w", err)
 	}
@@ -580,7 +566,7 @@ func (s *Service) concludeNoRunner(ctx context.Context, state ScaffoldState) (Sc
 // request into base. The returned state records the commit, also on error.
 func (s *Service) openScaffoldPR(ctx context.Context, state ScaffoldState, base string) (ScaffoldState, ScaffoldPR, error) {
 	inst, owner, repo := state.InstallationID, state.Owner, state.Repo
-	existing, ok, err := s.scaffoldGH.FindPullRequest(ctx, inst, owner, repo, scaffoldBranch)
+	existing, ok, err := s.gh.FindPullRequest(ctx, inst, owner, repo, scaffoldBranch)
 	if err != nil {
 		return state, ScaffoldPR{}, fmt.Errorf("find pull request from %s: %w", scaffoldBranch, err)
 	}
@@ -592,17 +578,17 @@ func (s *Service) openScaffoldPR(ctx context.Context, state ScaffoldState, base 
 	}
 
 	committed := false
-	err = s.scaffoldGH.CreateBranch(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA)
+	err = s.gh.CreateBranch(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA)
 	switch {
 	case err == nil:
 	case errors.Is(err, ErrBranchExists):
-		tip, err := s.scaffoldGH.BranchSHA(ctx, inst, owner, repo, scaffoldBranch)
+		tip, err := s.gh.BranchCommit(ctx, inst, owner, repo, scaffoldBranch)
 		if err != nil {
 			return state, ScaffoldPR{}, fmt.Errorf("read branch %s: %w", scaffoldBranch, err)
 		}
-		committed = state.CommitSHA != "" && tip == state.CommitSHA
-		if !committed && tip != state.BaseSHA {
-			if err := s.scaffoldGH.ResetBranch(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA); err != nil {
+		committed = state.CommitSHA != "" && tip.SHA == state.CommitSHA
+		if !committed && tip.SHA != state.BaseSHA {
+			if err := s.gh.ResetBranch(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA); err != nil {
 				return state, ScaffoldPR{}, fmt.Errorf("reset branch %s to %s: %w", scaffoldBranch, shortSHA(state.BaseSHA), err)
 			}
 		}
@@ -615,7 +601,7 @@ func (s *Service) openScaffoldPR(ctx context.Context, state ScaffoldState, base 
 		for _, f := range state.Files.Files() {
 			files = append(files, FileChange{Path: f.Path, Content: f.Content})
 		}
-		sha, err := s.comments.CommitFiles(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA, files, scaffoldCommitMessage)
+		sha, err := s.gh.CommitFiles(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA, files, scaffoldCommitMessage)
 		if err != nil {
 			return state, ScaffoldPR{}, fmt.Errorf("commit scaffold to %s: %w", scaffoldBranch, err)
 		}
@@ -627,9 +613,9 @@ func (s *Service) openScaffoldPR(ctx context.Context, state ScaffoldState, base 
 		}
 	}
 
-	pr, err := s.scaffoldGH.CreatePullRequest(ctx, inst, owner, repo, NewPullRequest{Title: scaffoldPRTitle, Body: scaffoldPRBody, Head: scaffoldBranch, Base: base})
+	pr, err := s.gh.CreatePullRequest(ctx, inst, owner, repo, NewPullRequest{Title: scaffoldPRTitle, Body: scaffoldPRBody, Head: scaffoldBranch, Base: base})
 	if err != nil {
-		found, ok, ferr := s.scaffoldGH.FindPullRequest(ctx, inst, owner, repo, scaffoldBranch)
+		found, ok, ferr := s.gh.FindPullRequest(ctx, inst, owner, repo, scaffoldBranch)
 		if ferr != nil || !ok || !found.ByBot {
 			return state, ScaffoldPR{}, errors.Join(fmt.Errorf("create pull request from %s: %w", scaffoldBranch, err), ferr)
 		}

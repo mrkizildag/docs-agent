@@ -177,7 +177,7 @@ func TestWebhookRedeliveryAfterFailedJobEnqueuesNewJob(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close() })
 
 	gh := newFailThenSucceedGitHub()
-	worker := jobqueue.NewWorker(store, jobs.HandleJob(gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)), slog.New(slog.DiscardHandler), 8)
+	worker := jobqueue.NewWorker(store, jobs.HandleJob(newGate(gh, store, gate.Runners{})), slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	t.Cleanup(func() { _ = stop() })
 	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store)
@@ -223,7 +223,7 @@ func TestWebhookSecondSynchronizeCancelsFirst(t *testing.T) {
 	t.Cleanup(func() { _ = store.Close() })
 
 	gh := newBlockingGitHub("sha1")
-	worker := jobqueue.NewWorker(store, jobs.HandleJob(gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)), slog.New(slog.DiscardHandler), 8)
+	worker := jobqueue.NewWorker(store, jobs.HandleJob(newGate(gh, store, gate.Runners{})), slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	t.Cleanup(func() { _ = stop() })
 	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store)
@@ -256,7 +256,7 @@ func TestWebhookPendingJobRunsAfterRestartAndDuplicateStaysNoOp(t *testing.T) {
 	// Process 1 accepts the webhook but dies before any worker runs it.
 	store1 := openStore(t, path)
 	gh1 := newBlockingGitHub("")
-	worker1 := jobqueue.NewWorker(store1, jobs.HandleJob(gate.NewService(gh1, unusedCommentGitHub{}, store1, gate.Runners{}, nil, nil)), logger, 8)
+	worker1 := jobqueue.NewWorker(store1, jobs.HandleJob(newGate(gh1, store1, gate.Runners{})), logger, 8)
 	h1 := httpapi.NewHandler(logger, secret, worker1, store1)
 	if code := postSigned(t, h1, secret, "d1", prBody(t, "opened", 1, "sha1")); code != http.StatusAccepted {
 		t.Fatalf("POST = %d, want 202", code)
@@ -269,7 +269,7 @@ func TestWebhookPendingJobRunsAfterRestartAndDuplicateStaysNoOp(t *testing.T) {
 	store2 := openStore(t, path)
 	t.Cleanup(func() { _ = store2.Close() })
 	gh2 := newBlockingGitHub("")
-	worker2 := jobqueue.NewWorker(store2, jobs.HandleJob(gate.NewService(gh2, unusedCommentGitHub{}, store2, gate.Runners{}, nil, nil)), logger, 8)
+	worker2 := jobqueue.NewWorker(store2, jobs.HandleJob(newGate(gh2, store2, gate.Runners{})), logger, 8)
 	stop := runWorker(worker2)
 	t.Cleanup(func() { _ = stop() })
 	if got := waitString(t, gh2.created); got != "sha1" {
@@ -324,7 +324,7 @@ func TestEnqueueDeadlineJobsIsIdempotent(t *testing.T) {
 		t.Fatalf("SavePR() = %v", err)
 	}
 
-	worker := jobqueue.NewWorker(store, jobs.HandleJob(gate.NewService(&blockingGitHub{}, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)), slog.New(slog.DiscardHandler), 1)
+	worker := jobqueue.NewWorker(store, jobs.HandleJob(newGate(&blockingGitHub{}, store, gate.Runners{})), slog.New(slog.DiscardHandler), 1)
 	counter := &countingEnqueuer{next: worker}
 
 	for _, now := range []time.Time{deadline.Add(-time.Second), deadline.Add(time.Second), deadline.Add(2 * time.Second)} {
@@ -373,7 +373,7 @@ func TestDeadlineJobFailedConcludeIsRetriedByLaterSweep(t *testing.T) {
 	}
 
 	gh := &failOnceConcludeGitHub{concluded: make(chan gate.CheckRun, 1)}
-	worker := jobqueue.NewWorker(store, jobs.HandleJob(gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)), slog.New(slog.DiscardHandler), 1)
+	worker := jobqueue.NewWorker(store, jobs.HandleJob(newGate(gh, store, gate.Runners{})), slog.New(slog.DiscardHandler), 1)
 	stop := runWorker(worker)
 	t.Cleanup(func() {
 		if err := stop(); err != nil {

@@ -268,3 +268,77 @@ func testPR() gate.PullRequest {
 		HeadSHA:        "abc123",
 	}
 }
+
+// The parts of gate.GitHub the fakes implement separately; newService joins them.
+type (
+	checkGitHub interface {
+		CreateCheckRun(ctx context.Context, installationID int64, owner, repo string, run gate.CheckRun) (int64, error)
+		GetPullRequest(ctx context.Context, installationID int64, owner, repo string, number int) (gate.PullRequest, error)
+		UpdateCheckRun(ctx context.Context, installationID int64, owner, repo string, id int64, run gate.CheckRun) error
+		WorkflowExists(ctx context.Context, installationID int64, owner, repo string) (bool, error)
+		MergeBase(ctx context.Context, installationID int64, owner, repo, base, head string) (string, error)
+		DocsExist(ctx context.Context, installationID int64, owner, repo, ref string) (bool, error)
+		ListChangedFiles(ctx context.Context, installationID int64, owner, repo string, number int) ([]review.ChangedFile, error)
+		ListComments(ctx context.Context, installationID int64, owner, repo string, number int) ([]gate.Comment, error)
+		CreateReviewComment(ctx context.Context, installationID int64, owner, repo string, number int, c gate.ReviewComment) (gate.Comment, error)
+		EditReviewComment(ctx context.Context, installationID int64, owner, repo string, id int64, body string) error
+		CreateIssueComment(ctx context.Context, installationID int64, owner, repo string, number int, body string) (gate.Comment, error)
+		EditIssueComment(ctx context.Context, installationID int64, owner, repo string, id int64, body string) error
+	}
+	commentGitHub interface {
+		Permission(ctx context.Context, installationID int64, owner, repo, user string) (bool, error)
+		FileAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) ([]byte, bool, error)
+		CommitFiles(ctx context.Context, installationID int64, owner, repo, branch, parentSHA string, files []gate.FileChange, message string) (string, error)
+		BranchCommit(ctx context.Context, installationID int64, owner, repo, branch string) (gate.Commit, error)
+		CommitAt(ctx context.Context, installationID int64, owner, repo, sha string) (gate.Commit, error)
+		React(ctx context.Context, installationID int64, owner, repo string, kind gate.CommentKind, id int64, reaction gate.Reaction) (int64, error)
+		Unreact(ctx context.Context, installationID int64, owner, repo string, kind gate.CommentKind, id, reactionID int64) error
+		ReplyToReviewComment(ctx context.Context, installationID int64, owner, repo string, number int, inReplyTo int64, body string) (gate.Comment, error)
+	}
+	branchGitHub interface {
+		DefaultBranch(ctx context.Context, installationID int64, owner, repo string) (name, sha string, err error)
+		CreateBranch(ctx context.Context, installationID int64, owner, repo, branch, sha string) error
+		ResetBranch(ctx context.Context, installationID int64, owner, repo, branch, sha string) error
+		BranchCommit(ctx context.Context, installationID int64, owner, repo, branch string) (gate.Commit, error)
+		CreatePullRequest(ctx context.Context, installationID int64, owner, repo string, pr gate.NewPullRequest) (gate.ScaffoldPR, error)
+		FindPullRequest(ctx context.Context, installationID int64, owner, repo, branch string) (pr gate.ScaffoldPR, ok bool, err error)
+	}
+)
+
+// wholeGitHub is a gate.GitHub made of its parts. BranchCommit asks the branch
+// fake first, which knows only the branches it made, then the comment fake.
+type wholeGitHub struct {
+	checkGitHub
+	commentGitHub
+	branchGitHub
+}
+
+func (w wholeGitHub) BranchCommit(ctx context.Context, id int64, owner, repo, branch string) (gate.Commit, error) {
+	c, err := w.branchGitHub.BranchCommit(ctx, id, owner, repo, branch)
+	if err != nil {
+		return gate.Commit{}, fmt.Errorf("branch fake: %w", err)
+	}
+	if c.SHA != "" {
+		return c, nil
+	}
+	c, err = w.commentGitHub.BranchCommit(ctx, id, owner, repo, branch)
+	if err != nil {
+		return gate.Commit{}, fmt.Errorf("comment fake: %w", err)
+	}
+	return c, nil
+}
+
+// newService is gate.NewService over the fakes of each part of the port. A nil
+// comments or branches is an empty fake, a nil queue records nothing.
+func newService(gh checkGitHub, comments commentGitHub, store gate.Store, runners gate.Runners, branches branchGitHub, queue gate.ScaffoldQueue) *gate.Service {
+	if comments == nil {
+		comments = &fakeCommentGitHub{}
+	}
+	if branches == nil {
+		branches = &scaffoldGitHub{branches: map[string]string{}}
+	}
+	if queue == nil {
+		queue = &fakeScaffoldQueue{}
+	}
+	return gate.NewService(wholeGitHub{gh, comments, branches}, store, runners, queue)
+}

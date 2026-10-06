@@ -10,11 +10,11 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
-// ErrBranchMoved is returned by CommentGitHub.CommitFiles when the branch no
+// ErrBranchMoved is returned by GitHub.CommitFiles when the branch no
 // longer points at the parent commit.
 var ErrBranchMoved = errors.New("gate: branch moved")
 
-// ErrCommitRejected is returned by CommentGitHub.CommitFiles when GitHub or the
+// ErrCommitRejected is returned by GitHub.CommitFiles when GitHub or the
 // target tree refuses the commit for a reason the user must fix (a protected
 // branch, a symlink or submodule at a proposal's path); nothing was committed.
 var ErrCommitRejected = errors.New("gate: commit rejected")
@@ -41,30 +41,6 @@ type Commit struct {
 	Message string
 	Parents []string
 	Mine    bool // authored by this App's bot
-}
-
-// CommentGitHub is what acting on a comment needs from GitHub.
-type CommentGitHub interface {
-	// Permission reports whether user may write to the repository.
-	Permission(ctx context.Context, installationID int64, owner, repo, user string) (canWrite bool, err error)
-	// FileAtRef returns the file at ref; ok is false when it does not exist there.
-	// A file it will not read for its size is an error wrapping
-	// review.ErrFileTooLarge, never ok=false.
-	FileAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (content []byte, ok bool, err error)
-	// CommitFiles commits files on top of parentSHA and moves branch to the new
-	// commit without forcing. It returns ErrBranchMoved when branch is no longer at parentSHA.
-	CommitFiles(ctx context.Context, installationID int64, owner, repo, branch, parentSHA string, files []FileChange, message string) (sha string, err error)
-	// BranchCommit returns the commit branch points at.
-	BranchCommit(ctx context.Context, installationID int64, owner, repo, branch string) (Commit, error)
-	// CommitAt returns the commit sha.
-	CommitAt(ctx context.Context, installationID int64, owner, repo, sha string) (Commit, error)
-	// React adds reaction to comment id of kind and returns the reaction's ID;
-	// adding one that already exists returns the existing ID.
-	React(ctx context.Context, installationID int64, owner, repo string, kind CommentKind, id int64, reaction Reaction) (int64, error)
-	// Unreact removes reaction reactionID from comment id of kind.
-	Unreact(ctx context.Context, installationID int64, owner, repo string, kind CommentKind, id, reactionID int64) error
-	// ReplyToReviewComment posts a reply in the thread of review comment inReplyTo.
-	ReplyToReviewComment(ctx context.Context, installationID int64, owner, repo string, number int, inReplyTo int64, body string) (Comment, error)
 }
 
 // OnApply is the state transition for a commit that applied the open proposals
@@ -201,7 +177,7 @@ func (s *Service) handleApply(ctx context.Context, state PRState, ev CommentEven
 	if err := s.store.SavePR(ctx, state); err != nil {
 		return "", fmt.Errorf("save pending apply: %w", err)
 	}
-	sha, err := s.comments.CommitFiles(ctx, state.InstallationID, state.Owner, state.Repo, state.HeadRef, state.HeadSHA, files, message)
+	sha, err := s.gh.CommitFiles(ctx, state.InstallationID, state.Owner, state.Repo, state.HeadRef, state.HeadSHA, files, message)
 	if errors.Is(err, ErrBranchMoved) {
 		var adopted bool
 		if sha, adopted, err = s.adoptCommit(ctx, state, state.PendingApply); err != nil {
@@ -342,7 +318,7 @@ func (s *Service) applyFiles(ctx context.Context, state PRState, targets []int) 
 		if c, ok := docs[path]; ok {
 			return c, true, nil
 		}
-		b, ok, err := s.comments.FileAtRef(ctx, state.InstallationID, state.Owner, state.Repo, path, state.HeadSHA)
+		b, ok, err := s.gh.FileAtRef(ctx, state.InstallationID, state.Owner, state.Repo, path, state.HeadSHA)
 		if err != nil {
 			return "", false, fmt.Errorf("read %s at %s: %w", path, shortSHA(state.HeadSHA), err)
 		}
@@ -428,7 +404,7 @@ func isPendingApply(c Commit, pa PendingApply) bool {
 // the parent of sha: a user push that superseded the bot's own push job lands
 // on top of it.
 func (s *Service) findPendingApply(ctx context.Context, state PRState, sha string, pa PendingApply) (Commit, bool, error) {
-	c, err := s.comments.CommitAt(ctx, state.InstallationID, state.Owner, state.Repo, sha)
+	c, err := s.gh.CommitAt(ctx, state.InstallationID, state.Owner, state.Repo, sha)
 	if err != nil {
 		return Commit{}, false, fmt.Errorf("read commit %s: %w", shortSHA(sha), err)
 	}
@@ -444,7 +420,7 @@ func (s *Service) lookBack(ctx context.Context, state PRState, c Commit, pa Pend
 	if len(c.Parents) == 0 {
 		return Commit{}, false, nil
 	}
-	parent, err := s.comments.CommitAt(ctx, state.InstallationID, state.Owner, state.Repo, c.Parents[0])
+	parent, err := s.gh.CommitAt(ctx, state.InstallationID, state.Owner, state.Repo, c.Parents[0])
 	if err != nil {
 		return Commit{}, false, fmt.Errorf("read commit %s: %w", shortSHA(c.Parents[0]), err)
 	}
@@ -454,7 +430,7 @@ func (s *Service) lookBack(ctx context.Context, state PRState, c Commit, pa Pend
 // adoptCommit recovers from a commit that landed before its state was saved:
 // the branch tip, or the commit under it, is ours when it is the pending apply's commit.
 func (s *Service) adoptCommit(ctx context.Context, state PRState, pa *PendingApply) (sha string, adopted bool, err error) {
-	c, err := s.comments.BranchCommit(ctx, state.InstallationID, state.Owner, state.Repo, state.HeadRef)
+	c, err := s.gh.BranchCommit(ctx, state.InstallationID, state.Owner, state.Repo, state.HeadRef)
 	if err != nil {
 		return "", false, fmt.Errorf("read branch %s: %w", state.HeadRef, err)
 	}
@@ -549,7 +525,7 @@ func (s *Service) replyApplied(ctx context.Context, state PRState, only string) 
 			replyID = c.ID
 		} else {
 			body := "✅ Applied in " + shortSHA(p.AppliedSHA) + "\n\n" + marker
-			c, err := s.comments.ReplyToReviewComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, p.CommentID, body)
+			c, err := s.gh.ReplyToReviewComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, p.CommentID, body)
 			if err != nil {
 				return posted, fmt.Errorf("reply to proposal %s: %w", p.ID, err)
 			}

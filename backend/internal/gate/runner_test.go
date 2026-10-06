@@ -51,7 +51,7 @@ func TestHandlePullRequestRunnerSelection(t *testing.T) {
 				runners.Server = tc.server
 			}
 
-			svc := gate.NewService(gh, nil, &fakeStore{}, runners, nil, nil)
+			svc := newService(gh, nil, &fakeStore{}, runners, nil, nil)
 			pr := testPR()
 			if err := svc.HandlePullRequest(t.Context(), pr); err != nil {
 				t.Fatalf("HandlePullRequest(%+v) = %v, want nil", pr, err)

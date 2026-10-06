@@ -96,10 +96,12 @@ const (
 	collectAttempts = 3
 	// postAttempts is how many times posting a result's comments is tried.
 	postAttempts = 3
-	// analysisDeadline is how long an analysis may stay in progress before the
-	// deadline sweep concludes its check run.
-	analysisDeadline = 10 * time.Minute
 )
+
+// AnalysisDeadline is how long an analysis may stay in progress before the
+// deadline sweep concludes its check run. Every runner's own timeout must be
+// shorter.
+const AnalysisDeadline = 10 * time.Minute
 
 // truncate cuts s to at most max bytes on a UTF-8 boundary, ending in a marker
 // when it cut anything.
