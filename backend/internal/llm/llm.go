@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"unicode/utf8"
 )
 
 // Role is who sent a Message.
@@ -125,5 +126,9 @@ func truncate(b []byte) string {
 	if len(b) <= max {
 		return string(b)
 	}
-	return string(b[:max]) + "..."
+	cut := max
+	for cut > 0 && !utf8.RuneStart(b[cut]) {
+		cut--
+	}
+	return string(b[:cut]) + "..."
 }

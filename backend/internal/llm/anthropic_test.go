@@ -2,11 +2,13 @@ package llm_test
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 )
@@ -62,5 +64,35 @@ func TestAnthropicComplete_DefaultMaxTokens(t *testing.T) {
 	}
 	if got.MaxTokens != 8192 {
 		t.Errorf("max_tokens = %d, want 8192", got.MaxTokens)
+	}
+}
+
+func TestComplete_InvalidJSONKeepsCauseAndTruncatesOnRune(t *testing.T) {
+	t.Parallel()
+
+	body := "a" + strings.Repeat("é", 150)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+
+	hc := &http.Client{Timeout: 5 * time.Second}
+	req := llm.Request{Model: "m", Messages: []llm.Message{{Role: llm.RoleUser, Text: "hi"}}}
+	models := map[string]llm.Model{
+		"anthropic": llm.NewAnthropic(hc, srv.URL, "k"),
+		"openai":    llm.NewOpenAI(hc, srv.URL, "k"),
+	}
+	for name, model := range models {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := model.Complete(t.Context(), req)
+			var syntaxErr *json.SyntaxError
+			if !errors.As(err, &syntaxErr) {
+				t.Fatalf("Complete() err = %v, want wrapping *json.SyntaxError", err)
+			}
+			if !utf8.ValidString(err.Error()) {
+				t.Errorf("Complete() err = %q, want valid UTF-8", err)
+			}
+		})
 	}
 }

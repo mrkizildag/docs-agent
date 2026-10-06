@@ -1,5 +1,5 @@
 // Package agent runs the model-driven tool-use loop shared by the server
-// runner and the scaffold command: the model reads files through os.Root
+// runner's analysis and scaffold runs: the model reads files through os.Root
 // until it calls a caller-supplied finishing tool.
 package agent
 
@@ -23,6 +23,11 @@ var ErrTokenBudget = errors.New("agent: token budget exceeded")
 // ErrDeadline means the run's context deadline passed. Cancellation is not a
 // deadline and never wraps this error.
 var ErrDeadline = errors.New("agent: deadline exceeded")
+
+// ErrModel means the model call failed or the model replied unusably (an
+// ErrMalformed also wraps ErrModel). Context cancellation and deadlines are
+// not model errors.
+var ErrModel = errors.New("agent: model failed")
 
 // ErrMalformed means the model returned maxEmptyReplies consecutive replies
 // with neither text nor tool calls.
@@ -93,7 +98,10 @@ func Run(ctx context.Context, m llm.Model, t Task, b *Budget) (json.RawMessage, 
 			Tools:    tools,
 		})
 		if err != nil {
-			return nil, stats, ctxError(step+1, err)
+			if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				return nil, stats, ctxError(step+1, err)
+			}
+			return nil, stats, fmt.Errorf("agent: step %d: %w: %w", step+1, ErrModel, err)
 		}
 
 		stats.InputTokens += resp.Usage.InputTokens
@@ -106,7 +114,7 @@ func Run(ctx context.Context, m llm.Model, t Task, b *Budget) (json.RawMessage, 
 			if resp.Text == "" {
 				empty++
 				if empty >= maxEmptyReplies {
-					return nil, stats, fmt.Errorf("agent: %d consecutive empty replies by step %d: %w", empty, stats.Steps, ErrMalformed)
+					return nil, stats, fmt.Errorf("agent: %d consecutive empty replies by step %d: %w: %w", empty, stats.Steps, ErrModel, ErrMalformed)
 				}
 			} else {
 				empty = 0
@@ -125,7 +133,7 @@ func Run(ctx context.Context, m llm.Model, t Task, b *Budget) (json.RawMessage, 
 
 		for _, call := range resp.ToolCalls {
 			if call.Name != t.Finish.Name {
-				results = append(results, callTool(t.Root, call))
+				results = append(results, callTool(ctx, t.Root, call))
 				continue
 			}
 

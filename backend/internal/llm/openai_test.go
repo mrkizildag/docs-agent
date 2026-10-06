@@ -204,3 +204,22 @@ func TestOpenAIComplete_EmptyToolResultKeepsContent(t *testing.T) {
 		t.Errorf("tool message content = %s, want \"\"", got)
 	}
 }
+
+func TestOpenAIComplete_EmptyToolArgsDefaultToEmptyObject(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[
+			{"id":"c1","type":"function","function":{"name":"list_dir","arguments":""}}]}}]}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	model := llm.NewOpenAI(&http.Client{Timeout: 5 * time.Second}, srv.URL, "k")
+	resp, err := model.Complete(t.Context(), llm.Request{Model: "m"})
+	if err != nil {
+		t.Fatalf("Complete() = %v, want nil", err)
+	}
+	if len(resp.ToolCalls) != 1 || string(resp.ToolCalls[0].Args) != "{}" {
+		t.Errorf("Complete() tool calls = %+v, want one with args {}", resp.ToolCalls)
+	}
+}

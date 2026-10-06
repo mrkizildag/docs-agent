@@ -43,7 +43,7 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (Response, error)
 
 	var wireResp anthropicResponse
 	if err := json.Unmarshal(respBody, &wireResp); err != nil {
-		return Response{}, fmt.Errorf("anthropic: response is not valid JSON: %s", truncate(respBody))
+		return Response{}, fmt.Errorf("anthropic: response is not valid JSON (%w): %s", err, truncate(respBody))
 	}
 	if wireResp.Content == nil {
 		return Response{}, fmt.Errorf("anthropic: response has no content: %s", truncate(respBody))

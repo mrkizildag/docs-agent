@@ -1,7 +1,9 @@
 package agent_test
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 )
 
 const secret = "TOP-SECRET-OUTSIDE"
@@ -19,7 +22,7 @@ func runTool(t *testing.T, root *os.Root, name, args string) llm.ToolResult {
 	t.Helper()
 
 	var got llm.ToolResult
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		func(llm.Request) (llm.Response, error) {
 			return llm.Response{ToolCalls: []llm.ToolCall{{ID: "1", Name: name, Args: json.RawMessage(args)}}}, nil
 		},
@@ -223,5 +226,26 @@ func TestListDir_MarksDirsAndSkipsGit(t *testing.T) {
 	}
 	if res.Content != "doc.md\nsub/\n" {
 		t.Errorf("list_dir = %q, want %q", res.Content, "doc.md\nsub/\n")
+	}
+}
+
+func TestGrep_StopsWhenContextCanceled(t *testing.T) {
+	t.Parallel()
+
+	root := testRoot(t)
+	for i := range 50 {
+		if err := root.WriteFile(fmt.Sprintf("f%d.txt", i), []byte("needle\n"), 0o600); err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	res := agent.CallTool(ctx, root, llm.ToolCall{ID: "1", Name: "grep", Args: json.RawMessage(`{"pattern":"needle"}`)})
+	if !res.IsError || !strings.Contains(res.Content, context.Canceled.Error()) {
+		t.Errorf("grep = %+v, want an IsError result naming %q", res, context.Canceled)
+	}
+	if strings.Contains(res.Content, "needle") {
+		t.Errorf("grep = %q, want no matches searched after cancel", res.Content)
 	}
 }
