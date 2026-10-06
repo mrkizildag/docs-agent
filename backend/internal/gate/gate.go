@@ -415,10 +415,11 @@ const (
 	collectAttempts = 3
 	// postAttempts is how many times posting a result's comments is tried.
 	postAttempts = 3
-	// analysisDeadline is how long an analysis may stay in progress before the
-	// deadline sweep concludes its check run.
-	analysisDeadline = 10 * time.Minute
 )
+
+// AnalysisDeadline bounds the armed placeholder before the deadline sweep
+// concludes its check run, and is also the deadline of the Actions review run.
+const AnalysisDeadline = 5 * time.Minute
 
 // truncate cuts s to at most max bytes on a UTF-8 boundary, ending in a marker
 // when it cut anything.
@@ -919,7 +920,7 @@ func (s *Service) startRun(ctx context.Context, state PRState, pr PullRequest, r
 
 	next := OnPush(state, pr)
 	next.CheckRunID = id
-	next.Run = &AwaitingRun{Nonce: fmt.Sprintf("check-%d", id), Deadline: time.Now().Add(analysisDeadline)}
+	next.Run = &AwaitingRun{Nonce: fmt.Sprintf("check-%d", id), Deadline: time.Now().Add(AnalysisDeadline)}
 
 	var out startOutcome
 	armCtx, cancelArm := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)

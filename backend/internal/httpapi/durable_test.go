@@ -470,13 +470,13 @@ func TestEnqueueDeadlineJobsLogsGivingUpOnce(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
 
-	for now := deadline.Add(24*time.Hour - time.Minute + 10*time.Second); now.Before(deadline.Add(24*time.Hour + 3*time.Minute)); now = now.Add(30 * time.Second) {
+	for now := deadline.Add(24*time.Hour - time.Minute + httpapi.DeadlineSweepEvery/3); now.Before(deadline.Add(24*time.Hour + 3*time.Minute)); now = now.Add(httpapi.DeadlineSweepEvery) {
 		if err := httpapi.EnqueueDeadlineJobs(t.Context(), src, newFakeEnqueuer(), logger, now); err != nil {
 			t.Fatalf("EnqueueDeadlineJobs(%v) = %v", now, err)
 		}
 	}
 	if got := strings.Count(logs.String(), "giving up on overdue run"); got != 1 {
-		t.Errorf("give-up warnings = %d, want 1 across sweeps every 30s:\n%s", got, logs.String())
+		t.Errorf("give-up warnings = %d, want 1 across sweeps every DeadlineSweepEvery:\n%s", got, logs.String())
 	}
 }
 

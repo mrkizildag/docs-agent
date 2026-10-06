@@ -23,8 +23,8 @@ import (
 )
 
 const (
-	maxParallelJobs   = 8
-	actionsRunTimeout = 10 * time.Minute
+	maxParallelJobs        = 8
+	actionsScaffoldTimeout = 10 * time.Minute
 )
 
 func main() {
@@ -152,7 +152,7 @@ const llmHTTPTimeout = 60 * time.Second
 // buildRunners wires the Actions runner and, from cfg.LLM, the server runner. A nil cfg.LLM
 // leaves the server slot empty, so a repo must run the Actions workflow.
 func buildRunners(cfg config.Config, ghClient *github.Client) (gate.Runners, error) {
-	actionsRunner := actions.New(ghClient, actionsRunTimeout)
+	actionsRunner := actions.New(ghClient, gate.AnalysisDeadline, actionsScaffoldTimeout)
 	if cfg.LLM == nil {
 		return gate.Runners{Actions: actionsRunner}, nil
 	}

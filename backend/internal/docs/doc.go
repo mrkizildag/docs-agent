@@ -5,6 +5,9 @@ package docs
 import (
 	"bytes"
 	"fmt"
+	"net/url"
+	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/bmatcuk/doublestar/v4"
@@ -80,43 +83,168 @@ func ParseBody(path string, src []byte) Doc {
 	return Doc{Path: path, Source: src, Sections: parseSections(src, bodyStart)}
 }
 
-// CheckScaffoldDoc reports why src is not a usable scaffold doc: it must parse
-// and carry a title, a summary and a covers key (an empty list is a value).
-func CheckScaffoldDoc(path string, src []byte) error {
+// CheckNewDoc reports why src is not a usable new doc and returns it parsed: it
+// must fit in MaxDocBytes, parse, carry a title, a summary and a covers key (an
+// empty list is a value), and link other docs of repo ("owner/repo") relatively.
+func CheckNewDoc(path string, src []byte, repo string) (Doc, error) {
+	if len(src) > MaxDocBytes {
+		return Doc{}, fmt.Errorf("check new doc %s: %d bytes exceed the %d byte cap", path, len(src), MaxDocBytes)
+	}
 	doc, err := ParseDoc(path, src)
 	if err != nil {
-		return fmt.Errorf("check scaffold doc %s: %w", path, err)
+		return Doc{}, fmt.Errorf("check new doc %s: %w", path, err)
 	}
 	switch {
 	case strings.TrimSpace(doc.Title) == "":
-		return fmt.Errorf("check scaffold doc %s: frontmatter has no title", path)
+		return Doc{}, fmt.Errorf("check new doc %s: frontmatter has no title", path)
 	case strings.TrimSpace(doc.Summary) == "":
-		return fmt.Errorf("check scaffold doc %s: frontmatter has no summary", path)
+		return Doc{}, fmt.Errorf("check new doc %s: frontmatter has no summary", path)
 	case doc.Covers == nil:
-		return fmt.Errorf("check scaffold doc %s: frontmatter has no covers list", path)
+		return Doc{}, fmt.Errorf("check new doc %s: frontmatter has no covers list", path)
+	}
+	if err := CheckDocLinks(src, repo); err != nil {
+		return Doc{}, fmt.Errorf("check new doc %s: %w", path, err)
+	}
+	return doc, nil
+}
+
+var (
+	referenceLink = regexp.MustCompile(`(?m)^ {0,3}\[[^\]]+\]:\s*<?([^\s>]+)`)
+)
+
+// CheckDocLinks reports the first inline or reference-style link in src, outside
+// code, that points at a doc of repo ("owner/repo") absolutely instead of
+// relatively.
+func CheckDocLinks(src []byte, repo string) error {
+	text := stripCode(src)
+	for _, re := range []*regexp.Regexp{linkTarget, referenceLink} {
+		for _, m := range re.FindAllSubmatch(text, -1) {
+			if target := string(m[1]); isAbsoluteDocLink(target, repo) {
+				return fmt.Errorf("link %q to another doc must be relative", target)
+			}
+		}
 	}
 	return nil
 }
 
+// stripCode drops fenced code blocks and inline code spans, where link syntax
+// is text and not a link.
+func stripCode(src []byte) []byte {
+	var (
+		out       []byte
+		fenceChar byte
+		fenceLen  int
+	)
+	rest := src
+	for len(rest) > 0 {
+		line, next := cutLine(rest)
+		full := rest[:len(rest)-len(next)]
+		rest = next
+
+		trimmed := strings.TrimLeft(trimCR(line), " ")
+		indent := len(trimCR(line)) - len(trimmed)
+		switch {
+		case fenceChar != 0:
+			if indent <= 3 && isFenceClose(trimmed, fenceChar, fenceLen) {
+				fenceChar = 0
+			}
+		case indent <= 3:
+			if ch, n, ok := fenceOpen(trimmed); ok {
+				fenceChar, fenceLen = ch, n
+				continue
+			}
+			out = append(out, full...)
+		default:
+			out = append(out, full...)
+		}
+	}
+	return stripCodeSpans(out)
+}
+
+// stripCodeSpans drops inline code spans: a backtick run closed by the next
+// run of the same length. An unclosed run is literal text.
+func stripCodeSpans(src []byte) []byte {
+	var out []byte
+	for i := 0; i < len(src); {
+		if src[i] != '`' {
+			out = append(out, src[i])
+			i++
+			continue
+		}
+		n := backtickRun(src, i)
+		end := -1
+		for j := i + n; j < len(src); {
+			if src[j] != '`' {
+				j++
+				continue
+			}
+			m := backtickRun(src, j)
+			if m == n {
+				end = j + m
+				break
+			}
+			j += m
+		}
+		if end < 0 {
+			out = append(out, src[i:i+n]...)
+			i += n
+			continue
+		}
+		i = end
+	}
+	return out
+}
+
+func backtickRun(src []byte, i int) int {
+	n := 0
+	for i+n < len(src) && src[i+n] == '`' {
+		n++
+	}
+	return n
+}
+
+// isAbsoluteDocLink reports whether a link target is a root-absolute path into
+// /docs/ or a GitHub URL into a docs/ folder of repo ("owner/repo"); links to
+// other repos and sites are not links to this repo's docs.
+func isAbsoluteDocLink(target, repo string) bool {
+	if target == "/docs" || strings.HasPrefix(target, "/docs/") || strings.HasPrefix(target, "/docs#") {
+		return true
+	}
+	u, err := url.Parse(target)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(segs) < 2 || !strings.EqualFold(segs[0]+"/"+segs[1], repo) {
+		return false
+	}
+	switch strings.TrimPrefix(strings.ToLower(u.Hostname()), "www.") {
+	case "github.com":
+		// /owner/repo/{blob,tree,raw,edit}/<ref>/docs/...
+		return len(segs) > 4 && slices.Contains([]string{"blob", "tree", "raw", "edit"}, segs[2]) && segs[4] == "docs"
+	case "raw.githubusercontent.com":
+		// /owner/repo/<ref>/docs/...
+		return len(segs) > 3 && segs[3] == "docs"
+	}
+	return false
+}
+
 // CheckScaffold reports why index, architecture and setup are not a usable
-// starting docs folder: each must pass CheckScaffoldDoc at its path, and the
-// index must link the other two relatively. Each file must fit in MaxDocBytes.
-func CheckScaffold(index, architecture, setup string) error {
+// starting docs folder for repo ("owner/repo"): each must pass CheckNewDoc at
+// its path, and the index must link the other two relatively.
+func CheckScaffold(index, architecture, setup, repo string) error {
 	for _, doc := range []struct{ path, src string }{
 		{"docs/README.md", index},
 		{"docs/architecture.md", architecture},
 		{"docs/guides/setup.md", setup},
 	} {
-		if len(doc.src) > MaxDocBytes {
-			return fmt.Errorf("check scaffold doc %s: %d bytes exceed the %d byte cap", doc.path, len(doc.src), MaxDocBytes)
-		}
-		if err := CheckScaffoldDoc(doc.path, []byte(doc.src)); err != nil {
+		if _, err := CheckNewDoc(doc.path, []byte(doc.src), repo); err != nil {
 			return err
 		}
 	}
 	for _, link := range []string{"](architecture.md)", "](guides/setup.md)"} {
 		if !strings.Contains(index, link) {
-			return fmt.Errorf("check scaffold doc docs/README.md: the index must link its sibling docs relatively, missing %q", link)
+			return fmt.Errorf("check scaffold docs/README.md: the index must link its sibling docs relatively, missing %q", link)
 		}
 	}
 	return nil

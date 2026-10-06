@@ -79,8 +79,9 @@ type ClaudeOutput[T any] struct {
 
 // Runner dispatches the repo's pollux-agent workflow and collects its result.
 type Runner struct {
-	api     WorkflowAPI
-	timeout time.Duration
+	api             WorkflowAPI
+	timeout         time.Duration
+	scaffoldTimeout time.Duration
 }
 
 var (
@@ -88,10 +89,10 @@ var (
 	_ review.AsyncScaffolder = (*Runner)(nil)
 )
 
-// New returns a Runner that dispatches through api and gives each run timeout
-// to complete.
-func New(api WorkflowAPI, timeout time.Duration) *Runner {
-	return &Runner{api: api, timeout: timeout}
+// New returns a Runner that dispatches through api and gives each review run
+// timeout and each scaffold run scaffoldTimeout to complete.
+func New(api WorkflowAPI, timeout, scaffoldTimeout time.Duration) *Runner {
+	return &Runner{api: api, timeout: timeout, scaffoldTimeout: scaffoldTimeout}
 }
 
 // Start computes the candidate docs from the PR's base commit and dispatches
@@ -118,7 +119,7 @@ func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started,
 	if selection.Empty() {
 		return review.Result{Runner: runnerName, Verdict: review.NoImpact{Reason: basedocs.NothingToReview}}, nil
 	}
-	pending, err := r.dispatch(ctx, req.InstallationID, req.Owner, req.Repo, req.HeadSHA, req.Number, selection.Candidates, selection.Uncovered)
+	pending, err := r.dispatch(ctx, r.timeout, req.InstallationID, req.Owner, req.Repo, req.HeadSHA, req.Number, selection.Candidates, selection.Uncovered)
 	if err != nil {
 		return nil, fmt.Errorf("start actions run %s: %w", where, err)
 	}
@@ -142,14 +143,14 @@ func (r *Runner) selectAtBase(ctx context.Context, installationID int64, owner, 
 // StartScaffold dispatches the workflow with pr_number 0 and no docs at
 // req.BaseSHA and returns review.Pending.
 func (r *Runner) StartScaffold(ctx context.Context, req review.ScaffoldRequest) (review.ScaffoldStarted, error) {
-	pending, err := r.dispatch(ctx, req.InstallationID, req.Owner, req.Repo, req.BaseSHA, 0, nil, nil)
+	pending, err := r.dispatch(ctx, r.scaffoldTimeout, req.InstallationID, req.Owner, req.Repo, req.BaseSHA, 0, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("start actions scaffold %s/%s: %w", req.Owner, req.Repo, err)
 	}
 	return pending, nil
 }
 
-func (r *Runner) dispatch(ctx context.Context, installationID int64, owner, repo, sha string, number int, docs, uncovered []string) (review.Pending, error) {
+func (r *Runner) dispatch(ctx context.Context, timeout time.Duration, installationID int64, owner, repo, sha string, number int, docs, uncovered []string) (review.Pending, error) {
 	nonce, err := newNonce()
 	if err != nil {
 		return review.Pending{}, err
@@ -160,7 +161,7 @@ func (r *Runner) dispatch(ctx context.Context, installationID int64, owner, repo
 		return review.Pending{}, fmt.Errorf("dispatch: %w", err)
 	}
 
-	return review.Pending{RunID: runID, Nonce: nonce, Deadline: time.Now().Add(r.timeout)}, nil
+	return review.Pending{RunID: runID, Nonce: nonce, Deadline: time.Now().Add(timeout)}, nil
 }
 
 // CollectScaffold decodes the completed run's result artifact. It returns
@@ -181,7 +182,7 @@ func (r *Runner) CollectScaffold(ctx context.Context, c review.Completion) (revi
 	if err != nil {
 		return review.Scaffold{}, &review.InvalidResultError{Cause: err}
 	}
-	if err := docs.CheckScaffold(out.Index, out.Architecture, out.Setup); err != nil {
+	if err := docs.CheckScaffold(out.Index, out.Architecture, out.Setup, c.Owner+"/"+c.Repo); err != nil {
 		return review.Scaffold{}, &review.InvalidResultError{Cause: errors.New(capText(err.Error()))}
 	}
 
@@ -242,7 +243,7 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 		if err != nil {
 			return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
 		}
-		validate = func(p review.Proposal) error { return selection.ValidateProposal(p, changed) }
+		validate = func(p review.Proposal) error { return selection.ValidateProposal(p, changed, c.Owner+"/"+c.Repo) }
 	}
 
 	proposals := make(review.Proposals, len(out.Proposals))

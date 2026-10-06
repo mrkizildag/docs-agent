@@ -675,6 +675,9 @@ func TestHandlePullRequestActionsStartsRun(t *testing.T) {
 	if armed := store.saveCalls[0].Run; armed == nil || armed.RunID != 0 || armed.Nonce != "check-555" || !armed.Deadline.After(time.Now()) {
 		t.Errorf("armed run = %+v, want no run ID, nonce check-555 and a future deadline", armed)
 	}
+	if limit := time.Now().Add(gate.AnalysisDeadline); store.saveCalls[0].Run.Deadline.After(limit) {
+		t.Errorf("armed deadline = %v, want within the analysis deadline, by %v", store.saveCalls[0].Run.Deadline, limit)
+	}
 	want := gate.PRState{
 		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123", CheckRunID: 555,
 		Run: &gate.AwaitingRun{RunID: 99, Nonce: "n1", Deadline: deadline, BaseSHA: "mb1"},

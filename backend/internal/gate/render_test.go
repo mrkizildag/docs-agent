@@ -103,6 +103,26 @@ func TestProposalCommentOffersApplyOnlyOffAFork(t *testing.T) {
 	}
 }
 
+func TestSuggestionCommentNotesForkOnly(t *testing.T) {
+	t.Parallel()
+
+	p := review.Proposal{DocPath: "docs/a.md", Section: "Usage", Reason: "r", Lines: review.LineRange{Start: 3, End: 4}, Original: "## Usage\nold\n", Content: "## Usage\nnew\n"}
+	changed := []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 10}}}}
+	for _, fork := range []bool{false, true} {
+		pr := testPR()
+		pr.Fork = fork
+		_, writes := gate.Reconcile(gate.PRState{}, pr, review.Proposals{p}, changed, nil)
+
+		body := writes[0].Review.Body
+		if !strings.Contains(body, "```suggestion") {
+			t.Fatalf("fork = %v: body is not a suggestion:\n%s", fork, body)
+		}
+		if got := strings.Contains(body, "Apply is not available: this pull request comes from a fork"); got != fork {
+			t.Errorf("fork = %v: body has fork note = %v:\n%s", fork, got, body)
+		}
+	}
+}
+
 func TestOutdatedProposalCommentHasNoApplyBox(t *testing.T) {
 	t.Parallel()
 
@@ -200,6 +220,30 @@ func TestSummaryRendering(t *testing.T) {
 			state: gate.PRState{HeadSHA: "h2", Skip: &gate.Skip{User: "bob", Scope: gate.SkipCommit, Reason: "typo", HeadSHA: "h1"}},
 			want:  []string{"- [ ] Skip this commit"},
 			not:   []string{"Skipped by", "[x]"},
+		},
+		{
+			name:  "commit skip at this head marks open proposals skipped",
+			state: gate.PRState{HeadSHA: "h1", Skip: &gate.Skip{User: "bob", Scope: gate.SkipCommit, Reason: "typo", HeadSHA: "h1"}, Proposals: []gate.ProposalState{prop(gate.ProposalOpen), prop(gate.ProposalApplied)}},
+			want:  []string{"| skipped |", "applied (abcdef1)"},
+			not:   []string{"| open |"},
+		},
+		{
+			name:  "commit skip heading does not claim open proposals",
+			state: gate.PRState{HeadSHA: "h1", Skip: &gate.Skip{User: "bob", Scope: gate.SkipCommit, Reason: "typo", HeadSHA: "h1"}, Proposals: []gate.ProposalState{prop(gate.ProposalOpen)}},
+			want:  []string{"proposed 1 doc update; the check is skipped.", "- [ ] Apply all"},
+			not:   []string{"proposes"},
+		},
+		{
+			name:  "skip heading with everything applied claims nothing open",
+			state: gate.PRState{HeadSHA: "h1", Skip: &gate.Skip{User: "bob", Scope: gate.SkipCommit, Reason: "typo", HeadSHA: "h1"}, Proposals: []gate.ProposalState{prop(gate.ProposalApplied)}},
+			want:  []string{"**pollux-agent**: the check is skipped."},
+			not:   []string{"proposed 0", "proposes"},
+		},
+		{
+			name:  "lapsed commit skip reads open again",
+			state: gate.PRState{HeadSHA: "h2", Skip: &gate.Skip{User: "bob", Scope: gate.SkipCommit, Reason: "typo", HeadSHA: "h1"}, Proposals: []gate.ProposalState{prop(gate.ProposalOpen)}},
+			want:  []string{"| open |"},
+			not:   []string{"| skipped |"},
 		},
 		{
 			name:  "pr skip survives a new head",

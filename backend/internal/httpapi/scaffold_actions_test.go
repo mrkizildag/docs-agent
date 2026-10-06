@@ -290,7 +290,7 @@ func newActionsScaffoldHarness(t *testing.T, server gate.ServerRunner) *actionsS
 		t.Fatalf("NewClient() error = %v", err)
 	}
 
-	gateSvc := gate.NewService(client, client, store, gate.Runners{Actions: actions.New(client, 10*time.Minute), Server: server}, client, httpapi.NewScaffoldQueue(baseStore))
+	gateSvc := gate.NewService(client, client, store, gate.Runners{Actions: actions.New(client, 10*time.Minute, 10*time.Minute), Server: server}, client, httpapi.NewScaffoldQueue(baseStore))
 	logger := slog.New(slog.DiscardHandler)
 	worker := jobqueue.NewWorker(baseStore, httpapi.HandleJob(gateSvc), logger, 8)
 	workerCtx, cancelWorker := context.WithCancel(t.Context())

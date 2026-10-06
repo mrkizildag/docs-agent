@@ -487,7 +487,7 @@ func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budge
 						return fmt.Errorf("proposal %s: %s already exists at head; pick a new doc_path or use \"section\" to replace a section of it", p.DocPath, p.DocPath)
 					}
 				}
-				if err := sel.ValidateProposal(p, req.ChangedFiles); err != nil {
+				if err := sel.ValidateProposal(p, req.ChangedFiles, req.Owner+"/"+req.Repo); err != nil {
 					return fmt.Errorf("proposal %s: %w", p.DocPath, err)
 				}
 				if p.Section == "" {

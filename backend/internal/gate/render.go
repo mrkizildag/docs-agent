@@ -10,6 +10,8 @@ import (
 
 const summaryMarker = "<!-- pollux-agent:summary -->"
 
+const forkApplyNote = "Apply is not available: this pull request comes from a fork the bot cannot push to."
+
 func proposalMarker(id string) string {
 	return "<!-- pollux-agent:proposal:" + id + " -->"
 }
@@ -19,7 +21,7 @@ func proposalMarker(id string) string {
 // checkbox variant on the anchor line.
 func proposalComment(headSHA, id string, p review.Proposal, changed []review.ChangedFile, fork bool) ReviewComment {
 	if suggestable(p, changed) {
-		rc := ReviewComment{CommitSHA: headSHA, Path: p.DocPath, Line: p.Lines.End, Body: renderSuggestion(id, p)}
+		rc := ReviewComment{CommitSHA: headSHA, Path: p.DocPath, Line: p.Lines.End, Body: renderSuggestion(id, p, fork)}
 		if p.Lines.Start != p.Lines.End {
 			rc.StartLine = p.Lines.Start
 		}
@@ -45,14 +47,18 @@ func suggestable(p review.Proposal, changed []review.ChangedFile) bool {
 	return false
 }
 
-func renderSuggestion(id string, p review.Proposal) string {
+func renderSuggestion(id string, p review.Proposal, fork bool) string {
 	// Lines covers the section's trailing blank lines; restate them so the
 	// suggestion does not remove the gap before the next heading.
 	original := strings.TrimRight(p.Original, "\n")
 	blank := max(len(strings.TrimPrefix(p.Original, original))-1, 0)
 	content := strings.TrimRight(p.Content, "\n") + "\n" + strings.Repeat("\n", blank)
 	fence := fenceFor(content)
-	return proposalMarker(id) + "\n\n" + inertProse(p.Reason) + "\n\n" + fence + "suggestion\n" + content + fence + "\n"
+	body := proposalMarker(id) + "\n\n" + inertProse(p.Reason) + "\n\n" + fence + "suggestion\n" + content + fence + "\n"
+	if fork {
+		body += "\n" + forkApplyNote + "\n"
+	}
+	return body
 }
 
 // renderOutdated keeps the old comment body readable under an outdated notice,
@@ -90,7 +96,7 @@ func renderCheckbox(id string, p review.Proposal, fork bool) string {
 		fmt.Fprintf(&b, "\nIndex entry: %s\n", codeSpan(p.IndexEntry))
 	}
 	if fork {
-		b.WriteString("\nApply is not available: this pull request comes from a fork the bot cannot push to.\n")
+		b.WriteString("\n" + forkApplyNote + "\n")
 	} else {
 		b.WriteString("\n" + checkbox(false, applyLabel) + "\n")
 	}
@@ -350,19 +356,30 @@ func renderSummary(state PRState) string {
 		if open == 1 {
 			noun = "update"
 		}
-		fmt.Fprintf(&b, "**pollux-agent** proposes %d doc %s.\n\n", open, noun)
+		switch {
+		case skipActive(state) && open == 0:
+			b.WriteString("**pollux-agent**: the check is skipped.\n\n")
+		case skipActive(state):
+			fmt.Fprintf(&b, "**pollux-agent** proposed %d doc %s; the check is skipped.\n\n", open, noun)
+		default:
+			fmt.Fprintf(&b, "**pollux-agent** proposes %d doc %s.\n\n", open, noun)
+		}
 	}
 	if len(state.Proposals) > 0 {
 		b.WriteString("| Doc | Section | Comment | State |\n| --- | --- | --- | --- |\n")
 	}
+	skipped := skipActive(state)
 	for _, p := range state.Proposals {
 		section := "(new doc)"
 		if p.Section != "" {
 			section = tableCodeSpan(p.Section)
 		}
 		status := string(p.State)
-		if p.State == ProposalApplied {
+		switch {
+		case p.State == ProposalApplied:
 			status = fmt.Sprintf("applied (%s)", shortSHA(p.AppliedSHA))
+		case p.State == ProposalOpen && skipped:
+			status = "skipped"
 		}
 		link := "-"
 		if p.CommentURL != "" {
