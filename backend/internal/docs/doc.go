@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"fmt"
 	"net/url"
+	"path"
 	"regexp"
 	"slices"
 	"strings"
@@ -218,9 +219,9 @@ func isAbsoluteDocLink(target, repo string) bool {
 	if len(segs) < 2 || !strings.EqualFold(segs[0]+"/"+segs[1], repo) {
 		return false
 	}
-	// A ref may contain slashes, so a docs segment anywhere after the ref's
-	// first segment counts: /owner/repo/{blob,tree,raw,edit}/<ref>/.../docs/...
-	// on github.com, /owner/repo/<ref>/.../docs/... on raw.githubusercontent.com.
+	// A ref may contain slashes, so where the ref ends is unknowable: any docs
+	// segment after the ref's first segment counts, but only for a markdown file,
+	// so source paths like backend/internal/docs/doc.go stay linkable.
 	var afterRef []string
 	switch strings.TrimPrefix(strings.ToLower(u.Hostname()), "www.") {
 	case "github.com":
@@ -232,7 +233,11 @@ func isAbsoluteDocLink(target, repo string) bool {
 			afterRef = segs[3:]
 		}
 	}
-	return slices.Contains(afterRef, "docs")
+	if len(afterRef) == 0 {
+		return false
+	}
+	ext := strings.ToLower(path.Ext(afterRef[len(afterRef)-1]))
+	return slices.Contains(afterRef[:len(afterRef)-1], "docs") && (ext == ".md" || ext == ".mdx")
 }
 
 // CheckScaffold reports why index, architecture and setup are not a usable
