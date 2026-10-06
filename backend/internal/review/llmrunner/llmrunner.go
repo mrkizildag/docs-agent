@@ -113,7 +113,7 @@ func classify(err error) review.FailureCause {
 		return review.CauseTooManyCandidates
 	case errors.Is(err, errClone):
 		return review.CauseClone
-	case errors.Is(err, errProvider):
+	case errors.Is(err, errProvider), errors.Is(err, agent.ErrModel):
 		return review.CauseProvider
 	default:
 		return review.CauseInternal
@@ -408,7 +408,7 @@ func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budge
 	raw, stats, err := agent.Run(ctx, r.m, task, budget)
 	r.logStats(ctx, "draft", stats)
 	if err != nil {
-		return nil, fmt.Errorf("draft proposals: %w: %w", errProvider, err)
+		return nil, fmt.Errorf("draft proposals: %w", err)
 	}
 
 	var parsed review.ProposalsArgs

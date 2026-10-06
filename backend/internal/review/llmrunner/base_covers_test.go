@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
@@ -25,7 +26,7 @@ func docWithCovers(covers, body string) string {
 func startBaseToHead(t *testing.T, repoDir, baseSHA, headSHA string, changed []review.ChangedFile, script ...func(llm.Request) (llm.Response, error)) (review.Verdict, []llm.Request, error) {
 	t.Helper()
 
-	model := &fakeModel{script: script}
+	model := &llmtest.ScriptedModel{Script: script}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 	runner.SetRemote(repoDir)
 
@@ -34,13 +35,13 @@ func startBaseToHead(t *testing.T, repoDir, baseSHA, headSHA string, changed []r
 	req.ChangedFiles = changed
 	started, err := runner.Start(t.Context(), req)
 	if err != nil {
-		return nil, model.calls, fmt.Errorf("start: %w", err)
+		return nil, model.Calls, fmt.Errorf("start: %w", err)
 	}
 	result, ok := started.(review.Result)
 	if !ok {
 		t.Fatalf("Start() = %T, want review.Result", started)
 	}
-	return result.Verdict, model.calls, nil
+	return result.Verdict, model.Calls, nil
 }
 
 // mustStartBaseToHead is startBaseToHead for runs that must succeed.

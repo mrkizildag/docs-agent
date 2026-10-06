@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	maxDocBytes   = 64 << 10
-	maxPatchBytes = 128 << 10
+	promptDocCap   = 64 << 10
+	promptPatchCap = 128 << 10
 
 	omittedPatch = "(patch omitted by GitHub: large or binary file)"
 
@@ -46,7 +46,7 @@ func capText(s string, max int, what string) string {
 }
 
 func docText(d docs.Doc) string {
-	return capText(string(d.Source), maxDocBytes, "doc")
+	return capText(string(d.Source), promptDocCap, "doc")
 }
 
 const triageSystemPrompt = `You triage whether a pull request makes one documentation file stale. ` +
@@ -65,7 +65,7 @@ const verifySystemPrompt = `You check one proposed documentation change against 
 
 func verifyUserPrompt(f fence, p review.Proposal, section, patch string) string {
 	return fmt.Sprintf("Proposal for %s (section %q, anchored at %s:%d)\nReason:\n%s\n\nProposed content:\n%s\n\nSection it replaces:\n%s\n\nPR diff:\n%s\n",
-		p.DocPath, p.Section, p.Anchor.File, p.Anchor.Line, f.wrap(p.Reason), f.wrap(p.Content), f.wrap(capText(section, maxDocBytes, "section")), f.wrap(patch))
+		p.DocPath, p.Section, p.Anchor.File, p.Anchor.Line, f.wrap(p.Reason), f.wrap(p.Content), f.wrap(capText(section, promptDocCap, "section")), f.wrap(patch))
 }
 
 const draftSystemPrompt = `You propose documentation updates for a pull request. Default to "no impact": only ` +
@@ -103,10 +103,10 @@ func hunkRanges(changed []review.ChangedFile) string {
 }
 
 // combinedPatch joins every changed file's unified diff text into one block
-// of at most about maxPatchBytes of diff text, noting each file it cuts.
+// of at most about promptPatchCap of diff text, noting each file it cuts.
 func combinedPatch(changed []review.ChangedFile) string {
 	var b strings.Builder
-	left := maxPatchBytes
+	left := promptPatchCap
 	for _, f := range changed {
 		name := f.Path
 		if f.PreviousPath != "" {
@@ -117,7 +117,7 @@ func combinedPatch(changed []review.ChangedFile) string {
 		case patch == "":
 			patch = omittedPatch
 		case left <= 0:
-			patch = fmt.Sprintf("(patch omitted: combined patch cap of %d KiB reached)", maxPatchBytes>>10)
+			patch = fmt.Sprintf("(patch omitted: combined patch cap of %d KiB reached)", promptPatchCap>>10)
 		case len(patch) > left:
 			patch = capText(patch, left, "patch")
 			left = 0

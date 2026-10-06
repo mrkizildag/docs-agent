@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
 
@@ -24,7 +25,7 @@ func TestStart_DeadlineDuringCloneIsErrDeadline(t *testing.T) {
 	}))
 	t.Cleanup(func() { close(release); srv.Close() })
 
-	model := &fakeModel{}
+	model := &llmtest.ScriptedModel{}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 	runner.SetRemote(srv.URL + "/o/r.git")
 	runner.SetTimeout(300 * time.Millisecond)
@@ -33,7 +34,7 @@ func TestStart_DeadlineDuringCloneIsErrDeadline(t *testing.T) {
 	if !errors.Is(err, agent.ErrDeadline) {
 		t.Fatalf("Start() = %v, want errors.Is agent.ErrDeadline", err)
 	}
-	if len(model.calls) != 0 {
-		t.Errorf("model saw %d calls, want 0", len(model.calls))
+	if len(model.Calls) != 0 {
+		t.Errorf("model saw %d calls, want 0", len(model.Calls))
 	}
 }

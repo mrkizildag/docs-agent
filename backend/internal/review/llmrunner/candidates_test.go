@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
@@ -21,7 +22,7 @@ func TestStart_GlobCoveredNestedFileTriagesOnlyItsDoc(t *testing.T) {
 	writeRepoFile(t, dir, "docs/b.md", "---\ntitle: B\nsummary: Describes B.\ncovers:\n  - other/*.go\n---\n# B\n\nold.\n")
 	headSHA := commitAll(t, dir, "init")
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 	runner.SetRemote(dir)
 
@@ -42,10 +43,10 @@ func TestStart_GlobCoveredNestedFileTriagesOnlyItsDoc(t *testing.T) {
 	if _, ok := result.Verdict.(review.NoImpact); !ok {
 		t.Fatalf("Verdict = %T, want review.NoImpact", result.Verdict)
 	}
-	if len(model.calls) != 1 {
-		t.Fatalf("model saw %d calls, want exactly 1 triage call (docs/a.md only)", len(model.calls))
+	if len(model.Calls) != 1 {
+		t.Fatalf("model saw %d calls, want exactly 1 triage call (docs/a.md only)", len(model.Calls))
 	}
-	prompt := model.calls[0].Messages[0].Text
+	prompt := model.Calls[0].Messages[0].Text
 	for _, want := range []string{"docs/a.md", patch} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("triage prompt missing %q:\n%s", want, prompt)

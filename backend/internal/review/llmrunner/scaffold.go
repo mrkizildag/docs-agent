@@ -61,7 +61,7 @@ func (r *Runner) scaffold(ctx context.Context, req review.ScaffoldRequest) (revi
 	}, agent.NewBudget(r.scaffoldLimits.tokens))
 	r.logStats(ctx, "scaffold", stats)
 	if err != nil {
-		return review.Scaffold{}, fmt.Errorf("write docs: %w: %w", errProvider, err)
+		return review.Scaffold{}, fmt.Errorf("write docs: %w", err)
 	}
 
 	var submitted review.ScaffoldDocs

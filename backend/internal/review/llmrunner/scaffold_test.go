@@ -11,6 +11,7 @@ import (
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
@@ -53,7 +54,7 @@ func TestStartScaffold_BrokenIndexIsReturnedToModel(t *testing.T) {
 	t.Parallel()
 
 	goodIndex := scaffoldFrontmatter + "## Index\n[a](architecture.md) [s](guides/setup.md)\n"
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		toolResponse(submitDocsCall("1", scaffoldFrontmatter+"## Index\n")),
 		func(req llm.Request) (llm.Response, error) {
 			if res := lastToolResult(req); !res.IsError || !strings.Contains(res.Content, "architecture.md") {
@@ -88,7 +89,7 @@ func TestStartScaffold_ReadsOutsideTheCloneAreToolErrors(t *testing.T) {
 			if err != nil {
 				t.Fatalf("marshal args: %v", err)
 			}
-			model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+			model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 				toolResponse(llm.ToolCall{ID: "r", Name: "read_file", Args: args}),
 				func(req llm.Request) (llm.Response, error) {
 					res := lastToolResult(req)
@@ -102,10 +103,10 @@ func TestStartScaffold_ReadsOutsideTheCloneAreToolErrors(t *testing.T) {
 			if _, err := startScaffold(t, model); err != nil {
 				t.Fatalf("StartScaffold() = %v, want nil", err)
 			}
-			if got := len(model.calls); got != 2 {
+			if got := len(model.Calls); got != 2 {
 				t.Fatalf("model calls = %d, want 2", got)
 			}
-			if prompt := model.calls[0].Messages[0].Text; !strings.Contains(prompt, "o/r") {
+			if prompt := model.Calls[0].Messages[0].Text; !strings.Contains(prompt, "o/r") {
 				t.Errorf("prompt = %q, want it to name the repo", prompt)
 			}
 		})
@@ -122,7 +123,7 @@ func TestStartScaffold_StepLimitIsLimitFailure(t *testing.T) {
 		script[i] = loop
 	}
 
-	_, err := startScaffold(t, &fakeModel{script: script})
+	_, err := startScaffold(t, &llmtest.ScriptedModel{Script: script})
 	var failedErr *review.FailedError
 	if !errors.As(err, &failedErr) || failedErr.Cause != review.CauseLimit || !errors.Is(err, agent.ErrStepLimit) {
 		t.Fatalf("StartScaffold() = %v, want *FailedError with CauseLimit wrapping agent.ErrStepLimit", err)
@@ -133,7 +134,7 @@ func TestStartScaffold_TokenBudgetOverrideAppliesToScaffold(t *testing.T) {
 	t.Parallel()
 
 	repoDir, sha := newGitRepo(t)
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		func(llm.Request) (llm.Response, error) {
 			return llm.Response{Text: "thinking", Usage: llm.Usage{InputTokens: 100}}, nil
 		},

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
@@ -15,10 +16,10 @@ const sectionDocFrontmatter = "---\ntitle: X\nsummary: Describes X.\ncovers:\n  
 
 // rejectedThenFixed scripts a draft whose first submission is bad: the model
 // must get an error tool result containing wantErr, then resubmits a good one.
-func rejectedThenFixed(t *testing.T, bad map[string]any, wantErr string) *fakeModel {
+func rejectedThenFixed(t *testing.T, bad map[string]any, wantErr string) *llmtest.ScriptedModel {
 	t.Helper()
 
-	return &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	return &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		triageResponse(true),
 		submitResponse(bad),
 		func(req llm.Request) (llm.Response, error) {
@@ -75,7 +76,7 @@ func TestStart_VerifyPromptShowsProposalOriginalOrNewDoc(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+			model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 				triageResponse(true),
 				submitResponse(tc.proposal),
 				verifyResponse(true),
@@ -83,7 +84,7 @@ func TestStart_VerifyPromptShowsProposalOriginalOrNewDoc(t *testing.T) {
 			if _, _, err := startResult(t, model); err != nil {
 				t.Fatalf("Start() = %v, want nil error", err)
 			}
-			if prompt := model.calls[len(model.calls)-1].Messages[0].Text; !strings.Contains(prompt, tc.want) {
+			if prompt := model.Calls[len(model.Calls)-1].Messages[0].Text; !strings.Contains(prompt, tc.want) {
 				t.Errorf("verify prompt = %q, want it to contain %q", prompt, tc.want)
 			}
 		})
@@ -98,7 +99,7 @@ func TestStart_LogsUnparseableDocsAndAgentStats(t *testing.T) {
 	headSHA := commitDoc(t, repoDir, "docs/x.md", sectionDocFrontmatter+"# X\n\nnewer behavior.\n")
 
 	var logs bytes.Buffer
-	runner := llmrunner.New(&fakeModel{script: []func(llm.Request) (llm.Response, error){
+	runner := llmrunner.New(&llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		triageResponse(true),
 		submitResponse(proposalFor("docs/x.md", 2)),
 		verifyResponse(true),

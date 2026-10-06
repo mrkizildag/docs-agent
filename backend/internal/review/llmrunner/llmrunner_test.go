@@ -11,25 +11,10 @@ import (
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
-
-// fakeModel scripts one llm.Response (or error) per call, in order, and
-// records every request it saw.
-type fakeModel struct {
-	script []func(req llm.Request) (llm.Response, error)
-	calls  []llm.Request
-}
-
-func (f *fakeModel) Complete(_ context.Context, req llm.Request) (llm.Response, error) {
-	f.calls = append(f.calls, req)
-	i := len(f.calls) - 1
-	if i >= len(f.script) {
-		return llm.Response{}, fmt.Errorf("fakeModel: unexpected call %d", i+1)
-	}
-	return f.script[i](req)
-}
 
 func triageResponse(impacted bool) func(llm.Request) (llm.Response, error) {
 	return func(llm.Request) (llm.Response, error) {
@@ -109,7 +94,7 @@ func TestStart_ImpactedDocProducesProposal(t *testing.T) {
 		"content":  "new behavior.",
 	}
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		triageResponse(true),
 		func(llm.Request) (llm.Response, error) {
 			return llm.Response{
@@ -173,7 +158,7 @@ func TestStart_AllTriageNoIsNoImpact(t *testing.T) {
 
 	repoDir, headSHA := newGitRepo(t)
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		triageResponse(false),
 	}}
 
@@ -204,25 +189,25 @@ func TestStart_AllTriageNoIsNoImpact(t *testing.T) {
 	if _, ok := result.Verdict.(review.NoImpact); !ok {
 		t.Fatalf("Verdict = %T, want review.NoImpact", result.Verdict)
 	}
-	if len(model.calls) != 1 {
-		t.Errorf("model saw %d calls, want exactly 1 (one triage call per candidate doc)", len(model.calls))
+	if len(model.Calls) != 1 {
+		t.Errorf("model saw %d calls, want exactly 1 (one triage call per candidate doc)", len(model.Calls))
 	}
 }
 
 func TestStart_CoveredFileIsTriagedWithItsPatch(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		triageResponse(false),
 	}}
 
 	if _, _, err := startResult(t, model); err != nil {
 		t.Fatalf("Start() = %v, want nil error", err)
 	}
-	if len(model.calls) != 1 {
-		t.Fatalf("model saw %d calls, want 1 triage call", len(model.calls))
+	if len(model.Calls) != 1 {
+		t.Fatalf("model saw %d calls, want 1 triage call", len(model.Calls))
 	}
-	prompt := model.calls[0].Messages[0].Text
+	prompt := model.Calls[0].Messages[0].Text
 	for _, want := range []string{"docs/x.md", "@@ -1,2 +1,3 @@\n func main() {}\n"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("triage prompt = %q, want it to contain %q", prompt, want)
@@ -234,7 +219,7 @@ func TestStart_UncoveredFileIsNoImpactWithoutModelCalls(t *testing.T) {
 	t.Parallel()
 
 	repoDir, headSHA := newGitRepo(t)
-	model := &fakeModel{}
+	model := &llmtest.ScriptedModel{}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 	runner.SetRemote(repoDir)
 
@@ -252,15 +237,15 @@ func TestStart_UncoveredFileIsNoImpactWithoutModelCalls(t *testing.T) {
 	if _, ok := result.Verdict.(review.NoImpact); !ok {
 		t.Fatalf("Verdict = %T, want review.NoImpact", result.Verdict)
 	}
-	if len(model.calls) != 0 {
-		t.Errorf("model saw %d calls, want 0", len(model.calls))
+	if len(model.Calls) != 0 {
+		t.Errorf("model saw %d calls, want 0", len(model.Calls))
 	}
 }
 
 func TestStart_NoChangedFilesIsNoImpactWithoutCloneOrModel(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{}
+	model := &llmtest.ScriptedModel{}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 
 	started, err := runner.Start(t.Context(), review.Request{Owner: "o", Repo: "r", Number: 1, HeadSHA: "deadbeef"})
@@ -274,8 +259,8 @@ func TestStart_NoChangedFilesIsNoImpactWithoutCloneOrModel(t *testing.T) {
 	if _, ok := result.Verdict.(review.NoImpact); !ok {
 		t.Fatalf("Verdict = %T, want review.NoImpact", result.Verdict)
 	}
-	if len(model.calls) != 0 {
-		t.Errorf("model saw %d calls, want 0", len(model.calls))
+	if len(model.Calls) != 0 {
+		t.Errorf("model saw %d calls, want 0", len(model.Calls))
 	}
 }
 
@@ -298,7 +283,7 @@ func startResult(t *testing.T, model llm.Model) (review.Verdict, *llmrunner.Runn
 func TestStart_VerificationDropsRejectedProposal(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		triageResponse(true),
 		submitResponse(proposalFor("docs/x.md", 2), proposalFor("docs/x.md", 3)),
 		verifyResponse(true),
@@ -318,7 +303,7 @@ func TestStart_VerificationDropsRejectedProposal(t *testing.T) {
 func TestStart_VerificationRejectsAllIsNoImpact(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		triageResponse(true),
 		submitResponse(proposalFor("docs/x.md", 2)),
 		textResponse(`{"supported": false, "reason": "diff\nunrelated"}`),
@@ -340,7 +325,7 @@ func TestStart_VerificationRejectsAllIsNoImpact(t *testing.T) {
 func TestStart_NoImpactReasonJoinsTriageReasons(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		triageResponse(false),
 	}}
 
@@ -357,7 +342,7 @@ func TestStart_NoImpactReasonJoinsTriageReasons(t *testing.T) {
 func TestStart_FencedTriageReplyParses(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		textResponse("Sure:\n```json\n{\"impacted\": false, \"reason\": \"fenced\"}\n```\nDone."),
 	}}
 
@@ -374,7 +359,7 @@ func TestStart_FencedTriageReplyParses(t *testing.T) {
 func TestStart_UnparseableTriageReplyErrorsWithReply(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		textResponse("I cannot decide."),
 	}}
 
@@ -387,7 +372,7 @@ func TestStart_UnparseableTriageReplyErrorsWithReply(t *testing.T) {
 func TestStart_InvalidProposalIsReturnedToModel(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		triageResponse(true),
 		submitResponse(proposalFor("docs/x.md", 99)),
 		func(req llm.Request) (llm.Response, error) {
@@ -412,7 +397,7 @@ func TestStart_InvalidProposalIsReturnedToModel(t *testing.T) {
 func TestStart_TokenBudgetExceededDuringTriage(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		func(llm.Request) (llm.Response, error) {
 			return llm.Response{Text: `{"impacted": false, "reason": "x"}`, Usage: llm.Usage{InputTokens: 100}}, nil
 		},
@@ -456,15 +441,15 @@ func TestStart_DeadlineIsErrDeadline(t *testing.T) {
 func TestStart_RejectsHeadSHAThatIsNotAFullObjectID(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{}
+	model := &llmtest.ScriptedModel{}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 
 	_, err := runner.Start(t.Context(), testRequest("--upload-pack=x"))
 	if err == nil {
 		t.Fatal("Start(head sha \"--upload-pack=x\") = nil error, want an error")
 	}
-	if len(model.calls) != 0 {
-		t.Errorf("model saw %d calls, want 0", len(model.calls))
+	if len(model.Calls) != 0 {
+		t.Errorf("model saw %d calls, want 0", len(model.Calls))
 	}
 }
 
@@ -473,7 +458,7 @@ func TestStart_SectionWithHashesIsNormalized(t *testing.T) {
 
 	p := proposalFor("docs/x.md", 2)
 	p["section"] = "## X"
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		triageResponse(true),
 		submitResponse(p),
 		verifyResponse(true),
@@ -493,7 +478,7 @@ func TestStart_UnknownSectionIsReturnedToModelWithHeadings(t *testing.T) {
 
 	bad := proposalFor("docs/x.md", 2)
 	bad["section"] = "Nope"
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		triageResponse(true),
 		submitResponse(bad),
 		func(req llm.Request) (llm.Response, error) {
@@ -518,14 +503,14 @@ func TestStart_UnknownSectionIsReturnedToModelWithHeadings(t *testing.T) {
 func TestStart_DraftPromptListsHunkRanges(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		triageResponse(true),
 		submitResponse(),
 	}}
 	if _, _, err := startResult(t, model); err != nil {
 		t.Fatalf("Start() = %v, want nil error", err)
 	}
-	if got := model.calls[1].Messages[0].Text; !strings.Contains(got, "main.go: 1-3") {
+	if got := model.Calls[1].Messages[0].Text; !strings.Contains(got, "main.go: 1-3") {
 		t.Errorf("draft prompt = %q, want it to contain \"main.go: 1-3\"", got)
 	}
 }
@@ -534,7 +519,7 @@ func TestStart_RenameMatchesDocCoveringOnlyOldPath(t *testing.T) {
 	t.Parallel()
 
 	repoDir, headSHA := newGitRepo(t)
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 	runner.SetRemote(repoDir)
 
@@ -544,15 +529,15 @@ func TestStart_RenameMatchesDocCoveringOnlyOldPath(t *testing.T) {
 	if _, err := runner.Start(t.Context(), req); err != nil {
 		t.Fatalf("Start() = %v, want nil error", err)
 	}
-	if len(model.calls) != 1 {
-		t.Fatalf("model saw %d calls, want 1 triage call for docs/x.md", len(model.calls))
+	if len(model.Calls) != 1 {
+		t.Fatalf("model saw %d calls, want 1 triage call for docs/x.md", len(model.Calls))
 	}
 }
 
 func TestStart_TriageReplyWithoutImpactedErrors(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){textResponse(`{"reason": "hmm"}`)}}
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){textResponse(`{"reason": "hmm"}`)}}
 	_, _, err := startResult(t, model)
 	if err == nil || !strings.Contains(err.Error(), "impacted") || !strings.Contains(err.Error(), "hmm") {
 		t.Fatalf("Start() = %v, want an error naming the missing field and quoting the reply", err)
@@ -562,7 +547,7 @@ func TestStart_TriageReplyWithoutImpactedErrors(t *testing.T) {
 func TestStart_VerifyReplyWithoutSupportedErrors(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		triageResponse(true),
 		submitResponse(proposalFor("docs/x.md", 2)),
 		textResponse(`{"reason": "hmm"}`),
@@ -577,7 +562,7 @@ func TestStart_PromptsFencePatchAndMarkOmittedPatch(t *testing.T) {
 	t.Parallel()
 
 	repoDir, headSHA := newGitRepo(t)
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 	runner.SetRemote(repoDir)
 
@@ -586,7 +571,7 @@ func TestStart_PromptsFencePatchAndMarkOmittedPatch(t *testing.T) {
 	if _, err := runner.Start(t.Context(), req); err != nil {
 		t.Fatalf("Start() = %v, want nil error", err)
 	}
-	prompt := model.calls[0].Messages[0].Text
+	prompt := model.Calls[0].Messages[0].Text
 	patchAt := strings.Index(prompt, "func main() {}")
 	open := strings.LastIndex(prompt[:patchAt], "<<<UNTRUSTED-")
 	end := strings.Index(prompt[patchAt:], "<<<END-")
@@ -596,8 +581,8 @@ func TestStart_PromptsFencePatchAndMarkOmittedPatch(t *testing.T) {
 	if !strings.Contains(prompt, "(patch omitted by GitHub: large or binary file)") {
 		t.Errorf("triage prompt does not mark the omitted patch:\n%s", prompt)
 	}
-	if !strings.Contains(model.calls[0].System, "<<<UNTRUSTED-") {
-		t.Errorf("triage system prompt does not explain the markers: %q", model.calls[0].System)
+	if !strings.Contains(model.Calls[0].System, "<<<UNTRUSTED-") {
+		t.Errorf("triage system prompt does not explain the markers: %q", model.Calls[0].System)
 	}
 }
 
@@ -610,7 +595,7 @@ func TestStart_TooManyCandidateDocsIsAnError(t *testing.T) {
 	}
 	headSHA := commitAll(t, dir, "init")
 
-	runner := llmrunner.New(&fakeModel{}, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(&llmtest.ScriptedModel{}, noToken, "triage-model", "draft-model")
 	runner.SetRemote(dir)
 	_, err := runner.Start(t.Context(), testRequest(headSHA))
 	if err == nil || !strings.Contains(err.Error(), "cap of 10") {
@@ -695,7 +680,7 @@ func TestStart_ProposalCarriesOriginalSectionAndLines(t *testing.T) {
 			if tc.indexItem != "" {
 				proposal["index_entry"] = tc.indexItem
 			}
-			model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+			model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 				triageResponse(true),
 				submitResponse(proposal),
 				verifyResponse(true),

@@ -3,6 +3,8 @@ package llmrunner
 import (
 	"log/slog"
 	"time"
+
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 // SetRemote overrides the clone's remote URL. Tests use it to clone a local
@@ -26,4 +28,9 @@ func (r *Runner) SetTokenBudget(n int) {
 // SetLogger overrides the logger.
 func (r *Runner) SetLogger(l *slog.Logger) {
 	r.log = l
+}
+
+// Failed exposes the runner's error classification.
+func Failed(err error) *review.FailedError {
+	return failed(err)
 }
