@@ -1,16 +1,17 @@
 package llmrunner_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gitfixture"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
@@ -33,10 +34,10 @@ func TestStart_FailureNamesItsCause(t *testing.T) {
 		timeout   time.Duration
 		want      review.FailureCause
 	}{
-		{name: "provider error", model: &fakeModel{script: []func(llm.Request) (llm.Response, error){providerDown}}, want: review.CauseProvider},
-		{name: "clone failure", model: &fakeModel{}, badRemote: true, want: review.CauseClone},
-		{name: "token limit", model: &fakeModel{script: []func(llm.Request) (llm.Response, error){overBudget}}, budget: 10, want: review.CauseLimit},
-		{name: "too many candidate docs", model: &fakeModel{}, extraDocs: 10, want: review.CauseTooManyCandidates},
+		{name: "provider error", model: &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){providerDown}}, want: review.CauseProvider},
+		{name: "clone failure", model: &llmtest.ScriptedModel{}, badRemote: true, want: review.CauseClone},
+		{name: "token limit", model: &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){overBudget}}, budget: 10, want: review.CauseLimit},
+		{name: "too many candidate docs", model: &llmtest.ScriptedModel{}, extraDocs: 10, want: review.CauseTooManyCandidates},
 		{name: "timeout", model: blockingModel{}, timeout: 200 * time.Millisecond, want: review.CauseTimeout},
 	}
 	for _, tc := range tests {
@@ -68,29 +69,48 @@ func TestStart_FailureNamesItsCause(t *testing.T) {
 	}
 }
 
-// commitCoveringDocs commits n more docs that cover main.go on top of dir's
-// HEAD and returns the new commit's SHA.
+func TestFailed_ClassifiesEachAgentCauseSeparately(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		err     error
+		expired bool // the run's own deadline had passed
+		want    review.FailureCause
+	}{
+		{name: "model failure", err: fmt.Errorf("step 1: %w: %w", agent.ErrModel, errors.New("500")), want: review.CauseProvider},
+		{name: "malformed replies", err: fmt.Errorf("%w: %w", agent.ErrModel, agent.ErrMalformed), want: review.CauseProvider},
+		{name: "step limit", err: fmt.Errorf("draft: %w", agent.ErrStepLimit), want: review.CauseLimit},
+		{name: "token budget", err: fmt.Errorf("draft: %w", agent.ErrTokenBudget), want: review.CauseLimit},
+		{name: "agent deadline", err: fmt.Errorf("draft: %w", agent.ErrDeadline), want: review.CauseTimeout},
+		{name: "run deadline", err: fmt.Errorf("draft: %w", context.DeadlineExceeded), expired: true, want: review.CauseTimeout},
+		{name: "model call cut by the run deadline", err: fmt.Errorf("triage: %w: %w", agent.ErrModel, context.DeadlineExceeded), expired: true, want: review.CauseTimeout},
+		{name: "provider http timeout", err: fmt.Errorf("step 1: %w: %w", agent.ErrModel, context.DeadlineExceeded), want: review.CauseProvider},
+		{name: "unclassified", err: errors.New("boom"), want: review.CauseInternal},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := t.Context()
+			if tc.expired {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				defer cancel()
+			}
+			if got := llmrunner.Failed(ctx, tc.err).Cause; got != tc.want {
+				t.Errorf("Failed(%v).Cause = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func commitCoveringDocs(t *testing.T, dir string, n int) string {
 	t.Helper()
 
-	git := func(args ...string) []byte {
-		t.Helper()
-		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, out)
-		}
-		return out
-	}
-
+	files := map[string]string{}
 	for i := range n {
-		doc := fmt.Sprintf("---\ntitle: Extra %d\nsummary: Describes extra %d.\ncovers:\n  - main.go\n---\n# Extra %d\n", i, i, i)
-		if err := os.WriteFile(filepath.Join(dir, "docs", fmt.Sprintf("extra%d.md", i)), []byte(doc), 0o600); err != nil {
-			t.Fatalf("write extra doc %d: %v", i, err)
-		}
+		files[fmt.Sprintf("docs/extra%d.md", i)] = fmt.Sprintf("---\ntitle: Extra %d\nsummary: Describes extra %d.\ncovers:\n  - main.go\n---\n# Extra %d\n", i, i, i)
 	}
-	git("add", "-A")
-	git("commit", "-q", "-m", "more docs")
-	return strings.TrimSpace(string(git("rev-parse", "HEAD")))
+	return gitfixture.Commit(t, dir, files, "more docs")
 }

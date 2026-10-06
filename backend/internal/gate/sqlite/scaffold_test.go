@@ -7,13 +7,14 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite/sqlitetest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 func TestLoadScaffold_Unseen(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 
 	got, err := store.LoadScaffold(t.Context(), "acme", "widgets")
 	if err != nil {
@@ -28,12 +29,12 @@ func TestLoadScaffold_Unseen(t *testing.T) {
 func TestSaveScaffold_RoundTrips(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 
 	want := gate.ScaffoldState{
 		Owner: "acme", Repo: "widgets", InstallationID: 9, Phase: gate.ScaffoldWritten, Attempt: 3, Failures: 2,
 		BaseSHA: "abc", Run: &gate.AwaitingRun{RunID: 5, Nonce: "n", Deadline: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)},
-		Files:     &review.Scaffold{Runner: "r", Model: "m", Index: "i", Architecture: "a", Setup: "s"},
+		Files:     &review.Scaffold{Runner: "r", Model: "m", ScaffoldDocs: review.ScaffoldDocs{Index: "i", Architecture: "a", Setup: "s"}},
 		CommitSHA: "c0ffee", PRNumber: 4, PRURL: "https://gh/pull/4",
 	}
 	if err := store.SaveScaffold(t.Context(), want); err != nil {
@@ -51,7 +52,7 @@ func TestSaveScaffold_RoundTrips(t *testing.T) {
 func TestRequestScaffold_CreatesOnceAndKeepsExistingState(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 
 	first, err := store.RequestScaffold(t.Context(), 9, "acme", "widgets", gate.ScaffoldWaiter{CheckRunID: 11})
 	if err != nil {
@@ -80,7 +81,7 @@ func TestRequestScaffold_CreatesOnceAndKeepsExistingState(t *testing.T) {
 func TestRequestScaffold_RefreshesInstallationID(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 
 	opened := gate.ScaffoldState{Owner: "acme", Repo: "widgets", InstallationID: 9, Phase: gate.ScaffoldWritten, PRNumber: 4, PRURL: "u"}
 	if err := store.SaveScaffold(t.Context(), opened); err != nil {
@@ -104,7 +105,7 @@ func TestRequestScaffold_RefreshesInstallationID(t *testing.T) {
 func TestUnlinkedScaffoldWaiters_AppendOnlyAndDeduplicated(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 
 	for _, w := range []gate.ScaffoldWaiter{{CheckRunID: 11}, {CheckRunID: 12}, {CheckRunID: 11}} {
 		if _, err := store.RequestScaffold(t.Context(), 9, "acme", "widgets", w); err != nil {
@@ -128,7 +129,7 @@ func TestUnlinkedScaffoldWaiters_AppendOnlyAndDeduplicated(t *testing.T) {
 func TestMarkScaffoldWaiterLinked_HidesOnlyThatWaiter(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 
 	for _, w := range []gate.ScaffoldWaiter{{CheckRunID: 11}, {CheckRunID: 12}} {
 		if _, err := store.RequestScaffold(t.Context(), 9, "acme", "widgets", w); err != nil {
@@ -155,7 +156,7 @@ func TestMarkScaffoldWaiterLinked_HidesOnlyThatWaiter(t *testing.T) {
 func TestScaffoldForRun(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 	deadline := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
 
@@ -196,7 +197,7 @@ func TestScaffoldForRun(t *testing.T) {
 func TestOverdueRuns_IncludesAwaitedScaffolds(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
@@ -229,7 +230,7 @@ func TestOverdueRuns_IncludesAwaitedScaffolds(t *testing.T) {
 func TestSaveScaffold_KeepsTheInstallationRequestScaffoldRecorded(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 
 	if _, err := store.RequestScaffold(t.Context(), 9, "acme", "widgets", gate.ScaffoldWaiter{CheckRunID: 11}); err != nil {
 		t.Fatalf("RequestScaffold() = %v, want nil error", err)

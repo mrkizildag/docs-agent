@@ -1,16 +1,16 @@
 package github_test
 
 import (
-	"archive/zip"
-	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -67,13 +67,7 @@ func TestCreateCheckRun(t *testing.T) {
 		}
 	})
 
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-
-	client, err := ghclient.NewClient(&http.Client{Timeout: 5 * time.Second}, 1, testPrivateKeyPEM(t), srv.URL)
-	if err != nil {
-		t.Fatalf("NewClient() = %v, want nil error", err)
-	}
+	client := newTestClient(t, mux)
 
 	run := gate.CheckRun{
 		Name:       "pollux-agent",
@@ -130,12 +124,7 @@ func TestWorkflowExists(t *testing.T) {
 			t.Parallel()
 
 			mux := http.NewServeMux()
-			mux.HandleFunc("POST /app/installations/{id}/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				if _, err := fmt.Fprintf(w, `{"token":"ghs_test","expires_at":%q}`, time.Now().Add(time.Hour).Format(time.RFC3339)); err != nil {
-					t.Errorf("write access_tokens response: %v", err)
-				}
-			})
+			handleAccessToken(t, mux)
 			mux.HandleFunc("GET /repos/o/r/contents/.github/workflows/pollux-agent.yml", func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(tc.status)
@@ -146,13 +135,7 @@ func TestWorkflowExists(t *testing.T) {
 				}
 			})
 
-			srv := httptest.NewServer(mux)
-			t.Cleanup(srv.Close)
-
-			client, err := ghclient.NewClient(&http.Client{Timeout: 5 * time.Second}, 1, testPrivateKeyPEM(t), srv.URL)
-			if err != nil {
-				t.Fatalf("NewClient() = %v, want nil error", err)
-			}
+			client := newTestClient(t, mux)
 
 			exists, err := client.WorkflowExists(t.Context(), 99, "o", "r")
 			if tc.wantErr {
@@ -186,13 +169,7 @@ func TestInstallationToken(t *testing.T) {
 		}
 	})
 
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-
-	client, err := ghclient.NewClient(&http.Client{Timeout: 5 * time.Second}, 1, testPrivateKeyPEM(t), srv.URL)
-	if err != nil {
-		t.Fatalf("NewClient() = %v, want nil error", err)
-	}
+	client := newTestClient(t, mux)
 
 	token, err := client.InstallationToken(t.Context(), 99, "r")
 	if err != nil {
@@ -215,12 +192,7 @@ func TestCreateCheckRunConcurrentInstallations(t *testing.T) {
 	t.Parallel()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /app/installations/{id}/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if _, err := fmt.Fprintf(w, `{"token":"ghs_test","expires_at":%q}`, time.Now().Add(time.Hour).Format(time.RFC3339)); err != nil {
-			t.Errorf("write access_tokens response: %v", err)
-		}
-	})
+	handleAccessToken(t, mux)
 	mux.HandleFunc("POST /repos/o/r/check-runs", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
@@ -229,13 +201,7 @@ func TestCreateCheckRunConcurrentInstallations(t *testing.T) {
 		}
 	})
 
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-
-	client, err := ghclient.NewClient(&http.Client{Timeout: 5 * time.Second}, 1, testPrivateKeyPEM(t), srv.URL)
-	if err != nil {
-		t.Fatalf("NewClient() = %v, want nil error", err)
-	}
+	client := newTestClient(t, mux)
 
 	run := gate.CheckRun{
 		Name:       "pollux-agent",
@@ -280,6 +246,14 @@ func handleAccessToken(t *testing.T, mux *http.ServeMux) {
 func newTestClient(t *testing.T, mux *http.ServeMux) *ghclient.Client {
 	t.Helper()
 
+	client, _ := newTestClientURL(t, mux)
+	return client
+}
+
+// newTestClientURL also returns the test server's URL, for handlers that redirect back to it.
+func newTestClientURL(t *testing.T, mux *http.ServeMux) (*ghclient.Client, string) {
+	t.Helper()
+
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
@@ -287,7 +261,7 @@ func newTestClient(t *testing.T, mux *http.ServeMux) *ghclient.Client {
 	if err != nil {
 		t.Fatalf("NewClient() = %v, want nil error", err)
 	}
-	return client
+	return client, srv.URL
 }
 
 func writeJSON(t *testing.T, w http.ResponseWriter, status int, body string) {
@@ -378,53 +352,146 @@ func TestDispatch(t *testing.T) {
 	}
 }
 
-func TestResultArtifact(t *testing.T) {
+func TestRunArtifact(t *testing.T) {
 	t.Parallel()
 
-	var archive bytes.Buffer
-	zw := zip.NewWriter(&archive)
-	f, err := zw.Create("result.json")
-	if err != nil {
-		t.Fatalf("create zip entry: %v", err)
+	const listed = `{"total_count":2,"artifacts":[{"id":1,"name":"pollux-agent-result","workflow_run":{"id":7}},{"id":3,"name":"other","workflow_run":{"id":4242}},{"id":2,"name":"pollux-agent-result","workflow_run":{"id":4242}}]}`
+	tests := []struct {
+		name         string
+		artifacts    string
+		downloadCode int
+		wantErr      string
+	}{
+		{name: "downloads the named artifact of the run", artifacts: listed, downloadCode: http.StatusOK},
+		{name: "non-200 download", artifacts: listed, downloadCode: http.StatusForbidden, wantErr: "status 403"},
+		{name: "missing artifact", artifacts: `{"total_count":0,"artifacts":[]}`, wantErr: "no pollux-agent-result artifact"},
+		{name: "expired artifact", artifacts: `{"total_count":1,"artifacts":[{"id":2,"name":"pollux-agent-result","expired":true,"workflow_run":{"id":4242}}]}`, wantErr: "no pollux-agent-result artifact"},
 	}
-	if _, err := f.Write([]byte(`{"head_sha":"abc"}`)); err != nil {
-		t.Fatalf("write zip entry: %v", err)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatalf("close zip: %v", err)
-	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
+			var (
+				client    *ghclient.Client
+				serverURL string
+			)
+			mux := http.NewServeMux()
+			handleAccessToken(t, mux)
+			mux.HandleFunc("GET /repos/o/r/actions/runs/4242/artifacts", func(w http.ResponseWriter, _ *http.Request) {
+				writeJSON(t, w, http.StatusOK, tc.artifacts)
+			})
+			mux.HandleFunc("GET /repos/o/r/actions/artifacts/2/zip", func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, serverURL+"/blob", http.StatusFound)
+			})
+			mux.HandleFunc("GET /blob", func(w http.ResponseWriter, r *http.Request) {
+				if auth := r.Header.Get("Authorization"); auth != "" {
+					t.Errorf("blob download Authorization = %q, want none", auth)
+				}
+				w.WriteHeader(tc.downloadCode)
+				if _, err := w.Write([]byte("zip bytes")); err != nil {
+					t.Errorf("write blob: %v", err)
+				}
+			})
+			client, serverURL = newTestClientURL(t, mux)
+
+			body, err := client.RunArtifact(t.Context(), 99, "o", "r", 4242, actions.ArtifactName)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("RunArtifact() error = %v, want one containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("RunArtifact() = %v, want nil", err)
+			}
+			defer func() { _ = body.Close() }()
+			got, err := io.ReadAll(body)
+			if err != nil || string(got) != "zip bytes" {
+				t.Errorf("RunArtifact() body = %q, %v, want the blob bytes", got, err)
+			}
+		})
+	}
+}
+
+func TestRunArtifact_PagesThroughArtifacts(t *testing.T) {
+	t.Parallel()
+
+	var (
+		client    *ghclient.Client
+		serverURL string
+	)
 	mux := http.NewServeMux()
 	handleAccessToken(t, mux)
-	mux.HandleFunc("GET /repos/o/r/actions/runs/4242/artifacts", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(t, w, http.StatusOK, `{"total_count":2,"artifacts":[{"id":1,"name":"pollux-agent-result","workflow_run":{"id":7}},{"id":3,"name":"other","workflow_run":{"id":4242}},{"id":2,"name":"pollux-agent-result","workflow_run":{"id":4242}}]}`)
-	})
-	var blobURL string
-	mux.HandleFunc("GET /repos/o/r/actions/artifacts/2/zip", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, blobURL, http.StatusFound)
-	})
-	mux.HandleFunc("GET /blob", func(w http.ResponseWriter, r *http.Request) {
-		if auth := r.Header.Get("Authorization"); auth != "" {
-			t.Errorf("blob download Authorization = %q, want none", auth)
+	mux.HandleFunc("GET /repos/o/r/actions/runs/4242/artifacts", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "2" {
+			writeJSON(t, w, http.StatusOK, `{"artifacts":[{"id":2,"name":"pollux-agent-result","workflow_run":{"id":4242}}]}`)
+			return
 		}
-		if _, err := w.Write(archive.Bytes()); err != nil {
+		w.Header().Set("Link", `<`+serverURL+`/repos/o/r/actions/runs/4242/artifacts?page=2>; rel="next"`)
+		writeJSON(t, w, http.StatusOK, `{"artifacts":[{"id":3,"name":"other","workflow_run":{"id":4242}}]}`)
+	})
+	mux.HandleFunc("GET /repos/o/r/actions/artifacts/2/zip", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, serverURL+"/blob", http.StatusFound)
+	})
+	mux.HandleFunc("GET /blob", func(w http.ResponseWriter, _ *http.Request) {
+		if _, err := w.Write([]byte("zip bytes")); err != nil {
 			t.Errorf("write blob: %v", err)
 		}
 	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	blobURL = srv.URL + "/blob"
+	client, serverURL = newTestClientURL(t, mux)
 
-	client, err := ghclient.NewClient(&http.Client{Timeout: 5 * time.Second}, 1, testPrivateKeyPEM(t), srv.URL)
+	body, err := client.RunArtifact(t.Context(), 99, "o", "r", 4242, actions.ArtifactName)
 	if err != nil {
-		t.Fatalf("NewClient() = %v, want nil error", err)
+		t.Fatalf("RunArtifact() = %v, want the artifact from page 2", err)
 	}
+	_ = body.Close()
+}
 
-	got, err := client.ResultArtifact(t.Context(), 99, "o", "r", 4242)
-	if err != nil {
-		t.Fatalf("ResultArtifact() = %v, want nil", err)
+func TestRunArtifact_RefusesUntrustedLinks(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		location func(base, other string) string
+	}{
+		{"non-https link to another host", func(_, other string) string { return other + "/blob" }},
+		{"redirect to a non-https host", func(base, other string) string { return base + "/hop?to=" + other + "/blob" }},
 	}
-	if string(got) != `{"head_sha":"abc"}` {
-		t.Errorf("ResultArtifact() = %q, want the result.json bytes", got)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				t.Error("request reached the untrusted host")
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(other.Close)
+
+			var (
+				client    *ghclient.Client
+				serverURL string
+			)
+			mux := http.NewServeMux()
+			handleAccessToken(t, mux)
+			mux.HandleFunc("GET /repos/o/r/actions/runs/4242/artifacts", func(w http.ResponseWriter, _ *http.Request) {
+				writeJSON(t, w, http.StatusOK, `{"artifacts":[{"id":2,"name":"pollux-agent-result","workflow_run":{"id":4242}}]}`)
+			})
+			mux.HandleFunc("GET /repos/o/r/actions/artifacts/2/zip", func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, tc.location(serverURL, other.URL), http.StatusFound)
+			})
+			mux.HandleFunc("GET /hop", func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, r.URL.Query().Get("to"), http.StatusFound) //nolint:gosec // test server: redirecting to the case's chosen target is the point
+			})
+			client, serverURL = newTestClientURL(t, mux)
+
+			body, err := client.RunArtifact(t.Context(), 99, "o", "r", 4242, actions.ArtifactName)
+			if err == nil {
+				_ = body.Close()
+				t.Fatal("RunArtifact() = nil error, want a refusal")
+			}
+			if !strings.Contains(err.Error(), "refus") {
+				t.Errorf("RunArtifact() error = %v, want one containing %q", err, "refus")
+			}
+		})
 	}
 }

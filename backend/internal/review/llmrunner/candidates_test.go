@@ -1,13 +1,12 @@
 package llmrunner_test
 
 import (
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/mrkizildag/pollux-agent/backend/internal/gitfixture"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
@@ -17,40 +16,14 @@ import (
 func TestStart_GlobCoveredNestedFileTriagesOnlyItsDoc(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	run := func(args ...string) string {
-		t.Helper()
-		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	write := func(rel, content string) {
-		t.Helper()
-		path := filepath.Join(dir, rel)
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatalf("mkdir %s: %v", rel, err)
-		}
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			t.Fatalf("write %s: %v", rel, err)
-		}
-	}
+	dir, headSHA := gitfixture.NewRepo(t, map[string]string{
+		"src/pkg/deep/x.go": "package deep\n\nfunc X() {}\n",
+		"other/y.go":        "package other\n",
+		"docs/a.md":         "---\ntitle: A\nsummary: Describes A.\ncovers:\n  - src/**/*.go\n---\n# A\n\nold.\n",
+		"docs/b.md":         "---\ntitle: B\nsummary: Describes B.\ncovers:\n  - other/*.go\n---\n# B\n\nold.\n",
+	})
 
-	run("init", "-q", "-b", "main")
-	run("config", "user.email", "test@example.com")
-	run("config", "user.name", "test")
-	write("src/pkg/deep/x.go", "package deep\n\nfunc X() {}\n")
-	write("other/y.go", "package other\n")
-	write("docs/a.md", "---\ntitle: A\nsummary: Describes A.\ncovers:\n  - src/**/*.go\n---\n# A\n\nold.\n")
-	write("docs/b.md", "---\ntitle: B\nsummary: Describes B.\ncovers:\n  - other/*.go\n---\n# B\n\nold.\n")
-	run("add", "-A")
-	run("commit", "-q", "-m", "init")
-	headSHA := run("rev-parse", "HEAD")
-
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 	runner.SetRemote(dir)
 
@@ -71,10 +44,10 @@ func TestStart_GlobCoveredNestedFileTriagesOnlyItsDoc(t *testing.T) {
 	if _, ok := result.Verdict.(review.NoImpact); !ok {
 		t.Fatalf("Verdict = %T, want review.NoImpact", result.Verdict)
 	}
-	if len(model.calls) != 1 {
-		t.Fatalf("model saw %d calls, want exactly 1 triage call (docs/a.md only)", len(model.calls))
+	if len(model.Calls) != 1 {
+		t.Fatalf("model saw %d calls, want exactly 1 triage call (docs/a.md only)", len(model.Calls))
 	}
-	prompt := model.calls[0].Messages[0].Text
+	prompt := model.Calls[0].Messages[0].Text
 	for _, want := range []string{"docs/a.md", patch} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("triage prompt missing %q:\n%s", want, prompt)

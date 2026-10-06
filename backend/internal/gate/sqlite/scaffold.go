@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
@@ -39,12 +38,8 @@ func loadScaffold(ctx context.Context, q queryRower, owner, repo string) (gate.S
 		return gate.ScaffoldState{}, fmt.Errorf("load scaffold %s/%s: %w", owner, repo, err)
 	}
 
-	if nonce != "" {
-		parsed, err := time.Parse(time.RFC3339Nano, deadline)
-		if err != nil {
-			return gate.ScaffoldState{}, fmt.Errorf("load scaffold %s/%s: parse run deadline %q: %w", owner, repo, deadline, err)
-		}
-		state.Run = &gate.AwaitingRun{RunID: runID, Nonce: nonce, Deadline: parsed}
+	if state.Run, err = decodeRun(runID, nonce, deadline); err != nil {
+		return gate.ScaffoldState{}, fmt.Errorf("load scaffold %s/%s: %w", owner, repo, err)
 	}
 	if files != "" {
 		state.Files = &review.Scaffold{}
@@ -58,11 +53,7 @@ func loadScaffold(ctx context.Context, q queryRower, owner, repo string) (gate.S
 // SaveScaffold upserts state, keyed by owner/repo. It never overwrites a stored
 // installation_id: RequestScaffold owns it.
 func (s *Store) SaveScaffold(ctx context.Context, state gate.ScaffoldState) error {
-	var runID int64
-	var nonce, deadline string
-	if state.Run != nil {
-		runID, nonce, deadline = state.Run.RunID, state.Run.Nonce, state.Run.Deadline.UTC().Format(time.RFC3339Nano)
-	}
+	runID, nonce, deadline := encodeRun(state.Run)
 	var files []byte
 	if state.Files != nil {
 		var err error

@@ -2,7 +2,6 @@ package github
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -63,9 +62,8 @@ func (c *Client) CommitFiles(ctx context.Context, installationID int64, owner, r
 		return "", fmt.Errorf("commit to %s/%s %s: create commit: %w", owner, repo, branch, err)
 	}
 
-	if _, _, err := client.Git.UpdateRef(ctx, owner, repo, "heads/"+branch, github.UpdateRef{SHA: commit.GetSHA(), Force: new(false)}); err != nil {
-		var apiErr *github.ErrorResponse
-		if errors.As(err, &apiErr) && apiErr.Response != nil && apiErr.Response.StatusCode == http.StatusUnprocessableEntity {
+	if _, _, err := client.Git.UpdateRef(ctx, owner, repo, branchRef(branch), github.UpdateRef{SHA: commit.GetSHA(), Force: new(false)}); err != nil {
+		if hasStatus(err, http.StatusUnprocessableEntity) {
 			tip, _, tipErr := client.Repositories.GetBranch(ctx, owner, repo, branch, 0)
 			if tipErr != nil {
 				return "", fmt.Errorf("commit to %s/%s %s: update ref: %w; read branch tip: %w", owner, repo, branch, err, tipErr)

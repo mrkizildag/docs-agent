@@ -4,6 +4,7 @@ package review
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -156,3 +157,8 @@ type LineRange struct {
 	Start int
 	End   int
 }
+
+// ErrFileTooLarge is returned by a FileAtRef implementation when the file exists
+// but exceeds the size it will read, so callers can tell it apart from a missing
+// file.
+var ErrFileTooLarge = errors.New("file too large to read")

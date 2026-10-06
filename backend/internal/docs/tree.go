@@ -11,8 +11,6 @@ import (
 	"github.com/bmatcuk/doublestar/v4"
 )
 
-const maxDocBytes = 1 << 20
-
 // Problem is a doc that failed to parse, with the cause.
 type Problem struct {
 	Path string
@@ -26,7 +24,7 @@ type Tree struct {
 }
 
 // Parse walks "docs" under fsys, which is rooted at the repo root, and parses
-// every .md file found at any depth. A missing docs folder yields an empty
+// every .md and .mdx file found at any depth. A missing docs folder yields an empty
 // Tree, not an error; per-file parse failures become Problems so one bad doc
 // doesn't stop the rest. Only regular files are read, and a file over 1 MiB is
 // a Problem; the tree is untrusted PR content.
@@ -45,7 +43,7 @@ func Parse(fsys fs.FS) (Tree, error) {
 		if err != nil {
 			return fmt.Errorf("walk %s: %w", p, err)
 		}
-		if !d.Type().IsRegular() || path.Ext(p) != ".md" {
+		if !d.Type().IsRegular() || !isDocFile(p) {
 			return nil
 		}
 
@@ -54,7 +52,7 @@ func Parse(fsys fs.FS) (Tree, error) {
 			return fmt.Errorf("read %s: %w", p, err)
 		}
 		if tooLarge {
-			tree.Problems = append(tree.Problems, Problem{Path: p, Err: fmt.Errorf("%s: larger than 1 MiB", p)})
+			tree.Problems = append(tree.Problems, Problem{Path: p, Err: errors.New("larger than 1 MiB")})
 
 			return nil
 		}
@@ -73,6 +71,13 @@ func Parse(fsys fs.FS) (Tree, error) {
 	return tree, nil
 }
 
+// isDocFile reports whether p has an extension review.Proposal accepts for doc_path.
+func isDocFile(p string) bool {
+	ext := path.Ext(p)
+
+	return ext == ".md" || ext == ".mdx"
+}
+
 func readDoc(fsys fs.FS, p string) (src []byte, tooLarge bool, err error) {
 	f, err := fsys.Open(p)
 	if err != nil {
@@ -84,18 +89,18 @@ func readDoc(fsys fs.FS, p string) (src []byte, tooLarge bool, err error) {
 		}
 	}()
 
-	src, err = io.ReadAll(io.LimitReader(f, maxDocBytes+1))
+	src, err = io.ReadAll(io.LimitReader(f, MaxDocBytes+1))
 	if err != nil {
 		return nil, false, fmt.Errorf("read: %w", err)
 	}
 
-	return src, len(src) > maxDocBytes, nil
+	return src, len(src) > MaxDocBytes, nil
 }
 
-func (t *Tree) add(path string, src []byte) {
-	doc, err := ParseDoc(path, src)
+func (t *Tree) add(p string, src []byte) {
+	doc, err := ParseDoc(p, src)
 	if err != nil {
-		t.Problems = append(t.Problems, Problem{Path: path, Err: err})
+		t.Problems = append(t.Problems, Problem{Path: p, Err: err})
 
 		return
 	}

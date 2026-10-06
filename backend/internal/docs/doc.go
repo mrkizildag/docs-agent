@@ -5,6 +5,7 @@ package docs
 import (
 	"bytes"
 	"fmt"
+	"path"
 	"strings"
 
 	"github.com/bmatcuk/doublestar/v4"
@@ -12,7 +13,7 @@ import (
 )
 
 // MaxDocBytes is the largest doc file the package reads.
-const MaxDocBytes = maxDocBytes
+const MaxDocBytes = 1 << 20
 
 // Doc is one parsed markdown file under docs/.
 type Doc struct {
@@ -39,20 +40,21 @@ type frontmatter struct {
 	Covers  []string `yaml:"covers"`
 }
 
-// ParseDoc parses one docs/ markdown file's frontmatter and sections.
+// ParseDoc parses one docs/ markdown file's frontmatter and sections. Its
+// errors do not name path; the caller knows it.
 func ParseDoc(path string, src []byte) (Doc, error) {
 	fm, body, err := splitFrontmatter(src)
 	if err != nil {
-		return Doc{}, fmt.Errorf("parse %s: %w", path, err)
+		return Doc{}, err
 	}
 
 	var meta frontmatter
 	if err := yaml.Unmarshal(fm, &meta); err != nil {
-		return Doc{}, fmt.Errorf("parse %s: decode frontmatter: %w", path, err)
+		return Doc{}, fmt.Errorf("decode frontmatter: %w", err)
 	}
 
 	if err := validateCovers(meta.Covers); err != nil {
-		return Doc{}, fmt.Errorf("parse %s: %w", path, err)
+		return Doc{}, err
 	}
 
 	return Doc{
@@ -98,52 +100,67 @@ func CheckScaffoldDoc(path string, src []byte) error {
 	return nil
 }
 
-// CheckScaffold reports why index, architecture and setup are not a usable
-// starting docs folder: each must pass CheckScaffoldDoc at its path, and the
-// index must link the other two relatively. Each file must fit in MaxDocBytes.
-func CheckScaffold(index, architecture, setup string) error {
-	for _, doc := range []struct{ path, src string }{
-		{"docs/README.md", index},
-		{"docs/architecture.md", architecture},
-		{"docs/guides/setup.md", setup},
-	} {
-		if len(doc.src) > MaxDocBytes {
-			return fmt.Errorf("check scaffold doc %s: %d bytes exceed the %d byte cap", doc.path, len(doc.src), MaxDocBytes)
-		}
-		if err := CheckScaffoldDoc(doc.path, []byte(doc.src)); err != nil {
-			return err
-		}
-	}
-	for _, link := range []string{"](architecture.md)", "](guides/setup.md)"} {
-		if !strings.Contains(index, link) {
-			return fmt.Errorf("check scaffold doc docs/README.md: the index must link its sibling docs relatively, missing %q", link)
-		}
-	}
-	return nil
+// ScaffoldFile is one file of a scaffold at its repo-relative path.
+type ScaffoldFile struct {
+	Path    string
+	Content string
 }
 
-// SectionSpan returns the text of the section titled heading (leading "#"s and
-// surrounding space ignored) and its 1-based inclusive line range, from the
-// heading line through the section's last line. ok is false when no heading
-// matches or when several do, since a span for the wrong one would be edited.
-func (d Doc) SectionSpan(heading string) (text string, start, end int, ok bool) {
-	want := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(heading), "#"))
+// CheckScaffold reports why files are not a usable starting docs folder: each
+// must fit in MaxDocBytes and pass CheckScaffoldDoc at its path, and the file
+// at indexPath must have an indexHeading section and link every other file
+// relatively, which assumes they sit under the index's directory. It reports a missing indexPath file.
+func CheckScaffold(files []ScaffoldFile, indexPath, indexHeading string) error {
+	var index *ScaffoldFile
 
-	var found *Section
+	for i, f := range files {
+		if len(f.Content) > MaxDocBytes {
+			return fmt.Errorf("check scaffold doc %s: %d bytes exceed the %d byte cap", f.Path, len(f.Content), MaxDocBytes)
+		}
 
-	for i, s := range d.Sections {
-		if s.Level == 0 || s.Heading != want {
+		if err := CheckScaffoldDoc(f.Path, []byte(f.Content)); err != nil {
+			return err
+		}
+
+		if f.Path == indexPath {
+			index = &files[i]
+		}
+	}
+
+	if index == nil {
+		return fmt.Errorf("check scaffold: no file at index path %s", indexPath)
+	}
+
+	doc, err := ParseDoc(index.Path, []byte(index.Content))
+	if err != nil {
+		return fmt.Errorf("check scaffold doc %s: %w", index.Path, err)
+	}
+
+	level := len(indexHeading) - len(strings.TrimLeft(indexHeading, "#"))
+	if section, ok := doc.findSection(indexHeading); !ok || section.Level != level {
+		return fmt.Errorf("check scaffold doc %s: the index must have exactly one %q section at that level", index.Path, indexHeading)
+	}
+
+	for _, f := range files {
+		if f.Path == indexPath {
 			continue
 		}
 
-		if found != nil {
-			return "", 0, 0, false
+		if link := "](" + strings.TrimPrefix(f.Path, path.Dir(indexPath)+"/") + ")"; !strings.Contains(index.Content, link) {
+			return fmt.Errorf("check scaffold doc %s: the index must link its sibling docs relatively, missing %q", index.Path, link)
 		}
-
-		found = &d.Sections[i]
 	}
 
-	if found == nil {
+	return nil
+}
+
+// SectionSpan returns the text of the section titled heading (a leading ATX
+// marker and surrounding space ignored) and its 1-based inclusive line range, from the
+// heading line through the section's last line. ok is false when no heading
+// matches or when several do, since a span for the wrong one would be edited.
+func (d Doc) SectionSpan(heading string) (text string, start, end int, ok bool) {
+	found, ok := d.findSection(heading)
+	if !ok {
 		return "", 0, 0, false
 	}
 
@@ -152,6 +169,39 @@ func (d Doc) SectionSpan(heading string) (text string, start, end int, ok bool) 
 	end = start + strings.Count(strings.TrimSuffix(text, "\n"), "\n")
 
 	return text, start, end, true
+}
+
+// findSection returns the one titled section whose heading is heading with its
+// ATX marker and surrounding space ignored; ok is false for none or several.
+func (d Doc) findSection(heading string) (found *Section, ok bool) {
+	want := normalizeHeading(heading)
+
+	for i, s := range d.Sections {
+		if s.Level == 0 || s.Heading != want {
+			continue
+		}
+
+		if found != nil {
+			return nil, false
+		}
+
+		found = &d.Sections[i]
+	}
+
+	return found, found != nil
+}
+
+// normalizeHeading is review.NormalizeSection, which this package cannot
+// import; a test in review/basedocs pins them together.
+func normalizeHeading(heading string) string {
+	for {
+		heading = strings.TrimSpace(heading)
+		hashes := len(heading) - len(strings.TrimLeft(heading, "#"))
+		if hashes < 1 || hashes > 6 || (hashes < len(heading) && heading[hashes] != ' ' && heading[hashes] != '\t') {
+			return heading
+		}
+		heading = heading[hashes:]
+	}
 }
 
 func validateCovers(covers []string) error {

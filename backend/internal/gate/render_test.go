@@ -5,13 +5,14 @@ import (
 	"testing"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/gatetest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 func TestProposalCommentBodies(t *testing.T) {
 	t.Parallel()
 
-	gh := &fakeGitHub{changed: []review.ChangedFile{{Path: "docs/s.md", Hunks: []review.LineRange{{Start: 1, End: 10}}, Patch: "@@ -1 +1,10 @@"}}}
+	gh := &gatetest.GitHub{Changed: []review.ChangedFile{{Path: "docs/s.md", Hunks: []review.LineRange{{Start: 1, End: 10}}, Patch: "@@ -1 +1,10 @@"}}}
 	checkbox := review.Proposal{
 		DocPath: "docs/a.md", Section: "Usage", Reason: "flag renamed", Anchor: review.Anchor{File: "a.go", Line: 4},
 		Original: "## Usage\nold\n", Lines: review.LineRange{Start: 3, End: 4}, Content: "## Usage\nnew\n",
@@ -24,13 +25,14 @@ func TestProposalCommentBodies(t *testing.T) {
 		DocPath: "docs/s.md", Section: "Run", Reason: "port changed", Anchor: review.Anchor{File: "c.go", Line: 2},
 		Original: "## Run\nport 1\n", Lines: review.LineRange{Start: 5, End: 6}, Content: "## Run\nport 2\n",
 	}
-	proposalService(t, gh, &fakeStore{}, review.Proposals{checkbox, newDoc, suggest})
+	proposalService(t, gh, newStore(t), review.Proposals{checkbox, newDoc, suggest})
 
-	if len(gh.reviewComments) != 3 || gh.createIssue != 1 {
-		t.Fatalf("review comments = %d, summaries = %d, want 3 and 1", len(gh.reviewComments), gh.createIssue)
+	reviewComments := gh.ReviewComments()
+	if n := gh.CallCount("CreateIssueComment"); len(reviewComments) != 3 || n != 1 {
+		t.Fatalf("review comments = %d, summaries = %d, want 3 and 1", len(reviewComments), n)
 	}
 
-	cb := gh.reviewComments[0]
+	cb := reviewComments[0]
 	if cb.Path != "a.go" || cb.Line != 4 || cb.CommitSHA != "abc123" {
 		t.Errorf("checkbox comment anchored at %s:%d on %s, want a.go:4 on abc123", cb.Path, cb.Line, cb.CommitSHA)
 	}
@@ -40,7 +42,7 @@ func TestProposalCommentBodies(t *testing.T) {
 		}
 	}
 
-	nd := gh.reviewComments[1]
+	nd := reviewComments[1]
 	if nd.Path != "b.go" || nd.Line != 9 {
 		t.Errorf("new doc comment anchored at %s:%d, want b.go:9", nd.Path, nd.Line)
 	}
@@ -53,7 +55,7 @@ func TestProposalCommentBodies(t *testing.T) {
 		t.Errorf("new doc body has removed lines:\n%s", nd.Body)
 	}
 
-	sg := gh.reviewComments[2]
+	sg := reviewComments[2]
 	if sg.Path != "docs/s.md" || sg.StartLine != 5 || sg.Line != 6 {
 		t.Errorf("suggestion anchored at %s:%d-%d, want docs/s.md:5-6", sg.Path, sg.StartLine, sg.Line)
 	}
@@ -61,9 +63,10 @@ func TestProposalCommentBodies(t *testing.T) {
 		t.Errorf("suggestion body = %q, want reason, suggestion block, no checkbox", sg.Body)
 	}
 
-	summary := gh.comments[0].Body
+	comments := gh.Comments()
+	summary := comments[0].Body
 	for i, want := range []string{"| `docs/a.md` | Usage |", "| `docs/b.md` | (new doc) |", "| `docs/s.md` | Run |"} {
-		row := want + " [view](" + gh.comments[i+1].URL + ") | open |"
+		row := want + " [view](" + comments[i+1].URL + ") | open |"
 		if !strings.Contains(summary, row) {
 			t.Errorf("summary missing row %q:\n%s", row, summary)
 		}
@@ -90,7 +93,7 @@ func TestProposalCommentOffersApplyOnlyOffAFork(t *testing.T) {
 			pr.Fork = tc.fork
 			_, writes := gate.Reconcile(gate.PRState{}, pr, review.Proposals{p}, nil, nil)
 
-			body := writes[0].Review.Body
+			body := writes.Creates[0].Comment.Body
 			if got := strings.Contains(body, "- [ ] Apply this change"); got != tc.wantCheckbox {
 				t.Errorf("body has apply checkbox = %v, want %v:\n%s", got, tc.wantCheckbox, body)
 			}
@@ -111,7 +114,7 @@ func TestOutdatedProposalCommentHasNoApplyBox(t *testing.T) {
 
 	_, writes := gate.Reconcile(prev, testPR(), review.NoImpact{Reason: "x"}, nil, existing)
 
-	body := writes[0].Body
+	body := writes.Edits[0].Body
 	if !strings.Contains(body, "flag renamed") || !strings.Contains(body, "Outdated") {
 		t.Errorf("outdated body = %q, want the old text under an outdated notice", body)
 	}
@@ -126,15 +129,15 @@ func renderedSummary(t *testing.T, state gate.PRState) string {
 	t.Helper()
 
 	state.InstallationID, state.Owner, state.Repo, state.Number, state.SummaryCommentID = 1, "acme", "widgets", 3, summaryID
-	gh := &fakeGitHub{}
+	gh := &gatetest.GitHub{}
 	for range summaryID {
-		gh.addComment(gate.CommentKindIssue, "stale")
+		gh.AddComment(gate.CommentKindIssue, "stale")
 	}
-	svc := gate.NewService(gh, &fakeCommentGitHub{}, &fakeStore{stored: state}, gate.Runners{}, nil, nil)
+	svc := newService(gh, newStore(t, state), gate.Runners{}, nil)
 	if err := svc.HandleComment(t.Context(), summaryTick("Apply all")); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)
 	}
-	return gh.comments[summaryID-1].Body
+	return gh.Comments()[summaryID-1].Body
 }
 
 func TestSummaryRendering(t *testing.T) {

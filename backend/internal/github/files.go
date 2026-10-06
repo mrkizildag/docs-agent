@@ -50,30 +50,21 @@ func (c *Client) ListChangedFiles(ctx context.Context, installationID int64, own
 	}
 
 	var files []review.ChangedFile
-	opts := &github.ListOptions{PerPage: 100}
-	for {
-		page, resp, err := client.PullRequests.ListFiles(ctx, owner, repo, number, opts)
+	for f, err := range client.PullRequests.ListFilesIter(ctx, owner, repo, number, &github.ListOptions{PerPage: 100}) {
 		if err != nil {
 			return nil, fmt.Errorf("list changed files %s/%s#%d: %w", owner, repo, number, err)
 		}
-
-		for _, f := range page {
-			hunks, err := parseHunks(f.GetPatch())
-			if err != nil {
-				return nil, fmt.Errorf("list changed files %s/%s#%d: parse patch of %s: %w", owner, repo, number, f.GetFilename(), err)
-			}
-			previous := ""
-			if f.GetStatus() == "renamed" {
-				previous = f.GetPreviousFilename()
-			}
-			files = append(files, review.ChangedFile{Path: f.GetFilename(), PreviousPath: previous, Removed: f.GetStatus() == "removed", Hunks: hunks, Patch: f.GetPatch(), Changes: f.GetChanges()})
+		hunks, err := parseHunks(f.GetPatch())
+		if err != nil {
+			return nil, fmt.Errorf("list changed files %s/%s#%d: parse patch of %s: %w", owner, repo, number, f.GetFilename(), err)
 		}
-
-		if resp.NextPage == 0 {
-			return files, nil
+		previous := ""
+		if f.GetStatus() == "renamed" {
+			previous = f.GetPreviousFilename()
 		}
-		opts.Page = resp.NextPage
+		files = append(files, review.ChangedFile{Path: f.GetFilename(), PreviousPath: previous, Removed: f.GetStatus() == "removed", Hunks: hunks, Patch: f.GetPatch(), Changes: f.GetChanges()})
 	}
+	return files, nil
 }
 
 // parseHunks returns the head-side line range of each hunk header in patch.

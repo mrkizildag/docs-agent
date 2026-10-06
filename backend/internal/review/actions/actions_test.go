@@ -1,10 +1,12 @@
 package actions_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"strings"
 	"testing"
@@ -26,6 +28,7 @@ type fakeAPI struct {
 	changed    []review.ChangedFile
 	changedErr error
 	files      map[string][]byte
+	fileErrs   map[string]error
 	fileReads  map[string]int
 	docsAt     map[string]fstest.MapFS
 }
@@ -39,8 +42,15 @@ func (f *fakeAPI) Dispatch(_ context.Context, _ int64, _, _ string, in actions.D
 	return f.runID, f.err
 }
 
-func (f *fakeAPI) ResultArtifact(_ context.Context, _ int64, _, _ string, _ int64) ([]byte, error) {
-	return f.artifact, f.err
+func (f *fakeAPI) RunArtifact(_ context.Context, _ int64, _, _ string, _ int64, name string) (io.ReadCloser, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if name != actions.ArtifactName {
+		return nil, fmt.Errorf("unexpected artifact %q", name)
+	}
+	archive, err := zipBytes(actions.ResultFileName, f.artifact)
+	return io.NopCloser(bytes.NewReader(archive)), err
 }
 
 func (f *fakeAPI) ListChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {
@@ -53,7 +63,7 @@ func (f *fakeAPI) FileAtRef(_ context.Context, _ int64, _, _, path, ref string) 
 	}
 	f.fileReads[path+"@"+ref]++
 	src, ok := f.files[path]
-	return src, ok, nil
+	return src, ok, f.fileErrs[path]
 }
 
 func TestStart(t *testing.T) {
@@ -239,6 +249,8 @@ func validProposal() map[string]any {
 func TestCollect(t *testing.T) {
 	t.Parallel()
 
+	const doc = "---\ntitle: A\nsummary: S.\ncovers:\n  - main.go\n---\n# A\n\n## Usage\nold usage\n"
+
 	completion := review.Completion{Owner: "o", Repo: "r", HeadSHA: "abc", RunID: 99, Nonce: "n1"}
 	proposal := validProposal()
 	outside := map[string]any{
@@ -278,6 +290,7 @@ func TestCollect(t *testing.T) {
 			want: review.Result{Runner: "actions", Model: "claude-code", Verdict: review.Proposals{{
 				DocPath: "docs/a.md", Section: "Usage", Anchor: review.Anchor{File: "main.go", Line: 3},
 				Reason: "flag renamed", Content: "new text",
+				Original: "## Usage\nold usage\n", Lines: review.LineRange{Start: 9, End: 10},
 			}}},
 		},
 		{name: "head mismatch", raw: artifact(t, "other", "n1", map[string]any{"structured_output": map[string]any{}}), wantInvalid: true},
@@ -309,7 +322,11 @@ func TestCollect(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			api := &fakeAPI{artifact: tc.raw, changed: []review.ChangedFile{{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 5}}}}}
+			api := &fakeAPI{
+				artifact: tc.raw,
+				changed:  []review.ChangedFile{{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 5}}}},
+				files:    map[string][]byte{"docs/a.md": []byte(doc)},
+			}
 			runner := actions.New(api, time.Minute)
 			got, err := runner.Collect(t.Context(), completion)
 
@@ -389,49 +406,139 @@ func TestCollectCapsProposalErrorText(t *testing.T) {
 	}
 }
 
+const sectionsDoc = "---\ntitle: A\nsummary: S.\ncovers:\n  - main.go\n---\n# A\n\n## Usage\nold usage\n\n## Other\nbody\n\n## Dup\nx\n\n## Dup\ny\n"
+
+func collectProposals(t *testing.T, api *fakeAPI, proposals ...map[string]any) (review.Result, error) {
+	t.Helper()
+
+	items := make([]any, len(proposals))
+	for i, p := range proposals {
+		items[i] = p
+	}
+	api.artifact = artifact(t, "abc", "n1", map[string]any{"structured_output": map[string]any{"proposals": items}})
+	api.changed = []review.ChangedFile{{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 5}}}}
+	res, err := actions.New(api, time.Minute).Collect(t.Context(), review.Completion{Owner: "o", Repo: "r", HeadSHA: "abc", Nonce: "n1"})
+	if err != nil {
+		return res, fmt.Errorf("collect: %w", err)
+	}
+	return res, nil
+}
+
 func TestCollectFillsOriginalAndLines(t *testing.T) {
 	t.Parallel()
 
-	const doc = "---\ntitle: A\nsummary: S.\ncovers:\n  - main.go\n---\n# A\n\n## Usage\nold usage\n\n## Other\nbody\n"
-	usage := validProposal()
 	other := validProposal()
 	other["section"] = "## Other"
-	missingSection := validProposal()
-	missingSection["section"] = "Nope"
-	missingDoc := validProposal()
-	missingDoc["doc_path"] = "docs/gone.md"
 
-	raw := artifact(t, "abc", "n1", map[string]any{
-		"structured_output": map[string]any{"proposals": []any{usage, other, missingSection, missingDoc}},
-	})
-	api := &fakeAPI{
-		artifact: raw,
-		changed:  []review.ChangedFile{{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 5}}}},
-		files:    map[string][]byte{"docs/a.md": []byte(doc)},
-	}
-
-	got, err := actions.New(api, time.Minute).Collect(t.Context(), review.Completion{Owner: "o", Repo: "r", HeadSHA: "abc", Nonce: "n1"})
+	api := &fakeAPI{files: map[string][]byte{"docs/a.md": []byte(sectionsDoc)}}
+	got, err := collectProposals(t, api, validProposal(), other)
 	if err != nil {
 		t.Fatalf("Collect() = %v, want nil", err)
 	}
 
 	proposals, ok := got.Verdict.(review.Proposals)
-	if !ok || len(proposals) != 4 {
-		t.Fatalf("Verdict = %#v, want 4 proposals", got.Verdict)
+	if !ok || len(proposals) != 2 {
+		t.Fatalf("Verdict = %#v, want 2 proposals", got.Verdict)
 	}
 	if p := proposals[0]; p.Original != "## Usage\nold usage\n\n" || p.Lines != (review.LineRange{Start: 9, End: 11}) {
 		t.Errorf("usage Original, Lines = %q, %+v", p.Original, p.Lines)
 	}
-	if p := proposals[1]; p.Original != "## Other\nbody\n" || p.Lines != (review.LineRange{Start: 12, End: 13}) {
-		t.Errorf("other Original, Lines = %q, %+v", p.Original, p.Lines)
+	if p := proposals[1]; p.Section != "Other" || p.Original != "## Other\nbody\n\n" || p.Lines != (review.LineRange{Start: 12, End: 14}) {
+		t.Errorf("other Section, Original, Lines = %q, %q, %+v", p.Section, p.Original, p.Lines)
 	}
-	for _, p := range proposals[2:] {
-		if p.Original != "" || p.Lines != (review.LineRange{}) {
-			t.Errorf("proposal %s/%s Original, Lines = %q, %+v, want empty", p.DocPath, p.Section, p.Original, p.Lines)
-		}
-	}
-	if diff := cmp.Diff(map[string]int{"docs/a.md@abc": 1, "docs/gone.md@abc": 1}, api.fileReads); diff != "" {
+	if diff := cmp.Diff(map[string]int{"docs/a.md@abc": 1}, api.fileReads); diff != "" {
 		t.Errorf("file reads (-want +got):\n%s", diff)
+	}
+}
+
+func TestCollectRejectsSectionThatDoesNotResolveAtHead(t *testing.T) {
+	t.Parallel()
+
+	missingSection := validProposal()
+	missingSection["section"] = "Nope"
+	ambiguous := validProposal()
+	ambiguous["section"] = "Dup"
+	missingDoc := validProposal()
+	missingDoc["doc_path"] = "docs/gone.md"
+
+	tests := []struct {
+		name     string
+		proposal map[string]any
+		wantErr  string
+	}{
+		{name: "no such heading lists the headings", proposal: missingSection, wantErr: `headings are: "A", "Usage", "Other", "Dup", "Dup"`},
+		{name: "duplicate heading", proposal: ambiguous, wantErr: "not exactly one"},
+		{name: "doc missing at head", proposal: missingDoc, wantErr: "does not exist at head"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			api := &fakeAPI{files: map[string][]byte{"docs/a.md": []byte(sectionsDoc)}}
+			_, err := collectProposals(t, api, tc.proposal)
+
+			var invalid *review.InvalidResultError
+			if !errors.As(err, &invalid) || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Collect() = %v, want *review.InvalidResultError containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestCollectToleratesBrokenFrontmatterAtHead(t *testing.T) {
+	t.Parallel()
+
+	api := &fakeAPI{files: map[string][]byte{"docs/a.md": []byte("---\ntitle: [\n---\n# A\n\n## Usage\nold usage\n")}}
+	got, err := collectProposals(t, api, validProposal())
+	if err != nil {
+		t.Fatalf("Collect() = %v, want nil", err)
+	}
+	proposals, ok := got.Verdict.(review.Proposals)
+	if !ok || len(proposals) != 1 || !strings.Contains(proposals[0].Original, "old usage") {
+		t.Fatalf("Verdict = %#v, want one proposal with Original filled", got.Verdict)
+	}
+}
+
+func TestCollectNormalizesSectionBeforeValidating(t *testing.T) {
+	t.Parallel()
+
+	hashOnly := validProposal()
+	hashOnly["section"] = "#"
+	hashOnly["index_entry"] = "a: Describes a."
+
+	api := &fakeAPI{}
+	got, err := collectProposals(t, api, hashOnly)
+	if err != nil {
+		t.Fatalf("Collect() = %v, want nil", err)
+	}
+	if proposals, ok := got.Verdict.(review.Proposals); !ok || len(proposals) != 1 || proposals[0].Section != "" {
+		t.Fatalf("Verdict = %#v, want one new-doc proposal", got.Verdict)
+	}
+}
+
+func TestCollectTooLargeDocLeavesOriginalEmpty(t *testing.T) {
+	t.Parallel()
+
+	api := &fakeAPI{fileErrs: map[string]error{"docs/a.md": fmt.Errorf("read docs/a.md: %w", review.ErrFileTooLarge)}}
+	got, err := collectProposals(t, api, validProposal())
+	if err != nil {
+		t.Fatalf("Collect() = %v, want nil", err)
+	}
+	if proposals, ok := got.Verdict.(review.Proposals); !ok || len(proposals) != 1 || proposals[0].Original != "" {
+		t.Fatalf("Verdict = %#v, want one proposal with no Original", got.Verdict)
+	}
+}
+
+func TestCollectReadErrorIsTransient(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("boom")
+	api := &fakeAPI{fileErrs: map[string]error{"docs/a.md": wantErr}}
+	_, err := collectProposals(t, api, validProposal())
+
+	var invalid *review.InvalidResultError
+	if !errors.Is(err, wantErr) || errors.As(err, &invalid) {
+		t.Fatalf("Collect() = %v, want transient error wrapping %v", err, wantErr)
 	}
 }
 
@@ -439,7 +546,7 @@ const scaffoldFrontmatter = "---\ntitle: T\nsummary: S\ncovers: []\n---\n"
 
 func validScaffoldOutput() map[string]any {
 	return map[string]any{
-		"index":        scaffoldFrontmatter + "[a](architecture.md) [s](guides/setup.md)\n",
+		"index":        scaffoldFrontmatter + "## Index\n[a](architecture.md) [s](guides/setup.md)\n",
 		"architecture": scaffoldFrontmatter,
 		"setup":        scaffoldFrontmatter,
 	}
@@ -498,11 +605,13 @@ func TestCollectScaffold(t *testing.T) {
 					t.Fatalf("CollectScaffold() = %v, want nil", err)
 				}
 				want := review.Scaffold{
-					Runner:       "actions",
-					Model:        "m1",
-					Index:        scaffoldFrontmatter + "[a](architecture.md) [s](guides/setup.md)\n",
-					Architecture: scaffoldFrontmatter,
-					Setup:        scaffoldFrontmatter,
+					Runner: "actions",
+					Model:  "m1",
+					ScaffoldDocs: review.ScaffoldDocs{
+						Index:        scaffoldFrontmatter + "## Index\n[a](architecture.md) [s](guides/setup.md)\n",
+						Architecture: scaffoldFrontmatter,
+						Setup:        scaffoldFrontmatter,
+					},
 				}
 				if diff := cmp.Diff(want, got); diff != "" {
 					t.Errorf("Scaffold (-want +got):\n%s", diff)

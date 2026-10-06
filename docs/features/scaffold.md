@@ -5,14 +5,16 @@ covers:
   - backend/internal/gate/scaffold.go
   - backend/internal/gate/sqlite/scaffold.go
   - backend/internal/github/scaffold.go
-  - backend/internal/review/scaffold.go
+  - backend/internal/review/*.go
   - backend/internal/review/llmrunner/scaffold.go
   - backend/internal/review/llmrunner/prompt.go
   - backend/internal/review/actions/actions.go
   - backend/internal/docs/doc.go
-  - backend/internal/gate/gate.go
+  - backend/internal/gate/runner.go
+  - backend/internal/gate/analyze.go
+  - backend/internal/jobs/**
+  - backend/internal/review/actions/artifact.go
   - backend/internal/httpapi/handler.go
-  - backend/internal/httpapi/job.go
   - action/action.yml
   - action/scaffold.md
   - action/scaffold.schema.json
@@ -39,7 +41,7 @@ The writer is chosen like the review runner, see [Architecture](../architecture.
 - **Actions workflow repos**: the gate dispatches the existing workflow with `pr_number` "0" and `head_sha` set to the default branch tip. The action treats PR number 0 as scaffold mode and writes the files instead of reviewing a diff. It also sends `docs` as an empty list, since the workflow requires that input for reviews (see [Actions runner](actions-runner.md)). Installed workflows reference `action@main`, so the action change must reach `main` before the server that dispatches scaffolds is deployed.
 - **Server runner**: the LLM agent runs over a clone of the default branch with the same read-only tools as review, confined to the clone, and with larger step, token, and time limits since it reads the whole repo.
 
-The output is exactly three files: `docs/README.md`, `docs/architecture.md`, `docs/guides/setup.md`. Each needs a non-empty `title` and `summary` and a `covers` key in its frontmatter, and the index must link the other two. The result type has no field for any other path, so a model cannot write outside these files.
+The output is exactly three files: `docs/README.md`, `docs/architecture.md`, `docs/guides/setup.md`. Each needs a non-empty `title` and `summary` and a `covers` key in its frontmatter, and the index must have exactly one `## Index` section (level 2) containing relative links to the other two; `action/scaffold.md` asks for it. The result type has no field for any other path, so a model cannot write outside these files.
 
 ## Opening the PR
 

@@ -11,7 +11,7 @@ covers:
 
 # Setup
 
-Requires Go (version in `backend/go.mod`) and golangci-lint v2. To run it in production, see [Deploy](deploy.md).
+Requires Go (version in `backend/go.mod`) and golangci-lint v2.12 (the version CI installs; change it in `.github/workflows/ci.yml`). To run it in production, see [Deploy](deploy.md).
 
 | Command      | Does                                                   |
 |--------------|--------------------------------------------------------|
@@ -20,7 +20,7 @@ Requires Go (version in `backend/go.mod`) and golangci-lint v2. To run it in pro
 | `make lint`  | golangci-lint, including formatting and import rules. Its cache is per worktree, in `.cache/`. |
 | `make fmt`   | Apply gofmt and goimports.                             |
 | `make generate` | Regenerate the three schemas in `action/` (proposal, result, scaffold) from the `internal/review` types; a test fails when any is stale. |
-| `make check` | lint, test, and govulncheck; what CI runs.             |
+| `make check` | lint, test, and govulncheck; what CI runs (`make check`), plus a `docker build .` job. |
 
 ## Configuration
 

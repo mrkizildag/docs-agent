@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 )
@@ -76,7 +78,7 @@ type grepArgs struct {
 // callTool runs call against root, returning a ToolResult that never panics:
 // an unknown tool name, malformed arguments, or a path outside root becomes an
 // error result, not a stopped loop.
-func callTool(root *os.Root, call llm.ToolCall) llm.ToolResult {
+func callTool(ctx context.Context, root *os.Root, call llm.ToolCall) llm.ToolResult {
 	var (
 		content string
 		err     error
@@ -85,7 +87,7 @@ func callTool(root *os.Root, call llm.ToolCall) llm.ToolResult {
 	case readFileToolName:
 		content, err = readFile(root, call.Args)
 	case grepToolName:
-		content, err = grep(root, call.Args)
+		content, err = grep(ctx, root, call.Args)
 	case listDirToolName:
 		content, err = listDir(root, call.Args)
 	default:
@@ -166,7 +168,7 @@ func listDir(root *os.Root, raw json.RawMessage) (string, error) {
 	return b.String(), nil
 }
 
-func grep(root *os.Root, raw json.RawMessage) (string, error) {
+func grep(ctx context.Context, root *os.Root, raw json.RawMessage) (string, error) {
 	var args grepArgs
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -188,6 +190,9 @@ func grep(root *os.Root, raw json.RawMessage) (string, error) {
 		truncated bool
 	)
 	walk := func(p string, d fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("walk %q: %w", p, err)
+		}
 		if walkErr != nil {
 			if p == start {
 				return walkErr
@@ -215,7 +220,11 @@ func grep(root *os.Root, raw json.RawMessage) (string, error) {
 				continue
 			}
 			if len(line) > maxGrepLineLen {
-				line = line[:maxGrepLineLen] + "..."
+				cut := maxGrepLineLen
+				for cut > 0 && !utf8.RuneStart(line[cut]) {
+					cut--
+				}
+				line = line[:cut] + "..."
 			}
 			entry := fmt.Sprintf("%s:%d: %s\n", p, i+1, line)
 			if matches >= maxGrepMatches || out.Len()+len(entry) > maxGrepBytes {

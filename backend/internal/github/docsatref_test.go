@@ -31,11 +31,12 @@ func TestDocsAtRef(t *testing.T) {
 			{"path":"a.md","type":"blob","mode":"100644","sha":"s1","size":4},
 			{"path":"sub","type":"tree","mode":"040000","sha":"t1"},
 			{"path":"sub/b.md","type":"blob","mode":"100644","sha":"s2","size":4},
+			{"path":"c.mdx","type":"blob","mode":"100644","sha":"s7","size":4},
 			{"path":"big.md","type":"blob","mode":"100644","sha":"s3","size":2000000},
 			{"path":"img.png","type":"blob","mode":"100644","sha":"s4","size":4},
 			{"path":"link.md","type":"blob","mode":"120000","sha":"s5","size":4}]}`)
 	})
-	for sha, body := range map[string]string{"s1": "# A\n", "s2": "# B\n"} {
+	for sha, body := range map[string]string{"s1": "# A\n", "s2": "# B\n", "s7": "# C\n"} {
 		mux.HandleFunc("GET /repos/o/r/git/blobs/"+sha, func(w http.ResponseWriter, r *http.Request) {
 			blobFetches.Add(1)
 			if !strings.Contains(r.Header.Get("Accept"), "raw") {
@@ -63,8 +64,8 @@ func TestDocsAtRef(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("walk: %v", err)
 	}
-	if fmt.Sprint(paths) != "[docs/a.md docs/sub/b.md]" {
-		t.Errorf("DocsAtRef() files = %v, want [docs/a.md docs/sub/b.md]", paths)
+	if fmt.Sprint(paths) != "[docs/a.md docs/c.mdx docs/sub/b.md]" {
+		t.Errorf("DocsAtRef() files = %v, want [docs/a.md docs/c.mdx docs/sub/b.md]", paths)
 	}
 	if b, _ := fs.ReadFile(got, "docs/sub/b.md"); string(b) != "# B\n" {
 		t.Errorf("docs/sub/b.md = %q, want %q", b, "# B\n")
@@ -73,8 +74,8 @@ func TestDocsAtRef(t *testing.T) {
 	if _, err := client.DocsAtRef(t.Context(), 1, "o", "r", "abc"); err != nil {
 		t.Fatalf("second DocsAtRef() = %v, want nil", err)
 	}
-	if n := blobFetches.Load(); n != 2 {
-		t.Errorf("blob fetches after two calls = %d, want 2 (second call served from cache)", n)
+	if n := blobFetches.Load(); n != 3 {
+		t.Errorf("blob fetches after two calls = %d, want 3 (second call served from cache)", n)
 	}
 }
 

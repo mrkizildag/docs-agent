@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,22 +14,8 @@ import (
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 )
-
-// fakeModel scripts one llm.Response (or error) per call, in order.
-type fakeModel struct {
-	script []func(req llm.Request) (llm.Response, error)
-	calls  []llm.Request
-}
-
-func (f *fakeModel) Complete(_ context.Context, req llm.Request) (llm.Response, error) {
-	f.calls = append(f.calls, req)
-	i := len(f.calls) - 1
-	if i >= len(f.script) {
-		return llm.Response{}, fmt.Errorf("fakeModel: unexpected call %d", i+1)
-	}
-	return f.script[i](req)
-}
 
 func testRoot(t *testing.T) *os.Root {
 	t.Helper()
@@ -59,7 +44,7 @@ func finishTool() llm.Tool {
 func TestRun_FinishesOnFirstToolCall(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		func(llm.Request) (llm.Response, error) {
 			return llm.Response{
 				ToolCalls: []llm.ToolCall{{ID: "1", Name: "submit", Args: json.RawMessage(`{"ok":true}`)}},
@@ -89,7 +74,7 @@ func TestRun_FinishesOnFirstToolCall(t *testing.T) {
 func TestRun_ReadFileThenFinish(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		func(llm.Request) (llm.Response, error) {
 			return llm.Response{
 				ToolCalls: []llm.ToolCall{{ID: "1", Name: "read_file", Args: json.RawMessage(`{"path":"doc.md"}`)}},
@@ -127,7 +112,7 @@ func TestRun_ReadFileThenFinish(t *testing.T) {
 func TestRun_ReadFileRefusesGitPath(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		func(llm.Request) (llm.Response, error) {
 			return llm.Response{
 				ToolCalls: []llm.ToolCall{{ID: "1", Name: "read_file", Args: json.RawMessage(`{"path":".git/config"}`)}},
@@ -158,7 +143,7 @@ func TestRun_ReadFileRefusesGitPath(t *testing.T) {
 func TestRun_UnknownToolDoesNotPanic(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		func(llm.Request) (llm.Response, error) {
 			return llm.Response{
 				ToolCalls: []llm.ToolCall{{ID: "1", Name: "run_shell", Args: json.RawMessage(`{}`)}},
@@ -190,7 +175,7 @@ func TestRun_AcceptRejectionIsRetried(t *testing.T) {
 	t.Parallel()
 
 	attempts := 0
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		func(llm.Request) (llm.Response, error) {
 			return llm.Response{
 				ToolCalls: []llm.ToolCall{{ID: "1", Name: "submit", Args: json.RawMessage(`{"bad":true}`)}},
@@ -234,7 +219,7 @@ func TestRun_AcceptRejectionIsRetried(t *testing.T) {
 func TestRun_StepLimit(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		func(llm.Request) (llm.Response, error) { return llm.Response{Text: "thinking"}, nil },
 		func(llm.Request) (llm.Response, error) { return llm.Response{Text: "thinking"}, nil },
 	}}
@@ -257,7 +242,7 @@ func TestRun_StepLimit(t *testing.T) {
 func TestRun_TokenBudget(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		func(llm.Request) (llm.Response, error) {
 			return llm.Response{Text: "thinking", Usage: llm.Usage{InputTokens: 600, OutputTokens: 600}}, nil
 		},
@@ -278,7 +263,7 @@ func TestRun_TokenBudget(t *testing.T) {
 func TestRun_OffersExactlyTheFourTools(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		func(req llm.Request) (llm.Response, error) {
 			var names []string
 			for _, tool := range req.Tools {
@@ -304,7 +289,7 @@ func TestRun_OffersExactlyTheFourTools(t *testing.T) {
 func TestRun_TextOnlyReplyGetsNudge(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 		func(llm.Request) (llm.Response, error) { return llm.Response{Text: "hmm"}, nil },
 		func(req llm.Request) (llm.Response, error) {
 			n := len(req.Messages)
@@ -343,12 +328,44 @@ func TestRun_DeadlineIsErrDeadline(t *testing.T) {
 
 	t.Run("from Complete", func(t *testing.T) {
 		t.Parallel()
-		model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+		ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(time.Hour))
+		defer cancel()
+		model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
+			func(llm.Request) (llm.Response, error) {
+				cancel()
+				return llm.Response{}, context.DeadlineExceeded
+			},
+		}}
+		_, _, err := agent.Run(ctx, model, task, agent.NewBudget(1000))
+		if errors.Is(err, agent.ErrDeadline) {
+			t.Errorf("Run() err = %v, want no ErrDeadline for a canceled run", err)
+		}
+	})
+
+	t.Run("unrelated model error at the deadline", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+		model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
+			func(llm.Request) (llm.Response, error) {
+				<-ctx.Done()
+				return llm.Response{}, errors.New("connection reset")
+			},
+		}}
+		_, _, err := agent.Run(ctx, model, task, agent.NewBudget(1000))
+		if !errors.Is(err, agent.ErrDeadline) {
+			t.Errorf("Run() err = %v, want ErrDeadline", err)
+		}
+	})
+
+	t.Run("provider timeout with a live context", func(t *testing.T) {
+		t.Parallel()
+		model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
 			func(llm.Request) (llm.Response, error) { return llm.Response{}, context.DeadlineExceeded },
 		}}
 		_, _, err := agent.Run(t.Context(), model, task, agent.NewBudget(1000))
-		if !errors.Is(err, agent.ErrDeadline) || !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("Run() err = %v, want ErrDeadline wrapping DeadlineExceeded", err)
+		if errors.Is(err, agent.ErrDeadline) || !errors.Is(err, agent.ErrModel) {
+			t.Errorf("Run() err = %v, want ErrModel and not ErrDeadline", err)
 		}
 	})
 
@@ -356,7 +373,7 @@ func TestRun_DeadlineIsErrDeadline(t *testing.T) {
 		t.Parallel()
 		ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
 		defer cancel()
-		_, _, err := agent.Run(ctx, &fakeModel{}, task, agent.NewBudget(1000))
+		_, _, err := agent.Run(ctx, &llmtest.ScriptedModel{}, task, agent.NewBudget(1000))
 		if !errors.Is(err, agent.ErrDeadline) || !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("Run() err = %v, want ErrDeadline wrapping DeadlineExceeded", err)
 		}
@@ -374,10 +391,15 @@ func TestRun_CancelIsNotErrDeadline(t *testing.T) {
 
 	t.Run("from Complete", func(t *testing.T) {
 		t.Parallel()
-		model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
-			func(llm.Request) (llm.Response, error) { return llm.Response{}, context.Canceled },
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){
+			func(llm.Request) (llm.Response, error) {
+				cancel()
+				return llm.Response{}, context.Canceled
+			},
 		}}
-		_, _, err := agent.Run(t.Context(), model, task, agent.NewBudget(1000))
+		_, _, err := agent.Run(ctx, model, task, agent.NewBudget(1000))
 		if errors.Is(err, agent.ErrDeadline) || !errors.Is(err, context.Canceled) {
 			t.Errorf("Run() err = %v, want Canceled and not ErrDeadline", err)
 		}
@@ -387,7 +409,7 @@ func TestRun_CancelIsNotErrDeadline(t *testing.T) {
 		t.Parallel()
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		_, _, err := agent.Run(ctx, &fakeModel{}, task, agent.NewBudget(1000))
+		_, _, err := agent.Run(ctx, &llmtest.ScriptedModel{}, task, agent.NewBudget(1000))
 		if errors.Is(err, agent.ErrDeadline) || !errors.Is(err, context.Canceled) {
 			t.Errorf("Run() err = %v, want Canceled and not ErrDeadline", err)
 		}
@@ -412,7 +434,7 @@ func emptyReplyTask(t *testing.T) agent.Task {
 func TestRun_ThreeEmptyRepliesIsErrMalformed(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){emptyReply, emptyReply, emptyReply}}
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){emptyReply, emptyReply, emptyReply}}
 	_, _, err := agent.Run(t.Context(), model, emptyReplyTask(t), agent.NewBudget(1000))
 	if !errors.Is(err, agent.ErrMalformed) {
 		t.Fatalf("Run() = %v, want ErrMalformed", err)
@@ -425,7 +447,7 @@ func TestRun_ThreeEmptyRepliesIsErrMalformed(t *testing.T) {
 func TestRun_TwoEmptyRepliesThenFinishSucceeds(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){emptyReply, emptyReply, finishReply}}
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){emptyReply, emptyReply, finishReply}}
 	_, stats, err := agent.Run(t.Context(), model, emptyReplyTask(t), agent.NewBudget(1000))
 	if err != nil {
 		t.Fatalf("Run() = %v, want nil error", err)
@@ -438,16 +460,56 @@ func TestRun_TwoEmptyRepliesThenFinishSucceeds(t *testing.T) {
 func TestRun_EmptyReplyAppendsNoEmptyAssistantMessage(t *testing.T) {
 	t.Parallel()
 
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){emptyReply, finishReply}}
+	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){emptyReply, finishReply}}
 	if _, _, err := agent.Run(t.Context(), model, emptyReplyTask(t), agent.NewBudget(1000)); err != nil {
 		t.Fatalf("Run() = %v, want nil error", err)
 	}
-	for _, m := range model.calls[1].Messages {
+	for _, m := range model.Calls[1].Messages {
 		if m.Role == llm.RoleAssistant {
 			t.Errorf("messages contain assistant message %+v, want none after an empty reply", m)
 		}
 	}
-	if n := len(model.calls[1].Messages); n != 2 {
+	if n := len(model.Calls[1].Messages); n != 2 {
 		t.Errorf("len(messages) = %d, want prompt and nudge", n)
+	}
+}
+
+func TestRun_ModelErrorWrapsErrModel(t *testing.T) {
+	t.Parallel()
+
+	task := agent.Task{
+		Model: "m", Prompt: "go", Root: testRoot(t), Finish: finishTool(),
+		Accept:   func(json.RawMessage) error { return nil },
+		MaxSteps: 5,
+	}
+	boom := errors.New("boom")
+
+	tests := []struct {
+		name      string
+		script    []func(llm.Request) (llm.Response, error)
+		wantCause error
+	}{
+		{
+			name:      "complete fails",
+			script:    []func(llm.Request) (llm.Response, error){func(llm.Request) (llm.Response, error) { return llm.Response{}, boom }},
+			wantCause: boom,
+		},
+		{
+			name:      "malformed replies",
+			script:    []func(llm.Request) (llm.Response, error){emptyReply, emptyReply, emptyReply},
+			wantCause: agent.ErrMalformed,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, _, err := agent.Run(t.Context(), &llmtest.ScriptedModel{Script: tc.script}, task, agent.NewBudget(1000))
+			if !errors.Is(err, agent.ErrModel) || !errors.Is(err, tc.wantCause) {
+				t.Errorf("Run() err = %v, want ErrModel wrapping %v", err, tc.wantCause)
+			}
+			if errors.Is(err, agent.ErrDeadline) {
+				t.Errorf("Run() err = %v, want not ErrDeadline", err)
+			}
+		})
 	}
 }

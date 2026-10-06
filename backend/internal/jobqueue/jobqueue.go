@@ -27,28 +27,31 @@ var errSuperseded = errors.New("job superseded by a newer job")
 type NewJob struct {
 	DeliveryID string // dedup key; a DeliveryID already seen is a no-op
 	Key        string // jobs with the same Key run one at a time
-	Kind       string
+	Kind       string // what the job carries; the handler dispatches on it
+	Group      string // supersede scope within a Key; empty means Kind
 	Payload    []byte
-	Supersedes bool // cancel older pending and running jobs with the same Key and Kind
+	Supersedes bool // cancel older pending and running jobs with the same Key and Group
 }
 
 // Job is a unit of work claimed from the Store.
 type Job struct {
-	ID      int64
-	Key     string
-	Kind    string
-	Payload []byte
+	ID         int64
+	Key        string
+	Kind       string
+	Payload    []byte
+	DeliveryID string
 }
 
 // Store persists jobs and deliveries durably.
 type Store interface {
 	// Enqueue records the delivery and the job in one transaction. A seen DeliveryID returns
 	// enqueued=false and changes nothing. With Supersedes, older pending jobs of the same Key
-	// and Kind become superseded, and the IDs of running ones are returned for cancellation.
+	// and Group become superseded, and the IDs of running ones are returned for cancellation.
 	Enqueue(ctx context.Context, job NewJob) (enqueued bool, supersededRunning []int64, err error)
 	// Claim marks the oldest pending job whose Key has no running job as running and returns it.
 	Claim(ctx context.Context) (job Job, ok bool, err error)
-	// Finish records a running job's terminal state; errMsg is "" unless failed.
+	// Finish records a running job's terminal state; errMsg is "" unless failed. A job that is
+	// no longer running keeps its state.
 	Finish(ctx context.Context, id int64, state State, errMsg string) error
 	// RequeueRunning moves every running job back to pending; called once at startup.
 	RequeueRunning(ctx context.Context) (int, error)
@@ -106,12 +109,11 @@ func (w *Worker) Enqueue(ctx context.Context, job NewJob) (enqueued bool, err er
 	}
 	w.mu.Unlock()
 
-	// An ID absent from w.running is either a job orphaned by a previous process (left
-	// running when it exited) or one already finished in the DB; re-marking an already
-	// terminal job superseded is harmless.
+	// An ID absent from w.running is a job orphaned by a previous process, or one that finished
+	// after the store listed it; Finish only moves a job that is still running.
 	for _, id := range orphaned {
 		if ferr := w.store.Finish(ctx, id, StateSuperseded, ""); ferr != nil {
-			w.logger.Error("finish orphaned superseded job", "job_id", id, "error", ferr)
+			w.logger.Error("finish orphaned superseded job", "job_id", id, "err", ferr)
 		}
 	}
 
@@ -162,7 +164,7 @@ func (w *Worker) claim(ctx context.Context) (Job, context.Context, context.Cance
 
 	job, ok, err := w.store.Claim(ctx)
 	if err != nil {
-		w.logger.Error("claim job", "error", err)
+		w.logger.Error("claim job", "err", err)
 		return Job{}, nil, nil, false
 	}
 	if !ok {
@@ -186,19 +188,19 @@ func (w *Worker) runJob(parentCtx, jobCtx context.Context, cancel context.Cancel
 	switch {
 	case errors.Is(cause, errSuperseded):
 		if ferr := w.store.Finish(finishCtx, job.ID, StateSuperseded, ""); ferr != nil {
-			w.logger.Error("finish superseded job", "job_id", job.ID, "error", ferr)
+			w.logger.Error("finish superseded job", jobAttrs(job, "err", ferr)...)
 		}
 	case err != nil && parentCtx.Err() != nil:
 		// The handler returned an error caused by the shutdown cancel: leave the job
 		// running so RequeueRunning picks it up on restart.
 	case err != nil:
-		w.logger.Error("job failed", "job_id", job.ID, "kind", job.Kind, "error", err)
+		w.logger.Error("job failed", jobAttrs(job, "err", err)...)
 		if ferr := w.store.Finish(finishCtx, job.ID, StateFailed, err.Error()); ferr != nil {
-			w.logger.Error("finish failed job", "job_id", job.ID, "error", ferr)
+			w.logger.Error("finish failed job", jobAttrs(job, "err", ferr)...)
 		}
 	default:
 		if ferr := w.store.Finish(finishCtx, job.ID, StateDone, ""); ferr != nil {
-			w.logger.Error("finish done job", "job_id", job.ID, "error", ferr)
+			w.logger.Error("finish done job", jobAttrs(job, "err", ferr)...)
 		}
 	}
 
@@ -207,6 +209,12 @@ func (w *Worker) runJob(parentCtx, jobCtx context.Context, cancel context.Cancel
 	w.mu.Unlock()
 
 	w.notify(w.jobDone)
+}
+
+// jobAttrs returns the log attributes that identify job, so its lines join with httpapi's delivery_id.
+func jobAttrs(job Job, extra ...any) []any {
+	attrs := []any{"job_id", job.ID, "key", job.Key, "kind", job.Kind, "delivery_id", job.DeliveryID}
+	return append(attrs, extra...)
 }
 
 func (w *Worker) runningCount() int {

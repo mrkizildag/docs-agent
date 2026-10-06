@@ -1,20 +1,21 @@
 // Package github adapts the GitHub REST API to the gate package's GitHub
-// interface, authenticating as the pollux-agent GitHub App.
+// interface and the actions package's WorkflowAPI, authenticating as the pollux-agent GitHub App.
 package github
 
 import (
-	"archive/zip"
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"sync"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
+	// ghinstallation's InstallationTokenOptions is typed with go-github v88.
 	githubv88 "github.com/google/go-github/v88/github"
 	"github.com/google/go-github/v92/github"
 
@@ -22,8 +23,8 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
 )
 
-// Client creates GitHub check runs, authenticating per installation as the
-// pollux-agent GitHub App.
+// Client implements gate.GitHub and actions.WorkflowAPI, authenticating per installation as the pollux-agent
+// GitHub App.
 type Client struct {
 	transport     http.RoundTripper
 	appID         int64
@@ -105,10 +106,7 @@ func (c *Client) CreateCheckRun(ctx context.Context, installationID int64, owner
 		Name:    run.Name,
 		HeadSHA: run.HeadSHA,
 		Status:  new(checkStatus(run)),
-		Output: &github.CheckRunOutput{
-			Title:   &run.Title,
-			Summary: &run.Summary,
-		},
+		Output:  checkRunOutput(run),
 	}
 	if run.Status != gate.StatusInProgress {
 		opts.Conclusion = new(string(run.Conclusion))
@@ -132,10 +130,7 @@ func (c *Client) UpdateCheckRun(ctx context.Context, installationID int64, owner
 	opts := github.UpdateCheckRunOptions{
 		Name:   run.Name,
 		Status: new(checkStatus(run)),
-		Output: &github.CheckRunOutput{
-			Title:   &run.Title,
-			Summary: &run.Summary,
-		},
+		Output: checkRunOutput(run),
 	}
 	if run.Status != gate.StatusInProgress {
 		opts.Conclusion = new(string(run.Conclusion))
@@ -146,6 +141,10 @@ func (c *Client) UpdateCheckRun(ctx context.Context, installationID int64, owner
 	}
 
 	return nil
+}
+
+func checkRunOutput(run gate.CheckRun) *github.CheckRunOutput {
+	return &github.CheckRunOutput{Title: &run.Title, Summary: &run.Summary}
 }
 
 func checkStatus(run gate.CheckRun) string {
@@ -173,12 +172,6 @@ func (c *Client) WorkflowExists(ctx context.Context, installationID int64, owner
 	return true, nil
 }
 
-const (
-	resultArtifactName = "pollux-agent-result"
-	resultFileName     = "result.json"
-	maxArtifactBytes   = 10 << 20
-)
-
 // Dispatch runs the pollux-agent workflow on owner/repo's default branch and
 // returns the ID of the run it started.
 func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo string, in actions.DispatchInputs) (int64, error) {
@@ -196,19 +189,19 @@ func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo
 		return 0, fmt.Errorf("dispatch workflow %s/%s: encode docs: %w", owner, repo, err)
 	}
 
-	r, _, err := client.Repositories.Get(ctx, owner, repo)
+	defaultBranch, err := defaultBranchName(ctx, client, owner, repo)
 	if err != nil {
-		return 0, fmt.Errorf("dispatch workflow %s/%s: get repository: %w", owner, repo, err)
+		return 0, fmt.Errorf("dispatch workflow %s/%s: %w", owner, repo, err)
 	}
 
 	details, _, err := client.Actions.CreateWorkflowDispatchEventByFileName(ctx, owner, repo, path.Base(gate.WorkflowPath),
 		github.CreateWorkflowDispatchEventRequest{
-			Ref: r.GetDefaultBranch(),
+			Ref: defaultBranch,
 			Inputs: map[string]any{
-				"head_sha":  in.HeadSHA,
-				"pr_number": strconv.Itoa(in.PRNumber),
-				"nonce":     in.Nonce,
-				"docs":      string(docsJSON),
+				actions.InputHeadSHA:  in.HeadSHA,
+				actions.InputPRNumber: strconv.Itoa(in.PRNumber),
+				actions.InputNonce:    in.Nonce,
+				actions.InputDocs:     string(docsJSON),
 			},
 			ReturnRunDetails: new(true),
 		})
@@ -222,83 +215,93 @@ func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo
 	return details.GetWorkflowRunID(), nil
 }
 
-// ResultArtifact returns the result.json inside run runID's result artifact.
-func (c *Client) ResultArtifact(ctx context.Context, installationID int64, owner, repo string, runID int64) ([]byte, error) {
+// RunArtifact returns the zip of run runID's artifact called name; the caller
+// closes it.
+func (c *Client) RunArtifact(ctx context.Context, installationID int64, owner, repo string, runID int64, name string) (io.ReadCloser, error) {
 	client, err := c.installationClient(installationID)
 	if err != nil {
-		return nil, fmt.Errorf("fetch result of run %d of %s/%s: %w", runID, owner, repo, err)
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: %w", runID, owner, repo, err)
 	}
 
-	list, _, err := client.Actions.ListWorkflowRunArtifacts(ctx, owner, repo, runID, &github.ListOptions{PerPage: 100})
+	artifactID, err := findArtifact(ctx, client, owner, repo, runID, name)
 	if err != nil {
-		return nil, fmt.Errorf("fetch result of run %d of %s/%s: list artifacts: %w", runID, owner, repo, err)
-	}
-
-	var artifactID int64
-	for _, a := range list.Artifacts {
-		if a.GetName() == resultArtifactName && !a.GetExpired() && a.GetWorkflowRun().GetID() == runID {
-			artifactID = a.GetID()
-			break
-		}
-	}
-	if artifactID == 0 {
-		return nil, fmt.Errorf("fetch result of run %d of %s/%s: no %s artifact", runID, owner, repo, resultArtifactName)
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: %w", runID, owner, repo, err)
 	}
 
 	archiveURL, _, err := client.Actions.DownloadArtifact(ctx, owner, repo, artifactID, 1)
 	if err != nil {
-		return nil, fmt.Errorf("fetch result of run %d of %s/%s: locate artifact %d: %w", runID, owner, repo, artifactID, err)
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: locate artifact %d: %w", runID, owner, repo, artifactID, err)
 	}
 
-	result, err := c.downloadResult(ctx, archiveURL.String())
-	if err != nil {
-		return nil, fmt.Errorf("fetch result of run %d of %s/%s: %w", runID, owner, repo, err)
+	if !c.allowedDownload(archiveURL) {
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: download artifact: refusing non-https link to %s", runID, owner, repo, archiveURL.Host)
 	}
-	return result, nil
+
+	// The link is pre-signed and takes no installation token.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, archiveURL.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: download artifact: %w", runID, owner, repo, err)
+	}
+	download := *c.httpClient
+	download.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if len(via) >= maxDownloadRedirects {
+			return fmt.Errorf("stopped after %d redirects", maxDownloadRedirects)
+		}
+		if !c.allowedDownload(next.URL) {
+			return fmt.Errorf("refusing redirect to %s", next.URL.Redacted())
+		}
+		return nil
+	}
+	resp, err := download.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: download artifact: %w", runID, owner, repo, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: download artifact: status %s", runID, owner, repo, resp.Status)
+	}
+	return resp.Body, nil
 }
 
-// downloadResult fetches the zip at archiveURL, a pre-signed link that takes
-// no installation token, and returns its result.json.
-func (c *Client) downloadResult(ctx context.Context, archiveURL string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, archiveURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("download artifact: %w", err)
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("download artifact: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("download artifact: status %s", resp.Status)
-	}
+const maxDownloadRedirects = 10
 
-	archive, err := io.ReadAll(io.LimitReader(resp.Body, maxArtifactBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("download artifact: %w", err)
+// findArtifact pages through run runID's artifacts for the unexpired one called name.
+func findArtifact(ctx context.Context, client *github.Client, owner, repo string, runID int64, name string) (int64, error) {
+	opts := &github.ListOptions{PerPage: 100}
+	for {
+		list, resp, err := client.Actions.ListWorkflowRunArtifacts(ctx, owner, repo, runID, opts)
+		if err != nil {
+			return 0, fmt.Errorf("list artifacts: %w", err)
+		}
+		for _, a := range list.Artifacts {
+			if a.GetName() == name && !a.GetExpired() && a.GetWorkflowRun().GetID() == runID {
+				return a.GetID(), nil
+			}
+		}
+		if resp.NextPage == 0 {
+			return 0, fmt.Errorf("no %s artifact", name)
+		}
+		opts.Page = resp.NextPage
 	}
-	if len(archive) > maxArtifactBytes {
-		return nil, fmt.Errorf("download artifact: larger than %d bytes", maxArtifactBytes)
-	}
+}
 
-	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
-	if err != nil {
-		return nil, fmt.Errorf("open artifact zip: %w", err)
+// allowedDownload reports whether u may be fetched: https, or the scheme and
+// host of the configured API base URL (a test server).
+func (c *Client) allowedDownload(u *url.URL) bool {
+	if u.Scheme == "https" {
+		return true
 	}
-	file, err := zr.Open(resultFileName)
-	if err != nil {
-		return nil, fmt.Errorf("open %s in artifact: %w", resultFileName, err)
-	}
-	defer func() { _ = file.Close() }()
+	base, err := url.Parse(c.baseURL)
+	return err == nil && c.baseURL != "" && u.Scheme == base.Scheme && u.Host == base.Host
+}
 
-	result, err := io.ReadAll(io.LimitReader(file, maxArtifactBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read %s in artifact: %w", resultFileName, err)
-	}
-	if len(result) > maxArtifactBytes {
-		return nil, fmt.Errorf("read %s in artifact: larger than %d bytes", resultFileName, maxArtifactBytes)
-	}
-	return result, nil
+func isNotFound(resp *github.Response) bool {
+	return resp != nil && resp.Response != nil && resp.StatusCode == http.StatusNotFound
+}
+
+func hasStatus(err error, code int) bool {
+	var apiErr *github.ErrorResponse
+	return errors.As(err, &apiErr) && apiErr.Response != nil && apiErr.Response.StatusCode == code
 }
 
 func (c *Client) installationClient(installationID int64) (*github.Client, error) {
@@ -314,22 +317,25 @@ func (c *Client) installationClient(installationID int64) (*github.Client, error
 		return nil, err
 	}
 
-	httpClient := &http.Client{
-		Transport: installationTransport,
-		Timeout:   c.httpClient.Timeout,
-	}
-
-	opts := []github.ClientOptionsFunc{github.WithHTTPClient(httpClient)}
-	if c.baseURL != "" {
-		opts = append(opts, github.WithURLs(&c.baseURL, &c.baseURL))
-	}
-
-	client, err := github.NewClient(opts...)
+	client, err := c.apiClient(installationTransport)
 	if err != nil {
 		return nil, fmt.Errorf("create GitHub client for installation %d: %w", installationID, err)
 	}
 
 	c.installationClients[installationID] = client
+	return client, nil
+}
+
+// apiClient returns a go-github client that authenticates through transport.
+func (c *Client) apiClient(transport http.RoundTripper) (*github.Client, error) {
+	opts := []github.ClientOptionsFunc{github.WithHTTPClient(&http.Client{Transport: transport, Timeout: c.httpClient.Timeout})}
+	if c.baseURL != "" {
+		opts = append(opts, github.WithURLs(&c.baseURL, &c.baseURL))
+	}
+	client, err := github.NewClient(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("create github client: %w", err)
+	}
 	return client, nil
 }
 
@@ -371,15 +377,23 @@ func (c *Client) installationTransportLocked(installationID int64) (*ghinstallat
 	return transport, nil
 }
 
-func (c *Client) newTransport(installationID int64) (*ghinstallation.Transport, error) {
-	// ghinstallation.refreshToken mutates the AppsTransport it wraps, so each
-	// transport needs its own rather than sharing one across goroutines.
+// newAppsTransport returns an App-JWT transport of its own: ghinstallation's
+// token refresh mutates it, so it must not be shared across goroutines.
+func (c *Client) newAppsTransport() (*ghinstallation.AppsTransport, error) {
 	appsTransport, err := ghinstallation.NewAppsTransport(c.transport, c.appID, c.privateKeyPEM)
 	if err != nil {
-		return nil, fmt.Errorf("create GitHub App transport for installation %d: %w", installationID, err)
+		return nil, fmt.Errorf("create GitHub App transport for app %d: %w", c.appID, err)
 	}
 	if c.baseURL != "" {
 		appsTransport.BaseURL = c.baseURL
+	}
+	return appsTransport, nil
+}
+
+func (c *Client) newTransport(installationID int64) (*ghinstallation.Transport, error) {
+	appsTransport, err := c.newAppsTransport()
+	if err != nil {
+		return nil, fmt.Errorf("installation %d: %w", installationID, err)
 	}
 
 	transport := ghinstallation.NewFromAppsTransport(appsTransport, installationID)
@@ -397,18 +411,11 @@ func (c *Client) appBotLogin(ctx context.Context) (string, error) {
 		return login, nil
 	}
 
-	appsTransport, err := ghinstallation.NewAppsTransport(c.transport, c.appID, c.privateKeyPEM)
+	appsTransport, err := c.newAppsTransport()
 	if err != nil {
-		return "", fmt.Errorf("create GitHub App transport for app %d: %w", c.appID, err)
+		return "", err
 	}
-	if c.baseURL != "" {
-		appsTransport.BaseURL = c.baseURL
-	}
-	opts := []github.ClientOptionsFunc{github.WithHTTPClient(&http.Client{Transport: appsTransport, Timeout: c.httpClient.Timeout})}
-	if c.baseURL != "" {
-		opts = append(opts, github.WithURLs(&c.baseURL, &c.baseURL))
-	}
-	client, err := github.NewClient(opts...)
+	client, err := c.apiClient(appsTransport)
 	if err != nil {
 		return "", fmt.Errorf("create GitHub App client for app %d: %w", c.appID, err)
 	}

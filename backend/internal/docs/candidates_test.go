@@ -19,6 +19,7 @@ func TestTreeCandidates(t *testing.T) {
 		covering("docs/a.md", "src/*.go"),
 		covering("docs/b.md", "src/*.go", "lib/*.go"),
 		covering("docs/c.md", "cmd/*.go"),
+		covering("docs/m.mdx", "mdx/*.go"),
 	}}
 
 	tests := []struct {
@@ -59,6 +60,11 @@ func TestTreeCandidates(t *testing.T) {
 			changes:        []docs.Change{{Path: "docs/a.txt", PreviousPath: "docs/a.md"}, {Path: "src/x.go"}},
 			wantCandidates: []string{"docs/b.md"},
 			wantDeleted:    []string{"docs/a.md"},
+		},
+		{
+			name:           "doc renamed to another mdx path is a candidate at the new path",
+			changes:        []docs.Change{{Path: "mdx/x.go"}, {Path: "docs/z.mdx", PreviousPath: "docs/m.mdx"}},
+			wantCandidates: []string{"docs/z.mdx"},
 		},
 		{
 			name:    "no match",

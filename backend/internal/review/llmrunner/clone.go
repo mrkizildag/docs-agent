@@ -28,7 +28,7 @@ var fullSHA = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
 type clone struct {
 	root      *os.Root
 	dir       string
-	remoteURL string
+	protocols string
 	token     string
 }
 
@@ -37,7 +37,7 @@ type clone struct {
 // if it's non-empty. The alsoFetch commits are only fetched, never checked
 // out. It returns the directory even on error once one was created, so the
 // caller can always remove it.
-func cloneAt(ctx context.Context, remoteURL, token, checkout string, alsoFetch ...string) (string, error) {
+func cloneAt(ctx context.Context, remoteURL, protocols, token, checkout string, alsoFetch ...string) (string, error) {
 	shas := append([]string{checkout}, alsoFetch...)
 	for _, sha := range shas {
 		if !fullSHA.MatchString(sha) {
@@ -56,7 +56,7 @@ func cloneAt(ctx context.Context, remoteURL, token, checkout string, alsoFetch .
 		{"checkout", "--detach", checkout},
 	}
 	for _, args := range steps {
-		if _, err := runGit(ctx, dir, remoteURL, token, args...); err != nil {
+		if _, err := runGit(ctx, dir, protocols, token, args...); err != nil {
 			return dir, fmt.Errorf("clone %s at %s: %w", remoteURL, checkout, err)
 		}
 	}
@@ -78,7 +78,8 @@ func (r *Runner) openClone(ctx context.Context, installationID int64, owner, rep
 		remoteURL = fmt.Sprintf("https://github.com/%s/%s.git", owner, repo)
 	}
 
-	dir, err := cloneAt(ctx, remoteURL, token, sha, alsoFetch...)
+	protocols := allowedProtocols(token)
+	dir, err := cloneAt(ctx, remoteURL, protocols, token, sha, alsoFetch...)
 	if err != nil {
 		if dir != "" {
 			_ = os.RemoveAll(dir) // best-effort cleanup of a temp dir; the runner has no logger
@@ -91,7 +92,7 @@ func (r *Runner) openClone(ctx context.Context, installationID int64, owner, rep
 		_ = os.RemoveAll(dir)
 		return nil, nil, fmt.Errorf("open clone root: %w", err)
 	}
-	return &clone{root: root, dir: dir, remoteURL: remoteURL, token: token}, func() {
+	return &clone{root: root, dir: dir, protocols: protocols, token: token}, func() {
 		_ = root.Close()
 		_ = os.RemoveAll(dir)
 	}, nil
@@ -101,9 +102,9 @@ func (r *Runner) openClone(ctx context.Context, installationID int64, owner, rep
 // objects and returns it as an in-memory fs.FS rooted at the repo
 // root. Nothing is checked out, so the PR's .gitattributes can't rewrite the
 // base docs, and the agent's root over the clone can't reach them. Only regular
-// .md files of at most docs.MaxDocBytes are included.
+// .md and .mdx files of at most docs.MaxDocBytes are included.
 func (c *clone) docsAt(ctx context.Context, baseSHA string) (fs.FS, error) {
-	listing, err := runGit(ctx, c.dir, c.remoteURL, c.token, "ls-tree", "-r", "-z", "--long", baseSHA, "--", "docs")
+	listing, err := runGit(ctx, c.dir, c.protocols, c.token, "ls-tree", "-r", "-z", "--long", baseSHA, "--", "docs")
 	if err != nil {
 		return nil, fmt.Errorf("list docs at %s: %w", baseSHA, err)
 	}
@@ -111,7 +112,7 @@ func (c *clone) docsAt(ctx context.Context, baseSHA string) (fs.FS, error) {
 	var paths, shas []string
 	for _, entry := range strings.Split(listing, "\x00") {
 		meta, path, ok := strings.Cut(entry, "\t")
-		if !ok || !strings.HasSuffix(path, ".md") {
+		if !ok || !isDocFile(path) {
 			continue
 		}
 		fields := strings.Fields(meta)
@@ -130,7 +131,7 @@ func (c *clone) docsAt(ctx context.Context, baseSHA string) (fs.FS, error) {
 		return files, nil
 	}
 
-	out, err := runGitStdin(ctx, c.dir, c.remoteURL, c.token, strings.Join(shas, "\n")+"\n", "cat-file", "--batch")
+	out, err := runGitStdin(ctx, c.dir, c.protocols, c.token, strings.Join(shas, "\n")+"\n", "cat-file", "--batch")
 	if err != nil {
 		return nil, fmt.Errorf("read docs at %s: %w", baseSHA, err)
 	}
@@ -157,17 +158,21 @@ func (c *clone) docsAt(ctx context.Context, baseSHA string) (fs.FS, error) {
 	return files, nil
 }
 
+func isDocFile(p string) bool {
+	return strings.HasSuffix(p, ".md") || strings.HasSuffix(p, ".mdx")
+}
+
 // runGit runs git in dir and returns its stdout.
-func runGit(ctx context.Context, dir, remoteURL, token string, args ...string) (string, error) {
-	return runGitStdin(ctx, dir, remoteURL, token, "", args...)
+func runGit(ctx context.Context, dir, protocols, token string, args ...string) (string, error) {
+	return runGitStdin(ctx, dir, protocols, token, "", args...)
 }
 
 // runGitStdin is runGit with stdin fed to git.
-func runGitStdin(ctx context.Context, dir, remoteURL, token, stdin string, args ...string) (string, error) {
+func runGitStdin(ctx context.Context, dir, protocols, token, stdin string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // args are fixed git subcommands plus validated SHAs and the runner's remote, not request text
 	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(stdin)
-	cmd.Env = gitEnv(dir, remoteURL, token)
+	cmd.Env = gitEnv(dir, protocols, token)
 	// git fetch forks git-remote-http, which inherits the output pipe; killing
 	// only git leaves it holding the pipe open, so kill the whole group.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -186,17 +191,22 @@ func runGitStdin(ctx context.Context, dir, remoteURL, token, stdin string, args 
 	return string(out), nil
 }
 
+// allowedProtocols is what git may speak: https whenever there is a token, so
+// the token never travels over anything else. Only tests clone without a token
+// (a local repo or server), so they may also use file and http.
+func allowedProtocols(token string) string {
+	if token != "" {
+		return "https"
+	}
+	return "https:file:http"
+}
+
 // gitEnv is the whole environment git runs in: it handles attacker-controlled
 // repository content, so it gets none of the server's secrets, no system or
-// user config, and only https and local-path remotes (plus http when the
-// remote itself is http). Without a token the caller's
-// GIT_CONFIG_COUNT/KEY_n/VALUE_n pass through so tests can redirect the remote
-// with url.<path>.insteadOf.
-func gitEnv(home, remoteURL, token string) []string {
-	protocols := "https:file"
-	if strings.HasPrefix(remoteURL, "http://") {
-		protocols += ":http"
-	}
+// user config, and only the protocols in protocols. Without a token the
+// caller's GIT_CONFIG_COUNT/KEY_n/VALUE_n pass through so tests can redirect
+// the remote with url.<path>.insteadOf.
+func gitEnv(home, protocols, token string) []string {
 	env := []string{
 		"HOME=" + home,
 		"GIT_CONFIG_NOSYSTEM=1",

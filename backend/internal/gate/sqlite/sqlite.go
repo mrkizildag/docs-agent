@@ -145,6 +145,8 @@ func migrations() []string {
 			linked INTEGER NOT NULL DEFAULT 0,
 			UNIQUE (owner, repo, check_run_id)
 		)`,
+		`ALTER TABLE jobs ADD COLUMN supersede_group TEXT NOT NULL DEFAULT '';
+		UPDATE jobs SET supersede_group = kind`,
 	}
 }
 

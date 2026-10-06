@@ -11,27 +11,49 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 )
 
+const prColumns = `installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, summary_comment_id, head_ref, proposals_sha,
+	fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha, failure_cause, pending_apply`
+
+// encodeRun flattens run into its stored columns; a nil run stores as zero values.
+func encodeRun(run *gate.AwaitingRun) (runID int64, nonce, deadline string) {
+	if run == nil {
+		return 0, "", ""
+	}
+	return run.RunID, run.Nonce, run.Deadline.UTC().Format(time.RFC3339Nano)
+}
+
+// decodeRun rebuilds the run from its stored columns; an empty nonce means no run is awaited.
+func decodeRun(runID int64, nonce, deadline string) (*gate.AwaitingRun, error) {
+	if nonce == "" {
+		return nil, nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, deadline)
+	if err != nil {
+		return nil, fmt.Errorf("parse run deadline %q: %w", deadline, err)
+	}
+	return &gate.AwaitingRun{RunID: runID, Nonce: nonce, Deadline: parsed}, nil
+}
+
 // LoadPR returns the state most recently saved for owner/repo#number, or the
 // zero-HeadSHA state (identity fields filled from the args) if it was never saved.
 func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gate.PRState, error) {
 	state := gate.PRState{Owner: owner, Repo: repo, Number: number}
 
-	var run gate.AwaitingRun
-	var deadline string
+	var runID int64
+	var nonce, deadline string
 	row := s.db.QueryRowContext(ctx,
-		`SELECT installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, summary_comment_id, head_ref, proposals_sha,
-			fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha, failure_cause, pending_apply
-		FROM pull_requests WHERE owner = ? AND repo = ? AND number = ?`,
+		`SELECT `+prColumns+` FROM pull_requests WHERE owner = ? AND repo = ? AND number = ?`,
 		owner, repo, number)
 
 	var pending gate.SkipAsk
 	var skip gate.Skip
 	var pendingApply string
-	if err := row.Scan(&state.InstallationID, &state.HeadSHA, &state.CheckRunID, &run.RunID, &run.Nonce, &deadline, &state.SummaryCommentID, &state.HeadRef, &state.ProposalsSHA,
-		&state.Fork, &pending.User, &pending.Scope, &skip.User, &skip.Scope, &skip.Reason, &skip.HeadSHA, &state.FailureCause, &pendingApply); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return state, nil
-		}
+	err := row.Scan(&state.InstallationID, &state.HeadSHA, &state.CheckRunID, &runID, &nonce, &deadline, &state.SummaryCommentID, &state.HeadRef, &state.ProposalsSHA,
+		&state.Fork, &pending.User, &pending.Scope, &skip.User, &skip.Scope, &skip.Reason, &skip.HeadSHA, &state.FailureCause, &pendingApply)
+	if errors.Is(err, sql.ErrNoRows) {
+		return state, nil
+	}
+	if err != nil {
 		return gate.PRState{}, fmt.Errorf("load pr %s/%s#%d: %w", owner, repo, number, err)
 	}
 
@@ -49,13 +71,8 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 		}
 	}
 
-	if run.Nonce != "" {
-		parsed, err := time.Parse(time.RFC3339Nano, deadline)
-		if err != nil {
-			return gate.PRState{}, fmt.Errorf("load pr %s/%s#%d: parse run deadline %q: %w", owner, repo, number, deadline, err)
-		}
-		run.Deadline = parsed
-		state.Run = &run
+	if state.Run, err = decodeRun(runID, nonce, deadline); err != nil {
+		return gate.PRState{}, fmt.Errorf("load pr %s/%s#%d: %w", owner, repo, number, err)
 	}
 
 	rows, err := s.db.QueryContext(ctx,
@@ -84,12 +101,7 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 // SavePR upserts state, keyed by owner/repo/number, replacing the PR's
 // proposal rows in the same transaction.
 func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
-	var run gate.AwaitingRun
-	var deadline string
-	if state.Run != nil {
-		run = *state.Run
-		deadline = run.Deadline.UTC().Format(time.RFC3339Nano)
-	}
+	runID, nonce, deadline := encodeRun(state.Run)
 
 	var pending gate.SkipAsk
 	if state.PendingSkip != nil {
@@ -115,8 +127,7 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO pull_requests (owner, repo, number, installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, summary_comment_id, head_ref, proposals_sha,
-			fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha, failure_cause, pending_apply)
+		INSERT INTO pull_requests (owner, repo, number, `+prColumns+`)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (owner, repo, number) DO UPDATE SET
 			installation_id = excluded.installation_id,
@@ -138,7 +149,7 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 			failure_cause = excluded.failure_cause,
 			pending_apply = excluded.pending_apply`,
 		state.Owner, state.Repo, state.Number, state.InstallationID, state.HeadSHA,
-		state.CheckRunID, run.RunID, run.Nonce, deadline, state.SummaryCommentID, state.HeadRef, state.ProposalsSHA,
+		state.CheckRunID, runID, nonce, deadline, state.SummaryCommentID, state.HeadRef, state.ProposalsSHA,
 		state.Fork, pending.User, pending.Scope, skip.User, skip.Scope, skip.Reason, skip.HeadSHA, state.FailureCause, string(pendingApply))
 	if err != nil {
 		return fmt.Errorf("save pr %s/%s#%d: %w", state.Owner, state.Repo, state.Number, err)
@@ -222,15 +233,15 @@ func (s *Store) OverdueRuns(ctx context.Context, now time.Time) ([]gate.OverdueR
 		return nil, err
 	}
 	scaffolds, err := s.overdue(ctx, now, true,
-		`SELECT owner, repo, 0, run_nonce, run_deadline FROM repo_scaffolds WHERE phase = 'awaiting' AND run_nonce != ''`)
+		`SELECT owner, repo, 0, run_nonce, run_deadline FROM repo_scaffolds WHERE phase = ? AND run_nonce != ''`, gate.ScaffoldAwaiting)
 	if err != nil {
 		return nil, err
 	}
 	return append(prs, scaffolds...), nil
 }
 
-func (s *Store) overdue(ctx context.Context, now time.Time, scaffold bool, query string) ([]gate.OverdueRun, error) {
-	rows, err := s.db.QueryContext(ctx, query)
+func (s *Store) overdue(ctx context.Context, now time.Time, scaffold bool, query string, args ...any) ([]gate.OverdueRun, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list awaited runs: %w", err)
 	}

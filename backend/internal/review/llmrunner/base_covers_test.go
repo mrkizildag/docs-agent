@@ -4,12 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/mrkizildag/pollux-agent/backend/internal/gitfixture"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
+	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/llmrunner"
 )
@@ -26,7 +27,7 @@ func docWithCovers(covers, body string) string {
 func startBaseToHead(t *testing.T, repoDir, baseSHA, headSHA string, changed []review.ChangedFile, script ...func(llm.Request) (llm.Response, error)) (review.Verdict, []llm.Request, error) {
 	t.Helper()
 
-	model := &fakeModel{script: script}
+	model := &llmtest.ScriptedModel{Script: script}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 	runner.SetRemote(repoDir)
 
@@ -35,13 +36,13 @@ func startBaseToHead(t *testing.T, repoDir, baseSHA, headSHA string, changed []r
 	req.ChangedFiles = changed
 	started, err := runner.Start(t.Context(), req)
 	if err != nil {
-		return nil, model.calls, fmt.Errorf("start: %w", err)
+		return nil, model.Calls, fmt.Errorf("start: %w", err)
 	}
 	result, ok := started.(review.Result)
 	if !ok {
 		t.Fatalf("Start() = %T, want review.Result", started)
 	}
-	return result.Verdict, model.calls, nil
+	return result.Verdict, model.Calls, nil
 }
 
 // mustStartBaseToHead is startBaseToHead for runs that must succeed.
@@ -160,18 +161,7 @@ func TestStart_RenamedCoveringDocIsTriagedAtItsNewPath(t *testing.T) {
 func removeFiles(t *testing.T, dir string, paths ...string) string {
 	t.Helper()
 
-	for _, args := range [][]string{append([]string{"rm", "-q"}, paths...), {"commit", "-q", "-m", "rm"}} {
-		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
-		cmd.Dir = dir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, out)
-		}
-	}
-	out, err := exec.CommandContext(t.Context(), "git", "-C", dir, "rev-parse", "HEAD").Output() //nolint:gosec // dir is a t.TempDir path, not external input
-	if err != nil {
-		t.Fatalf("rev-parse HEAD: %v", err)
-	}
-	return strings.TrimSpace(string(out))
+	return gitfixture.Remove(t, dir, "rm", paths...)
 }
 
 func TestStart_DeletedCoveringDocIsRestoredWithoutModelCalls(t *testing.T) {

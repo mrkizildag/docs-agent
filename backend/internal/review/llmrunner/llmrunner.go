@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -27,10 +28,18 @@ const runnerName = "llmrunner"
 // Caps on one analysis run, sized from measured runs on the Gemini free tier
 // (1-3 steps, at most 46k tokens).
 const (
-	stepCap         = 12
-	tokenBudget     = 120_000
-	analysisTimeout = 150 * time.Second
+	stepCap     = 12
+	tokenBudget = 120_000
+	// AnalysisTimeout must stay below gate.AnalysisDeadline; cmd/server tests it.
+	AnalysisTimeout = 150 * time.Second
 )
+
+// limits caps one agent run: its steps, total tokens, and wall-clock time.
+type limits struct {
+	steps   int
+	tokens  int
+	timeout time.Duration
+}
 
 // Runner implements review.Runner by triaging candidate docs with a small
 // model and drafting proposals with an agent loop.
@@ -40,10 +49,12 @@ type Runner struct {
 	triageModel string
 	model       string
 
-	// Test overrides; see export_test.go.
-	remote  string
-	timeout time.Duration
-	budget  int
+	analysisLimits limits
+	scaffoldLimits limits
+	log            *slog.Logger
+
+	// Test override; see export_test.go.
+	remote string
 }
 
 var (
@@ -54,7 +65,12 @@ var (
 // New returns a Runner that triages with triageModel, drafts with model, both
 // served by m, and authenticates clones with a token from token.
 func New(m llm.Model, token func(ctx context.Context, installationID int64, repo string) (string, error), triageModel, model string) *Runner {
-	return &Runner{m: m, token: token, triageModel: triageModel, model: model, timeout: analysisTimeout, budget: tokenBudget}
+	return &Runner{
+		m: m, token: token, triageModel: triageModel, model: model,
+		analysisLimits: limits{steps: stepCap, tokens: tokenBudget, timeout: AnalysisTimeout},
+		scaffoldLimits: limits{steps: scaffoldStepCap, tokens: scaffoldTokenBudget, timeout: scaffoldTimeout},
+		log:            slog.Default(),
+	}
 }
 
 var (
@@ -70,19 +86,22 @@ func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started,
 		return r.noImpact("no changed files"), nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	ctx, cancel := context.WithTimeout(ctx, r.analysisLimits.timeout)
 	defer cancel()
 
 	res, err := r.analyze(ctx, req)
 	if err != nil {
-		return nil, failed(fmt.Errorf("start analysis %s/%s#%d: %w", req.Owner, req.Repo, req.Number, err))
+		return nil, failed(ctx, fmt.Errorf("start analysis %s/%s#%d: %w", req.Owner, req.Repo, req.Number, err))
 	}
 	return res, nil
 }
 
-// failed classifies err into the *review.FailedError a runner returns.
-func failed(err error) *review.FailedError {
-	if errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, agent.ErrDeadline) {
+// failed classifies err from a run whose context is ctx into the
+// *review.FailedError a runner returns. The run's own deadline decides a
+// timeout: a provider HTTP timeout also matches DeadlineExceeded while the run
+// still has time, and that is a provider failure.
+func failed(ctx context.Context, err error) *review.FailedError {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) && !errors.Is(err, agent.ErrDeadline) {
 		err = fmt.Errorf("%w: %w", agent.ErrDeadline, err)
 	}
 	return &review.FailedError{Cause: classify(err), Err: err}
@@ -98,7 +117,7 @@ func classify(err error) review.FailureCause {
 		return review.CauseTooManyCandidates
 	case errors.Is(err, errClone):
 		return review.CauseClone
-	case errors.Is(err, errProvider):
+	case errors.Is(err, errProvider), errors.Is(err, agent.ErrModel):
 		return review.CauseProvider
 	default:
 		return review.CauseInternal
@@ -126,6 +145,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	if err != nil {
 		return review.Result{}, fmt.Errorf("base docs of %s: %w", req.BaseSHA, err)
 	}
+	r.logProblems(ctx, "base", req.BaseSHA, selection.Problems)
 	if len(selection.Restores) > 0 {
 		return review.Result{Runner: runnerName, Model: "", Verdict: review.Proposals(selection.Restores)}, nil
 	}
@@ -141,6 +161,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	if err != nil {
 		return review.Result{}, fmt.Errorf("parse docs of %s: %w", req.HeadSHA, err)
 	}
+	r.logProblems(ctx, "head", req.HeadSHA, headTree.Problems)
 	index := make(docIndex, len(headTree.Docs))
 	for _, d := range headTree.Docs {
 		index[d.Path] = d
@@ -160,7 +181,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	if err != nil {
 		return review.Result{}, err
 	}
-	budget := agent.NewBudget(r.budget)
+	budget := agent.NewBudget(r.analysisLimits.tokens)
 	patch := combinedPatch(req.ChangedFiles)
 
 	var impacted, reasons []string
@@ -191,7 +212,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	var kept []review.Proposal
 	var rejected []string
 	for _, p := range proposals {
-		supported, why, err := r.verify(ctx, index, budget, fence, p, patch)
+		supported, why, err := r.verify(ctx, budget, fence, p, patch)
 		if err != nil {
 			return review.Result{}, fmt.Errorf("verify proposal %s: %w", p.DocPath, err)
 		}
@@ -206,6 +227,14 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	}
 
 	return review.Result{Runner: runnerName, Model: r.model, Verdict: review.Proposals(kept)}, nil
+}
+
+// logProblems records docs that failed to parse: they silently drop out of
+// covers matching, so someone must be able to see why a doc was not reviewed.
+func (r *Runner) logProblems(ctx context.Context, side, sha string, problems []docs.Problem) {
+	for _, p := range problems {
+		r.log.WarnContext(ctx, "doc failed to parse and is skipped", "commit", side, "sha", sha, "path", p.Path, "err", p.Err)
+	}
 }
 
 // headDoc reads docPath from the head clone for a candidate that docs.Parse
@@ -240,11 +269,7 @@ const maxReasonLen = 300
 
 // oneLine collapses s onto a single line and truncates it to max bytes.
 func oneLine(s string, max int) string {
-	s = strings.Join(strings.Fields(s), " ")
-	if len(s) > max {
-		s = strings.ToValidUTF8(s[:max], "") + "..."
-	}
-	return s
+	return review.Truncate(strings.Join(strings.Fields(s), " "), max, "...")
 }
 
 // docIndex maps a repo-relative doc path to its parsed doc at the head commit;
@@ -313,19 +338,10 @@ func (r *Runner) triage(ctx context.Context, index docIndex, budget *agent.Budge
 
 // verify asks the triage model whether p is supported by the patch, given the
 // doc section p replaces.
-func (r *Runner) verify(ctx context.Context, index docIndex, budget *agent.Budget, f fence, p review.Proposal, patch string) (supported bool, reason string, err error) {
-	section := "(new doc)"
-	if p.Section != "" {
-		doc, ok := index[p.DocPath]
-		if ok {
-			text, _, found := lookupSection(doc, p.Section)
-			if !found {
-				text = string(doc.Source)
-			}
-			section = text
-		} else {
-			section = "(doc does not exist)"
-		}
+func (r *Runner) verify(ctx context.Context, budget *agent.Budget, f fence, p review.Proposal, patch string) (supported bool, reason string, err error) {
+	section := p.Original
+	if section == "" {
+		section = "(new doc)"
 	}
 
 	var v verifyVerdict
@@ -339,47 +355,19 @@ func (r *Runner) verify(ctx context.Context, index docIndex, budget *agent.Budge
 	return *v.Supported, v.Reason, nil
 }
 
-// normalizeSection strips leading '#'s and surrounding spaces from a section
-// heading as models write it.
-func normalizeSection(section string) string {
-	return strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(section), "#"))
-}
-
-// lookupSection returns the markdown under the heading titled heading. When
-// none matches it returns the quoted headings of the doc instead.
-func lookupSection(doc docs.Doc, heading string) (text string, headings []string, found bool) {
-	want := normalizeSection(heading)
-	for _, s := range doc.Sections {
-		if s.Level == 0 {
-			continue
-		}
-		if s.Heading == want {
-			return string(doc.Source[s.Start:s.End]), nil, true
-		}
-		headings = append(headings, fmt.Sprintf("%q", s.Heading))
-	}
-	return "", headings, false
-}
-
-// checkSection reports an error listing the doc's headings when section names
-// none of them. A doc missing at the head commit has no headings to check.
-func checkSection(index docIndex, docPath, section string) error {
-	doc, ok := index[docPath]
+// fillSection sets p.Original and p.Lines from the doc p replaces a section of.
+// p.Section is normalized. It reports why p cannot replace a section of its
+// doc: the doc is not in the index, or Section does not name exactly one
+// heading of it.
+func fillSection(index docIndex, p *review.Proposal) error {
+	doc, ok := index[p.DocPath]
 	if !ok {
-		return nil
+		return fmt.Errorf("section %q: %s is not an existing doc; leave section empty to create a new doc", p.Section, p.DocPath)
 	}
-	_, headings, found := lookupSection(doc, section)
-	if found {
-		return nil
+	if err := basedocs.FillOriginal(p, doc); err != nil {
+		return fmt.Errorf("check section of %s: %w", p.DocPath, err)
 	}
-	return fmt.Errorf("section %q: no such heading in %s; headings are: %s", section, docPath, strings.Join(headings, ", "))
-}
-
-// submitProposalsArgs is the argument shape of the submit_proposals finishing
-// tool: an object wrapping the array, since function-calling parameters must
-// be a JSON Schema object.
-type submitProposalsArgs struct {
-	Proposals []review.Proposal `json:"proposals"`
+	return nil
 }
 
 // draft runs the agent loop that drafts proposals for the impacted docs.
@@ -394,6 +382,7 @@ func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budge
 		impactedDocs[i] = index[p]
 	}
 
+	var accepted []review.Proposal
 	task := agent.Task{
 		Model:  r.model,
 		System: draftSystemPrompt,
@@ -401,71 +390,45 @@ func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budge
 		Root:   root,
 		Finish: finish,
 		Accept: func(args json.RawMessage) error {
-			var parsed submitProposalsArgs
+			var parsed review.ProposalsArgs
 			if err := json.Unmarshal(args, &parsed); err != nil {
 				return fmt.Errorf("decode submit_proposals arguments: %w", err)
 			}
-			for _, p := range parsed.Proposals {
+			for i := range parsed.Proposals {
+				p := &parsed.Proposals[i]
+				p.Section = review.NormalizeSection(p.Section)
 				if err := p.Validate(req.ChangedFiles); err != nil {
 					return fmt.Errorf("proposal %s: %w", p.DocPath, err)
 				}
 				if p.Section == "" {
 					continue
 				}
-				if err := checkSection(index, p.DocPath, normalizeSection(p.Section)); err != nil {
+				if err := fillSection(index, p); err != nil {
 					return fmt.Errorf("proposal %s: %w", p.DocPath, err)
 				}
 			}
+			accepted = parsed.Proposals
 			return nil
 		},
-		MaxSteps: stepCap,
+		MaxSteps: r.analysisLimits.steps,
 	}
 
-	raw, _, err := agent.Run(ctx, r.m, task, budget)
+	_, stats, err := agent.Run(ctx, r.m, task, budget)
+	r.logStats(ctx, "draft", stats)
 	if err != nil {
-		return nil, fmt.Errorf("draft proposals: %w: %w", errProvider, err)
+		return nil, fmt.Errorf("draft proposals: %w", err)
 	}
+	return accepted, nil
+}
 
-	var parsed submitProposalsArgs
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, fmt.Errorf("decode accepted submit_proposals arguments: %w", err)
-	}
-
-	for i := range parsed.Proposals {
-		p := &parsed.Proposals[i]
-		p.Section = normalizeSection(p.Section)
-		if p.Section == "" {
-			continue
-		}
-		if text, start, end, ok := index[p.DocPath].SectionSpan(p.Section); ok {
-			p.Original, p.Lines = text, review.LineRange{Start: start, End: end}
-		}
-	}
-	return parsed.Proposals, nil
+func (r *Runner) logStats(ctx context.Context, what string, stats agent.Stats) {
+	r.log.InfoContext(ctx, "agent run finished", "run", what, "steps", stats.Steps, "input_tokens", stats.InputTokens, "output_tokens", stats.OutputTokens)
 }
 
 func submitProposalsTool() (llm.Tool, error) {
-	proposalSchema, err := review.ProposalSchema()
+	schema, err := review.ProposalsArgsSchema()
 	if err != nil {
 		return llm.Tool{}, fmt.Errorf("build submit_proposals schema: %w", err)
-	}
-
-	schema, err := json.Marshal(struct {
-		Type       string         `json:"type"`
-		Properties map[string]any `json:"properties"`
-		Required   []string       `json:"required"`
-	}{
-		Type: "object",
-		Properties: map[string]any{
-			"proposals": map[string]any{
-				"type":  "array",
-				"items": json.RawMessage(proposalSchema),
-			},
-		},
-		Required: []string{"proposals"},
-	})
-	if err != nil {
-		return llm.Tool{}, fmt.Errorf("marshal submit_proposals schema: %w", err)
 	}
 
 	return llm.Tool{

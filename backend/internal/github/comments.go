@@ -24,37 +24,24 @@ func (c *Client) ListComments(ctx context.Context, installationID int64, owner, 
 
 	var comments []gate.Comment
 	reviewOpts := &github.PullRequestListCommentsOptions{ListOptions: github.ListOptions{PerPage: 100}}
-	for {
-		page, resp, err := client.PullRequests.ListComments(ctx, owner, repo, number, reviewOpts)
+	for rc, err := range client.PullRequests.ListCommentsIter(ctx, owner, repo, number, reviewOpts) {
 		if err != nil {
 			return nil, fmt.Errorf("list review comments %s/%s#%d: %w", owner, repo, number, err)
 		}
-		for _, rc := range page {
-			comments = append(comments, gate.Comment{
-				ID: rc.GetID(), Mine: rc.GetUser().GetLogin() == bot, Kind: gate.CommentKindReview, URL: rc.GetHTMLURL(), Body: rc.GetBody(),
-				Path: rc.GetPath(), StartLine: rc.GetStartLine(), Line: rc.GetLine(),
-			})
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		reviewOpts.Page = resp.NextPage
+		comments = append(comments, gate.Comment{
+			ID: rc.GetID(), Mine: rc.GetUser().GetLogin() == bot, Kind: gate.CommentKindReview, URL: rc.GetHTMLURL(), Body: rc.GetBody(),
+			Path: rc.GetPath(), StartLine: rc.GetStartLine(), Line: rc.GetLine(),
+		})
 	}
 
 	issueOpts := &github.IssueListCommentsOptions{ListOptions: github.ListOptions{PerPage: 100}}
-	for {
-		page, resp, err := client.Issues.ListComments(ctx, owner, repo, number, issueOpts)
+	for ic, err := range client.Issues.ListCommentsIter(ctx, owner, repo, number, issueOpts) {
 		if err != nil {
 			return nil, fmt.Errorf("list issue comments %s/%s#%d: %w", owner, repo, number, err)
 		}
-		for _, ic := range page {
-			comments = append(comments, gate.Comment{ID: ic.GetID(), Mine: ic.GetUser().GetLogin() == bot, Kind: gate.CommentKindIssue, URL: ic.GetHTMLURL(), Body: ic.GetBody()})
-		}
-		if resp.NextPage == 0 {
-			return comments, nil
-		}
-		issueOpts.Page = resp.NextPage
+		comments = append(comments, gate.Comment{ID: ic.GetID(), Mine: ic.GetUser().GetLogin() == bot, Kind: gate.CommentKindIssue, URL: ic.GetHTMLURL(), Body: ic.GetBody()})
 	}
+	return comments, nil
 }
 
 // CreateReviewComment creates a review comment on the right side of c.Path at

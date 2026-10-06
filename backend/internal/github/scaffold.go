@@ -13,8 +13,6 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 )
 
-var _ gate.ScaffoldGitHub = (*Client)(nil)
-
 // DocsExist reports whether owner/repo has any entry named docs at ref: a
 // directory, a file, or a submodule. Only a missing path is false.
 func (c *Client) DocsExist(ctx context.Context, installationID int64, owner, repo, ref string) (bool, error) {
@@ -40,16 +38,27 @@ func (c *Client) DefaultBranch(ctx context.Context, installationID int64, owner,
 		return "", "", fmt.Errorf("default branch of %s/%s: %w", owner, repo, err)
 	}
 
-	r, _, err := client.Repositories.Get(ctx, owner, repo)
+	name, err := defaultBranchName(ctx, client, owner, repo)
 	if err != nil {
-		return "", "", fmt.Errorf("default branch of %s/%s: get repository: %w", owner, repo, err)
+		return "", "", fmt.Errorf("default branch of %s/%s: %w", owner, repo, err)
 	}
-	name := r.GetDefaultBranch()
 	b, _, err := client.Repositories.GetBranch(ctx, owner, repo, name, 0)
 	if err != nil {
 		return "", "", fmt.Errorf("default branch of %s/%s: get branch %s: %w", owner, repo, name, err)
 	}
 	return name, b.GetCommit().GetSHA(), nil
+}
+
+func defaultBranchName(ctx context.Context, client *github.Client, owner, repo string) (string, error) {
+	r, _, err := client.Repositories.Get(ctx, owner, repo)
+	if err != nil {
+		return "", fmt.Errorf("get repository: %w", err)
+	}
+	return r.GetDefaultBranch(), nil
+}
+
+func branchRef(branch string) string {
+	return "refs/heads/" + branch
 }
 
 // CreateBranch creates branch at sha. It returns gate.ErrBranchExists when the
@@ -60,9 +69,9 @@ func (c *Client) CreateBranch(ctx context.Context, installationID int64, owner, 
 		return fmt.Errorf("create branch %s of %s/%s: %w", branch, owner, repo, err)
 	}
 
-	if _, _, err := client.Git.CreateRef(ctx, owner, repo, github.CreateRef{Ref: "refs/heads/" + branch, SHA: sha}); err != nil {
+	if _, _, err := client.Git.CreateRef(ctx, owner, repo, github.CreateRef{Ref: branchRef(branch), SHA: sha}); err != nil {
 		var apiErr *github.ErrorResponse
-		if errors.As(err, &apiErr) && apiErr.Response != nil && apiErr.Response.StatusCode == http.StatusUnprocessableEntity &&
+		if hasStatus(err, http.StatusUnprocessableEntity) && errors.As(err, &apiErr) &&
 			strings.Contains(apiErr.Message, "Reference already exists") {
 			return fmt.Errorf("create branch %s of %s/%s: %w", branch, owner, repo, gate.ErrBranchExists)
 		}
@@ -78,25 +87,10 @@ func (c *Client) ResetBranch(ctx context.Context, installationID int64, owner, r
 		return fmt.Errorf("reset branch %s of %s/%s: %w", branch, owner, repo, err)
 	}
 
-	force := true
-	if _, _, err := client.Git.UpdateRef(ctx, owner, repo, "refs/heads/"+branch, github.UpdateRef{SHA: sha, Force: &force}); err != nil {
+	if _, _, err := client.Git.UpdateRef(ctx, owner, repo, branchRef(branch), github.UpdateRef{SHA: sha, Force: new(true)}); err != nil {
 		return fmt.Errorf("reset branch %s of %s/%s: %w", branch, owner, repo, err)
 	}
 	return nil
-}
-
-// BranchSHA returns the commit branch points at.
-func (c *Client) BranchSHA(ctx context.Context, installationID int64, owner, repo, branch string) (string, error) {
-	client, err := c.installationClient(installationID)
-	if err != nil {
-		return "", fmt.Errorf("tip of %s/%s %s: %w", owner, repo, branch, err)
-	}
-
-	b, _, err := client.Repositories.GetBranch(ctx, owner, repo, branch, 0)
-	if err != nil {
-		return "", fmt.Errorf("tip of %s/%s %s: %w", owner, repo, branch, err)
-	}
-	return b.GetCommit().GetSHA(), nil
 }
 
 // CreatePullRequest opens a pull request from pr.Head into pr.Base.
@@ -114,8 +108,8 @@ func (c *Client) CreatePullRequest(ctx context.Context, installationID int64, ow
 }
 
 // FindPullRequest returns the pull request opened from branch of owner/repo
-// itself, preferring this App's bot's (open first), then an open one, over the rest. ByBot is set when its author
-// is this App's bot user.
+// itself, preferring this App's bot's open one, then the bot's, then any open
+// one, over the rest. ByBot is set when its author is this App's bot user.
 func (c *Client) FindPullRequest(ctx context.Context, installationID int64, owner, repo, branch string) (gate.ScaffoldPR, bool, error) {
 	client, err := c.installationClient(installationID)
 	if err != nil {
@@ -127,9 +121,13 @@ func (c *Client) FindPullRequest(ctx context.Context, installationID int64, owne
 		return gate.ScaffoldPR{}, false, fmt.Errorf("find pull request from %s in %s/%s: %w", branch, owner, repo, err)
 	}
 
-	list, _, err := client.PullRequests.List(ctx, owner, repo, &github.PullRequestListOptions{State: "all", Head: owner + ":" + branch, ListOptions: github.ListOptions{PerPage: 100}})
-	if err != nil {
-		return gate.ScaffoldPR{}, false, fmt.Errorf("find pull request from %s in %s/%s: %w", branch, owner, repo, err)
+	var list []*github.PullRequest
+	opts := &github.PullRequestListOptions{State: "all", Head: owner + ":" + branch, ListOptions: github.ListOptions{PerPage: 100}}
+	for pr, err := range client.PullRequests.ListIter(ctx, owner, repo, opts) {
+		if err != nil {
+			return gate.ScaffoldPR{}, false, fmt.Errorf("find pull request from %s in %s/%s: %w", branch, owner, repo, err)
+		}
+		list = append(list, pr)
 	}
 	if len(list) == 0 {
 		return gate.ScaffoldPR{}, false, nil

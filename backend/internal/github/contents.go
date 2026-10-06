@@ -7,10 +7,12 @@ import (
 	"github.com/google/go-github/v92/github"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/docs"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 // FileAtRef returns the content of the file at path in owner/repo at ref. ok
-// is false when the path is not a file at ref or the file exceeds docs.MaxDocBytes.
+// is false when the path is not a file at ref. It returns an error wrapping
+// review.ErrFileTooLarge when the file exceeds docs.MaxDocBytes.
 func (c *Client) FileAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (content []byte, ok bool, err error) {
 	client, err := c.installationClient(installationID)
 	if err != nil {
@@ -24,8 +26,11 @@ func (c *Client) FileAtRef(ctx context.Context, installationID int64, owner, rep
 		}
 		return nil, false, fmt.Errorf("read %s of %s/%s at %s: %w", path, owner, repo, ref, err)
 	}
-	if file == nil || file.GetSize() > docs.MaxDocBytes {
+	if file == nil {
 		return nil, false, nil
+	}
+	if file.GetSize() > docs.MaxDocBytes {
+		return nil, false, fmt.Errorf("read %s of %s/%s at %s: %d bytes exceed the %d byte cap: %w", path, owner, repo, ref, file.GetSize(), docs.MaxDocBytes, review.ErrFileTooLarge)
 	}
 
 	text, err := file.GetContent()

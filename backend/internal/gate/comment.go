@@ -163,10 +163,16 @@ func writeContext(ctx context.Context) (context.Context, context.CancelFunc) {
 // reply and a refusal reaction. A redelivery of an applied proposal only posts
 // what is still missing.
 func (s *Service) HandleComment(ctx context.Context, ev CommentEvent) error {
-	op := fmt.Sprintf("handle comment %d of %s/%s#%d", ev.CommentID, ev.Owner, ev.Repo, ev.Number)
+	if err := s.handleComment(ctx, ev); err != nil {
+		return fmt.Errorf("handle comment %d of %s/%s#%d: %w", ev.CommentID, ev.Owner, ev.Repo, ev.Number, err)
+	}
+	return nil
+}
+
+func (s *Service) handleComment(ctx context.Context, ev CommentEvent) error {
 	state, err := s.store.LoadPR(ctx, ev.Owner, ev.Repo, ev.Number)
 	if err != nil {
-		return fmt.Errorf("%s: load state: %w", op, err)
+		return fmt.Errorf("load state: %w", err)
 	}
 	intent := ParseIntent(ev, state)
 	if intent.Kind == IntentNone {
@@ -174,73 +180,73 @@ func (s *Service) HandleComment(ctx context.Context, ev CommentEvent) error {
 	}
 	state.InstallationID = cmp.Or(state.InstallationID, ev.InstallationID)
 
-	canWrite, err := s.comments.Permission(ctx, state.InstallationID, state.Owner, state.Repo, ev.Sender)
+	canWrite, err := s.gh.Permission(ctx, state.InstallationID, state.Owner, state.Repo, ev.Sender)
 	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
+		return fmt.Errorf("check permission of %s: %w", ev.Sender, err)
 	}
 	if !canWrite {
-		final, err := s.say(ctx, state, ev, "you need write access to this repository to do that.", op)
+		final, err := s.say(ctx, state, ev, "you need write access to this repository to do that.")
 		if err != nil {
 			return err
 		}
-		return s.settle(ctx, state, ev, 0, final, op)
+		return s.settle(ctx, state, ev, 0, final)
 	}
 
-	seen, err := s.comments.React(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, ReactionSeen)
+	seen, err := s.gh.React(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, ReactionSeen)
 	if err != nil {
-		return fmt.Errorf("%s: react %s: %w", op, ReactionSeen, err)
+		return fmt.Errorf("react %s: %w", ReactionSeen, err)
 	}
-	final, err := s.act(ctx, state, ev, intent, op)
+	final, err := s.act(ctx, state, ev, intent)
 	if err != nil {
 		return err
 	}
-	return s.settle(ctx, state, ev, seen, final, op)
+	return s.settle(ctx, state, ev, seen, final)
 }
 
 // act runs intent for ev, whose sender may write, and reports how it ended:
 // ReactionDone when the action completed, ReactionRefused when a reply told the
 // sender why not, "" when a newer job superseded it and left the work to that job.
-func (s *Service) act(ctx context.Context, state PRState, ev CommentEvent, in Intent, op string) (Reaction, error) {
+func (s *Service) act(ctx context.Context, state PRState, ev CommentEvent, in Intent) (Reaction, error) {
 	if state.HeadSHA == "" {
-		return s.say(ctx, state, ev, "pollux-agent hasn't analyzed this PR yet; push or reopen it, then try again.", op)
+		return s.say(ctx, state, ev, "pollux-agent hasn't analyzed this PR yet; push or reopen it, then try again.")
 	}
 	switch in.Kind {
 	case IntentApply, IntentApplyAll:
-		return s.handleApply(ctx, state, ev, in, op)
+		return s.handleApply(ctx, state, ev, in)
 	case IntentNone:
 		return ReactionDone, nil
 	case IntentSkipAsk, IntentSkip, IntentSkipReason:
-		return s.handleSkip(ctx, state, in, ev.Sender, op)
+		return s.handleSkip(ctx, state, in, ev.Sender)
 	case IntentRerun:
 		rerun := RerunRequest{InstallationID: state.InstallationID, PRRef: PRRef{Owner: ev.Owner, Repo: ev.Repo, Number: ev.Number}, SummaryCommentID: ev.CommentID}
 		var reported *reportedFailure
-		if err := s.HandleRerun(ctx, rerun); err != nil && !errors.As(err, &reported) {
+		if err := s.handleRerun(ctx, rerun); err != nil && !errors.As(err, &reported) {
 			if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) && !errors.Is(cause, context.DeadlineExceeded) {
 				return "", nil
 			}
-			return "", fmt.Errorf("%s: %w", op, err)
+			return "", fmt.Errorf("rerun: %w", err)
 		}
 		return ReactionDone, nil
 	default:
-		return "", fmt.Errorf("%s: unknown intent %d", op, in.Kind)
+		return "", fmt.Errorf("unknown intent %d", in.Kind)
 	}
 }
 
 // settle swaps the 👀 on ev's comment (seen, 0 when none was added) for final,
 // after the action's own writes; an empty final only removes the 👀.
-func (s *Service) settle(ctx context.Context, state PRState, ev CommentEvent, seen int64, final Reaction, op string) error {
+func (s *Service) settle(ctx context.Context, state PRState, ev CommentEvent, seen int64, final Reaction) error {
 	ctx, cancel := writeContext(ctx)
 	defer cancel()
 	if seen != 0 {
-		if err := s.comments.Unreact(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, seen); err != nil {
-			return fmt.Errorf("%s: remove %s reaction: %w", op, ReactionSeen, err)
+		if err := s.gh.Unreact(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, seen); err != nil {
+			return fmt.Errorf("remove %s reaction: %w", ReactionSeen, err)
 		}
 	}
 	if final == "" {
 		return nil
 	}
-	if _, err := s.comments.React(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, final); err != nil {
-		return fmt.Errorf("%s: react %s: %w", op, final, err)
+	if _, err := s.gh.React(ctx, state.InstallationID, state.Owner, state.Repo, ev.Kind, ev.CommentID, final); err != nil {
+		return fmt.Errorf("react %s: %w", final, err)
 	}
 	return nil
 }
@@ -248,18 +254,18 @@ func (s *Service) settle(ctx context.Context, state PRState, ev CommentEvent, se
 // say answers ev: in the review thread for a review comment, else as an issue
 // comment addressed to the sender. A refused tick is then unticked so it can be
 // ticked again. It returns ReactionRefused for the caller to settle.
-func (s *Service) say(ctx context.Context, state PRState, ev CommentEvent, text, op string) (Reaction, error) {
+func (s *Service) say(ctx context.Context, state PRState, ev CommentEvent, text string) (Reaction, error) {
 	ctx, cancel := writeContext(ctx)
 	defer cancel()
 	if ev.Kind == CommentKindReview {
-		if _, err := s.comments.ReplyToReviewComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, ev.CommentID, "@"+ev.Sender+" "+text); err != nil {
-			return "", fmt.Errorf("%s: reply: %w", op, err)
+		if _, err := s.gh.ReplyToReviewComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, ev.CommentID, "@"+ev.Sender+" "+text); err != nil {
+			return "", fmt.Errorf("reply: %w", err)
 		}
 	} else if _, err := s.gh.CreateIssueComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, "@"+ev.Sender+" "+text); err != nil {
-		return "", fmt.Errorf("%s: reply: %w", op, err)
+		return "", fmt.Errorf("reply: %w", err)
 	}
 	if strings.TrimSpace(ev.Ticked) != "" {
-		if err := s.untick(ctx, state, ev, op); err != nil {
+		if err := s.untick(ctx, state, ev); err != nil {
 			return "", err
 		}
 	}
@@ -268,16 +274,16 @@ func (s *Service) say(ctx context.Context, state PRState, ev CommentEvent, text,
 
 // untick restores the box ev ticked: the summary is redrawn from state, a
 // review comment loses the tick on its Apply box.
-func (s *Service) untick(ctx context.Context, state PRState, ev CommentEvent, op string) error {
+func (s *Service) untick(ctx context.Context, state PRState, ev CommentEvent) error {
 	if ev.Kind == CommentKindIssue {
 		if state.SummaryCommentID == 0 || ev.CommentID != state.SummaryCommentID {
 			return nil
 		}
-		return s.redrawSummary(ctx, state, op)
+		return s.redrawSummary(ctx, state)
 	}
 	existing, err := s.gh.ListComments(ctx, state.InstallationID, state.Owner, state.Repo, state.Number)
 	if err != nil {
-		return fmt.Errorf("%s: list comments: %w", op, err)
+		return fmt.Errorf("list comments: %w", err)
 	}
 	c, ok := findComment(existing, CommentKindReview, ev.CommentID)
 	if !ok {
@@ -288,19 +294,19 @@ func (s *Service) untick(ctx context.Context, state PRState, ev CommentEvent, op
 		return nil
 	}
 	if err := s.gh.EditReviewComment(ctx, state.InstallationID, state.Owner, state.Repo, ev.CommentID, body); err != nil {
-		return fmt.Errorf("%s: untick comment %d: %w", op, ev.CommentID, err)
+		return fmt.Errorf("untick comment %d: %w", ev.CommentID, err)
 	}
 	return nil
 }
 
 // redrawSummary rewrites the summary comment from state; it does nothing when
 // there is no summary comment.
-func (s *Service) redrawSummary(ctx context.Context, state PRState, op string) error {
+func (s *Service) redrawSummary(ctx context.Context, state PRState) error {
 	if state.SummaryCommentID == 0 {
 		return nil
 	}
 	if err := s.gh.EditIssueComment(ctx, state.InstallationID, state.Owner, state.Repo, state.SummaryCommentID, renderSummary(state)); err != nil {
-		return fmt.Errorf("%s: edit summary comment: %w", op, err)
+		return fmt.Errorf("edit summary comment: %w", err)
 	}
 	return nil
 }

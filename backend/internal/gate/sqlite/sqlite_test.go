@@ -11,23 +11,9 @@ import (
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite/sqlitetest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 )
-
-func open(t *testing.T) (*sqlite.Store, string) {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "state.db")
-	store, err := sqlite.Open(t.Context(), path)
-	if err != nil {
-		t.Fatalf("Open(%q) = %v, want nil error", path, err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Errorf("Close() = %v, want nil error", err)
-		}
-	})
-	return store, path
-}
 
 func TestOpen_MigrationsIdempotentOnReopen(t *testing.T) {
 	t.Parallel()
@@ -79,7 +65,7 @@ func TestOpen_RejectsANewerSchema(t *testing.T) {
 func TestLoadPR_Unseen(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 
 	got, err := store.LoadPR(t.Context(), "acme", "widgets", 7)
 	if err != nil {
@@ -95,7 +81,7 @@ func TestLoadPR_Unseen(t *testing.T) {
 func TestSavePR_RoundTripAndOverwrite(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	state := gate.PRState{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1"}
@@ -128,7 +114,7 @@ func TestSavePR_RoundTripAndOverwrite(t *testing.T) {
 func TestSavePR_RoundTripRunAndProposalsAndPRForRun(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	state := gate.PRState{
@@ -222,7 +208,7 @@ func TestSavePR_RoundTripForkAndSkips(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			store, _ := open(t)
+			store := sqlitetest.Open(t)
 			ctx := t.Context()
 			state := gate.PRState{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1"}
 			tc.edit(&state)
@@ -256,7 +242,7 @@ func TestSavePR_RoundTripForkAndSkips(t *testing.T) {
 func TestEnqueue_DuplicateDeliveryIsNoOp(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	job := jobqueue.NewJob{DeliveryID: "d1", Key: "owner/repo#1", Kind: "pull_request", Payload: []byte("a")}
@@ -296,7 +282,7 @@ func TestEnqueue_DuplicateDeliveryIsNoOp(t *testing.T) {
 func TestEnqueue_RedeliveryAfterFailedJobEnqueuesNewJob(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	enqueue(t, store, "d1", "owner/repo#1", "pull_request", false)
@@ -344,7 +330,7 @@ func TestEnqueue_RedeliveryAfterNonFailedJobStaysNoOp(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			store, _ := open(t)
+			store := sqlitetest.Open(t)
 			ctx := t.Context()
 
 			enqueue(t, store, "d1", "owner/repo#1", "pull_request", false)
@@ -375,7 +361,7 @@ func TestEnqueue_RedeliveryAfterNonFailedJobStaysNoOp(t *testing.T) {
 func TestClaim_OrderAndPerKeyExclusion(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	enqueue(t, store, "d1", "owner/repo#1", "pull_request", false)
@@ -422,7 +408,7 @@ func TestClaim_OrderAndPerKeyExclusion(t *testing.T) {
 func TestEnqueue_DifferentKindNotSuperseded(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	enqueue(t, store, "d1", "owner/repo#1", "sync", false)
@@ -446,7 +432,7 @@ func TestEnqueue_DifferentKindNotSuperseded(t *testing.T) {
 func TestEnqueue_SupersedesPending(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	enqueue(t, store, "d1", "owner/repo#1", "sync", false)
@@ -476,7 +462,7 @@ func TestEnqueue_SupersedesPending(t *testing.T) {
 func TestEnqueue_SupersedesRunning(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	enqueue(t, store, "d1", "owner/repo#1", "sync", false)
@@ -495,7 +481,7 @@ func TestEnqueue_SupersedesRunning(t *testing.T) {
 func TestRequeueRunning(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	enqueue(t, store, "d1", "owner/repo#1", "pull_request", false)
@@ -525,7 +511,7 @@ func TestRequeueRunning(t *testing.T) {
 func TestData_SurvivesCloseAndOpen(t *testing.T) {
 	t.Parallel()
 
-	store, path := open(t)
+	store, path := sqlitetest.OpenPath(t)
 	ctx := t.Context()
 
 	if err := store.SavePR(ctx, gate.PRState{Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1"}); err != nil {
@@ -593,7 +579,7 @@ func enqueueWithResult(t *testing.T, store *sqlite.Store, deliveryID, key, kind 
 func TestOverdueRuns(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
@@ -620,7 +606,7 @@ func TestOverdueRuns(t *testing.T) {
 func TestPRsForHead(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 	for _, st := range []gate.PRState{
 		{Owner: "acme", Repo: "widgets", Number: 8, HeadSHA: "a"},
@@ -642,5 +628,82 @@ func TestPRsForHead(t *testing.T) {
 	}
 	if got, err := store.PRsForHead(ctx, "acme", "widgets", "zzz"); err != nil || len(got) != 0 {
 		t.Errorf("PRsForHead(unknown head) = %v, %v, want none", got, err)
+	}
+}
+
+func TestEnqueue_SupersedesAcrossKindsInTheSameGroup(t *testing.T) {
+	t.Parallel()
+
+	store := sqlitetest.Open(t)
+	ctx := t.Context()
+
+	ok, _, err := store.Enqueue(ctx, jobqueue.NewJob{DeliveryID: "d1", Key: "owner/repo#1", Kind: "rerun", Group: "pull_request", Payload: []byte("p")})
+	if err != nil || !ok {
+		t.Fatalf("Enqueue(rerun) = (%v, %v), want ok", ok, err)
+	}
+	ok, _, err = store.Enqueue(ctx, jobqueue.NewJob{DeliveryID: "d2", Key: "owner/repo#1", Kind: "pull_request", Group: "pull_request", Payload: []byte("p"), Supersedes: true})
+	if err != nil || !ok {
+		t.Fatalf("Enqueue(pull_request) = (%v, %v), want ok", ok, err)
+	}
+
+	claimed, ok, err := store.Claim(ctx)
+	if err != nil || !ok {
+		t.Fatalf("Claim() = (%+v, %v, %v), want ok", claimed, ok, err)
+	}
+	if claimed.Kind != "pull_request" {
+		t.Errorf("Claim() kind = %q, want pull_request: the rerun in the same group must be superseded", claimed.Kind)
+	}
+	if _, ok, err := store.Claim(ctx); err != nil || ok {
+		t.Errorf("second Claim() = (%v, %v), want nothing left", ok, err)
+	}
+}
+
+func TestOpen_BackfillsTheSupersedeGroupOfQueuedJobsToTheirKind(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := sqlite.Open(t.Context(), path)
+	if err != nil {
+		t.Fatalf("Open() = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+
+	// Rewind to the schema before the supersede_group migration, with a job queued then.
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open() = %v", err)
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE jobs DROP COLUMN supersede_group`,
+		`INSERT INTO jobs (key, kind, payload, state, created_at, updated_at, delivery_id)
+		 VALUES ('owner/repo#1', 'pull_request', 'old', 'pending', 't', 't', 'old')`,
+		`PRAGMA user_version = 9`,
+	} {
+		if _, err := db.ExecContext(t.Context(), stmt); err != nil {
+			t.Fatalf("exec %q = %v", stmt, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+
+	store, err = sqlite.Open(t.Context(), path)
+	if err != nil {
+		t.Fatalf("reopen = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	enqueue(t, store, "d2", "owner/repo#1", "pull_request", true)
+	claimed, ok, err := store.Claim(t.Context())
+	if err != nil || !ok {
+		t.Fatalf("Claim() = (%+v, %v, %v), want ok", claimed, ok, err)
+	}
+	if claimed.DeliveryID != "d2" {
+		t.Errorf("Claim() delivery = %q, want d2: the job queued before the migration must be superseded", claimed.DeliveryID)
+	}
+	if _, ok, err := store.Claim(t.Context()); err != nil || ok {
+		t.Errorf("second Claim() = (%v, %v), want nothing left", ok, err)
 	}
 }

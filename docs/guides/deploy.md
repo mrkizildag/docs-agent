@@ -13,12 +13,13 @@ covers:
 
 pollux runs as one container on a single host, started with Docker Compose. Tailscale Funnel runs on the host's own `tailscaled` (not in a container) and forwards public HTTPS to the container, so GitHub can reach `POST /webhook` without opening ports on the host.
 
-The image is built in stages from static Go binaries and runs on distroless `static-debian12:nonroot` as uid 65532. There is no shell in it. The image includes a `/healthcheck` binary that the compose health check runs against `/healthz`.
+The image is built in stages from static Go binaries and runs on `debian:bookworm-slim` (pinned by digest) with only `git` and `ca-certificates` added, as uid 65532 (`nonroot`, login shell `nologin`). `git` is there because the server runner clones the PR head; the server refuses to start with `LLM_PROVIDER` set if `git` is missing from the PATH. The healthcheck needs no shell. The image includes a `/healthcheck` binary that the compose health check runs against `/healthz`.
 
 `compose.yaml` at the repo root defines the `pollux` service:
 
 - The port is published on `127.0.0.1:8080` only. Nothing but the host (and Funnel) can reach it.
 - The named volume `pollux-data` is mounted at `/data`. The SQLite database lives at `/data/pollux.db` and holds the job queue and PR state.
+- The root filesystem is read-only; `/tmp` is a tmpfs, which is where the server runner clones each PR head.
 - `restart: unless-stopped` brings it back after a reboot or crash.
 
 ## First deploy
@@ -83,7 +84,7 @@ The database lives in the `pollux-data` volume. Backups are not covered here.
 ## Troubleshooting
 
 - **`permission denied` reading the private key**: the container runs as uid 65532. Re-run the `chmod` from step 2 on the host file that `GITHUB_APP_PRIVATE_KEY_FILE` points to.
-- **Container `unhealthy`**: check `docker compose logs pollux` for why the server is not serving, then `curl http://127.0.0.1:8080/healthz` from the host. The distroless image has no shell, so `docker compose exec` into it will not work.
+- **Container `unhealthy`**: check `docker compose logs pollux` for why the server is not serving, then `curl http://127.0.0.1:8080/healthz` from the host. The image has `/bin/sh`: `docker compose exec pollux sh` gives a shell as uid 65532, and the root filesystem is read-only. Logs and the host `curl` are usually enough.
 - **Exits right after start with a config error**: a required variable in `.env` is missing or invalid; the log line names it. See [Setup](setup.md). Remember `ADDR`, `DATABASE_PATH`, and the key path inside the container are set by compose.
 - **`pollux-deploy` rolled back**: its output shows the failing step (fetch, build, or health wait); `docker compose logs pollux` shows why the new container didn't turn healthy.
 - **Deliveries fail from GitHub but `/healthz` is fine**: run `tailscale funnel status` and confirm the URL and the `/webhook` path match the App's webhook URL.

@@ -18,8 +18,8 @@ func now() string {
 // transaction. A delivery seen before is a no-op unless every job recorded
 // against it ended failed: GitHub reuses a delivery ID on Redeliver, and a
 // failed delivery must be retryable. If job.Supersedes, older pending jobs
-// with the same key+kind are marked superseded, and the IDs of older running
-// jobs with the same key+kind are returned (left running; the caller cancels
+// with the same key+group are marked superseded, and the IDs of older running
+// jobs with the same key+group are returned (left running; the caller cancels
 // them).
 func (s *Store) Enqueue(ctx context.Context, job jobqueue.NewJob) (bool, []int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -44,10 +44,14 @@ func (s *Store) Enqueue(ctx context.Context, job jobqueue.NewJob) (bool, []int64
 		}
 	}
 
+	group := job.Group
+	if group == "" {
+		group = job.Kind
+	}
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO jobs (key, kind, payload, state, error, created_at, updated_at, delivery_id)
-		 VALUES (?, ?, ?, ?, '', ?, ?, ?)`,
-		job.Key, job.Kind, job.Payload, jobqueue.StatePending, ts, ts, job.DeliveryID)
+		`INSERT INTO jobs (key, kind, supersede_group, payload, state, error, created_at, updated_at, delivery_id)
+		 VALUES (?, ?, ?, ?, ?, '', ?, ?, ?)`,
+		job.Key, job.Kind, group, job.Payload, jobqueue.StatePending, ts, ts, job.DeliveryID)
 	if err != nil {
 		return false, nil, fmt.Errorf("enqueue job: insert job: %w", err)
 	}
@@ -59,7 +63,7 @@ func (s *Store) Enqueue(ctx context.Context, job jobqueue.NewJob) (bool, []int64
 
 	var supersededRunning []int64
 	if job.Supersedes {
-		supersededRunning, err = supersede(ctx, tx, job.Key, job.Kind, newID, ts)
+		supersededRunning, err = supersede(ctx, tx, job.Key, group, newID, ts)
 		if err != nil {
 			return false, nil, err
 		}
@@ -85,18 +89,18 @@ func deliveryOnlyHasFailedJobs(ctx context.Context, tx *sql.Tx, deliveryID strin
 	return notFailed == 0, nil
 }
 
-// supersede marks older pending jobs with the given key+kind as superseded,
-// and returns the IDs of older running jobs with the same key+kind.
-func supersede(ctx context.Context, tx *sql.Tx, key, kind string, newID int64, ts string) ([]int64, error) {
+// supersede marks older pending jobs with the given key+group as superseded,
+// and returns the IDs of older running jobs with the same key+group.
+func supersede(ctx context.Context, tx *sql.Tx, key, group string, newID int64, ts string) ([]int64, error) {
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET state = ?, updated_at = ? WHERE key = ? AND kind = ? AND state = ? AND id != ?`,
-		jobqueue.StateSuperseded, ts, key, kind, jobqueue.StatePending, newID); err != nil {
+		`UPDATE jobs SET state = ?, updated_at = ? WHERE key = ? AND supersede_group = ? AND state = ? AND id != ?`,
+		jobqueue.StateSuperseded, ts, key, group, jobqueue.StatePending, newID); err != nil {
 		return nil, fmt.Errorf("enqueue job: supersede pending: %w", err)
 	}
 
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id FROM jobs WHERE key = ? AND kind = ? AND state = ? AND id != ?`,
-		key, kind, jobqueue.StateRunning, newID)
+		`SELECT id FROM jobs WHERE key = ? AND supersede_group = ? AND state = ? AND id != ?`,
+		key, group, jobqueue.StateRunning, newID)
 	if err != nil {
 		return nil, fmt.Errorf("enqueue job: select running: %w", err)
 	}
@@ -127,7 +131,7 @@ func (s *Store) Claim(ctx context.Context) (jobqueue.Job, bool, error) {
 	defer func() { _ = tx.Rollback() }()
 
 	row := tx.QueryRowContext(ctx, `
-		SELECT id, key, kind, payload FROM jobs
+		SELECT id, key, kind, payload, delivery_id FROM jobs
 		WHERE state = ?
 		  AND key NOT IN (SELECT key FROM jobs WHERE state = ?)
 		ORDER BY id
@@ -135,7 +139,7 @@ func (s *Store) Claim(ctx context.Context) (jobqueue.Job, bool, error) {
 		jobqueue.StatePending, jobqueue.StateRunning)
 
 	var job jobqueue.Job
-	if err := row.Scan(&job.ID, &job.Key, &job.Kind, &job.Payload); err != nil {
+	if err := row.Scan(&job.ID, &job.Key, &job.Kind, &job.Payload, &job.DeliveryID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return jobqueue.Job{}, false, nil
 		}
@@ -155,11 +159,12 @@ func (s *Store) Claim(ctx context.Context) (jobqueue.Job, bool, error) {
 	return job, true, nil
 }
 
-// Finish sets the terminal state, error message, and updated_at for job id.
+// Finish sets the terminal state, error message, and updated_at for running job
+// id. A job already in a terminal state is left as it is.
 func (s *Store) Finish(ctx context.Context, id int64, state jobqueue.State, errMsg string) error {
 	if _, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET state = ?, error = ?, updated_at = ? WHERE id = ?`,
-		state, errMsg, now(), id); err != nil {
+		`UPDATE jobs SET state = ?, error = ?, updated_at = ? WHERE id = ? AND state = ?`,
+		state, errMsg, now(), id, jobqueue.StateRunning); err != nil {
 		return fmt.Errorf("finish job %d: %w", id, err)
 	}
 	return nil

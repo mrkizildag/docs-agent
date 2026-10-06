@@ -25,7 +25,7 @@ const (
 		"Edit them freely; Pollux will keep them current in later pull requests. It opens this pull request once and does not update it."
 )
 
-// ErrBranchExists is returned by ScaffoldGitHub.CreateBranch when the branch already exists.
+// ErrBranchExists is returned by GitHub.CreateBranch when the branch already exists.
 var ErrBranchExists = errors.New("gate: branch exists")
 
 // RepoRef identifies a repository.
@@ -82,20 +82,6 @@ type NewPullRequest struct {
 	Body  string
 	Head  string
 	Base  string
-}
-
-// ScaffoldGitHub is what writing and proposing a scaffold needs from GitHub.
-type ScaffoldGitHub interface {
-	// DefaultBranch returns the default branch's name and tip commit.
-	DefaultBranch(ctx context.Context, installationID int64, owner, repo string) (name, sha string, err error)
-	// CreateBranch creates branch at sha; it returns ErrBranchExists when branch exists.
-	CreateBranch(ctx context.Context, installationID int64, owner, repo, branch, sha string) error
-	// ResetBranch force-moves an existing branch to sha.
-	ResetBranch(ctx context.Context, installationID int64, owner, repo, branch, sha string) error
-	BranchSHA(ctx context.Context, installationID int64, owner, repo, branch string) (string, error)
-	CreatePullRequest(ctx context.Context, installationID int64, owner, repo string, pr NewPullRequest) (ScaffoldPR, error)
-	// FindPullRequest returns the pull request opened from branch, preferring the bot's (open first), then an open one, over the rest.
-	FindPullRequest(ctx context.Context, installationID int64, owner, repo, branch string) (pr ScaffoldPR, ok bool, err error)
 }
 
 // ScaffoldQueue schedules the repo-keyed job that writes the scaffold; one
@@ -164,11 +150,11 @@ func OnScaffoldDocsPresent(s ScaffoldState) ScaffoldState {
 	return s
 }
 
-// OnScaffoldNoRunner is the state transition for a job that finds no runner to
+// onScaffoldNoRunner is the state transition for a job that finds no runner to
 // write the files: pure, no I/O. It bumps Attempt but not Failures, because the
 // job for the finished attempt must not swallow the next request and a missing
 // runner is not a failed attempt.
-func OnScaffoldNoRunner(s ScaffoldState) ScaffoldState {
+func onScaffoldNoRunner(s ScaffoldState) ScaffoldState {
 	s.Attempt++
 	s.Phase, s.Run = ScaffoldIdle, nil
 	return s
@@ -189,6 +175,13 @@ func ScaffoldOverdue(state ScaffoldState, now time.Time) bool {
 func noRunnerRun(headSHA string) CheckRun {
 	run := CheckRun{Name: CheckName, HeadSHA: headSHA, Status: StatusCompleted}
 	return neutral(run, noDocsTitle, "No scaffold can be written until an analysis runner is set up: "+setupGuideURL)
+}
+
+// noAnalysisRunnerRun is the neutral check run of a PR whose head has docs/
+// when no analysis runner is configured.
+func noAnalysisRunnerRun(headSHA string) CheckRun {
+	run := CheckRun{Name: CheckName, HeadSHA: headSHA, Status: StatusCompleted}
+	return neutral(run, "No analysis runner configured", "Set up an analysis runner: "+setupGuideURL)
 }
 
 // noDocsRun is the neutral check run of a PR whose head has no docs/ folder
@@ -223,19 +216,20 @@ func docsPresentRun(headSHA string) CheckRun {
 	return neutral(run, noDocsTitle, "The default branch already has a docs/ folder, so Pollux wrote no scaffold. Merge or rebase the default branch into this pull request to have its docs analyzed.")
 }
 
-// concludeNoDocs reports the neutral check run of a PR without docs/ when no
-// runner could write a scaffold.
-func (s *Service) concludeNoDocs(ctx context.Context, state PRState, pr PullRequest) error {
-	id, err := s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, noRunnerRun(pr.HeadSHA))
-	if err != nil {
-		return fmt.Errorf("create check run: %w", err)
-	}
-	next := OnPush(state, pr)
-	next.CheckRunID = id
-	if err := s.store.SavePR(ctx, next); err != nil {
+// saveScaffold saves state within a write budget that survives a cancelled ctx.
+func (s *Service) saveScaffold(ctx context.Context, state ScaffoldState) error {
+	ctx, cancel := writeContext(ctx)
+	defer cancel()
+	if err := s.store.SaveScaffold(ctx, state); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}
 	return nil
+}
+
+// concludeNoDocs reports the neutral check run of a PR without docs/ when no
+// runner could write a scaffold.
+func (s *Service) concludeNoDocs(ctx context.Context, state PRState, pr PullRequest) error {
+	return s.concludeWithRun(ctx, OnPush(state, pr), noRunnerRun(pr.HeadSHA))
 }
 
 // requestScaffold reports the neutral check run of a PR without docs/ and asks
@@ -278,18 +272,21 @@ func (s *Service) requestScaffold(ctx context.Context, state PRState, pr PullReq
 // the PR exists leaves the scaffold to be requested again by the next PR event
 // and is returned.
 func (s *Service) HandleScaffold(ctx context.Context, ref RepoRef) error {
-	op := fmt.Sprintf("handle scaffold of %s/%s", ref.Owner, ref.Repo)
+	if err := s.handleScaffold(ctx, ref); err != nil {
+		return fmt.Errorf("handle scaffold of %s/%s: %w", ref.Owner, ref.Repo, err)
+	}
+	return nil
+}
+
+func (s *Service) handleScaffold(ctx context.Context, ref RepoRef) error {
 	state, err := s.store.LoadScaffold(ctx, ref.Owner, ref.Repo)
 	if err != nil {
-		return fmt.Errorf("%s: load state: %w", op, err)
+		return fmt.Errorf("load state: %w", err)
 	}
 	if state.Phase == ScaffoldAwaiting || state.Phase == ScaffoldGaveUp {
 		return nil
 	}
-	if err := s.advanceScaffold(ctx, state); err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-	return nil
+	return s.advanceScaffold(ctx, state)
 }
 
 // HandleScaffoldRun continues the scaffold from the external run rc reports, if
@@ -297,10 +294,16 @@ func (s *Service) HandleScaffold(ctx context.Context, ref RepoRef) error {
 // failed or whose result is unusable fails the attempt; a result that could not
 // be read is returned for retry.
 func (s *Service) HandleScaffoldRun(ctx context.Context, rc RunCompleted) error {
-	op := fmt.Sprintf("handle scaffold run %d of %s/%s", rc.RunID, rc.Owner, rc.Repo)
+	if err := s.handleScaffoldRun(ctx, rc); err != nil {
+		return fmt.Errorf("handle scaffold run %d of %s/%s: %w", rc.RunID, rc.Owner, rc.Repo, err)
+	}
+	return nil
+}
+
+func (s *Service) handleScaffoldRun(ctx context.Context, rc RunCompleted) error {
 	state, err := s.store.LoadScaffold(ctx, rc.Owner, rc.Repo)
 	if err != nil {
-		return fmt.Errorf("%s: load state: %w", op, err)
+		return fmt.Errorf("load state: %w", err)
 	}
 	if !MatchesScaffoldRun(state, rc) {
 		return nil
@@ -311,7 +314,7 @@ func (s *Service) HandleScaffoldRun(ctx context.Context, rc RunCompleted) error 
 		var invalid *review.InvalidResultError
 		files, err = s.collectScaffold(ctx, state)
 		if err != nil && !errors.As(err, &invalid) {
-			return fmt.Errorf("%s: %w", op, err)
+			return err
 		}
 	} else {
 		err = fmt.Errorf("workflow run concluded %q", rc.Conclusion)
@@ -320,18 +323,15 @@ func (s *Service) HandleScaffoldRun(ctx context.Context, rc RunCompleted) error 
 		if serr := s.saveScaffoldFailed(ctx, state); serr != nil {
 			err = errors.Join(err, serr)
 		}
-		return fmt.Errorf("%s: %w", op, err)
+		return err
 	}
 
-	writeCtx, cancel := writeContext(ctx)
 	state = OnScaffoldWritten(state, files)
-	err = s.store.SaveScaffold(writeCtx, state)
-	cancel()
-	if err != nil {
-		return fmt.Errorf("%s: save state: %w", op, err)
+	if err := s.saveScaffold(ctx, state); err != nil {
+		return err
 	}
 	if err := s.advanceScaffold(ctx, state); err != nil {
-		return fmt.Errorf("%s: %w", op, s.healWaiters(ctx, RepoRef{Owner: rc.Owner, Repo: rc.Repo}, err))
+		return s.healWaiters(ctx, RepoRef{Owner: rc.Owner, Repo: rc.Repo}, err)
 	}
 	return nil
 }
@@ -339,18 +339,21 @@ func (s *Service) HandleScaffoldRun(ctx context.Context, rc RunCompleted) error 
 // HandleScaffoldDeadline fails the scaffold attempt if the run identified by
 // nonce is still awaited for ref and overdue at now; otherwise it does nothing.
 func (s *Service) HandleScaffoldDeadline(ctx context.Context, ref RepoRef, nonce string, now time.Time) error {
-	op := fmt.Sprintf("handle scaffold deadline of %s/%s", ref.Owner, ref.Repo)
+	if err := s.handleScaffoldDeadline(ctx, ref, nonce, now); err != nil {
+		return fmt.Errorf("handle scaffold deadline of %s/%s: %w", ref.Owner, ref.Repo, err)
+	}
+	return nil
+}
+
+func (s *Service) handleScaffoldDeadline(ctx context.Context, ref RepoRef, nonce string, now time.Time) error {
 	state, err := s.store.LoadScaffold(ctx, ref.Owner, ref.Repo)
 	if err != nil {
-		return fmt.Errorf("%s: load state: %w", op, err)
+		return fmt.Errorf("load state: %w", err)
 	}
 	if !ScaffoldOverdue(state, now) || state.Run.Nonce != nonce {
 		return nil
 	}
-	if err := s.saveScaffoldFailed(ctx, state); err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-	return nil
+	return s.saveScaffoldFailed(ctx, state)
 }
 
 // healWaiters returns err, after enqueueing a scaffold job for the saved
@@ -430,7 +433,7 @@ func (s *Service) collectScaffold(ctx context.Context, state ScaffoldState) (rev
 		RunID:          state.Run.RunID,
 		Nonce:          state.Run.Nonce,
 	}
-	files, err := collectWithRetry(ctx, s.collectBackoff, func(ctx context.Context) (review.Scaffold, error) {
+	files, err := retry(ctx, collectAttempts, s.retryBackoff, func(ctx context.Context) (review.Scaffold, error) {
 		return s.runners.Actions.CollectScaffold(ctx, completion)
 	})
 	if err != nil {
@@ -444,7 +447,7 @@ func (s *Service) collectScaffold(ctx context.Context, state ScaffoldState) (rev
 // which holds the files once they are written.
 func (s *Service) proposeScaffold(ctx context.Context, state ScaffoldState) (ScaffoldState, error) {
 	inst, owner, repo := state.InstallationID, state.Owner, state.Repo
-	base, tip, err := s.scaffoldGH.DefaultBranch(ctx, inst, owner, repo)
+	base, tip, err := s.gh.DefaultBranch(ctx, inst, owner, repo)
 	if err != nil {
 		return state, fmt.Errorf("find default branch: %w", err)
 	}
@@ -468,12 +471,7 @@ func (s *Service) proposeScaffold(ctx context.Context, state ScaffoldState) (Sca
 		return state, err
 	}
 	state = OnScaffoldOpened(state, pr)
-	writeCtx, cancel := writeContext(ctx)
-	defer cancel()
-	if err := s.store.SaveScaffold(writeCtx, state); err != nil {
-		return state, fmt.Errorf("save state: %w", err)
-	}
-	return state, nil
+	return state, s.saveScaffold(ctx, state)
 }
 
 // concludeDocsPresent frees the scaffold for a later request, then tells the
@@ -482,11 +480,8 @@ func (s *Service) proposeScaffold(ctx context.Context, state ScaffoldState) (Sca
 // *waitersError, and a job for the saved state finds the waiters still unlinked.
 func (s *Service) concludeDocsPresent(ctx context.Context, state ScaffoldState) (ScaffoldState, error) {
 	done := OnScaffoldDocsPresent(state)
-	writeCtx, cancel := writeContext(ctx)
-	err := s.store.SaveScaffold(writeCtx, done)
-	cancel()
-	if err != nil {
-		return state, fmt.Errorf("save state: %w", err)
+	if err := s.saveScaffold(ctx, done); err != nil {
+		return state, err
 	}
 	if err := s.concludeWaiters(ctx, done, docsPresentRun("")); err != nil {
 		return done, &waitersError{err}
@@ -534,19 +529,14 @@ func (s *Service) startScaffold(ctx context.Context, state ScaffoldState, tip st
 	default:
 		return state, fmt.Errorf("write scaffold: unexpected review.ScaffoldStarted %T", started)
 	}
-	writeCtx, cancel := writeContext(ctx)
-	defer cancel()
-	if err := s.store.SaveScaffold(writeCtx, state); err != nil {
-		return state, fmt.Errorf("save state: %w", err)
-	}
-	return state, nil
+	return state, s.saveScaffold(ctx, state)
 }
 
 // concludeNoRunner frees the scaffold for a later request when no runner can
 // write it, then tells the unlinked waiting check runs. It is not a failed
 // attempt; the waiters stay unlinked for the request that finds a runner.
 func (s *Service) concludeNoRunner(ctx context.Context, state ScaffoldState) (ScaffoldState, error) {
-	idle := OnScaffoldNoRunner(state)
+	idle := onScaffoldNoRunner(state)
 	writeCtx, cancel := writeContext(ctx)
 	defer cancel()
 	if err := s.store.SaveScaffold(writeCtx, idle); err != nil {
@@ -568,7 +558,7 @@ func (s *Service) concludeNoRunner(ctx context.Context, state ScaffoldState) (Sc
 // request into base. The returned state records the commit, also on error.
 func (s *Service) openScaffoldPR(ctx context.Context, state ScaffoldState, base string) (ScaffoldState, ScaffoldPR, error) {
 	inst, owner, repo := state.InstallationID, state.Owner, state.Repo
-	existing, ok, err := s.scaffoldGH.FindPullRequest(ctx, inst, owner, repo, scaffoldBranch)
+	existing, ok, err := s.gh.FindPullRequest(ctx, inst, owner, repo, scaffoldBranch)
 	if err != nil {
 		return state, ScaffoldPR{}, fmt.Errorf("find pull request from %s: %w", scaffoldBranch, err)
 	}
@@ -580,17 +570,17 @@ func (s *Service) openScaffoldPR(ctx context.Context, state ScaffoldState, base 
 	}
 
 	committed := false
-	err = s.scaffoldGH.CreateBranch(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA)
+	err = s.gh.CreateBranch(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA)
 	switch {
 	case err == nil:
 	case errors.Is(err, ErrBranchExists):
-		tip, err := s.scaffoldGH.BranchSHA(ctx, inst, owner, repo, scaffoldBranch)
+		tip, err := s.gh.BranchCommit(ctx, inst, owner, repo, scaffoldBranch)
 		if err != nil {
 			return state, ScaffoldPR{}, fmt.Errorf("read branch %s: %w", scaffoldBranch, err)
 		}
-		committed = state.CommitSHA != "" && tip == state.CommitSHA
-		if !committed && tip != state.BaseSHA {
-			if err := s.scaffoldGH.ResetBranch(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA); err != nil {
+		committed = state.CommitSHA != "" && tip.SHA == state.CommitSHA
+		if !committed && tip.SHA != state.BaseSHA {
+			if err := s.gh.ResetBranch(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA); err != nil {
 				return state, ScaffoldPR{}, fmt.Errorf("reset branch %s to %s: %w", scaffoldBranch, shortSHA(state.BaseSHA), err)
 			}
 		}
@@ -603,21 +593,19 @@ func (s *Service) openScaffoldPR(ctx context.Context, state ScaffoldState, base 
 		for _, f := range state.Files.Files() {
 			files = append(files, FileChange{Path: f.Path, Content: f.Content})
 		}
-		sha, err := s.comments.CommitFiles(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA, files, scaffoldCommitMessage)
+		sha, err := s.gh.CommitFiles(ctx, inst, owner, repo, scaffoldBranch, state.BaseSHA, files, scaffoldCommitMessage)
 		if err != nil {
 			return state, ScaffoldPR{}, fmt.Errorf("commit scaffold to %s: %w", scaffoldBranch, err)
 		}
 		state.CommitSHA = sha
-		writeCtx, cancel := writeContext(ctx)
-		defer cancel()
-		if err := s.store.SaveScaffold(writeCtx, state); err != nil {
-			return state, ScaffoldPR{}, fmt.Errorf("save state: %w", err)
+		if err := s.saveScaffold(ctx, state); err != nil {
+			return state, ScaffoldPR{}, err
 		}
 	}
 
-	pr, err := s.scaffoldGH.CreatePullRequest(ctx, inst, owner, repo, NewPullRequest{Title: scaffoldPRTitle, Body: scaffoldPRBody, Head: scaffoldBranch, Base: base})
+	pr, err := s.gh.CreatePullRequest(ctx, inst, owner, repo, NewPullRequest{Title: scaffoldPRTitle, Body: scaffoldPRBody, Head: scaffoldBranch, Base: base})
 	if err != nil {
-		found, ok, ferr := s.scaffoldGH.FindPullRequest(ctx, inst, owner, repo, scaffoldBranch)
+		found, ok, ferr := s.gh.FindPullRequest(ctx, inst, owner, repo, scaffoldBranch)
 		if ferr != nil || !ok || !found.ByBot {
 			return state, ScaffoldPR{}, errors.Join(fmt.Errorf("create pull request from %s: %w", scaffoldBranch, err), ferr)
 		}

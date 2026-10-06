@@ -35,7 +35,7 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (Response, error) {
 
 	var wireResp openAIResponse
 	if err := json.Unmarshal(respBody, &wireResp); err != nil {
-		return Response{}, fmt.Errorf("openai: response is not valid JSON: %s", truncate(respBody))
+		return Response{}, fmt.Errorf("openai: response is not valid JSON (%w): %s", err, truncate(respBody))
 	}
 	if len(wireResp.Choices) == 0 {
 		return Response{}, fmt.Errorf("openai: response has no choices: %s", truncate(respBody))
@@ -44,7 +44,11 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (Response, error) {
 	msg := wireResp.Choices[0].Message
 	toolCalls := make([]ToolCall, 0, len(msg.ToolCalls))
 	for _, tc := range msg.ToolCalls {
-		toolCalls = append(toolCalls, ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: json.RawMessage(tc.Function.Arguments), Extra: tc.ExtraContent})
+		args := json.RawMessage(tc.Function.Arguments)
+		if len(args) == 0 {
+			args = json.RawMessage(`{}`)
+		}
+		toolCalls = append(toolCalls, ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: args, Extra: tc.ExtraContent})
 	}
 
 	// Gemini counts thinking tokens only in total_tokens.
