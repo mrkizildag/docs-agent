@@ -3,6 +3,7 @@ package llmrunner_test
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,7 +28,7 @@ func startBaseToHead(t *testing.T, repoDir, baseSHA, headSHA string, changed []r
 	t.Helper()
 
 	model := &fakeModel{script: script}
-	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 	runner.SetRemote(repoDir)
 
 	req := testRequest(headSHA)

@@ -118,7 +118,7 @@ runs:
         status=0
         cd "$workdir"
         claude -p "$prompt" \
-          --output-format json \
+          --output-format stream-json --verbose \
           --json-schema "$(cat "$schema_file")" \
           --tools Read,Grep,Glob \
           --permission-mode default \
@@ -127,12 +127,21 @@ runs:
           --disallowedTools Bash,Edit,Write,WebFetch,WebSearch,NotebookEdit,Task \
           --add-dir "$CHECKOUT" \
           --add-dir "$out" \
-          < /dev/null > "$out/claude.json" || status=$?
+          < /dev/null > "$out/transcript.jsonl" || status=$?
+
+        jq -cR 'fromjson? | objects | select(.type == "result")' "$out/transcript.jsonl" | tail -n 1 > "$out/claude.json"
 
         jq -n --arg head_sha "$HEAD_SHA" --arg nonce "$NONCE" --rawfile raw "$out/claude.json" \
           '{head_sha: $head_sha, nonce: $nonce,
             claude: ($raw | try fromjson catch {is_error: true, result: "claude produced no JSON output"})}' \
           > "$out/result.json"
+
+        token="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        echo "::group::Agent trace"
+        echo "::stop-commands::$token"
+        jq -rR -f "$ACTION_PATH/trace.jq" "$out/transcript.jsonl" || true
+        echo "::$token::"
+        echo "::endgroup::"
         exit "$status"
 
     - name: Upload result
@@ -141,4 +150,13 @@ runs:
       with:
         name: pollux-agent-result
         path: ${{ runner.temp }}/pollux-agent/result.json
+        if-no-files-found: ignore
+
+    - name: Upload transcript
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pollux-agent-transcript
+        path: ${{ runner.temp }}/pollux-agent/transcript.jsonl
+        retention-days: 14
         if-no-files-found: ignore

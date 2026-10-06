@@ -51,6 +51,10 @@ The same workflow writes a repo's starting `docs/` when the PR has none: the ser
 
 Running an org-wide bot on one person's Claude subscription may not count as ordinary individual use under Anthropic's consumer terms. For team repos, prefer an `ANTHROPIC_API_KEY` secret.
 
+## Inspecting a run
+
+Open the workflow run: the "Run Claude" step's "Agent trace" group lists each file read and search plus turns, duration, and cost. The full stream is the `pollux-agent-transcript` artifact, kept 14 days.
+
 ## Latency
 
 Expect about 30 seconds per PR: a spike measured 27 s from dispatch to result, about 20 s of it fixed Actions overhead. A run that fails or doesn't report in time ends the check neutral with the cause; it is never left in progress.

@@ -2,6 +2,7 @@ package llmrunner_test
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -25,7 +26,7 @@ func TestStart_DeadlineDuringCloneIsErrDeadline(t *testing.T) {
 	t.Cleanup(func() { close(release); srv.Close() })
 
 	model := &fakeModel{}
-	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 	runner.SetRemote(srv.URL + "/o/r.git")
 	runner.SetTimeout(300 * time.Millisecond)
 

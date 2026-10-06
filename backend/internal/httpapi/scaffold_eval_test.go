@@ -76,7 +76,7 @@ type evalEnv struct {
 func startEvalEnv(t *testing.T, store *sqlite.Store, gh gateScaffoldGitHub, model llm.Model) evalEnv {
 	t.Helper()
 	noToken := func(context.Context, int64, string) (string, error) { return "", nil }
-	svc := gate.NewService(gh, gh, store, gate.Runners{Server: llmrunner.New(model, noToken, "triage", "draft")}, gh, httpapi.NewScaffoldQueue(store))
+	svc := gate.NewService(gh, gh, store, gate.Runners{Server: llmrunner.New(model, noToken, "triage", "draft", slog.New(slog.DiscardHandler))}, gh, httpapi.NewScaffoldQueue(store))
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(svc), slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	var once sync.Once
