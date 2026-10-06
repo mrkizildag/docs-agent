@@ -182,3 +182,47 @@ func (s *Store) RequeueRunning(ctx context.Context) (int, error) {
 
 	return int(n), nil
 }
+
+// Prune deletes finished jobs last updated before before, then deliveries
+// received before before that have no job left, in one transaction. It returns
+// the number of jobs and deliveries deleted.
+func (s *Store) Prune(ctx context.Context, before time.Time) (int, int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("prune: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// julianday compares instants; RFC3339Nano trims trailing zeros, so string order is not time order.
+	cutoff := before.UTC().Format(time.RFC3339Nano)
+
+	jobsRes, err := tx.ExecContext(ctx,
+		`DELETE FROM jobs WHERE state IN (?, ?, ?) AND julianday(updated_at) < julianday(?)`,
+		jobqueue.StateDone, jobqueue.StateFailed, jobqueue.StateSuperseded, cutoff)
+	if err != nil {
+		return 0, 0, fmt.Errorf("prune: delete jobs: %w", err)
+	}
+
+	deliveriesRes, err := tx.ExecContext(ctx,
+		`DELETE FROM deliveries WHERE julianday(received_at) < julianday(?)
+		 AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.delivery_id = deliveries.delivery_id)`,
+		cutoff)
+	if err != nil {
+		return 0, 0, fmt.Errorf("prune: delete deliveries: %w", err)
+	}
+
+	jobs, err := jobsRes.RowsAffected()
+	if err != nil {
+		return 0, 0, fmt.Errorf("prune: jobs rows affected: %w", err)
+	}
+	deliveries, err := deliveriesRes.RowsAffected()
+	if err != nil {
+		return 0, 0, fmt.Errorf("prune: deliveries rows affected: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("prune: commit: %w", err)
+	}
+
+	return int(jobs), int(deliveries), nil
+}

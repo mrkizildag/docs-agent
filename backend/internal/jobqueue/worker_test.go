@@ -2,6 +2,7 @@ package jobqueue_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -503,4 +504,120 @@ func TestOrphanedRunningJobIsSupersededBeforeRestart(t *testing.T) {
 	c2.release("2") <- nil
 	cancelRun2()
 	waitRun(t, runDone2)
+}
+
+type pruneRecorder struct {
+	*sqlite.Store
+
+	calls chan time.Time
+	err   error
+}
+
+func (p *pruneRecorder) Prune(ctx context.Context, before time.Time) (int, int, error) {
+	p.calls <- before
+	if p.err != nil {
+		return 0, 0, p.err
+	}
+
+	jobs, deliveries, err := p.Store.Prune(ctx, before)
+	if err != nil {
+		return 0, 0, fmt.Errorf("prune: %w", err)
+	}
+	return jobs, deliveries, nil
+}
+
+func TestRunPrunesPeriodicallyNotAtStartup(t *testing.T) {
+	t.Parallel()
+
+	const interval = 200 * time.Millisecond
+
+	store := &pruneRecorder{Store: newStore(t), calls: make(chan time.Time, 16)}
+	w := jobqueue.NewWorker(store, newCtrl().handle, testLogger(), 1)
+	jobqueue.SetPruneSchedule(w, interval, interval)
+	runDone, cancelRun := startWorker(t, w)
+
+	start := time.Now()
+
+	select {
+	case before := <-store.calls:
+		t.Fatalf("Prune called at startup with before=%v, want first call after %v", before, interval)
+	case <-time.After(interval / 2):
+	}
+
+	select {
+	case before := <-store.calls:
+		if elapsed := time.Since(start); elapsed < interval/2 {
+			t.Errorf("first Prune after %v, want about %v", elapsed, interval)
+		}
+		if want := time.Now().Add(-jobqueue.RetentionWindow); before.Sub(want).Abs() > testTimeout {
+			t.Errorf("Prune before = %v, want about %v", before, want)
+		}
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for Prune")
+	}
+
+	cancelRun()
+	waitRun(t, runDone)
+}
+
+func TestRunKeepsRunningJobsWhenPruneFails(t *testing.T) {
+	t.Parallel()
+
+	store := &pruneRecorder{Store: newStore(t), calls: make(chan time.Time, 16), err: errors.New("disk full")}
+	c := newCtrl()
+	w := jobqueue.NewWorker(store, c.handle, testLogger(), 1)
+	jobqueue.SetPruneSchedule(w, 50*time.Millisecond, 50*time.Millisecond)
+	runDone, cancelRun := startWorker(t, w)
+
+	select {
+	case <-store.calls:
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for Prune")
+	}
+
+	if _, err := w.Enqueue(context.Background(), jobqueue.NewJob{
+		DeliveryID: "d1", Key: "k", Kind: "a", Payload: []byte("1"),
+	}); err != nil {
+		t.Fatalf("Enqueue() = %v, want nil error", err)
+	}
+	waitJob(t, c.started, testTimeout)
+
+	select {
+	case <-store.calls:
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for a second Prune after the first failed")
+	}
+
+	cancelRun()
+	waitRun(t, runDone)
+}
+
+func TestRunFirstPruneSoonAfterStartNotHourly(t *testing.T) {
+	t.Parallel()
+
+	store := &pruneRecorder{Store: newStore(t), calls: make(chan time.Time, 16)}
+	w := jobqueue.NewWorker(store, newCtrl().handle, testLogger(), 1)
+	jobqueue.SetPruneSchedule(w, 50*time.Millisecond, time.Hour)
+	runDone, cancelRun := startWorker(t, w)
+
+	select {
+	case <-store.calls:
+		t.Fatal("Prune called before the first-prune delay")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	select {
+	case <-store.calls:
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for the first Prune")
+	}
+
+	select {
+	case <-store.calls:
+		t.Fatal("second Prune within the regular interval, want one only after it")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	cancelRun()
+	waitRun(t, runDone)
 }

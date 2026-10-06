@@ -20,6 +20,18 @@ const (
 	StateSuperseded State = "superseded"
 )
 
+const (
+	// RetentionWindow is how long finished jobs and their deliveries are kept.
+	RetentionWindow = 7 * 24 * time.Hour
+)
+
+const (
+	// The first prune is a minute after start so a server restarted more often than hourly
+	// still prunes, without slowing startup.
+	firstPruneDelay = time.Minute
+	pruneInterval   = time.Hour
+)
+
 // errSuperseded is the context cancellation cause for a running job replaced by a newer one.
 var errSuperseded = errors.New("job superseded by a newer job")
 
@@ -52,6 +64,9 @@ type Store interface {
 	Finish(ctx context.Context, id int64, state State, errMsg string) error
 	// RequeueRunning moves every running job back to pending; called once at startup.
 	RequeueRunning(ctx context.Context) (int, error)
+	// Prune deletes finished jobs last updated before before, then deliveries received before
+	// before that have no job left.
+	Prune(ctx context.Context, before time.Time) (jobs, deliveries int, err error)
 }
 
 // Handler runs a single job. The context is cancelled if the job is superseded or the worker shuts down.
@@ -63,6 +78,8 @@ type Worker struct {
 	handle      Handler
 	logger      *slog.Logger
 	maxParallel int
+
+	firstPrune, pruneEvery time.Duration
 
 	wake    chan struct{}
 	jobDone chan struct{}
@@ -78,6 +95,8 @@ func NewWorker(store Store, handle Handler, logger *slog.Logger, maxParallel int
 		handle:      handle,
 		logger:      logger,
 		maxParallel: maxParallel,
+		firstPrune:  firstPruneDelay,
+		pruneEvery:  pruneInterval,
 		wake:        make(chan struct{}, 1),
 		jobDone:     make(chan struct{}, 1),
 		running:     make(map[int64]context.CancelCauseFunc),
@@ -133,6 +152,9 @@ func (w *Worker) Run(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
+	pruneTimer := time.NewTimer(w.firstPrune)
+	defer pruneTimer.Stop()
+
 	for {
 		for w.runningCount() < w.maxParallel {
 			job, jobCtx, cancel, ok := w.claim(ctx)
@@ -150,7 +172,21 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-w.wake:
 		case <-w.jobDone:
 		case <-ticker.C:
+		case <-pruneTimer.C:
+			w.prune(ctx)
+			pruneTimer.Reset(w.pruneEvery)
 		}
+	}
+}
+
+func (w *Worker) prune(ctx context.Context) {
+	jobs, deliveries, err := w.store.Prune(ctx, time.Now().Add(-RetentionWindow))
+	if err != nil {
+		w.logger.Error("prune deliveries and jobs", "error", err)
+		return
+	}
+	if deliveries > 0 || jobs > 0 {
+		w.logger.Info("pruned deliveries and jobs", "jobs", jobs, "deliveries", deliveries)
 	}
 }
 
