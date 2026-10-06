@@ -35,6 +35,12 @@ type RunLookup interface {
 }
 
 func NewHandler(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer, runs RunLookup) *http.ServeMux {
+	return NewHandlerWithWebhookRateLimit(logger, webhookSecret, jobs, runs, DefaultWebhookRateLimitConfig())
+}
+
+// NewHandlerWithWebhookRateLimit is like NewHandler but accepts custom webhook rate
+// limits (used in tests).
+func NewHandlerWithWebhookRateLimit(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer, runs RunLookup, rateLimit WebhookRateLimitConfig) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -42,7 +48,8 @@ func NewHandler(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer, runs R
 			logger.Warn("write healthz response", "err", err)
 		}
 	})
-	mux.HandleFunc("POST /webhook", webhookHandler(logger, webhookSecret, jobs, runs))
+	lim := newWebhookRateLimiter(rateLimit)
+	mux.HandleFunc("POST /webhook", withWebhookRateLimit(logger, lim, webhookHandler(logger, webhookSecret, jobs, runs)))
 	return mux
 }
 

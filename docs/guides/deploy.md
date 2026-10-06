@@ -57,6 +57,8 @@ curl -fsS http://127.0.0.1:8080/healthz
 
 prints `ok`. Then in the App's "Advanced → Recent deliveries", redeliver the `ping`; it should return `202`.
 
+`POST /webhook` is rate-limited before the body is read: a global token bucket plus a per-client-IP bucket; either cap yields `429` without reading the body. Behind Funnel the container sees the proxy as the TCP peer, so the server keys per-IP limits on `X-Forwarded-For` (the leftmost address Funnel sets to the real client) only when the TCP peer is loopback. Compose publishes `8080` on loopback only, so the public surface is Funnel, not a forged header from the internet.
+
 ## Updates
 
 Deploys are manual. Link the deploy script onto your `PATH` once:
@@ -87,3 +89,4 @@ The database lives in the `pollux-data` volume. Backups are not covered here.
 - **Exits right after start with a config error**: a required variable in `.env` is missing or invalid; the log line names it. See [Setup](setup.md). Remember `ADDR`, `DATABASE_PATH`, and the key path inside the container are set by compose.
 - **`pollux-deploy` rolled back**: its output shows the failing step (fetch, build, or health wait); `docker compose logs pollux` shows why the new container didn't turn healthy.
 - **Deliveries fail from GitHub but `/healthz` is fine**: run `tailscale funnel status` and confirm the URL and the `/webhook` path match the App's webhook URL.
+- **Deliveries return `429`**: the endpoint is rate-limited per IP and globally; sustained abuse or a mis-keyed client IP (missing `X-Forwarded-For` through Funnel) can throttle legitimate traffic. Check server logs for `webhook rate limited`.
