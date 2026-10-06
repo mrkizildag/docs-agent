@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite/sqlitetest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 )
 
@@ -23,17 +24,50 @@ func testLogger() *slog.Logger {
 func newStore(t *testing.T) *sqlite.Store {
 	t.Helper()
 
-	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "jobs.db"))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Errorf("close store: %v", err)
-		}
-	})
+	return sqlitetest.Open(t)
+}
 
-	return store
+// finishingStore fails every job that Enqueue reports as superseded and running, as if it
+// ended between the store listing it and the worker finishing it.
+type finishingStore struct {
+	*sqlite.Store
+}
+
+func (s finishingStore) Enqueue(ctx context.Context, job jobqueue.NewJob) (bool, []int64, error) {
+	enqueued, ids, err := s.Store.Enqueue(ctx, job)
+	if err != nil {
+		return false, nil, fmt.Errorf("enqueue: %w", err)
+	}
+	for _, id := range ids {
+		if err := s.Finish(ctx, id, jobqueue.StateFailed, "boom"); err != nil {
+			return false, nil, fmt.Errorf("finish %d: %w", id, err)
+		}
+	}
+	return enqueued, ids, nil
+}
+
+func TestSupersedeOrphan_KeepsTerminalState(t *testing.T) {
+	t.Parallel()
+
+	store := newStore(t)
+	ctx := t.Context()
+
+	if enqueued, _, err := store.Enqueue(ctx, jobqueue.NewJob{DeliveryID: "d1", Key: "k", Kind: "a", Payload: []byte("x")}); err != nil || !enqueued {
+		t.Fatalf("Enqueue(d1) = %v, %v, want true, nil", enqueued, err)
+	}
+	if _, ok, err := store.Claim(ctx); err != nil || !ok {
+		t.Fatalf("Claim() = %v, %v, want true, nil", ok, err)
+	}
+
+	w := jobqueue.NewWorker(finishingStore{store}, newCtrl().handle, testLogger(), 1)
+	if enqueued, err := w.Enqueue(ctx, jobqueue.NewJob{DeliveryID: "d2", Key: "k", Kind: "a", Payload: []byte("x"), Supersedes: true}); err != nil || !enqueued {
+		t.Fatalf("Enqueue(d2) = %v, %v, want true, nil", enqueued, err)
+	}
+
+	retried, _, err := store.Enqueue(ctx, jobqueue.NewJob{DeliveryID: "d1", Key: "k", Kind: "a", Payload: []byte("x")})
+	if err != nil || !retried {
+		t.Errorf("Enqueue(d1) after orphan supersede = %v, %v, want true, nil: the failed job must stay failed so a redelivery retries", retried, err)
+	}
 }
 
 // ctrl lets a test observe when jobs start and are cancelled, and control when they finish.

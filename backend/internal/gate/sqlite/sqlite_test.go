@@ -11,6 +11,7 @@ import (
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite/sqlitetest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 )
 
@@ -79,7 +80,7 @@ func TestOpen_RejectsANewerSchema(t *testing.T) {
 func TestLoadPR_Unseen(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 
 	got, err := store.LoadPR(t.Context(), "acme", "widgets", 7)
 	if err != nil {
@@ -95,7 +96,7 @@ func TestLoadPR_Unseen(t *testing.T) {
 func TestSavePR_RoundTripAndOverwrite(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	state := gate.PRState{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1"}
@@ -128,7 +129,7 @@ func TestSavePR_RoundTripAndOverwrite(t *testing.T) {
 func TestSavePR_RoundTripRunAndProposalsAndPRForRun(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	state := gate.PRState{
@@ -222,7 +223,7 @@ func TestSavePR_RoundTripForkAndSkips(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			store, _ := open(t)
+			store := sqlitetest.Open(t)
 			ctx := t.Context()
 			state := gate.PRState{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1"}
 			tc.edit(&state)
@@ -256,7 +257,7 @@ func TestSavePR_RoundTripForkAndSkips(t *testing.T) {
 func TestEnqueue_DuplicateDeliveryIsNoOp(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	job := jobqueue.NewJob{DeliveryID: "d1", Key: "owner/repo#1", Kind: "pull_request", Payload: []byte("a")}
@@ -296,7 +297,7 @@ func TestEnqueue_DuplicateDeliveryIsNoOp(t *testing.T) {
 func TestEnqueue_RedeliveryAfterFailedJobEnqueuesNewJob(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	enqueue(t, store, "d1", "owner/repo#1", "pull_request", false)
@@ -344,7 +345,7 @@ func TestEnqueue_RedeliveryAfterNonFailedJobStaysNoOp(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			store, _ := open(t)
+			store := sqlitetest.Open(t)
 			ctx := t.Context()
 
 			enqueue(t, store, "d1", "owner/repo#1", "pull_request", false)
@@ -375,7 +376,7 @@ func TestEnqueue_RedeliveryAfterNonFailedJobStaysNoOp(t *testing.T) {
 func TestClaim_OrderAndPerKeyExclusion(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	enqueue(t, store, "d1", "owner/repo#1", "pull_request", false)
@@ -422,7 +423,7 @@ func TestClaim_OrderAndPerKeyExclusion(t *testing.T) {
 func TestEnqueue_DifferentKindNotSuperseded(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	enqueue(t, store, "d1", "owner/repo#1", "sync", false)
@@ -446,7 +447,7 @@ func TestEnqueue_DifferentKindNotSuperseded(t *testing.T) {
 func TestEnqueue_SupersedesPending(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	enqueue(t, store, "d1", "owner/repo#1", "sync", false)
@@ -476,7 +477,7 @@ func TestEnqueue_SupersedesPending(t *testing.T) {
 func TestEnqueue_SupersedesRunning(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	enqueue(t, store, "d1", "owner/repo#1", "sync", false)
@@ -495,7 +496,7 @@ func TestEnqueue_SupersedesRunning(t *testing.T) {
 func TestRequeueRunning(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 
 	enqueue(t, store, "d1", "owner/repo#1", "pull_request", false)
@@ -593,7 +594,7 @@ func enqueueWithResult(t *testing.T, store *sqlite.Store, deliveryID, key, kind 
 func TestOverdueRuns(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
@@ -620,7 +621,7 @@ func TestOverdueRuns(t *testing.T) {
 func TestPRsForHead(t *testing.T) {
 	t.Parallel()
 
-	store, _ := open(t)
+	store := sqlitetest.Open(t)
 	ctx := t.Context()
 	for _, st := range []gate.PRState{
 		{Owner: "acme", Repo: "widgets", Number: 8, HeadSHA: "a"},

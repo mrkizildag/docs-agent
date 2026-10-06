@@ -127,7 +127,7 @@ func (s *Store) Claim(ctx context.Context) (jobqueue.Job, bool, error) {
 	defer func() { _ = tx.Rollback() }()
 
 	row := tx.QueryRowContext(ctx, `
-		SELECT id, key, kind, payload FROM jobs
+		SELECT id, key, kind, payload, delivery_id FROM jobs
 		WHERE state = ?
 		  AND key NOT IN (SELECT key FROM jobs WHERE state = ?)
 		ORDER BY id
@@ -135,7 +135,7 @@ func (s *Store) Claim(ctx context.Context) (jobqueue.Job, bool, error) {
 		jobqueue.StatePending, jobqueue.StateRunning)
 
 	var job jobqueue.Job
-	if err := row.Scan(&job.ID, &job.Key, &job.Kind, &job.Payload); err != nil {
+	if err := row.Scan(&job.ID, &job.Key, &job.Kind, &job.Payload, &job.DeliveryID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return jobqueue.Job{}, false, nil
 		}
@@ -155,11 +155,12 @@ func (s *Store) Claim(ctx context.Context) (jobqueue.Job, bool, error) {
 	return job, true, nil
 }
 
-// Finish sets the terminal state, error message, and updated_at for job id.
+// Finish sets the terminal state, error message, and updated_at for running job
+// id. A job already in a terminal state is left as it is.
 func (s *Store) Finish(ctx context.Context, id int64, state jobqueue.State, errMsg string) error {
 	if _, err := s.db.ExecContext(ctx,
-		`UPDATE jobs SET state = ?, error = ?, updated_at = ? WHERE id = ?`,
-		state, errMsg, now(), id); err != nil {
+		`UPDATE jobs SET state = ?, error = ?, updated_at = ? WHERE id = ? AND state = ?`,
+		state, errMsg, now(), id, jobqueue.StateRunning); err != nil {
 		return fmt.Errorf("finish job %d: %w", id, err)
 	}
 	return nil
