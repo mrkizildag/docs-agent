@@ -187,11 +187,10 @@ func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo
 		return 0, fmt.Errorf("dispatch workflow %s/%s: %w", owner, repo, err)
 	}
 
-	docPaths := in.Docs
-	if docPaths == nil {
-		docPaths = []string{}
-	}
-	docsJSON, err := json.Marshal(docPaths)
+	docsJSON, err := json.Marshal(struct {
+		Review    []string `json:"review"`
+		Uncovered []string `json:"uncovered"`
+	}{Review: nonNil(in.Docs), Uncovered: nonNil(in.Uncovered)})
 	if err != nil {
 		return 0, fmt.Errorf("dispatch workflow %s/%s: encode docs: %w", owner, repo, err)
 	}
@@ -220,6 +219,14 @@ func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo
 	}
 
 	return details.GetWorkflowRunID(), nil
+}
+
+// nonNil makes a nil slice encode as [] rather than null.
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }
 
 // ResultArtifact returns the result.json inside run runID's result artifact.

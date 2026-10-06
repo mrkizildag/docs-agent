@@ -1,0 +1,1 @@
+def norm: if type == "array" then {review: ., uncovered: []} elif type == "object" then {review: (.review // []), uncovered: (.uncovered // [])} else error("bad shape") end; norm | .[$key] | if type == "array" and all(.[]; type == "string") then (if length == 0 then "(none)" else map("- " + tojson) | join("\n") end) else error("bad list") end

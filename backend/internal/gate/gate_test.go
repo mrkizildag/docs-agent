@@ -657,7 +657,7 @@ func TestHandlePullRequestActionsStartsRun(t *testing.T) {
 	t.Parallel()
 
 	deadline := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	gh := &fakeGitHub{workflowExists: true, checkRunID: 555}
+	gh := &fakeGitHub{workflowExists: true, checkRunID: 555, mergeBase: "mb1"}
 	runner := &fakeRunner{started: review.Pending{RunID: 99, Nonce: "n1", Deadline: deadline}}
 	store := &fakeStore{}
 	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil)
@@ -677,7 +677,7 @@ func TestHandlePullRequestActionsStartsRun(t *testing.T) {
 	}
 	want := gate.PRState{
 		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123", CheckRunID: 555,
-		Run: &gate.AwaitingRun{RunID: 99, Nonce: "n1", Deadline: deadline},
+		Run: &gate.AwaitingRun{RunID: 99, Nonce: "n1", Deadline: deadline, BaseSHA: "mb1"},
 	}
 	if diff := cmp.Diff(want, store.saveCalls[1]); diff != "" {
 		t.Errorf("started state (-want +got):\n%s", diff)
@@ -687,7 +687,7 @@ func TestHandlePullRequestActionsStartsRun(t *testing.T) {
 func awaitingState() gate.PRState {
 	return gate.PRState{
 		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123", CheckRunID: 555,
-		Run: &gate.AwaitingRun{RunID: 99, Nonce: "n1"},
+		Run: &gate.AwaitingRun{RunID: 99, Nonce: "n1", BaseSHA: "mb1"},
 	}
 }
 
@@ -761,7 +761,7 @@ func TestHandleRunCompleted(t *testing.T) {
 				t.Errorf("Collect calls = %+v, want called = %v", tc.runner.collected, tc.wantCollected)
 			}
 			if tc.wantCollected {
-				want := review.Completion{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123", RunID: 99, Nonce: "n1"}
+				want := review.Completion{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123", BaseSHA: "mb1", RunID: 99, Nonce: "n1"}
 				if diff := cmp.Diff(want, tc.runner.collected[0]); diff != "" {
 					t.Errorf("Collect completion (-want +got):\n%s", diff)
 				}

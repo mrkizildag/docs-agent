@@ -38,6 +38,9 @@ type DispatchInputs struct {
 	Nonce    string
 	// Docs are the candidate doc paths the run must review.
 	Docs []string
+	// Uncovered are the changed files no base doc covers; the run decides
+	// whether they need a new doc.
+	Uncovered []string
 }
 
 // WorkflowAPI is the GitHub Actions surface the runner needs.
@@ -98,13 +101,9 @@ func New(api WorkflowAPI, timeout time.Duration) *Runner {
 func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started, error) {
 	where := fmt.Sprintf("%s/%s#%d", req.Owner, req.Repo, req.Number)
 
-	baseFS, err := r.api.DocsAtRef(ctx, req.InstallationID, req.Owner, req.Repo, req.BaseSHA)
+	selection, err := r.selectAtBase(ctx, req.InstallationID, req.Owner, req.Repo, req.BaseSHA, req.ChangedFiles)
 	if err != nil {
 		return nil, fmt.Errorf("start actions run %s: %w", where, err)
-	}
-	selection, err := basedocs.Select(baseFS, req.ChangedFiles)
-	if err != nil {
-		return nil, fmt.Errorf("start actions run %s: base %s: %w", where, req.BaseSHA, err)
 	}
 	if len(selection.Restores) > 0 {
 		return review.Result{Runner: runnerName, Verdict: review.Proposals(selection.Restores)}, nil
@@ -116,30 +115,47 @@ func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started,
 		}
 	}
 
-	pending, err := r.dispatch(ctx, req.InstallationID, req.Owner, req.Repo, req.HeadSHA, req.Number, selection.Candidates)
+	if selection.Empty() {
+		return review.Result{Runner: runnerName, Verdict: review.NoImpact{Reason: basedocs.NothingToReview}}, nil
+	}
+	pending, err := r.dispatch(ctx, req.InstallationID, req.Owner, req.Repo, req.HeadSHA, req.Number, selection.Candidates, selection.Uncovered)
 	if err != nil {
 		return nil, fmt.Errorf("start actions run %s: %w", where, err)
 	}
 	return pending, nil
 }
 
+// selectAtBase picks the candidate, uncovered, and restorable docs from the
+// docs tree at sha.
+func (r *Runner) selectAtBase(ctx context.Context, installationID int64, owner, repo, sha string, changed []review.ChangedFile) (basedocs.Selection, error) {
+	baseFS, err := r.api.DocsAtRef(ctx, installationID, owner, repo, sha)
+	if err != nil {
+		return basedocs.Selection{}, fmt.Errorf("base %s: %w", sha, err)
+	}
+	selection, err := basedocs.Select(baseFS, changed)
+	if err != nil {
+		return basedocs.Selection{}, fmt.Errorf("base %s: %w", sha, err)
+	}
+	return selection, nil
+}
+
 // StartScaffold dispatches the workflow with pr_number 0 and no docs at
 // req.BaseSHA and returns review.Pending.
 func (r *Runner) StartScaffold(ctx context.Context, req review.ScaffoldRequest) (review.ScaffoldStarted, error) {
-	pending, err := r.dispatch(ctx, req.InstallationID, req.Owner, req.Repo, req.BaseSHA, 0, nil)
+	pending, err := r.dispatch(ctx, req.InstallationID, req.Owner, req.Repo, req.BaseSHA, 0, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("start actions scaffold %s/%s: %w", req.Owner, req.Repo, err)
 	}
 	return pending, nil
 }
 
-func (r *Runner) dispatch(ctx context.Context, installationID int64, owner, repo, sha string, number int, docs []string) (review.Pending, error) {
+func (r *Runner) dispatch(ctx context.Context, installationID int64, owner, repo, sha string, number int, docs, uncovered []string) (review.Pending, error) {
 	nonce, err := newNonce()
 	if err != nil {
 		return review.Pending{}, err
 	}
 
-	runID, err := r.api.Dispatch(ctx, installationID, owner, repo, DispatchInputs{HeadSHA: sha, PRNumber: number, Nonce: nonce, Docs: docs})
+	runID, err := r.api.Dispatch(ctx, installationID, owner, repo, DispatchInputs{HeadSHA: sha, PRNumber: number, Nonce: nonce, Docs: docs, Uncovered: uncovered})
 	if err != nil {
 		return review.Pending{}, fmt.Errorf("dispatch: %w", err)
 	}
@@ -213,10 +229,35 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 		return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
 	}
 
+	// A run started before its merge base was stored can't have a new doc's
+	// covers checked, so new docs from it are refused rather than trusted.
+	validate := func(p review.Proposal) error {
+		if p.Section == "" {
+			return errors.New("new doc: the run has no stored merge base to check its covers against")
+		}
+		return p.Validate(changed)
+	}
+	if c.BaseSHA != "" {
+		selection, err := r.selectAtBase(ctx, c.InstallationID, c.Owner, c.Repo, c.BaseSHA, changed)
+		if err != nil {
+			return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
+		}
+		validate = func(p review.Proposal) error { return selection.ValidateProposal(p, changed) }
+	}
+
 	proposals := make(review.Proposals, len(out.Proposals))
 	for i, p := range out.Proposals {
-		if err := p.Validate(changed); err != nil {
+		if err := validate(p); err != nil {
 			return review.Result{}, &review.InvalidResultError{Cause: fmt.Errorf("proposal %d: %s", i, capText(err.Error()))}
+		}
+		if p.Section == "" {
+			_, exists, err := r.api.FileAtRef(ctx, c.InstallationID, c.Owner, c.Repo, p.DocPath, c.HeadSHA)
+			if err != nil {
+				return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: read %s at %s: %w", c.RunID, c.Owner, c.Repo, p.DocPath, c.HeadSHA, err)
+			}
+			if exists {
+				return review.Result{}, &review.InvalidResultError{Cause: fmt.Errorf("proposal %d: new doc %s already exists at head", i, p.DocPath)}
+			}
 		}
 		proposals[i] = p
 	}

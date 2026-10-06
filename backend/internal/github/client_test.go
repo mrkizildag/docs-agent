@@ -349,32 +349,54 @@ func TestCreateAndUpdateCheckRunInProgress(t *testing.T) {
 func TestDispatch(t *testing.T) {
 	t.Parallel()
 
-	var got map[string]any
-	mux := http.NewServeMux()
-	handleAccessToken(t, mux)
-	mux.HandleFunc("GET /repos/o/r", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(t, w, http.StatusOK, `{"default_branch":"trunk"}`)
-	})
-	mux.HandleFunc("POST /repos/o/r/actions/workflows/pollux-agent.yml/dispatches", func(w http.ResponseWriter, r *http.Request) {
-		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
-			t.Errorf("decode dispatch body: %v", err)
-		}
-		writeJSON(t, w, http.StatusOK, `{"workflow_run_id":4242,"run_url":"u","html_url":"h"}`)
-	})
-	client := newTestClient(t, mux)
-
-	runID, err := client.Dispatch(t.Context(), 99, "o", "r", actions.DispatchInputs{HeadSHA: "abc", PRNumber: 7, Nonce: "n1", Docs: []string{"docs/a.md"}})
-	if err != nil || runID != 4242 {
-		t.Fatalf("Dispatch() = %d, %v, want 4242, nil", runID, err)
+	tests := []struct {
+		name     string
+		in       actions.DispatchInputs
+		wantDocs string
+	}{
+		{
+			name:     "both lists",
+			in:       actions.DispatchInputs{HeadSHA: "abc", PRNumber: 7, Nonce: "n1", Docs: []string{"docs/a.md"}, Uncovered: []string{"src/x.go"}},
+			wantDocs: `{"review":["docs/a.md"],"uncovered":["src/x.go"]}`,
+		},
+		{
+			name:     "nil uncovered",
+			in:       actions.DispatchInputs{HeadSHA: "abc", PRNumber: 7, Nonce: "n1", Docs: []string{"docs/a.md"}},
+			wantDocs: `{"review":["docs/a.md"],"uncovered":[]}`,
+		},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	want := map[string]any{
-		"ref":                "trunk",
-		"inputs":             map[string]any{"head_sha": "abc", "pr_number": "7", "nonce": "n1", "docs": `["docs/a.md"]`},
-		"return_run_details": true,
-	}
-	if diff := cmp.Diff(want, got); diff != "" {
-		t.Errorf("dispatch body (-want +got):\n%s", diff)
+			var got map[string]any
+			mux := http.NewServeMux()
+			handleAccessToken(t, mux)
+			mux.HandleFunc("GET /repos/o/r", func(w http.ResponseWriter, _ *http.Request) {
+				writeJSON(t, w, http.StatusOK, `{"default_branch":"trunk"}`)
+			})
+			mux.HandleFunc("POST /repos/o/r/actions/workflows/pollux-agent.yml/dispatches", func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+					t.Errorf("decode dispatch body: %v", err)
+				}
+				writeJSON(t, w, http.StatusOK, `{"workflow_run_id":4242,"run_url":"u","html_url":"h"}`)
+			})
+			client := newTestClient(t, mux)
+
+			runID, err := client.Dispatch(t.Context(), 99, "o", "r", tc.in)
+			if err != nil || runID != 4242 {
+				t.Fatalf("Dispatch() = %d, %v, want 4242, nil", runID, err)
+			}
+
+			want := map[string]any{
+				"ref":                "trunk",
+				"inputs":             map[string]any{"head_sha": "abc", "pr_number": "7", "nonce": "n1", "docs": tc.wantDocs},
+				"return_run_details": true,
+			}
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("dispatch body (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 

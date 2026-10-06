@@ -185,6 +185,7 @@ type AwaitingRun struct {
 	RunID    int64
 	Nonce    string
 	Deadline time.Time
+	BaseSHA  string // merge base the run was started at
 }
 
 // RunCompleted reports that an external analysis run finished.
@@ -343,9 +344,9 @@ func Overdue(state PRState, now time.Time) bool {
 }
 
 // OnStarted is the state transition for an analysis that runs elsewhere: pure, no I/O.
-func OnStarted(state PRState, pending review.Pending, checkRunID int64) PRState {
+func OnStarted(state PRState, pending review.Pending, checkRunID int64, baseSHA string) PRState {
 	state.CheckRunID = checkRunID
-	state.Run = &AwaitingRun{RunID: pending.RunID, Nonce: pending.Nonce, Deadline: pending.Deadline}
+	state.Run = &AwaitingRun{RunID: pending.RunID, Nonce: pending.Nonce, Deadline: pending.Deadline, BaseSHA: baseSHA}
 	return state
 }
 
@@ -920,15 +921,14 @@ func (s *Service) startRun(ctx context.Context, state PRState, pr PullRequest, r
 	next.CheckRunID = id
 	next.Run = &AwaitingRun{Nonce: fmt.Sprintf("check-%d", id), Deadline: time.Now().Add(analysisDeadline)}
 
-	var started review.Started
-	var changed []review.ChangedFile
+	var out startOutcome
 	armCtx, cancelArm := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
 	err = s.store.SavePR(armCtx, next)
 	cancelArm()
 	if err != nil {
 		err = fmt.Errorf("save state: %w", err)
 	} else {
-		started, changed, err = s.start(ctx, runner, pr)
+		out, err = s.start(ctx, runner, pr)
 		if err != nil && ctx.Err() != nil {
 			// Superseded or shutting down: the armed state stays so the next job
 			// closes this check run as superseded, or the deadline sweep does.
@@ -941,15 +941,15 @@ func (s *Service) startRun(ctx context.Context, state PRState, pr PullRequest, r
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
 	defer cancel()
 	if err == nil {
-		switch res := started.(type) {
+		switch res := out.started.(type) {
 		case review.Pending:
-			next = OnStarted(next, res, id)
+			next = OnStarted(next, res, id, out.mergeBase)
 		case review.Result:
-			if next, err = s.concludeResult(writeCtx, next, pr, res, changed); err != nil {
+			if next, err = s.concludeResult(writeCtx, next, pr, res, out.changed); err != nil {
 				return err
 			}
 		default:
-			err = fmt.Errorf("unknown review.Started %T", started)
+			err = fmt.Errorf("unknown review.Started %T", out.started)
 		}
 	}
 	if err != nil {
@@ -1172,6 +1172,7 @@ func (s *Service) collect(ctx context.Context, state PRState, rc RunCompleted) (
 		Repo:           state.Repo,
 		Number:         state.Number,
 		HeadSHA:        state.HeadSHA,
+		BaseSHA:        state.Run.BaseSHA,
 		RunID:          state.Run.RunID,
 		Nonce:          state.Run.Nonce,
 	}
@@ -1334,18 +1335,24 @@ func selectRunner(hasWorkflow bool, runners Runners) runnerSelection {
 	return runnerServer
 }
 
-func (s *Service) start(ctx context.Context, runner review.Runner, pr PullRequest) (review.Started, []review.ChangedFile, error) {
+type startOutcome struct {
+	started   review.Started
+	changed   []review.ChangedFile
+	mergeBase string
+}
+
+func (s *Service) start(ctx context.Context, runner review.Runner, pr PullRequest) (startOutcome, error) {
 	changed, err := s.gh.ListChangedFiles(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list changed files: %w", err)
+		return startOutcome{}, fmt.Errorf("list changed files: %w", err)
 	}
 	if limit, ok := oversized(changed); ok {
-		return nil, nil, &tooLargeError{limit: limit}
+		return startOutcome{}, &tooLargeError{limit: limit}
 	}
 
 	mergeBase, err := s.gh.MergeBase(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.BaseSHA, pr.HeadSHA)
 	if err != nil {
-		return nil, nil, fmt.Errorf("find merge base: %w", err)
+		return startOutcome{}, fmt.Errorf("find merge base: %w", err)
 	}
 
 	started, err := runner.Start(ctx, review.Request{
@@ -1358,9 +1365,9 @@ func (s *Service) start(ctx context.Context, runner review.Runner, pr PullReques
 		ChangedFiles:   changed,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("start analysis: %w", err)
+		return startOutcome{}, fmt.Errorf("start analysis: %w", err)
 	}
-	return started, changed, nil
+	return startOutcome{started: started, changed: changed, mergeBase: mergeBase}, nil
 }
 
 // reconciles reports whether a verdict concludes the analysis, so that its

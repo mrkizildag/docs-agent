@@ -171,6 +171,56 @@ func TestProposalValidate(t *testing.T) {
 			wantErrPart: "section: must be one line",
 		},
 		{
+			name: "section only hashes",
+			proposal: func() review.Proposal {
+				p := validProposal()
+				p.Section = "#"
+				return p
+			},
+			changed:     validChanged(),
+			wantErrPart: "section: must name a heading",
+		},
+		{
+			name: "section only hashes and spaces",
+			proposal: func() review.Proposal {
+				p := validProposal()
+				p.Section = " ## "
+				return p
+			},
+			changed:     validChanged(),
+			wantErrPart: "section: must name a heading",
+		},
+		{
+			name: "section only a space",
+			proposal: func() review.Proposal {
+				p := validProposal()
+				p.Section = " "
+				return p
+			},
+			changed:     validChanged(),
+			wantErrPart: "section: must name a heading",
+		},
+		{
+			name: "section only hashes and two spaces",
+			proposal: func() review.Proposal {
+				p := validProposal()
+				p.Section = "#  "
+				return p
+			},
+			changed:     validChanged(),
+			wantErrPart: "section: must name a heading",
+		},
+		{
+			name: "section only unicode spaces",
+			proposal: func() review.Proposal {
+				p := validProposal()
+				p.Section = "#\u00a0\u2003"
+				return p
+			},
+			changed:     validChanged(),
+			wantErrPart: "section: must name a heading",
+		},
+		{
 			name: "section control character",
 			proposal: func() review.Proposal {
 				p := validProposal()

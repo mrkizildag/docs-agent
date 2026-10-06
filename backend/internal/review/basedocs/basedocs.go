@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,10 +21,22 @@ const MaxCandidates = 10
 const maxRestoreReasonPaths = 3
 
 // Selection is the base-docs outcome for a PR. Restores is non-empty only when
-// the PR deleted a covering doc that can be restored; Candidates is then nil.
+// the PR deleted a covering doc that can be restored; Candidates and Uncovered
+// are then nil. Uncovered lists the changed files no base doc covers.
 type Selection struct {
 	Candidates []string
+	Uncovered  []string
 	Restores   []review.Proposal
+}
+
+// NothingToReview is the "No doc impact" reason when every changed file is
+// under docs/ or removed, and no doc covers it.
+const NothingToReview = "the PR only edits docs or removes files no doc covers"
+
+// Empty reports whether the selection has no candidate docs and no uncovered
+// files, so there is nothing to review. Runners call it after handling Restores.
+func (s Selection) Empty() bool {
+	return len(s.Candidates) == 0 && len(s.Uncovered) == 0
 }
 
 // Select matches files against the docs in baseFS.
@@ -37,8 +50,9 @@ func Select(baseFS fs.FS, files []review.ChangedFile) (Selection, error) {
 		changes[i] = docs.Change{Path: f.Path, PreviousPath: f.PreviousPath, Removed: f.Removed}
 	}
 	candidates, deleted := baseTree.Candidates(changes)
+	uncovered := baseTree.Uncovered(changes)
 	if len(deleted) == 0 {
-		return Selection{Candidates: candidates}, nil
+		return Selection{Candidates: candidates, Uncovered: uncovered}, nil
 	}
 	restores, err := restores(baseFS, baseTree, deleted, files)
 	if err != nil {
@@ -47,7 +61,34 @@ func Select(baseFS fs.FS, files []review.ChangedFile) (Selection, error) {
 	if len(restores) > 0 {
 		return Selection{Restores: restores}, nil
 	}
-	return Selection{Candidates: candidates}, nil
+	return Selection{Candidates: candidates, Uncovered: uncovered}, nil
+}
+
+// ValidateProposal checks p against the changed files and, for a new doc
+// (empty section), that it parses and its covers match an uncovered file.
+// Restores don't go through it: they recreate a base doc that already covered
+// its files.
+func (s Selection) ValidateProposal(p review.Proposal, changed []review.ChangedFile) error {
+	if err := p.Validate(changed); err != nil {
+		return err //nolint:wrapcheck // the caller names the proposal.
+	}
+	if p.Section != "" {
+		return nil
+	}
+	if path.Ext(p.DocPath) != ".md" {
+		return fmt.Errorf("doc_path %q: a new doc must end in .md", p.DocPath)
+	}
+	if len(p.Content) > docs.MaxDocBytes {
+		return fmt.Errorf("content: %d bytes exceed the %d byte cap for a doc", len(p.Content), docs.MaxDocBytes)
+	}
+	doc, err := docs.ParseDoc(p.DocPath, []byte(p.Content))
+	if err != nil {
+		return fmt.Errorf("parse new doc: %w", err)
+	}
+	if !slices.ContainsFunc(s.Uncovered, func(f string) bool { return doc.CoversAny(f) }) {
+		return fmt.Errorf("covers match none of the uncovered changed files %q", s.Uncovered)
+	}
+	return nil
 }
 
 // restores proposes recreating each deleted base doc from its text at the base

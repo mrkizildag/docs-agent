@@ -91,3 +91,31 @@ func TestDocCoversAny(t *testing.T) {
 		t.Error("CoversAny(x.go, lib/b.go) = true, want false")
 	}
 }
+
+func TestTreeUncovered(t *testing.T) {
+	t.Parallel()
+
+	base := docs.Tree{Docs: []docs.Doc{covering("docs/a.md", "src/*.go")}}
+
+	tests := []struct {
+		name    string
+		changes []docs.Change
+		want    []string
+	}{
+		{name: "covered file", changes: []docs.Change{{Path: "src/a.go"}}},
+		{name: "uncovered file", changes: []docs.Change{{Path: "lib/z.go"}, {Path: "lib/b.go"}}, want: []string{"lib/b.go", "lib/z.go"}},
+		{name: "removed file is skipped", changes: []docs.Change{{Path: "lib/b.go", Removed: true}}},
+		{name: "file under docs is skipped", changes: []docs.Change{{Path: "docs/new.md"}}},
+		{name: "rename out of a covered path is covered", changes: []docs.Change{{Path: "lib/b.go", PreviousPath: "src/b.go"}}},
+		{name: "rename between uncovered paths", changes: []docs.Change{{Path: "lib/b.go", PreviousPath: "lib/a.go"}}, want: []string{"lib/b.go"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if diff := cmp.Diff(tc.want, base.Uncovered(tc.changes)); diff != "" {
+				t.Errorf("Uncovered() (-want +got):\n%s", diff)
+			}
+		})
+	}
+}

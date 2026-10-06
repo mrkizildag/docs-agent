@@ -126,12 +126,15 @@ func TestStart_DocAddedByThePRIsNotACandidate(t *testing.T) {
 		commitDoc(t, repoDir, "docs/new.md", docWithCovers("\n  - main.go", "new."))
 		headSHA := commitDoc(t, repoDir, "main.go", mainGoChanged)
 
-		verdict, calls := mustStartBaseToHead(t, repoDir, baseSHA, headSHA, []review.ChangedFile{mainGoChange()})
+		verdict, calls := mustStartBaseToHead(t, repoDir, baseSHA, headSHA, []review.ChangedFile{mainGoChange()}, newDocResponse(false))
 		if _, ok := verdict.(review.NoImpact); !ok {
 			t.Errorf("verdict = %#v, want NoImpact", verdict)
 		}
-		if len(calls) != 0 {
-			t.Errorf("model saw %d calls, want 0", len(calls))
+		if len(calls) != 1 {
+			t.Fatalf("model saw %d calls, want only the new-doc decision (docs/new.md is not a candidate)", len(calls))
+		}
+		if prompt := calls[0].Messages[0].Text; !strings.Contains(prompt, "main.go") {
+			t.Errorf("new-doc prompt = %q, want it to list main.go as uncovered", prompt)
 		}
 	})
 }

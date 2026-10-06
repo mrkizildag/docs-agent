@@ -19,7 +19,7 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 	var run gate.AwaitingRun
 	var deadline string
 	row := s.db.QueryRowContext(ctx,
-		`SELECT installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, summary_comment_id, head_ref, proposals_sha,
+		`SELECT installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, run_base_sha, summary_comment_id, head_ref, proposals_sha,
 			fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha, failure_cause, pending_apply
 		FROM pull_requests WHERE owner = ? AND repo = ? AND number = ?`,
 		owner, repo, number)
@@ -27,7 +27,7 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 	var pending gate.SkipAsk
 	var skip gate.Skip
 	var pendingApply string
-	if err := row.Scan(&state.InstallationID, &state.HeadSHA, &state.CheckRunID, &run.RunID, &run.Nonce, &deadline, &state.SummaryCommentID, &state.HeadRef, &state.ProposalsSHA,
+	if err := row.Scan(&state.InstallationID, &state.HeadSHA, &state.CheckRunID, &run.RunID, &run.Nonce, &deadline, &run.BaseSHA, &state.SummaryCommentID, &state.HeadRef, &state.ProposalsSHA,
 		&state.Fork, &pending.User, &pending.Scope, &skip.User, &skip.Scope, &skip.Reason, &skip.HeadSHA, &state.FailureCause, &pendingApply); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return state, nil
@@ -115,9 +115,9 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO pull_requests (owner, repo, number, installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, summary_comment_id, head_ref, proposals_sha,
+		INSERT INTO pull_requests (owner, repo, number, installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, run_base_sha, summary_comment_id, head_ref, proposals_sha,
 			fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha, failure_cause, pending_apply)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (owner, repo, number) DO UPDATE SET
 			installation_id = excluded.installation_id,
 			head_sha = excluded.head_sha,
@@ -125,6 +125,7 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 			run_id = excluded.run_id,
 			run_nonce = excluded.run_nonce,
 			run_deadline = excluded.run_deadline,
+			run_base_sha = excluded.run_base_sha,
 			summary_comment_id = excluded.summary_comment_id,
 			head_ref = excluded.head_ref,
 			proposals_sha = excluded.proposals_sha,
@@ -138,7 +139,7 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 			failure_cause = excluded.failure_cause,
 			pending_apply = excluded.pending_apply`,
 		state.Owner, state.Repo, state.Number, state.InstallationID, state.HeadSHA,
-		state.CheckRunID, run.RunID, run.Nonce, deadline, state.SummaryCommentID, state.HeadRef, state.ProposalsSHA,
+		state.CheckRunID, run.RunID, run.Nonce, deadline, run.BaseSHA, state.SummaryCommentID, state.HeadRef, state.ProposalsSHA,
 		state.Fork, pending.User, pending.Scope, skip.User, skip.Scope, skip.Reason, skip.HeadSHA, state.FailureCause, string(pendingApply))
 	if err != nil {
 		return fmt.Errorf("save pr %s/%s#%d: %w", state.Owner, state.Repo, state.Number, err)

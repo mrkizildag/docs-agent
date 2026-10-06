@@ -264,17 +264,20 @@ func TestStart_CoveredFileIsTriagedWithItsPatch(t *testing.T) {
 	}
 }
 
-func TestStart_UncoveredFileIsNoImpactWithoutModelCalls(t *testing.T) {
-	t.Parallel()
+func newDocResponse(needed bool) func(llm.Request) (llm.Response, error) {
+	return textResponse(fmt.Sprintf(`{"needed": %t, "reason": "scripted"}`, needed))
+}
+
+func startUncovered(t *testing.T, changed []review.ChangedFile, script ...func(llm.Request) (llm.Response, error)) (review.Verdict, *fakeModel) {
+	t.Helper()
 
 	repoDir, headSHA := newGitRepo(t)
-	model := &fakeModel{}
+	model := &fakeModel{script: script}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 	runner.SetRemote(repoDir)
 
 	req := testRequest(headSHA)
-	req.ChangedFiles[0].Path = "other.go"
-
+	req.ChangedFiles = changed
 	started, err := runner.Start(t.Context(), req)
 	if err != nil {
 		t.Fatalf("Start() = %v, want nil error", err)
@@ -283,8 +286,176 @@ func TestStart_UncoveredFileIsNoImpactWithoutModelCalls(t *testing.T) {
 	if !ok {
 		t.Fatalf("Start() = %T, want review.Result", started)
 	}
-	if _, ok := result.Verdict.(review.NoImpact); !ok {
-		t.Fatalf("Verdict = %T, want review.NoImpact", result.Verdict)
+	return result.Verdict, model
+}
+
+func otherGoChange() review.ChangedFile {
+	return review.ChangedFile{Path: "other.go", Hunks: []review.LineRange{{Start: 1, End: 3}}, Patch: "@@ -0,0 +1,3 @@\n+func other() {}\n"}
+}
+
+func newDocProposal(covers string) map[string]any {
+	return map[string]any{
+		"doc_path":    "docs/other.md",
+		"section":     "",
+		"anchor":      map[string]any{"file": "other.go", "line": 2},
+		"reason":      "other.go adds a feature",
+		"content":     "---\ntitle: Other\nsummary: About other.\ncovers:\n  - " + covers + "\n---\n# Other\n",
+		"index_entry": "- [Other](other.md): about other.",
+	}
+}
+
+func startCoveredOnly(t *testing.T, script ...func(llm.Request) (llm.Response, error)) (review.Verdict, *llmrunner.Runner, *fakeModel) {
+	t.Helper()
+
+	model := &fakeModel{script: script}
+	verdict, runner, err := startResult(t, model)
+	if err != nil {
+		t.Fatalf("Start() = %v, want nil error", err)
+	}
+	return verdict, runner, model
+}
+
+func TestStart_UncoveredFileWithoutNeedIsNoImpactAfterOneCall(t *testing.T) {
+	t.Parallel()
+
+	verdict, model := startUncovered(t, []review.ChangedFile{otherGoChange()}, newDocResponse(false))
+	noImpact, ok := verdict.(review.NoImpact)
+	if !ok {
+		t.Fatalf("Verdict = %T, want review.NoImpact", verdict)
+	}
+	for _, want := range []string{"other.go", "no new doc needed", "no doc covers"} {
+		if !strings.Contains(noImpact.Reason, want) {
+			t.Errorf("Reason = %q, want it to contain %q", noImpact.Reason, want)
+		}
+	}
+	if len(model.calls) != 1 {
+		t.Fatalf("model saw %d calls, want exactly 1 new-doc decision", len(model.calls))
+	}
+	if prompt := model.calls[0].Messages[0].Text; !strings.Contains(prompt, "other.go") || !strings.Contains(prompt, "func other() {}") {
+		t.Errorf("new-doc prompt = %q, want the uncovered file and its patch", prompt)
+	}
+}
+
+func TestStart_UncoveredFileThatNeedsADocGetsANewDocProposal(t *testing.T) {
+	t.Parallel()
+
+	verdict, model := startUncovered(t, []review.ChangedFile{otherGoChange()},
+		newDocResponse(true), submitResponse(newDocProposal("other.go")), verifyResponse(true))
+	proposals, ok := verdict.(review.Proposals)
+	if !ok || len(proposals) != 1 {
+		t.Fatalf("Verdict = %#v, want one proposal", verdict)
+	}
+	if p := proposals[0]; p.DocPath != "docs/other.md" || p.Section != "" || p.IndexEntry == "" || p.Original != "" {
+		t.Errorf("proposal = %+v, want a new doc docs/other.md with an index entry", p)
+	}
+	for _, want := range []string{"---\n", "title:", "covers:", "other.go"} {
+		if !strings.Contains(proposals[0].Content, want) {
+			t.Errorf("new-doc Content = %q, want frontmatter containing %q", proposals[0].Content, want)
+		}
+	}
+	if prompt := model.calls[1].Messages[0].Text; !strings.Contains(prompt, "no doc covers") || !strings.Contains(prompt, "other.go") {
+		t.Errorf("draft prompt = %q, want it to list the uncovered file", prompt)
+	}
+}
+
+func TestStart_NewDocWhoseCoversMissTheUncoveredFilesIsReturnedToModel(t *testing.T) {
+	t.Parallel()
+
+	_, model := startUncovered(t, []review.ChangedFile{otherGoChange()},
+		newDocResponse(true), submitResponse(newDocProposal("elsewhere.go")), submitResponse(),
+	)
+	last := model.calls[len(model.calls)-1].Messages
+	results := last[len(last)-1].ToolResults
+	if len(results) != 1 || !results[0].IsError || !strings.Contains(results[0].Content, "docs/other.md") {
+		t.Errorf("tool results = %+v, want an error naming docs/other.md", results)
+	}
+}
+
+func TestStart_NewDocIsRejectedWhenNoneWasNeeded(t *testing.T) {
+	t.Parallel()
+
+	changed := []review.ChangedFile{mainGoChange(), otherGoChange()}
+	_, model := startUncovered(t, changed,
+		triageResponse(true), newDocResponse(false), submitResponse(newDocProposal("other.go")), submitResponse(), verifyResponse(true))
+	last := model.calls[len(model.calls)-1].Messages
+	results := last[len(last)-1].ToolResults
+	if len(results) != 1 || !results[0].IsError || !strings.Contains(results[0].Content, "not allowed") {
+		t.Errorf("tool results = %+v, want an error rejecting the new doc", results)
+	}
+}
+
+func TestStart_HashOnlySectionCannotBypassNewDocChecks(t *testing.T) {
+	t.Parallel()
+
+	proposal := proposalFor("docs/x.md", 2)
+	proposal["section"] = "#"
+	verdict, _, model := startCoveredOnly(t, triageResponse(true), submitResponse(proposal), submitResponse())
+	last := model.calls[len(model.calls)-1].Messages
+	results := last[len(last)-1].ToolResults
+	if len(results) != 1 || !results[0].IsError || !strings.Contains(results[0].Content, "not allowed") {
+		t.Errorf("tool results = %+v, want an error rejecting the new doc", results)
+	}
+	if _, ok := verdict.(review.NoImpact); !ok {
+		t.Errorf("Verdict = %#v, want NoImpact, no new doc", verdict)
+	}
+}
+
+func TestStart_NewDocAtAnExistingPathIsReturnedToModel(t *testing.T) {
+	t.Parallel()
+
+	proposal := newDocProposal("other.go")
+	proposal["doc_path"] = "docs/x.md"
+	changed := []review.ChangedFile{mainGoChange(), otherGoChange()}
+	_, model := startUncovered(t, changed,
+		triageResponse(true), newDocResponse(true), submitResponse(proposal), submitResponse(), verifyResponse(true))
+	last := model.calls[len(model.calls)-1].Messages
+	results := last[len(last)-1].ToolResults
+	if len(results) != 1 || !results[0].IsError || !strings.Contains(results[0].Content, "already exists") {
+		t.Errorf("tool results = %+v, want an error telling the model to pick a new path", results)
+	}
+}
+
+func TestStart_ChangedPathWithNewlineIsQuotedInAnchorHunks(t *testing.T) {
+	t.Parallel()
+
+	evil := otherGoChange()
+	evil.Path = "evil\nInjected: line.go"
+	_, model := startUncovered(t, []review.ChangedFile{evil}, newDocResponse(true), submitResponse())
+	prompt := model.calls[1].Messages[0].Text
+	if want := `"evil\nInjected: line.go": 1-3`; !strings.Contains(prompt, want) {
+		t.Errorf("draft prompt = %q, want it to contain the quoted path line %q", prompt, want)
+	}
+	if strings.Contains(prompt, "\nInjected: line.go: ") {
+		t.Errorf("draft prompt = %q, want no line started by the raw path tail", prompt)
+	}
+}
+
+func TestStart_MixedChangeTriagesCandidatesAndDecidesNewDoc(t *testing.T) {
+	t.Parallel()
+
+	changed := []review.ChangedFile{mainGoChange(), otherGoChange()}
+	verdict, model := startUncovered(t, changed,
+		triageResponse(true), newDocResponse(true),
+		submitResponse(proposalFor("docs/x.md", 2), newDocProposal("other.go")), verifyResponse(true), verifyResponse(true))
+	proposals, ok := verdict.(review.Proposals)
+	if !ok || len(proposals) != 2 {
+		t.Fatalf("Verdict = %#v, want a section proposal and a new-doc proposal", verdict)
+	}
+	if len(model.calls) != 5 {
+		t.Errorf("model saw %d calls, want 5 (triage, new-doc, draft, 2 verifies)", len(model.calls))
+	}
+}
+
+func TestStart_RemovalsAndDocsOnlyAreNoImpactWithoutModelCalls(t *testing.T) {
+	t.Parallel()
+
+	changed := []review.ChangedFile{
+		{Path: "gone.go", Removed: true},
+		{Path: "docs/new.md", Hunks: []review.LineRange{{Start: 1, End: 3}}, Patch: "@@ -0,0 +1,3 @@\n+x\n"},
+	}
+	verdict, model := startUncovered(t, changed)
+	if _, ok := verdict.(review.NoImpact); !ok {
+		t.Fatalf("Verdict = %T, want review.NoImpact", verdict)
 	}
 	if len(model.calls) != 0 {
 		t.Errorf("model saw %d calls, want 0", len(model.calls))
@@ -559,7 +730,7 @@ func TestStart_DraftPromptListsHunkRanges(t *testing.T) {
 	if _, _, err := startResult(t, model); err != nil {
 		t.Fatalf("Start() = %v, want nil error", err)
 	}
-	if got := model.calls[1].Messages[0].Text; !strings.Contains(got, "main.go: 1-3") {
+	if got := model.calls[1].Messages[0].Text; !strings.Contains(got, `"main.go": 1-3`) {
 		t.Errorf("draft prompt = %q, want it to contain \"main.go: 1-3\"", got)
 	}
 }
@@ -568,7 +739,7 @@ func TestStart_RenameMatchesDocCoveringOnlyOldPath(t *testing.T) {
 	t.Parallel()
 
 	repoDir, headSHA := newGitRepo(t)
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){triageResponse(false), newDocResponse(false)}}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 	runner.SetRemote(repoDir)
 
@@ -611,7 +782,7 @@ func TestStart_PromptsFencePatchAndMarkOmittedPatch(t *testing.T) {
 	t.Parallel()
 
 	repoDir, headSHA := newGitRepo(t)
-	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){triageResponse(false), newDocResponse(false)}}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
 	runner.SetRemote(repoDir)
 
@@ -705,7 +876,6 @@ func TestStart_ProposalCarriesOriginalSectionAndLines(t *testing.T) {
 		doc       string
 		docPath   string
 		section   string
-		indexItem string
 		want      string
 		wantLines review.LineRange
 	}{
@@ -741,15 +911,6 @@ func TestStart_ProposalCarriesOriginalSectionAndLines(t *testing.T) {
 			want:      "## Mid\nmid body\n\n",
 			wantLines: review.LineRange{Start: 9, End: 11},
 		},
-		{
-			name:      "new doc has no original",
-			doc:       frontmatter + body + "\n",
-			docPath:   "docs/new.md",
-			section:   "",
-			indexItem: "new: Describes new.",
-			want:      "",
-			wantLines: review.LineRange{},
-		},
 	}
 
 	for _, tc := range tests {
@@ -761,9 +922,6 @@ func TestStart_ProposalCarriesOriginalSectionAndLines(t *testing.T) {
 
 			proposal := proposalFor(tc.docPath, 2)
 			proposal["section"] = tc.section
-			if tc.indexItem != "" {
-				proposal["index_entry"] = tc.indexItem
-			}
 			model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
 				triageResponse(true),
 				submitResponse(proposal),
@@ -798,5 +956,46 @@ func TestStart_ProposalCarriesOriginalSectionAndLines(t *testing.T) {
 				t.Errorf("doc lines %d-%d = %q, want them to equal Original %q", got.Lines.Start, got.Lines.End, replaced, got.Original)
 			}
 		})
+	}
+}
+
+func TestStart_DocsFileAtHeadIsAbsentReadme(t *testing.T) {
+	t.Parallel()
+
+	dir, baseSHA := newGitRepo(t)
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("rm", "-rq", "docs")
+	if err := os.WriteFile(filepath.Join(dir, "docs"), []byte("not a directory\n"), 0o600); err != nil {
+		t.Fatalf("write docs file: %v", err)
+	}
+	git("add", "-A")
+	git("commit", "-q", "-m", "docs becomes a file")
+	headSHA := git("rev-parse", "HEAD")
+
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){newDocResponse(false)}}
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner.SetRemote(dir)
+	req := testRequest(headSHA)
+	req.BaseSHA = baseSHA
+	req.ChangedFiles = []review.ChangedFile{otherGoChange()}
+
+	started, err := runner.Start(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Start() = %v, want nil error", err)
+	}
+	if _, ok := started.(review.Result); !ok {
+		t.Fatalf("Start() = %T, want review.Result", started)
+	}
+	if len(model.calls) != 1 {
+		t.Fatalf("model saw %d calls, want exactly 1 new-doc decision", len(model.calls))
 	}
 }
