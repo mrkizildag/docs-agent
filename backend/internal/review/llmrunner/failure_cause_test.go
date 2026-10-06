@@ -3,6 +3,7 @@ package llmrunner_test
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,7 +48,7 @@ func TestStart_FailureNamesItsCause(t *testing.T) {
 			if tc.extraDocs != 0 {
 				headSHA = commitCoveringDocs(t, repoDir, tc.extraDocs)
 			}
-			runner := llmrunner.New(tc.model, noToken, "triage-model", "draft-model")
+			runner := llmrunner.New(tc.model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 			runner.SetRemote(repoDir)
 			if tc.badRemote {
 				runner.SetRemote(filepath.Join(t.TempDir(), "missing.git"))

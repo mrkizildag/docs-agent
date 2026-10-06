@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -39,6 +40,7 @@ type Runner struct {
 	token       func(ctx context.Context, installationID int64, repo string) (string, error)
 	triageModel string
 	model       string
+	log         *slog.Logger
 
 	// Test overrides; see export_test.go.
 	remote  string
@@ -53,8 +55,8 @@ var (
 
 // New returns a Runner that triages with triageModel, drafts with model, both
 // served by m, and authenticates clones with a token from token.
-func New(m llm.Model, token func(ctx context.Context, installationID int64, repo string) (string, error), triageModel, model string) *Runner {
-	return &Runner{m: m, token: token, triageModel: triageModel, model: model, timeout: analysisTimeout, budget: tokenBudget}
+func New(m llm.Model, token func(ctx context.Context, installationID int64, repo string) (string, error), triageModel, model string, log *slog.Logger) *Runner {
+	return &Runner{m: m, token: token, triageModel: triageModel, model: model, log: log, timeout: analysisTimeout, budget: tokenBudget}
 }
 
 var (
@@ -116,6 +118,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	}
 	defer cleanup()
 	root := c.root
+	log := r.log.With("repo", req.Owner+"/"+req.Repo, "pr", req.Number, "head_sha", req.HeadSHA)
 
 	baseFS, err := c.docsAt(ctx, req.BaseSHA)
 	if err != nil {
@@ -165,7 +168,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 
 	var impacted, reasons []string
 	for _, docPath := range candidates {
-		isImpacted, why, err := r.triage(ctx, index, budget, fence, docPath, patch)
+		isImpacted, why, err := r.triage(ctx, log, index, budget, fence, docPath, patch)
 		if err != nil {
 			return review.Result{}, fmt.Errorf("triage %s: %w", docPath, err)
 		}
@@ -182,7 +185,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		if err != nil {
 			return review.Result{}, fmt.Errorf("read docs/README.md of %s: %w", req.HeadSHA, err)
 		}
-		needed, why, err := r.decideNewDoc(ctx, budget, fence, string(readme), uncovered, patch)
+		needed, why, err := r.decideNewDoc(ctx, log, budget, fence, string(readme), uncovered, patch)
 		if err != nil {
 			return review.Result{}, fmt.Errorf("decide new doc: %w", err)
 		}
@@ -201,7 +204,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		return r.noImpact(oneLine(prefix+strings.Join(reasons, "; "), maxReasonLen)), nil
 	}
 
-	proposals, err := r.draft(ctx, root, index, budget, fence, req, selection, impacted, allowNewDoc, patch)
+	proposals, err := r.draft(ctx, log, root, index, budget, fence, req, selection, impacted, allowNewDoc, patch)
 	if err != nil {
 		return review.Result{}, err
 	}
@@ -212,7 +215,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	var kept []review.Proposal
 	var rejected []string
 	for _, p := range proposals {
-		supported, why, err := r.verify(ctx, index, budget, fence, p, patch)
+		supported, why, err := r.verify(ctx, log, index, budget, fence, p, patch)
 		if err != nil {
 			return review.Result{}, fmt.Errorf("verify proposal %s: %w", p.DocPath, err)
 		}
@@ -330,7 +333,7 @@ func decodeVerdict(reply string, v any) error {
 // ask sends one tool-less prompt to model, charges its usage to budget, and
 // decodes the JSON verdict in the reply into v. It returns the reply text for
 // error messages.
-func (r *Runner) ask(ctx context.Context, budget *agent.Budget, model, system, prompt string, v any) (string, error) {
+func (r *Runner) ask(ctx context.Context, log *slog.Logger, kind string, budget *agent.Budget, model, system, prompt string, v any) (string, error) {
 	resp, err := r.m.Complete(ctx, llm.Request{
 		Model:    model,
 		System:   system,
@@ -339,6 +342,8 @@ func (r *Runner) ask(ctx context.Context, budget *agent.Budget, model, system, p
 	if err != nil {
 		return "", fmt.Errorf("complete: %w: %w", errProvider, err)
 	}
+	log.Info("agent call", "kind", kind, "model", model,
+		"input_tokens", resp.Usage.InputTokens, "output_tokens", resp.Usage.OutputTokens)
 	if err := budget.Charge(resp.Usage); err != nil {
 		return "", fmt.Errorf("charge token budget: %w", err)
 	}
@@ -350,9 +355,9 @@ func (r *Runner) ask(ctx context.Context, budget *agent.Budget, model, system, p
 
 // triage runs one small-model call for docPath, returning whether the PR's
 // diff makes it stale and why.
-func (r *Runner) triage(ctx context.Context, index docIndex, budget *agent.Budget, f fence, docPath, patch string) (impacted bool, reason string, err error) {
+func (r *Runner) triage(ctx context.Context, log *slog.Logger, index docIndex, budget *agent.Budget, f fence, docPath, patch string) (impacted bool, reason string, err error) {
 	var v triageVerdict
-	reply, err := r.ask(ctx, budget, r.triageModel, triageSystemPrompt, triageUserPrompt(f, index[docPath], patch), &v)
+	reply, err := r.ask(ctx, log, "triage", budget, r.triageModel, triageSystemPrompt, triageUserPrompt(f, index[docPath], patch), &v)
 	if err != nil {
 		return false, "", err
 	}
@@ -364,9 +369,9 @@ func (r *Runner) triage(ctx context.Context, index docIndex, budget *agent.Budge
 
 // decideNewDoc runs one small-model call on whether the PR's diff adds
 // behavior that needs a new doc because no existing doc can hold it.
-func (r *Runner) decideNewDoc(ctx context.Context, budget *agent.Budget, f fence, readme string, uncovered []string, patch string) (needed bool, reason string, err error) {
+func (r *Runner) decideNewDoc(ctx context.Context, log *slog.Logger, budget *agent.Budget, f fence, readme string, uncovered []string, patch string) (needed bool, reason string, err error) {
 	var v newDocVerdict
-	reply, err := r.ask(ctx, budget, r.triageModel, newDocSystemPrompt, newDocUserPrompt(f, readme, uncovered, patch), &v)
+	reply, err := r.ask(ctx, log, "new_doc", budget, r.triageModel, newDocSystemPrompt, newDocUserPrompt(f, readme, uncovered, patch), &v)
 	if err != nil {
 		return false, "", err
 	}
@@ -378,7 +383,7 @@ func (r *Runner) decideNewDoc(ctx context.Context, budget *agent.Budget, f fence
 
 // verify asks the triage model whether p is supported by the patch, given the
 // doc section p replaces.
-func (r *Runner) verify(ctx context.Context, index docIndex, budget *agent.Budget, f fence, p review.Proposal, patch string) (supported bool, reason string, err error) {
+func (r *Runner) verify(ctx context.Context, log *slog.Logger, index docIndex, budget *agent.Budget, f fence, p review.Proposal, patch string) (supported bool, reason string, err error) {
 	section := "(new doc)"
 	if p.Section != "" {
 		doc, ok := index[p.DocPath]
@@ -394,7 +399,7 @@ func (r *Runner) verify(ctx context.Context, index docIndex, budget *agent.Budge
 	}
 
 	var v verifyVerdict
-	reply, err := r.ask(ctx, budget, r.triageModel, verifySystemPrompt, verifyUserPrompt(f, p, section, patch), &v)
+	reply, err := r.ask(ctx, log, "verify", budget, r.triageModel, verifySystemPrompt, verifyUserPrompt(f, p, section, patch), &v)
 	if err != nil {
 		return false, "", err
 	}
@@ -450,7 +455,7 @@ type submitProposalsArgs struct {
 // draft runs the agent loop that drafts proposals for the impacted docs. It
 // may propose a new doc only when allowNewDoc, the new-doc decision for
 // sel.Uncovered, is true.
-func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budget *agent.Budget, f fence, req review.Request, sel basedocs.Selection, impacted []string, allowNewDoc bool, patch string) ([]review.Proposal, error) {
+func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, index docIndex, budget *agent.Budget, f fence, req review.Request, sel basedocs.Selection, impacted []string, allowNewDoc bool, patch string) ([]review.Proposal, error) {
 	finish, err := submitProposalsTool()
 	if err != nil {
 		return nil, err
@@ -500,6 +505,7 @@ func (r *Runner) draft(ctx context.Context, root *os.Root, index docIndex, budge
 			return nil
 		},
 		MaxSteps: stepCap,
+		Log:      log,
 	}
 
 	raw, _, err := agent.Run(ctx, r.m, task, budget)

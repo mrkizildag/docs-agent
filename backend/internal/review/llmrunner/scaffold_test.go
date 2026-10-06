@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -40,7 +41,7 @@ func lastToolResult(req llm.Request) llm.ToolResult {
 func startScaffold(t *testing.T, model llm.Model) (review.ScaffoldStarted, error) {
 	t.Helper()
 	repoDir, sha := newGitRepo(t)
-	runner := llmrunner.New(model, noToken, "m", "m")
+	runner := llmrunner.New(model, noToken, "m", "m", slog.New(slog.DiscardHandler))
 	runner.SetRemote(repoDir)
 	started, err := runner.StartScaffold(t.Context(), review.ScaffoldRequest{Owner: "o", Repo: "r", BaseSHA: sha})
 	if err != nil {

@@ -370,7 +370,7 @@ func TestWebhookToActionsScaffoldPullRequest(t *testing.T) {
 func TestWebhookToActionsScaffoldPreferredOverServerRunner(t *testing.T) {
 	t.Parallel()
 	noToken := func(context.Context, int64, string) (string, error) { return "", nil }
-	testWebhookToActionsScaffoldPullRequest(t, llmrunner.New(unusedModel{t: t}, noToken, "triage", "draft"))
+	testWebhookToActionsScaffoldPullRequest(t, llmrunner.New(unusedModel{t: t}, noToken, "triage", "draft", slog.New(slog.DiscardHandler)))
 }
 
 func testWebhookToActionsScaffoldPullRequest(t *testing.T, server gate.ServerRunner) {

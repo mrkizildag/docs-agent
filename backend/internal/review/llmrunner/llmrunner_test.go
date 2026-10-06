@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -166,7 +167,7 @@ func TestStart_ImpactedDocProducesProposal(t *testing.T) {
 		verifyResponse(true),
 	}}
 
-	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 	runner.SetRemote(repoDir)
 
 	req := review.Request{
@@ -211,7 +212,7 @@ func TestStart_AllTriageNoIsNoImpact(t *testing.T) {
 		triageResponse(false),
 	}}
 
-	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 	runner.SetRemote(repoDir)
 
 	req := review.Request{
@@ -273,7 +274,7 @@ func startUncovered(t *testing.T, changed []review.ChangedFile, script ...func(l
 
 	repoDir, headSHA := newGitRepo(t)
 	model := &fakeModel{script: script}
-	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 	runner.SetRemote(repoDir)
 
 	req := testRequest(headSHA)
@@ -466,7 +467,7 @@ func TestStart_NoChangedFilesIsNoImpactWithoutCloneOrModel(t *testing.T) {
 	t.Parallel()
 
 	model := &fakeModel{}
-	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 
 	started, err := runner.Start(t.Context(), review.Request{Owner: "o", Repo: "r", Number: 1, HeadSHA: "deadbeef"})
 	if err != nil {
@@ -487,7 +488,7 @@ func TestStart_NoChangedFilesIsNoImpactWithoutCloneOrModel(t *testing.T) {
 func startResult(t *testing.T, model llm.Model) (review.Verdict, *llmrunner.Runner, error) {
 	t.Helper()
 	repoDir, headSHA := newGitRepo(t)
-	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 	runner.SetRemote(repoDir)
 	started, err := runner.Start(t.Context(), testRequest(headSHA))
 	if err != nil {
@@ -624,7 +625,7 @@ func TestStart_TokenBudgetExceededDuringTriage(t *testing.T) {
 	}}
 
 	repoDir, headSHA := newGitRepo(t)
-	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 	runner.SetRemote(repoDir)
 	runner.SetTokenBudget(10)
 
@@ -645,7 +646,7 @@ func TestStart_DeadlineIsErrDeadline(t *testing.T) {
 	t.Parallel()
 
 	repoDir, headSHA := newGitRepo(t)
-	runner := llmrunner.New(blockingModel{}, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(blockingModel{}, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 	runner.SetRemote(repoDir)
 	runner.SetTimeout(200 * time.Millisecond)
 
@@ -662,7 +663,7 @@ func TestStart_RejectsHeadSHAThatIsNotAFullObjectID(t *testing.T) {
 	t.Parallel()
 
 	model := &fakeModel{}
-	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 
 	_, err := runner.Start(t.Context(), testRequest("--upload-pack=x"))
 	if err == nil {
@@ -740,7 +741,7 @@ func TestStart_RenameMatchesDocCoveringOnlyOldPath(t *testing.T) {
 
 	repoDir, headSHA := newGitRepo(t)
 	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){triageResponse(false), newDocResponse(false)}}
-	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 	runner.SetRemote(repoDir)
 
 	req := testRequest(headSHA)
@@ -783,7 +784,7 @@ func TestStart_PromptsFencePatchAndMarkOmittedPatch(t *testing.T) {
 
 	repoDir, headSHA := newGitRepo(t)
 	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){triageResponse(false), newDocResponse(false)}}
-	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 	runner.SetRemote(repoDir)
 
 	req := testRequest(headSHA)
@@ -837,7 +838,7 @@ func TestStart_TooManyCandidateDocsIsAnError(t *testing.T) {
 		t.Fatalf("rev-parse HEAD: %v", err)
 	}
 
-	runner := llmrunner.New(&fakeModel{}, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(&fakeModel{}, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 	runner.SetRemote(dir)
 	_, err = runner.Start(t.Context(), testRequest(strings.TrimSpace(string(out))))
 	if err == nil || !strings.Contains(err.Error(), "cap of 10") {
@@ -927,7 +928,7 @@ func TestStart_ProposalCarriesOriginalSectionAndLines(t *testing.T) {
 				submitResponse(proposal),
 				verifyResponse(true),
 			}}
-			runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+			runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 			runner.SetRemote(repoDir)
 
 			started, err := runner.Start(t.Context(), testRequest(headSHA))
@@ -982,7 +983,7 @@ func TestStart_DocsFileAtHeadIsAbsentReadme(t *testing.T) {
 	headSHA := git("rev-parse", "HEAD")
 
 	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){newDocResponse(false)}}
-	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
 	runner.SetRemote(dir)
 	req := testRequest(headSHA)
 	req.BaseSHA = baseSHA

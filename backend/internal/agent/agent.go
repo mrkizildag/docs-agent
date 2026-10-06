@@ -8,7 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 )
@@ -39,6 +42,9 @@ type Task struct {
 	Finish   llm.Tool
 	Accept   func(json.RawMessage) error
 	MaxSteps int
+	// Log receives one record per tool call and one summary record per run;
+	// nil discards them.
+	Log *slog.Logger
 }
 
 // Stats is what a Run consumed.
@@ -75,6 +81,21 @@ func (b *Budget) Charge(u llm.Usage) error {
 // model calls t.Finish with arguments t.Accept accepts. A t.Accept error is
 // reported back to the model as a tool error, and the loop continues.
 func Run(ctx context.Context, m llm.Model, t Task, b *Budget) (json.RawMessage, Stats, error) {
+	if t.Log == nil {
+		t.Log = slog.New(slog.DiscardHandler)
+	}
+	start := time.Now()
+	raw, stats, err := run(ctx, m, t, b)
+	outcome := "finished"
+	if err != nil {
+		outcome = err.Error()
+	}
+	t.Log.Info("agent run done", "steps", stats.Steps, "input_tokens", stats.InputTokens,
+		"output_tokens", stats.OutputTokens, "duration", time.Since(start).Round(time.Millisecond), "outcome", outcome)
+	return raw, stats, err
+}
+
+func run(ctx context.Context, m llm.Model, t Task, b *Budget) (json.RawMessage, Stats, error) {
 	tools := append(readTools(), t.Finish)
 	messages := []llm.Message{{Role: llm.RoleUser, Text: t.Prompt}}
 	var stats Stats
@@ -100,6 +121,11 @@ func Run(ctx context.Context, m llm.Model, t Task, b *Budget) (json.RawMessage, 
 		stats.OutputTokens += resp.Usage.OutputTokens
 		if err := b.Charge(resp.Usage); err != nil {
 			return nil, stats, err
+		}
+
+		for _, call := range resp.ToolCalls {
+			t.Log.Info("agent step", "step", stats.Steps, "tool", call.Name, "arg", argSummary(call),
+				"input_tokens", resp.Usage.InputTokens, "output_tokens", resp.Usage.OutputTokens)
 		}
 
 		if len(resp.ToolCalls) == 0 {
@@ -154,4 +180,28 @@ func ctxError(n int, err error) error {
 		return fmt.Errorf("agent: step %d: %w: %w", n, ErrDeadline, err)
 	}
 	return fmt.Errorf("agent: step %d: %w", n, err)
+}
+
+const maxArgSummary = 120
+
+// argSummary is the path or pattern a read tool call targets, truncated; it
+// is empty for other tools so submitted content never reaches the log.
+func argSummary(call llm.ToolCall) string {
+	var a struct {
+		Path    string `json:"path"`
+		Pattern string `json:"pattern"`
+	}
+	switch call.Name {
+	case readFileToolName, listDirToolName, grepToolName:
+		if json.Unmarshal(call.Args, &a) != nil {
+			return ""
+		}
+	default:
+		return ""
+	}
+	s := strings.Join(strings.Fields(a.Pattern+" "+a.Path), " ")
+	if len(s) > maxArgSummary {
+		s = strings.ToValidUTF8(s[:maxArgSummary], "") + "..."
+	}
+	return s
 }

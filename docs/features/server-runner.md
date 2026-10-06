@@ -46,6 +46,10 @@ A run has a step cap, a token budget, and a deadline that leaves room inside the
 
 The runner classifies every failure once, at the point it starts, into a fixed cause: provider error, timeout, step or token limit, too many candidate docs, clone failure, or internal. The gate shows fixed text per cause and anything unclassified as a generic failure. Provider errors and model replies can carry model output or response bodies, so the cause never quotes them; the detail stays in the server log.
 
+## Run visibility
+
+The agent loop logs one record per tool call (step, tool, the path or pattern truncated to 120 characters, tokens of that step; never file contents or submitted text) and one at the end with steps, tokens, duration, and outcome. Triage, new-doc, and verification calls log their tokens. Records carry `repo`, `pr`, and `head_sha` (scaffold runs `repo` and `scaffold_sha`), so one PR's run is a grep of the server log. The logger is passed into `llmrunner.New` and `agent.Task.Log`.
+
 ## Size limits
 
 Before any review LLM call or dispatch, the gate rejects a PR with more than 50 changed files or more than 1 MiB of patch text, for both runners; the check ends neutral "PR too large to analyze" naming the limit. A text file whose patch GitHub omitted (it reports changes but no patch) counts as over, since its size is unknown; a binary file has no patch and does not. Partial analysis of a large PR is not attempted. The file limit is one named constant so a per-plan value can replace it later; at 50 files the listing is far below GitHub's 3000-file cap, so a truncated listing cannot reach analysis.

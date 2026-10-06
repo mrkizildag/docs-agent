@@ -1,10 +1,12 @@
 package agent_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -449,5 +451,62 @@ func TestRun_EmptyReplyAppendsNoEmptyAssistantMessage(t *testing.T) {
 	}
 	if n := len(model.calls[1].Messages); n != 2 {
 		t.Errorf("len(messages) = %d, want prompt and nudge", n)
+	}
+}
+
+func TestRun_LogsStepsAndTotals(t *testing.T) {
+	t.Parallel()
+
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+		func(llm.Request) (llm.Response, error) {
+			return llm.Response{
+				ToolCalls: []llm.ToolCall{
+					{ID: "1", Name: "read_file", Args: json.RawMessage(`{"path":"doc.md"}`)},
+					{ID: "2", Name: "grep", Args: json.RawMessage(`{"pattern":"foo","path":"docs"}`)},
+				},
+				Usage: llm.Usage{InputTokens: 10, OutputTokens: 5},
+			}, nil
+		},
+		func(llm.Request) (llm.Response, error) {
+			return llm.Response{
+				ToolCalls: []llm.ToolCall{{ID: "3", Name: "submit", Args: json.RawMessage(`{"secret":"body"}`)}},
+				Usage:     llm.Usage{InputTokens: 20, OutputTokens: 7},
+			}, nil
+		},
+	}}
+	var buf bytes.Buffer
+	task := agent.Task{
+		Model: "m", Prompt: "go", Root: testRoot(t), Finish: finishTool(),
+		Accept:   func(json.RawMessage) error { return nil },
+		MaxSteps: 5,
+		Log:      slog.New(slog.NewJSONHandler(&buf, nil)).With("repo", "o/r", "pr", 7),
+	}
+
+	if _, _, err := agent.Run(t.Context(), model, task, agent.NewBudget(1000)); err != nil {
+		t.Fatalf("Run() = %v, want nil error", err)
+	}
+
+	type rec struct {
+		Msg, Tool, Arg, Repo, Outcome string
+		Step, Steps, PR               int
+		InputTokens                   int `json:"input_tokens"`
+		OutputTokens                  int `json:"output_tokens"`
+	}
+	var got []rec
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var r rec
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		got = append(got, r)
+	}
+	want := []rec{
+		{Msg: "agent step", Repo: "o/r", PR: 7, Step: 1, Tool: "read_file", Arg: "doc.md", InputTokens: 10, OutputTokens: 5},
+		{Msg: "agent step", Repo: "o/r", PR: 7, Step: 1, Tool: "grep", Arg: "foo docs", InputTokens: 10, OutputTokens: 5},
+		{Msg: "agent step", Repo: "o/r", PR: 7, Step: 2, Tool: "submit", InputTokens: 20, OutputTokens: 7},
+		{Msg: "agent run done", Repo: "o/r", PR: 7, Steps: 2, InputTokens: 30, OutputTokens: 12, Outcome: "finished"},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("log records mismatch (-want +got):\n%s", diff)
 	}
 }
