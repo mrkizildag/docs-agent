@@ -164,11 +164,11 @@ func OnScaffoldDocsPresent(s ScaffoldState) ScaffoldState {
 	return s
 }
 
-// OnScaffoldNoRunner is the state transition for a job that finds no runner to
+// onScaffoldNoRunner is the state transition for a job that finds no runner to
 // write the files: pure, no I/O. It bumps Attempt but not Failures, because the
 // job for the finished attempt must not swallow the next request and a missing
 // runner is not a failed attempt.
-func OnScaffoldNoRunner(s ScaffoldState) ScaffoldState {
+func onScaffoldNoRunner(s ScaffoldState) ScaffoldState {
 	s.Attempt++
 	s.Phase, s.Run = ScaffoldIdle, nil
 	return s
@@ -278,18 +278,21 @@ func (s *Service) requestScaffold(ctx context.Context, state PRState, pr PullReq
 // the PR exists leaves the scaffold to be requested again by the next PR event
 // and is returned.
 func (s *Service) HandleScaffold(ctx context.Context, ref RepoRef) error {
-	op := fmt.Sprintf("handle scaffold of %s/%s", ref.Owner, ref.Repo)
+	if err := s.handleScaffold(ctx, ref); err != nil {
+		return fmt.Errorf("handle scaffold of %s/%s: %w", ref.Owner, ref.Repo, err)
+	}
+	return nil
+}
+
+func (s *Service) handleScaffold(ctx context.Context, ref RepoRef) error {
 	state, err := s.store.LoadScaffold(ctx, ref.Owner, ref.Repo)
 	if err != nil {
-		return fmt.Errorf("%s: load state: %w", op, err)
+		return fmt.Errorf("load state: %w", err)
 	}
 	if state.Phase == ScaffoldAwaiting || state.Phase == ScaffoldGaveUp {
 		return nil
 	}
-	if err := s.advanceScaffold(ctx, state); err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-	return nil
+	return s.advanceScaffold(ctx, state)
 }
 
 // HandleScaffoldRun continues the scaffold from the external run rc reports, if
@@ -297,10 +300,16 @@ func (s *Service) HandleScaffold(ctx context.Context, ref RepoRef) error {
 // failed or whose result is unusable fails the attempt; a result that could not
 // be read is returned for retry.
 func (s *Service) HandleScaffoldRun(ctx context.Context, rc RunCompleted) error {
-	op := fmt.Sprintf("handle scaffold run %d of %s/%s", rc.RunID, rc.Owner, rc.Repo)
+	if err := s.handleScaffoldRun(ctx, rc); err != nil {
+		return fmt.Errorf("handle scaffold run %d of %s/%s: %w", rc.RunID, rc.Owner, rc.Repo, err)
+	}
+	return nil
+}
+
+func (s *Service) handleScaffoldRun(ctx context.Context, rc RunCompleted) error {
 	state, err := s.store.LoadScaffold(ctx, rc.Owner, rc.Repo)
 	if err != nil {
-		return fmt.Errorf("%s: load state: %w", op, err)
+		return fmt.Errorf("load state: %w", err)
 	}
 	if !MatchesScaffoldRun(state, rc) {
 		return nil
@@ -311,7 +320,7 @@ func (s *Service) HandleScaffoldRun(ctx context.Context, rc RunCompleted) error 
 		var invalid *review.InvalidResultError
 		files, err = s.collectScaffold(ctx, state)
 		if err != nil && !errors.As(err, &invalid) {
-			return fmt.Errorf("%s: %w", op, err)
+			return err
 		}
 	} else {
 		err = fmt.Errorf("workflow run concluded %q", rc.Conclusion)
@@ -320,7 +329,7 @@ func (s *Service) HandleScaffoldRun(ctx context.Context, rc RunCompleted) error 
 		if serr := s.saveScaffoldFailed(ctx, state); serr != nil {
 			err = errors.Join(err, serr)
 		}
-		return fmt.Errorf("%s: %w", op, err)
+		return err
 	}
 
 	writeCtx, cancel := writeContext(ctx)
@@ -328,10 +337,10 @@ func (s *Service) HandleScaffoldRun(ctx context.Context, rc RunCompleted) error 
 	err = s.store.SaveScaffold(writeCtx, state)
 	cancel()
 	if err != nil {
-		return fmt.Errorf("%s: save state: %w", op, err)
+		return fmt.Errorf("save state: %w", err)
 	}
 	if err := s.advanceScaffold(ctx, state); err != nil {
-		return fmt.Errorf("%s: %w", op, s.healWaiters(ctx, RepoRef{Owner: rc.Owner, Repo: rc.Repo}, err))
+		return s.healWaiters(ctx, RepoRef{Owner: rc.Owner, Repo: rc.Repo}, err)
 	}
 	return nil
 }
@@ -339,18 +348,21 @@ func (s *Service) HandleScaffoldRun(ctx context.Context, rc RunCompleted) error 
 // HandleScaffoldDeadline fails the scaffold attempt if the run identified by
 // nonce is still awaited for ref and overdue at now; otherwise it does nothing.
 func (s *Service) HandleScaffoldDeadline(ctx context.Context, ref RepoRef, nonce string, now time.Time) error {
-	op := fmt.Sprintf("handle scaffold deadline of %s/%s", ref.Owner, ref.Repo)
+	if err := s.handleScaffoldDeadline(ctx, ref, nonce, now); err != nil {
+		return fmt.Errorf("handle scaffold deadline of %s/%s: %w", ref.Owner, ref.Repo, err)
+	}
+	return nil
+}
+
+func (s *Service) handleScaffoldDeadline(ctx context.Context, ref RepoRef, nonce string, now time.Time) error {
 	state, err := s.store.LoadScaffold(ctx, ref.Owner, ref.Repo)
 	if err != nil {
-		return fmt.Errorf("%s: load state: %w", op, err)
+		return fmt.Errorf("load state: %w", err)
 	}
 	if !ScaffoldOverdue(state, now) || state.Run.Nonce != nonce {
 		return nil
 	}
-	if err := s.saveScaffoldFailed(ctx, state); err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-	return nil
+	return s.saveScaffoldFailed(ctx, state)
 }
 
 // healWaiters returns err, after enqueueing a scaffold job for the saved
@@ -430,7 +442,7 @@ func (s *Service) collectScaffold(ctx context.Context, state ScaffoldState) (rev
 		RunID:          state.Run.RunID,
 		Nonce:          state.Run.Nonce,
 	}
-	files, err := collectWithRetry(ctx, s.collectBackoff, func(ctx context.Context) (review.Scaffold, error) {
+	files, err := retry(ctx, collectAttempts, s.retryBackoff, func(ctx context.Context) (review.Scaffold, error) {
 		return s.runners.Actions.CollectScaffold(ctx, completion)
 	})
 	if err != nil {
@@ -546,7 +558,7 @@ func (s *Service) startScaffold(ctx context.Context, state ScaffoldState, tip st
 // write it, then tells the unlinked waiting check runs. It is not a failed
 // attempt; the waiters stay unlinked for the request that finds a runner.
 func (s *Service) concludeNoRunner(ctx context.Context, state ScaffoldState) (ScaffoldState, error) {
-	idle := OnScaffoldNoRunner(state)
+	idle := onScaffoldNoRunner(state)
 	writeCtx, cancel := writeContext(ctx)
 	defer cancel()
 	if err := s.store.SaveScaffold(writeCtx, idle); err != nil {

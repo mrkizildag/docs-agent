@@ -27,6 +27,7 @@ type fakeCommentGitHub struct {
 	sha       string                 // the commit CommitFiles makes; "abcdef1234567" when empty
 	api       *fakeGitHub            // when set, replies are also added to its comments
 	replyErr  error                  // ReplyToReviewComment fails with it
+	fileErrs  map[string]error       // FileAtRef fails with the error of its path
 
 	permissionCalls int
 	commits         [][]gate.FileChange
@@ -59,6 +60,9 @@ func (f *fakeCommentGitHub) Permission(context.Context, int64, string, string, s
 }
 
 func (f *fakeCommentGitHub) FileAtRef(_ context.Context, _ int64, _, _, path, _ string) ([]byte, bool, error) {
+	if err := f.fileErrs[path]; err != nil {
+		return nil, false, err
+	}
 	c, ok := f.files[path]
 	return []byte(c), ok, nil
 }
@@ -732,4 +736,33 @@ func (f *fakeCommentGitHub) CommitAt(_ context.Context, _ int64, _, _, sha strin
 		return f.branch, nil
 	}
 	return gate.Commit{}, nil
+}
+
+func TestHandleCommentApplyRefusesWhenAFileCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	tooLarge := fmt.Errorf("docs/README.md: %w", review.ErrFileTooLarge)
+	for _, path := range []string{review.IndexPath, "docs/a.md", "docs/c.md"} {
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+
+			store := &fakeStore{stored: threeState(), live: true}
+			api := apiWithComments()
+			comments := &fakeCommentGitHub{canWrite: true, files: baseFiles(), api: api, fileErrs: map[string]error{path: tooLarge}}
+			svc := gate.NewService(api, comments, store, gate.Runners{}, nil, nil)
+
+			err := svc.HandleComment(t.Context(), issueComment("/pollux-agent apply"))
+			if !errors.Is(err, review.ErrFileTooLarge) {
+				t.Fatalf("HandleComment() = %v, want wrapping review.ErrFileTooLarge", err)
+			}
+			if len(comments.commits) != 0 {
+				t.Errorf("commits = %+v, want none", comments.commits)
+			}
+			for _, p := range store.stored.Proposals {
+				if p.State != gate.ProposalOpen {
+					t.Errorf("proposal %s = %v, want still open", p.ID, p.State)
+				}
+			}
+		})
+	}
 }

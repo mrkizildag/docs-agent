@@ -77,9 +77,28 @@ func TestHandleRunCompletedInvalidResultHidesDetail(t *testing.T) {
 	}
 }
 
-// Validation: "After any failure, the summary comment exists. It states the
-// cause and holds an unticked Re-run analysis checkbox." An Actions run that
-// fails is a failure.
+func TestHandleRunCompletedUnusableResultWritesFailureSummary(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{}
+	runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{}}}
+	svc := gate.NewService(gh, nil, &fakeStore{stored: awaitingState()}, gate.Runners{Actions: runner}, nil, nil)
+
+	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
+		t.Fatalf("HandleRunCompleted() = %v, want nil", err)
+	}
+	if len(gh.updates) != 1 || gh.updates[0].run.Title != "Analysis failed" {
+		t.Fatalf("updates = %+v, want one Analysis failed", gh.updates)
+	}
+	cause := gh.updates[0].run.Summary
+	if len(gh.comments) != 1 || !strings.Contains(gh.comments[0].Body, cause) ||
+		!strings.Contains(gh.comments[0].Body, "- [ ] Re-run analysis\n") {
+		t.Errorf("comments = %+v, want one summary stating %q with an unticked Re-run box", gh.comments, cause)
+	}
+}
+
+// An Actions run that fails writes a summary that states the cause and holds an
+// unticked Re-run box.
 func TestHandleRunCompletedFailureWritesFailureSummary(t *testing.T) {
 	t.Parallel()
 

@@ -1,4 +1,12 @@
-// Package gate is the domain: deciding what check run a pull request gets.
+// Package gate is the domain of the pollux-agent GitHub App: what check run a
+// pull request gets, which proposal and summary comments it carries, and what
+// acting on those comments does. HandlePullRequest, HandleRunCompleted and
+// HandleDeadline report the check run; HandleComment applies proposals to the
+// head branch (Apply), waives the check (skip) and re-runs the analysis;
+// HandleScaffold and its siblings write and propose the docs scaffold of a repo
+// that has no docs/ folder. State transitions are pure functions over PRState and
+// ScaffoldState; the Service performs their I/O through the GitHub,
+// CommentGitHub, ScaffoldGitHub, ScaffoldQueue and Store ports it declares.
 package gate
 
 import (
@@ -254,7 +262,7 @@ type ProposalState struct {
 // ProposalID is the stable identity of a proposal across re-runs: a short hash
 // of its doc path and normalized section heading (path alone for a new doc).
 func ProposalID(docPath, section string) string {
-	section = strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(section), "#"))
+	section = review.NormalizeSection(section)
 	sum := sha256.Sum256([]byte(docPath + "\x00" + section))
 	return hex.EncodeToString(sum[:6])
 }
@@ -322,10 +330,10 @@ func pendingSkipCancelled(prev PRState, pr PullRequest) *SkipAsk {
 	return prev.PendingSkip
 }
 
-// Superseded returns the neutral check run that closes the check run of an
+// superseded returns the neutral check run that closes the check run of an
 // awaited run when a new analysis of pr replaces it, on any head; ok is false
 // when there is nothing to close. Pure, no I/O.
-func Superseded(state PRState, pr PullRequest) (run CheckRun, ok bool) {
+func superseded(state PRState, pr PullRequest) (run CheckRun, ok bool) {
 	if state.Run == nil || state.CheckRunID == 0 {
 		return CheckRun{}, false
 	}
@@ -337,13 +345,13 @@ func Superseded(state PRState, pr PullRequest) (run CheckRun, ok bool) {
 	return neutral(run, "Superseded", "Superseded by "+by), true
 }
 
-// Overdue reports whether state awaits a run whose deadline has passed at now.
-func Overdue(state PRState, now time.Time) bool {
+// overdue reports whether state awaits a run whose deadline has passed at now.
+func overdue(state PRState, now time.Time) bool {
 	return state.Run != nil && now.After(state.Run.Deadline)
 }
 
-// OnStarted is the state transition for an analysis that runs elsewhere: pure, no I/O.
-func OnStarted(state PRState, pending review.Pending, checkRunID int64) PRState {
+// onStarted is the state transition for an analysis that runs elsewhere: pure, no I/O.
+func onStarted(state PRState, pending review.Pending, checkRunID int64) PRState {
 	state.CheckRunID = checkRunID
 	state.Run = &AwaitingRun{RunID: pending.RunID, Nonce: pending.Nonce, Deadline: pending.Deadline}
 	return state
@@ -360,7 +368,35 @@ type Outcome struct {
 	Failed *AnalysisFailed
 }
 
-func resultOutcome(r review.Result) Outcome { return Outcome{Result: &r} }
+// resultOutcome is the outcome of r, or a failed one when r's verdict cannot
+// conclude an analysis.
+func resultOutcome(r review.Result) Outcome {
+	if cause := unusableCause(r.Verdict); cause != "" {
+		return failedOutcome(cause)
+	}
+	return Outcome{Result: &r}
+}
+
+// unusableCause is the fixed cause for a verdict that cannot conclude an
+// analysis (an empty proposal list, where no impact must be NoImpact, or an
+// unknown verdict), or "" for a usable one.
+func unusableCause(v review.Verdict) string {
+	switch v := v.(type) {
+	case review.NoImpact:
+		return ""
+	case review.Proposals:
+		if len(v) == 0 {
+			return "The runner returned an empty proposal list."
+		}
+		return ""
+	}
+	return "The runner returned an unknown verdict."
+}
+
+// unusableResultError is a result whose verdict cannot conclude the analysis.
+type unusableResultError struct{ cause string }
+
+func (e *unusableResultError) Error() string { return "unusable result: " + e.cause }
 
 func failedOutcome(cause string) Outcome { return Outcome{Failed: &AnalysisFailed{Cause: cause}} }
 
@@ -465,17 +501,14 @@ func concludeUncapped(state PRState, outcome Outcome) (PRState, CheckRun) {
 			return state, run
 		case review.Proposals:
 			pending := unapplied(state, v)
-			if len(v) > 0 && len(pending) == 0 {
+			if len(pending) == 0 {
 				run.Conclusion, run.Title, run.Summary = ConclusionSuccess, "Docs up to date", "Every proposed doc change is already applied."
 				return state, run
 			}
-			if len(v) > 0 {
-				run.Conclusion, run.Title, run.Summary = ConclusionActionRequired, "Docs need updating", proposalsSummary(pending)
-				return state, run
-			}
-			return state, neutral(run, "Analysis failed", "runner returned an empty proposal list; no impact must be NoImpact")
+			run.Conclusion, run.Title, run.Summary = ConclusionActionRequired, "Docs need updating", proposalsSummary(pending)
+			return state, run
 		default:
-			return state, neutral(run, "Analysis failed", fmt.Sprintf("unknown review.Verdict %T", outcome.Result.Verdict))
+			return state, neutral(run, "Analysis failed", unusableCause(v))
 		}
 	case outcome.Failed != nil:
 		title := cmp.Or(outcome.Failed.Title, "Analysis failed")
@@ -593,11 +626,11 @@ func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []r
 	return next, writes
 }
 
-// ReconcileFailure is the state transition for a failed run: pure, no I/O. It
+// reconcileFailure is the state transition for a failed run: pure, no I/O. It
 // returns prev with only SummaryCommentID possibly changed, and the one summary
 // write that reports the failure. Proposals are left as they are, so earlier
 // ones stay listed.
-func ReconcileFailure(prev PRState, existing []Comment) (PRState, CommentWrite) {
+func reconcileFailure(prev PRState, existing []Comment) (PRState, CommentWrite) {
 	next := prev
 	resolveSummary(&next, existing)
 	return next, CommentWrite{Summary: true, ID: next.SummaryCommentID}
@@ -659,13 +692,19 @@ func adoptMarked(ps *ProposalState, existing []Comment) {
 	}
 }
 
-func findMarked(existing []Comment, kind CommentKind, marker string) (Comment, bool) {
+// findMine returns the first comment of ours of kind that match accepts; a
+// listed comment someone else wrote never matches, so it is never edited.
+func findMine(existing []Comment, kind CommentKind, match func(Comment) bool) (Comment, bool) {
 	for _, c := range existing {
-		if c.Mine && c.Kind == kind && hasMarker(c.Body, marker) {
+		if c.Mine && c.Kind == kind && match(c) {
 			return c, true
 		}
 	}
 	return Comment{}, false
+}
+
+func findMarked(existing []Comment, kind CommentKind, marker string) (Comment, bool) {
+	return findMine(existing, kind, func(c Comment) bool { return hasMarker(c.Body, marker) })
 }
 
 // hasMarker reports whether marker is the first line of body.
@@ -674,15 +713,8 @@ func hasMarker(body, marker string) bool {
 	return strings.TrimRight(first, "\r") == marker
 }
 
-// findComment returns our comment id; a listed comment someone else wrote
-// counts as missing so it is never edited.
 func findComment(existing []Comment, kind CommentKind, id int64) (Comment, bool) {
-	for _, c := range existing {
-		if c.Mine && c.Kind == kind && c.ID == id {
-			return c, true
-		}
-	}
-	return Comment{}, false
+	return findMine(existing, kind, func(c Comment) bool { return c.ID == id })
 }
 
 // sameAnchor reports whether existing sits where rc would be created; a
@@ -720,8 +752,8 @@ type Service struct {
 	comments      CommentGitHub
 	scaffoldGH    ScaffoldGitHub
 	scaffoldQueue ScaffoldQueue
-	// collectBackoff is the wait before the first Collect retry; it doubles.
-	collectBackoff time.Duration
+	// retryBackoff is the wait before the first retry of a Collect or a post; it doubles.
+	retryBackoff time.Duration
 }
 
 // NewService returns a Service that reports check runs through gh, acts on
@@ -729,14 +761,7 @@ type Service struct {
 // runners for analysis, and writes scaffolds through scaffoldGH, scheduling
 // their jobs on scaffoldQueue.
 func NewService(gh GitHub, comments CommentGitHub, store Store, runners Runners, scaffoldGH ScaffoldGitHub, scaffoldQueue ScaffoldQueue) *Service {
-	return &Service{gh: gh, comments: comments, store: store, runners: runners, scaffoldGH: scaffoldGH, scaffoldQueue: scaffoldQueue, collectBackoff: time.Second}
-}
-
-// WithCollectBackoff sets the wait before the first Collect retry (doubling
-// each retry) and returns s.
-func (s *Service) WithCollectBackoff(d time.Duration) *Service {
-	s.collectBackoff = d
-	return s
+	return &Service{gh: gh, comments: comments, store: store, runners: runners, scaffoldGH: scaffoldGH, scaffoldQueue: scaffoldQueue, retryBackoff: time.Second}
 }
 
 // HandlePullRequest selects an analysis runner for pr, runs it, and reports
@@ -744,32 +769,34 @@ func (s *Service) WithCollectBackoff(d time.Duration) *Service {
 // the check run in progress until HandleRunCompleted concludes it. A push of the
 // commit a crashed Apply made keeps that Apply's proposals applied.
 func (s *Service) HandlePullRequest(ctx context.Context, pr PullRequest) error {
-	op := fmt.Sprintf("handle pull request %s/%s#%d", pr.Owner, pr.Repo, pr.Number)
-	state, err := s.store.LoadPR(ctx, pr.Owner, pr.Repo, pr.Number)
-	if err != nil {
-		return fmt.Errorf("%s: load state: %w", op, err)
-	}
-	if err := s.analyzeHead(ctx, state, pr); err != nil {
-		return fmt.Errorf("%s: %w", op, err)
+	if err := s.handlePullRequest(ctx, pr); err != nil {
+		return fmt.Errorf("handle pull request %s/%s#%d: %w", pr.Owner, pr.Repo, pr.Number, err)
 	}
 	return nil
+}
+
+func (s *Service) handlePullRequest(ctx context.Context, pr PullRequest) error {
+	state, err := s.store.LoadPR(ctx, pr.Owner, pr.Repo, pr.Number)
+	if err != nil {
+		return fmt.Errorf("load state: %w", err)
+	}
+	return s.analyzeHead(ctx, state, pr)
 }
 
 // analyzeHead analyzes pr's head against the stored state, as a push or a
 // re-run does: the push of a crashed Apply's commit keeps its proposals
 // applied, and a pending skip ask the new head cancels gets a note.
 func (s *Service) analyzeHead(ctx context.Context, loaded PRState, pr PullRequest) error {
-	op := fmt.Sprintf("adopt pending apply of %s/%s#%d", pr.Owner, pr.Repo, pr.Number)
-	state, adopted, err := s.adoptPendingApply(ctx, loaded, pr, op)
+	state, adopted, err := s.adoptPendingApply(ctx, loaded, pr)
 	if err != nil {
-		return err
+		return fmt.Errorf("adopt pending apply: %w", err)
 	}
 	// Once the adopted state is saved, a failed comment write must not stop the
 	// analysis of the new head.
 	var commentErr error
 	if adopted {
 		writeCtx, cancel := writeContext(ctx)
-		_, commentErr = s.finishApply(writeCtx, state, loaded.PendingApply.IDs, "", op)
+		_, commentErr = s.finishApply(writeCtx, state, loaded.PendingApply.IDs, "")
 		cancel()
 	}
 	analyzeErr := errors.Join(commentErr, s.analyze(ctx, state, pr))
@@ -804,31 +831,35 @@ func (s *Service) headSaved(ctx context.Context, pr PullRequest) bool {
 // the pull request is not open, or its current head is already being analyzed
 // within its deadline.
 func (s *Service) HandleRerun(ctx context.Context, r RerunRequest) error {
+	if err := s.handleRerun(ctx, r); err != nil {
+		return fmt.Errorf("handle rerun of %s/%s#%d: %w", r.PRRef.Owner, r.PRRef.Repo, r.PRRef.Number, err)
+	}
+	return nil
+}
+
+func (s *Service) handleRerun(ctx context.Context, r RerunRequest) error {
 	ref := r.PRRef
 	state, err := s.store.LoadPR(ctx, ref.Owner, ref.Repo, ref.Number)
 	if err != nil {
-		return fmt.Errorf("handle rerun of %s/%s#%d: load state: %w", ref.Owner, ref.Repo, ref.Number, err)
+		return fmt.Errorf("load state: %w", err)
 	}
 	if r.SummaryCommentID != 0 && r.SummaryCommentID != state.SummaryCommentID {
 		return nil
 	}
 	pr, err := s.gh.GetPullRequest(ctx, r.InstallationID, ref.Owner, ref.Repo, ref.Number)
 	if err != nil {
-		return fmt.Errorf("handle rerun of %s/%s#%d: %w", ref.Owner, ref.Repo, ref.Number, err)
+		return fmt.Errorf("get pull request: %w", err)
 	}
-	if !pr.Open || (state.Run != nil && state.HeadSHA == pr.HeadSHA && !Overdue(state, time.Now())) {
+	if !pr.Open || (state.Run != nil && state.HeadSHA == pr.HeadSHA && !overdue(state, time.Now())) {
 		return nil
 	}
-	if err := s.analyzeHead(ctx, state, pr); err != nil {
-		return fmt.Errorf("handle rerun of %s/%s#%d: %w", ref.Owner, ref.Repo, ref.Number, err)
-	}
-	return nil
+	return s.analyzeHead(ctx, state, pr)
 }
 
 // analyze closes the check run of any awaited analysis, then starts a new one
 // on the runner the repo uses.
 func (s *Service) analyze(ctx context.Context, state PRState, pr PullRequest) error {
-	if old, ok := Superseded(state, pr); ok {
+	if old, ok := superseded(state, pr); ok {
 		if err := s.gh.UpdateCheckRun(ctx, state.InstallationID, state.Owner, state.Repo, state.CheckRunID, old); err != nil {
 			return fmt.Errorf("supersede check run %d: %w", state.CheckRunID, err)
 		}
@@ -887,14 +918,13 @@ func (s *Service) analyze(ctx context.Context, state PRState, pr PullRequest) er
 // concludeSkipped reports the active PR skip as the check run for the new head
 // without starting any analysis.
 func (s *Service) concludeSkipped(ctx context.Context, next PRState, pr PullRequest) error {
-	op := fmt.Sprintf("handle pull request %s/%s#%d", pr.Owner, pr.Repo, pr.Number)
 	id, err := s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, skipRun(next))
 	if err != nil {
-		return fmt.Errorf("%s: create check run: %w", op, err)
+		return fmt.Errorf("create check run: %w", err)
 	}
 	next.CheckRunID = id
 	if err := s.store.SavePR(ctx, next); err != nil {
-		return fmt.Errorf("%s: save state: %w", op, err)
+		return fmt.Errorf("save state: %w", err)
 	}
 	return nil
 }
@@ -922,7 +952,7 @@ func (s *Service) startRun(ctx context.Context, state PRState, pr PullRequest, r
 
 	var started review.Started
 	var changed []review.ChangedFile
-	armCtx, cancelArm := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
+	armCtx, cancelArm := writeContext(ctx)
 	err = s.store.SavePR(armCtx, next)
 	cancelArm()
 	if err != nil {
@@ -938,13 +968,17 @@ func (s *Service) startRun(ctx context.Context, state PRState, pr PullRequest, r
 
 	// The write budget starts once the analysis returns; a server analysis can
 	// take longer than writeTimeout on its own.
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
+	writeCtx, cancel := writeContext(ctx)
 	defer cancel()
 	if err == nil {
 		switch res := started.(type) {
 		case review.Pending:
-			next = OnStarted(next, res, id)
+			next = onStarted(next, res, id)
 		case review.Result:
+			if out := resultOutcome(res); out.Failed != nil {
+				err = &unusableResultError{cause: out.Failed.Cause}
+				break
+			}
 			if next, err = s.concludeResult(writeCtx, next, pr, res, changed); err != nil {
 				return err
 			}
@@ -968,8 +1002,12 @@ func (s *Service) startRun(ctx context.Context, state PRState, pr PullRequest, r
 func (s *Service) failRun(ctx context.Context, state PRState, pr PullRequest, cause error) error {
 	outcome := failedOutcome(failureCause(cause))
 	var large *tooLargeError
-	if errors.As(cause, &large) {
+	var unusable *unusableResultError
+	switch {
+	case errors.As(cause, &large):
 		outcome = Outcome{Failed: &AnalysisFailed{Title: titleTooLarge, Cause: large.limit}}
+	case errors.As(cause, &unusable):
+		outcome = failedOutcome(unusable.cause)
 	}
 	if err := s.concludeFailed(ctx, state, pr, outcome); err != nil {
 		return errors.Join(cause, err)
@@ -1003,32 +1041,21 @@ func (s *Service) concludeFailed(ctx context.Context, state PRState, pr PullRequ
 	return errors.Join(errs...)
 }
 
-// concludeResult concludes the check run for a result, then, when the verdict
-// concludes the analysis, saves state and posts its comments, retrying the posts
-// with backoff. If every post fails the run is re-armed so the deadline sweep
-// ends the check neutral. Callers save the returned state.
+// concludeResult concludes the check run for a result whose verdict is usable,
+// saves state and posts its comments, retrying the posts with backoff. If every
+// post fails the run is re-armed so the deadline sweep ends the check neutral.
+// Callers save the returned state.
 func (s *Service) concludeResult(ctx context.Context, state PRState, pr PullRequest, res review.Result, changed []review.ChangedFile) (PRState, error) {
 	next, run := conclude(state, resultOutcome(res))
 	if err := s.gh.UpdateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, state.CheckRunID, run); err != nil {
 		return PRState{}, fmt.Errorf("conclude check run %d: %w", state.CheckRunID, err)
 	}
-	if !reconciles(res.Verdict) {
-		return next, nil
-	}
 	if err := s.store.SavePR(ctx, next); err != nil {
 		return PRState{}, fmt.Errorf("save state: %w", err)
 	}
-	posted, err := s.postComments(ctx, next, pr, res.Verdict, changed)
-	backoff := s.collectBackoff
-	for attempt := 1; attempt < postAttempts && err != nil; attempt++ {
-		select {
-		case <-ctx.Done():
-			return PRState{}, errors.Join(err, ctx.Err())
-		case <-time.After(backoff):
-		}
-		backoff *= 2
-		posted, err = s.postComments(ctx, next, pr, res.Verdict, changed)
-	}
+	posted, err := retry(ctx, postAttempts, s.retryBackoff, func(ctx context.Context) (PRState, error) {
+		return s.postComments(ctx, next, pr, res.Verdict, changed)
+	})
 	if err != nil {
 		// A check claiming proposals that were never posted is worse than a neutral
 		// one the user can re-run, so re-arm the run for the deadline sweep.
@@ -1079,9 +1106,16 @@ func failureCause(err error) string {
 // HandleRunCompleted concludes the check run of the analysis run rc reports,
 // if it is the one the pull request awaits; any other completion is ignored.
 func (s *Service) HandleRunCompleted(ctx context.Context, rc RunCompleted) error {
+	if err := s.handleRunCompleted(ctx, rc); err != nil {
+		return fmt.Errorf("handle run %d of %s/%s#%d: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
+	}
+	return nil
+}
+
+func (s *Service) handleRunCompleted(ctx context.Context, rc RunCompleted) error {
 	state, err := s.store.LoadPR(ctx, rc.Owner, rc.Repo, rc.Number)
 	if err != nil {
-		return fmt.Errorf("handle run %d of %s/%s#%d: load state: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
+		return fmt.Errorf("load state: %w", err)
 	}
 	if !MatchesRun(state, rc) {
 		return nil
@@ -1089,47 +1123,44 @@ func (s *Service) HandleRunCompleted(ctx context.Context, rc RunCompleted) error
 
 	outcome, err := s.collect(ctx, state, rc)
 	if err != nil && outcome.Failed == nil {
-		return fmt.Errorf("handle run %d of %s/%s#%d: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
+		return err
 	}
 
 	pr := state.pullRequest()
 	if outcome.Failed != nil {
 		// err is the detail behind the fixed cause; it goes to the job log only.
-		if cerr := s.concludeFailed(ctx, state, pr, outcome); cerr != nil {
-			err = errors.Join(err, cerr)
-		}
-		if err != nil {
-			return fmt.Errorf("handle run %d of %s/%s#%d: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
-		}
-		return nil
+		return errors.Join(err, s.concludeFailed(ctx, state, pr, outcome))
 	}
 
-	var changed []review.ChangedFile
-	if reconciles(outcome.Result.Verdict) {
-		changed, err = s.gh.ListChangedFiles(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number)
-		if err != nil {
-			return fmt.Errorf("handle run %d of %s/%s#%d: list changed files: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
-		}
+	changed, err := s.gh.ListChangedFiles(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number)
+	if err != nil {
+		return fmt.Errorf("list changed files: %w", err)
 	}
 	next, err := s.concludeResult(ctx, state, pr, *outcome.Result, changed)
 	if err != nil {
-		return fmt.Errorf("handle run %d of %s/%s#%d: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
+		return err
 	}
 	if err := s.store.SavePR(ctx, next); err != nil {
-		return fmt.Errorf("handle run %d of %s/%s#%d: save state: %w", rc.RunID, rc.Owner, rc.Repo, rc.Number, err)
+		return fmt.Errorf("save state: %w", err)
 	}
-
 	return nil
 }
 
 // HandleDeadline concludes the check run neutral if the run identified by
 // nonce is still awaited for ref and overdue at now; otherwise it does nothing.
 func (s *Service) HandleDeadline(ctx context.Context, ref PRRef, nonce string, now time.Time) error {
+	if err := s.handleDeadline(ctx, ref, nonce, now); err != nil {
+		return fmt.Errorf("handle deadline of %s/%s#%d: %w", ref.Owner, ref.Repo, ref.Number, err)
+	}
+	return nil
+}
+
+func (s *Service) handleDeadline(ctx context.Context, ref PRRef, nonce string, now time.Time) error {
 	state, err := s.store.LoadPR(ctx, ref.Owner, ref.Repo, ref.Number)
 	if err != nil {
-		return fmt.Errorf("handle deadline of %s/%s#%d: load state: %w", ref.Owner, ref.Repo, ref.Number, err)
+		return fmt.Errorf("load state: %w", err)
 	}
-	if !Overdue(state, now) || state.Run.Nonce != nonce {
+	if !overdue(state, now) || state.Run.Nonce != nonce {
 		return nil
 	}
 
@@ -1137,11 +1168,7 @@ func (s *Service) HandleDeadline(ctx context.Context, ref PRRef, nonce string, n
 	if state.Run.RunID != 0 {
 		cause = "The pollux-agent workflow run did not report a result before the deadline."
 	}
-	pr := state.pullRequest()
-	if err := s.concludeFailed(ctx, state, pr, failedOutcome(cause)); err != nil {
-		return fmt.Errorf("handle deadline of %s/%s#%d: %w", ref.Owner, ref.Repo, ref.Number, err)
-	}
-	return nil
+	return s.concludeFailed(ctx, state, state.pullRequest(), failedOutcome(cause))
 }
 
 // runFailureCause is the fixed one-line text for a workflow run that did not succeed.
@@ -1183,7 +1210,7 @@ func (s *Service) collect(ctx context.Context, state PRState, rc RunCompleted) (
 	if failed {
 		result, err = s.runners.Actions.Collect(ctx, completion)
 	} else {
-		result, err = collectWithRetry(ctx, s.collectBackoff, func(ctx context.Context) (review.Result, error) {
+		result, err = retry(ctx, collectAttempts, s.retryBackoff, func(ctx context.Context) (review.Result, error) {
 			return s.runners.Actions.Collect(ctx, completion)
 		})
 	}
@@ -1202,21 +1229,21 @@ func (s *Service) collect(ctx context.Context, state PRState, rc RunCompleted) (
 	}
 }
 
-// collectWithRetry returns try's result, retrying a transient error with a
-// doubling backoff up to collectAttempts tries. It stops at once on
-// *review.InvalidResultError or when ctx ends.
-func collectWithRetry[T any](ctx context.Context, backoff time.Duration, try func(context.Context) (T, error)) (T, error) {
+// retry returns fn's result, retrying an error with a doubling backoff up to
+// attempts tries. It stops at once on *review.InvalidResultError, which a retry
+// cannot fix, or when ctx ends.
+func retry[T any](ctx context.Context, attempts int, backoff time.Duration, fn func(context.Context) (T, error)) (T, error) {
 	var invalid *review.InvalidResultError
-	result, err := try(ctx)
-	for attempt := 1; attempt < collectAttempts && err != nil && !errors.As(err, &invalid); attempt++ {
+	result, err := fn(ctx)
+	for attempt := 1; attempt < attempts && err != nil && !errors.As(err, &invalid); attempt++ {
 		select {
 		case <-ctx.Done():
 			var zero T
-			return zero, fmt.Errorf("wait to retry collect: %w", ctx.Err())
+			return zero, errors.Join(err, ctx.Err())
 		case <-time.After(backoff):
 		}
 		backoff *= 2
-		result, err = try(ctx)
+		result, err = fn(ctx)
 	}
 	return result, err
 }
@@ -1276,7 +1303,7 @@ func (s *Service) postFailureSummary(ctx context.Context, prev PRState, pr PullR
 	if err != nil {
 		return PRState{}, fmt.Errorf("list comments: %w", err)
 	}
-	next, w := ReconcileFailure(prev, existing)
+	next, w := reconcileFailure(prev, existing)
 	if err := s.writeSummary(ctx, pr, &next, w); err != nil {
 		return PRState{}, err
 	}
@@ -1361,18 +1388,6 @@ func (s *Service) start(ctx context.Context, runner review.Runner, pr PullReques
 		return nil, nil, fmt.Errorf("start analysis: %w", err)
 	}
 	return started, changed, nil
-}
-
-// reconciles reports whether a verdict concludes the analysis, so that its
-// proposals belong in comments; an empty proposal list is a failed analysis.
-func reconciles(v review.Verdict) bool {
-	switch v := v.(type) {
-	case review.NoImpact:
-		return true
-	case review.Proposals:
-		return len(v) > 0
-	}
-	return false
 }
 
 func proposalsSummary(proposals review.Proposals) string {

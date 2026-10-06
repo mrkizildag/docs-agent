@@ -57,7 +57,7 @@ func cleanReason(reason string) string {
 }
 
 // handleSkip acts on a skip intent from a sender already allowed to write.
-func (s *Service) handleSkip(ctx context.Context, state PRState, in Intent, sender, op string) (Reaction, error) {
+func (s *Service) handleSkip(ctx context.Context, state PRState, in Intent, sender string) (Reaction, error) {
 	ctx, cancel := writeContext(ctx)
 	defer cancel()
 	var err error
@@ -65,15 +65,15 @@ func (s *Service) handleSkip(ctx context.Context, state PRState, in Intent, send
 	case IntentSkipAsk:
 		ask := SkipAsk{User: sender, Scope: in.Scope}
 		if (state.PendingSkip != nil && *state.PendingSkip == ask) || (skipActive(state) && state.Skip.Scope == ask.Scope) {
-			err = s.redrawSummary(ctx, state, op)
+			err = s.redrawSummary(ctx, state)
 		} else {
-			err = s.askSkipReason(ctx, state, ask, op)
+			err = s.askSkipReason(ctx, state, ask)
 		}
 	case IntentSkip:
-		err = s.skip(ctx, state, Skip{User: sender, Scope: in.Scope, Reason: cleanReason(in.Reason)}, op)
+		err = s.skip(ctx, state, Skip{User: sender, Scope: in.Scope, Reason: cleanReason(in.Reason)})
 	case IntentSkipReason:
 		if state.PendingSkip != nil {
-			err = s.skip(ctx, state, Skip{User: state.PendingSkip.User, Scope: state.PendingSkip.Scope, Reason: cleanReason(in.Reason)}, op)
+			err = s.skip(ctx, state, Skip{User: state.PendingSkip.User, Scope: state.PendingSkip.Scope, Reason: cleanReason(in.Reason)})
 		}
 	case IntentNone, IntentApply, IntentApplyAll, IntentRerun:
 	}
@@ -83,39 +83,39 @@ func (s *Service) handleSkip(ctx context.Context, state PRState, in Intent, send
 	return ReactionDone, nil
 }
 
-func (s *Service) askSkipReason(ctx context.Context, state PRState, ask SkipAsk, op string) error {
+func (s *Service) askSkipReason(ctx context.Context, state PRState, ask SkipAsk) error {
 	body := fmt.Sprintf("@%s, reply with the reason for skipping this %s; your next comment on this PR becomes the reason.", ask.User, ask.Scope.noun())
 	if _, err := s.gh.CreateIssueComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, body); err != nil {
-		return fmt.Errorf("%s: ask for skip reason: %w", op, err)
+		return fmt.Errorf("ask for skip reason: %w", err)
 	}
 	state.PendingSkip = &ask
-	return s.saveAndRedraw(ctx, state, op)
+	return s.saveAndRedraw(ctx, state)
 }
 
 // skip concludes the check run as skipped. A skip already in state only redraws
 // the summary, which finishes a run that failed after saving.
-func (s *Service) skip(ctx context.Context, state PRState, sk Skip, op string) error {
+func (s *Service) skip(ctx context.Context, state PRState, sk Skip) error {
 	if state.Skip != nil && *state.Skip == (Skip{User: sk.User, Scope: sk.Scope, Reason: sk.Reason, HeadSHA: state.HeadSHA}) {
-		return s.redrawSummary(ctx, state, op)
+		return s.redrawSummary(ctx, state)
 	}
 	state, run := OnSkip(state, sk)
 	if state.CheckRunID == 0 {
 		id, err := s.gh.CreateCheckRun(ctx, state.InstallationID, state.Owner, state.Repo, run)
 		if err != nil {
-			return fmt.Errorf("%s: create check run: %w", op, err)
+			return fmt.Errorf("create check run: %w", err)
 		}
 		state.CheckRunID = id
 	} else if err := s.gh.UpdateCheckRun(ctx, state.InstallationID, state.Owner, state.Repo, state.CheckRunID, run); err != nil {
-		return fmt.Errorf("%s: update check run %d: %w", op, state.CheckRunID, err)
+		return fmt.Errorf("update check run %d: %w", state.CheckRunID, err)
 	}
-	return s.saveAndRedraw(ctx, state, op)
+	return s.saveAndRedraw(ctx, state)
 }
 
 // saveAndRedraw saves state before redrawing the summary, so a failed redraw
 // never leaves a concluded check run with unsaved state; a retry redraws again.
-func (s *Service) saveAndRedraw(ctx context.Context, state PRState, op string) error {
+func (s *Service) saveAndRedraw(ctx context.Context, state PRState) error {
 	if err := s.store.SavePR(ctx, state); err != nil {
-		return fmt.Errorf("%s: save state: %w", op, err)
+		return fmt.Errorf("save state: %w", err)
 	}
-	return s.redrawSummary(ctx, state, op)
+	return s.redrawSummary(ctx, state)
 }

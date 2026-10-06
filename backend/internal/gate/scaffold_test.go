@@ -364,7 +364,7 @@ func TestHandleScaffoldRun(t *testing.T) {
 			sgh := &scaffoldGitHub{branches: map[string]string{"pollux-agent/docs-scaffold": "tip"}}
 			comments := &fakeCommentGitHub{}
 			store := &scaffoldStore{fakeStore: &fakeStore{}, state: tc.state, waiters: []gate.ScaffoldWaiter{{CheckRunID: 11}}}
-			svc := gate.NewService(gh, comments, store, gate.Runners{Actions: runner}, sgh, &fakeScaffoldQueue{}).WithCollectBackoff(0)
+			svc := gate.NewService(gh, comments, store, gate.Runners{Actions: runner}, sgh, &fakeScaffoldQueue{}).WithRetryBackoff(0)
 			tc.rc.Owner, tc.rc.Repo = "acme", "widgets"
 
 			err := svc.HandleScaffoldRun(t.Context(), tc.rc)
