@@ -54,7 +54,7 @@ type ScaffoldFile struct {
 // paths are defined for writing.
 func (s Scaffold) Files() []ScaffoldFile {
 	return []ScaffoldFile{
-		{Path: "docs/README.md", Content: s.Index},
+		{Path: IndexPath, Content: s.Index},
 		{Path: "docs/architecture.md", Content: s.Architecture},
 		{Path: "docs/guides/setup.md", Content: s.Setup},
 	}
