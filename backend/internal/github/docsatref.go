@@ -56,7 +56,7 @@ func (b *blobCache) put(sha string, data []byte) {
 	b.size += len(data)
 }
 
-// DocsAtRef returns the .md files under docs/ of owner/repo at ref as a file
+// DocsAtRef returns the .md and .mdx files under docs/ of owner/repo at ref as a file
 // system rooted at the repo root. Files over docs.MaxDocBytes are left out. It
 // errors when the docs tree is truncated, when the root tree is truncated without a docs entry, or holds more than maxDocsAtRef docs.
 func (c *Client) DocsAtRef(ctx context.Context, installationID int64, owner, repo, ref string) (fs.FS, error) {
@@ -94,7 +94,7 @@ func (c *Client) DocsAtRef(ctx context.Context, installationID int64, owner, rep
 
 	for _, e := range tree.Entries {
 		p := e.GetPath()
-		if e.GetType() != "blob" || e.GetMode() == "120000" || path.Ext(p) != ".md" || e.GetSize() > docs.MaxDocBytes {
+		if e.GetType() != "blob" || e.GetMode() == "120000" || !isDocFile(p) || e.GetSize() > docs.MaxDocBytes {
 			continue
 		}
 		p = "docs/" + p
@@ -112,4 +112,10 @@ func (c *Client) DocsAtRef(ctx context.Context, installationID int64, owner, rep
 		files[p] = &fstest.MapFile{Data: src}
 	}
 	return files, nil
+}
+
+func isDocFile(p string) bool {
+	ext := path.Ext(p)
+
+	return ext == ".md" || ext == ".mdx"
 }

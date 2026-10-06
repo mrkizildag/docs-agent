@@ -1,5 +1,6 @@
-// Package github adapts the GitHub REST API to the gate package's GitHub
-// interface, authenticating as the pollux-agent GitHub App.
+// Package github adapts the GitHub REST API to the gate package's GitHub,
+// CommentGitHub and ScaffoldGitHub interfaces and the actions package's
+// WorkflowAPI, authenticating as the pollux-agent GitHub App.
 package github
 
 import (
@@ -15,6 +16,7 @@ import (
 	"sync"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
+	// ghinstallation's InstallationTokenOptions is typed with go-github v88.
 	githubv88 "github.com/google/go-github/v88/github"
 	"github.com/google/go-github/v92/github"
 
@@ -22,8 +24,9 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
 )
 
-// Client creates GitHub check runs, authenticating per installation as the
-// pollux-agent GitHub App.
+// Client implements gate.GitHub, gate.CommentGitHub, gate.ScaffoldGitHub and
+// actions.WorkflowAPI, authenticating per installation as the pollux-agent
+// GitHub App.
 type Client struct {
 	transport     http.RoundTripper
 	appID         int64
@@ -48,6 +51,7 @@ type cloneKey struct {
 
 var (
 	_ gate.GitHub         = (*Client)(nil)
+	_ gate.CommentGitHub  = (*Client)(nil)
 	_ actions.WorkflowAPI = (*Client)(nil)
 )
 
@@ -105,10 +109,7 @@ func (c *Client) CreateCheckRun(ctx context.Context, installationID int64, owner
 		Name:    run.Name,
 		HeadSHA: run.HeadSHA,
 		Status:  new(checkStatus(run)),
-		Output: &github.CheckRunOutput{
-			Title:   &run.Title,
-			Summary: &run.Summary,
-		},
+		Output:  checkRunOutput(run),
 	}
 	if run.Status != gate.StatusInProgress {
 		opts.Conclusion = new(string(run.Conclusion))
@@ -132,10 +133,7 @@ func (c *Client) UpdateCheckRun(ctx context.Context, installationID int64, owner
 	opts := github.UpdateCheckRunOptions{
 		Name:   run.Name,
 		Status: new(checkStatus(run)),
-		Output: &github.CheckRunOutput{
-			Title:   &run.Title,
-			Summary: &run.Summary,
-		},
+		Output: checkRunOutput(run),
 	}
 	if run.Status != gate.StatusInProgress {
 		opts.Conclusion = new(string(run.Conclusion))
@@ -146,6 +144,10 @@ func (c *Client) UpdateCheckRun(ctx context.Context, installationID int64, owner
 	}
 
 	return nil
+}
+
+func checkRunOutput(run gate.CheckRun) *github.CheckRunOutput {
+	return &github.CheckRunOutput{Title: &run.Title, Summary: &run.Summary}
 }
 
 func checkStatus(run gate.CheckRun) string {
@@ -196,14 +198,14 @@ func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo
 		return 0, fmt.Errorf("dispatch workflow %s/%s: encode docs: %w", owner, repo, err)
 	}
 
-	r, _, err := client.Repositories.Get(ctx, owner, repo)
+	defaultBranch, err := defaultBranchName(ctx, client, owner, repo)
 	if err != nil {
-		return 0, fmt.Errorf("dispatch workflow %s/%s: get repository: %w", owner, repo, err)
+		return 0, fmt.Errorf("dispatch workflow %s/%s: %w", owner, repo, err)
 	}
 
 	details, _, err := client.Actions.CreateWorkflowDispatchEventByFileName(ctx, owner, repo, path.Base(gate.WorkflowPath),
 		github.CreateWorkflowDispatchEventRequest{
-			Ref: r.GetDefaultBranch(),
+			Ref: defaultBranch,
 			Inputs: map[string]any{
 				"head_sha":  in.HeadSHA,
 				"pr_number": strconv.Itoa(in.PRNumber),
@@ -314,22 +316,25 @@ func (c *Client) installationClient(installationID int64) (*github.Client, error
 		return nil, err
 	}
 
-	httpClient := &http.Client{
-		Transport: installationTransport,
-		Timeout:   c.httpClient.Timeout,
-	}
-
-	opts := []github.ClientOptionsFunc{github.WithHTTPClient(httpClient)}
-	if c.baseURL != "" {
-		opts = append(opts, github.WithURLs(&c.baseURL, &c.baseURL))
-	}
-
-	client, err := github.NewClient(opts...)
+	client, err := c.apiClient(installationTransport)
 	if err != nil {
 		return nil, fmt.Errorf("create GitHub client for installation %d: %w", installationID, err)
 	}
 
 	c.installationClients[installationID] = client
+	return client, nil
+}
+
+// apiClient returns a go-github client that authenticates through transport.
+func (c *Client) apiClient(transport http.RoundTripper) (*github.Client, error) {
+	opts := []github.ClientOptionsFunc{github.WithHTTPClient(&http.Client{Transport: transport, Timeout: c.httpClient.Timeout})}
+	if c.baseURL != "" {
+		opts = append(opts, github.WithURLs(&c.baseURL, &c.baseURL))
+	}
+	client, err := github.NewClient(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("create github client: %w", err)
+	}
 	return client, nil
 }
 
@@ -371,15 +376,23 @@ func (c *Client) installationTransportLocked(installationID int64) (*ghinstallat
 	return transport, nil
 }
 
-func (c *Client) newTransport(installationID int64) (*ghinstallation.Transport, error) {
-	// ghinstallation.refreshToken mutates the AppsTransport it wraps, so each
-	// transport needs its own rather than sharing one across goroutines.
+// newAppsTransport returns an App-JWT transport of its own: ghinstallation's
+// token refresh mutates it, so it must not be shared across goroutines.
+func (c *Client) newAppsTransport() (*ghinstallation.AppsTransport, error) {
 	appsTransport, err := ghinstallation.NewAppsTransport(c.transport, c.appID, c.privateKeyPEM)
 	if err != nil {
-		return nil, fmt.Errorf("create GitHub App transport for installation %d: %w", installationID, err)
+		return nil, fmt.Errorf("create GitHub App transport for app %d: %w", c.appID, err)
 	}
 	if c.baseURL != "" {
 		appsTransport.BaseURL = c.baseURL
+	}
+	return appsTransport, nil
+}
+
+func (c *Client) newTransport(installationID int64) (*ghinstallation.Transport, error) {
+	appsTransport, err := c.newAppsTransport()
+	if err != nil {
+		return nil, fmt.Errorf("installation %d: %w", installationID, err)
 	}
 
 	transport := ghinstallation.NewFromAppsTransport(appsTransport, installationID)
@@ -397,18 +410,11 @@ func (c *Client) appBotLogin(ctx context.Context) (string, error) {
 		return login, nil
 	}
 
-	appsTransport, err := ghinstallation.NewAppsTransport(c.transport, c.appID, c.privateKeyPEM)
+	appsTransport, err := c.newAppsTransport()
 	if err != nil {
-		return "", fmt.Errorf("create GitHub App transport for app %d: %w", c.appID, err)
+		return "", err
 	}
-	if c.baseURL != "" {
-		appsTransport.BaseURL = c.baseURL
-	}
-	opts := []github.ClientOptionsFunc{github.WithHTTPClient(&http.Client{Transport: appsTransport, Timeout: c.httpClient.Timeout})}
-	if c.baseURL != "" {
-		opts = append(opts, github.WithURLs(&c.baseURL, &c.baseURL))
-	}
-	client, err := github.NewClient(opts...)
+	client, err := c.apiClient(appsTransport)
 	if err != nil {
 		return "", fmt.Errorf("create GitHub App client for app %d: %w", c.appID, err)
 	}

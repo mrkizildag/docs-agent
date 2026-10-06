@@ -5,11 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-github/v92/github"
@@ -22,12 +20,7 @@ func newCommentsClient(t *testing.T, routes map[string]http.HandlerFunc) *ghclie
 	t.Helper()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /app/installations/{id}/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if _, err := fmt.Fprintf(w, `{"token":"ghs_test","expires_at":%q}`, time.Now().Add(time.Hour).Format(time.RFC3339)); err != nil {
-			t.Errorf("write access_tokens response: %v", err)
-		}
-	})
+	handleAccessToken(t, mux)
 	if _, ok := routes["GET /app"]; !ok {
 		mux.HandleFunc("GET /app", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -40,13 +33,7 @@ func newCommentsClient(t *testing.T, routes map[string]http.HandlerFunc) *ghclie
 		mux.HandleFunc(pattern, h)
 	}
 
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-
-	client, err := ghclient.NewClient(&http.Client{Timeout: 5 * time.Second}, 1, testPrivateKeyPEM(t), srv.URL)
-	if err != nil {
-		t.Fatalf("NewClient() = %v, want nil error", err)
-	}
+	client := newTestClient(t, mux)
 	return client
 }
 

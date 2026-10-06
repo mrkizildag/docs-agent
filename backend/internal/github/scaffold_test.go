@@ -3,6 +3,7 @@ package github_test
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -169,6 +170,13 @@ func TestFindPullRequest(t *testing.T) {
 		case "found":
 			writeJSON(t, w, http.StatusOK, `[{"number":6,"state":"closed","html_url":"https://github.com/o/found/pull/6","user":{"login":"alice","type":"User"}},`+
 				`{"number":7,"state":"open","html_url":"https://github.com/o/found/pull/7","user":{"login":"pollux-agent[bot]","type":"Bot"}}]`)
+		case "paged":
+			if r.URL.Query().Get("page") == "2" {
+				writeJSON(t, w, http.StatusOK, `[{"number":10,"state":"open","html_url":"https://github.com/o/paged/pull/10","user":{"login":"pollux-agent[bot]","type":"Bot"}}]`)
+				return
+			}
+			w.Header().Set("Link", fmt.Sprintf(`<http://%s/repos/o/paged/pulls?page=2>; rel="next"`, r.Host))
+			writeJSON(t, w, http.StatusOK, `[{"number":9,"state":"closed","html_url":"https://github.com/o/paged/pull/9","user":{"login":"alice","type":"User"}}]`)
 		case "other-bot":
 			writeJSON(t, w, http.StatusOK, `[{"number":8,"state":"open","html_url":"https://github.com/o/other-bot/pull/8","user":{"login":"renovate[bot]","type":"Bot"}}]`)
 		default:
@@ -180,6 +188,10 @@ func TestFindPullRequest(t *testing.T) {
 	got, ok, err := client.FindPullRequest(t.Context(), 1, "o", "found", "b")
 	if want := (gate.ScaffoldPR{Number: 7, URL: "https://github.com/o/found/pull/7", ByBot: true, Open: true}); err != nil || !ok || got != want {
 		t.Errorf("FindPullRequest(found) = %+v, %v, %v; want %+v, true, nil", got, ok, err, want)
+	}
+	got, ok, err = client.FindPullRequest(t.Context(), 1, "o", "paged", "b")
+	if want := (gate.ScaffoldPR{Number: 10, URL: "https://github.com/o/paged/pull/10", ByBot: true, Open: true}); err != nil || !ok || got != want {
+		t.Errorf("FindPullRequest(paged) = %+v, %v, %v; want %+v, true, nil", got, ok, err, want)
 	}
 	got, ok, err = client.FindPullRequest(t.Context(), 1, "o", "other-bot", "b")
 	if want := (gate.ScaffoldPR{Number: 8, URL: "https://github.com/o/other-bot/pull/8", Open: true}); err != nil || !ok || got != want {
