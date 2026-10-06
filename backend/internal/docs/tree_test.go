@@ -262,13 +262,31 @@ func TestParseProblemsCarryPathAndCause(t *testing.T) {
 	}
 
 	for i, p := range tree.Problems {
-		if p.Path != wantProblems[i] || p.Err == nil || !strings.Contains(p.Err.Error(), p.Path) {
-			t.Errorf("Problems[%d] = %+v, want path %s with cause naming it", i, p, wantProblems[i])
+		if p.Path != wantProblems[i] || p.Err == nil || strings.Contains(p.Err.Error(), p.Path) {
+			t.Errorf("Problems[%d] = %+v, want path %s with a cause that does not repeat it", i, p, wantProblems[i])
 		}
 	}
 
 	if got := tree.Match([]string{"y/z.go", "x/q"}); len(got) != 2 {
 		t.Errorf("Match = %v, want both docs", got)
+	}
+}
+
+func TestParseWalksMdx(t *testing.T) {
+	t.Parallel()
+
+	fsys := fstest.MapFS{
+		"docs/a.mdx": {Data: []byte("---\ntitle: A\ncovers: [\"a/**\"]\n---\n")},
+		"docs/b.md":  {Data: []byte("---\ntitle: B\ncovers: [\"b/**\"]\n---\n")},
+		"docs/c.txt": {Data: []byte("ignored")},
+	}
+
+	tree, err := docs.Parse(fsys)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if diff := cmp.Diff([]string{"docs/a.mdx", "docs/b.md"}, docPaths(tree.Docs)); diff != "" {
+		t.Errorf("doc paths mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -321,12 +339,10 @@ func TestParseSkipsSymlinks(t *testing.T) {
 func TestParseLargeFileBecomesProblem(t *testing.T) {
 	t.Parallel()
 
-	const maxDocBytes = 1 << 20
-
 	head := "---\ntitle: big\ncovers: [\"a/**\"]\n---\n"
 	fsys := fstest.MapFS{
-		"docs/big.md":   {Data: []byte(head + strings.Repeat("x", maxDocBytes+1-len(head)))},
-		"docs/exact.md": {Data: []byte(head + strings.Repeat("x", maxDocBytes-len(head)))},
+		"docs/big.md":   {Data: []byte(head + strings.Repeat("x", docs.MaxDocBytes+1-len(head)))},
+		"docs/exact.md": {Data: []byte(head + strings.Repeat("x", docs.MaxDocBytes-len(head)))},
 		"docs/ok.md":    {Data: []byte(head)},
 	}
 

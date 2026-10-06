@@ -24,7 +24,7 @@ const (
 // review.Scaffold; every error is a *review.FailedError whose Err keeps the
 // original chain.
 func (r *Runner) StartScaffold(ctx context.Context, req review.ScaffoldRequest) (review.ScaffoldStarted, error) {
-	ctx, cancel := context.WithTimeout(ctx, scaffoldTimeout)
+	ctx, cancel := context.WithTimeout(ctx, r.scaffoldLimits.timeout)
 	defer cancel()
 
 	res, err := r.scaffold(ctx, req)
@@ -50,15 +50,16 @@ func (r *Runner) scaffold(ctx context.Context, req review.ScaffoldRequest) (revi
 		return review.Scaffold{}, err
 	}
 
-	raw, _, err := agent.Run(ctx, r.m, agent.Task{
+	raw, stats, err := agent.Run(ctx, r.m, agent.Task{
 		Model:    r.model,
 		System:   scaffoldSystemPrompt,
 		Prompt:   scaffoldUserPrompt(f, req.Owner, req.Repo, req.BaseSHA),
 		Root:     c.root,
 		Finish:   finish,
 		Accept:   checkSubmittedDocs,
-		MaxSteps: scaffoldStepCap,
-	}, agent.NewBudget(scaffoldTokenBudget))
+		MaxSteps: r.scaffoldLimits.steps,
+	}, agent.NewBudget(r.scaffoldLimits.tokens))
+	r.logStats(ctx, "scaffold", stats)
 	if err != nil {
 		return review.Scaffold{}, fmt.Errorf("write docs: %w: %w", errProvider, err)
 	}
@@ -76,7 +77,12 @@ func checkSubmittedDocs(args json.RawMessage) error {
 	if err := json.Unmarshal(args, &d); err != nil {
 		return fmt.Errorf("decode submit_docs arguments: %w", err)
 	}
-	if err := docs.CheckScaffold(d.Index, d.Architecture, d.Setup); err != nil {
+	files := d.Files()
+	scaffold := make([]docs.ScaffoldFile, len(files))
+	for i, f := range files {
+		scaffold[i] = docs.ScaffoldFile(f)
+	}
+	if err := docs.CheckScaffold(scaffold, review.IndexPath, review.IndexHeading); err != nil {
 		return fmt.Errorf("submit_docs: %w", err)
 	}
 	return nil

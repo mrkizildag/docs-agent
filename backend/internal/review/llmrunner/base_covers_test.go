@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -160,18 +159,8 @@ func TestStart_RenamedCoveringDocIsTriagedAtItsNewPath(t *testing.T) {
 func removeFiles(t *testing.T, dir string, paths ...string) string {
 	t.Helper()
 
-	for _, args := range [][]string{append([]string{"rm", "-q"}, paths...), {"commit", "-q", "-m", "rm"}} {
-		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
-		cmd.Dir = dir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, out)
-		}
-	}
-	out, err := exec.CommandContext(t.Context(), "git", "-C", dir, "rev-parse", "HEAD").Output() //nolint:gosec // dir is a t.TempDir path, not external input
-	if err != nil {
-		t.Fatalf("rev-parse HEAD: %v", err)
-	}
-	return strings.TrimSpace(string(out))
+	git(t, dir, append([]string{"rm", "-q"}, paths...)...)
+	return commitAll(t, dir, "rm")
 }
 
 func TestStart_DeletedCoveringDocIsRestoredWithoutModelCalls(t *testing.T) {

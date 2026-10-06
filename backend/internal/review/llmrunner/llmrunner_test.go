@@ -5,9 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -91,41 +88,10 @@ func testRequest(headSHA string) review.Request {
 func newGitRepo(t *testing.T) (string, string) {
 	t.Helper()
 
-	dir := t.TempDir()
-	run := func(args ...string) {
-		t.Helper()
-		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
-		cmd.Dir = dir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, out)
-		}
-	}
-
-	run("init", "-q", "-b", "main")
-	run("config", "user.email", "test@example.com")
-	run("config", "user.name", "test")
-
-	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o600); err != nil {
-		t.Fatalf("write main.go: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0o700); err != nil {
-		t.Fatalf("mkdir docs: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "docs", "x.md"), []byte("---\ntitle: X\nsummary: Describes X.\ncovers:\n  - main.go\n---\n# X\n\nold behavior.\n"), 0o600); err != nil {
-		t.Fatalf("write docs/x.md: %v", err)
-	}
-
-	run("add", "-A")
-	run("commit", "-q", "-m", "init")
-
-	out, err := exec.CommandContext(t.Context(), "git", "-C", dir, "rev-parse", "HEAD").Output() //nolint:gosec // dir is a t.TempDir path, not external input
-	if err != nil {
-		t.Fatalf("rev-parse HEAD: %v", err)
-	}
-	headSHA := string(out)
-	headSHA = headSHA[:len(headSHA)-1] // trim trailing newline
-
-	return dir, headSHA
+	dir := initGitRepo(t)
+	writeRepoFile(t, dir, "main.go", "package main\n\nfunc main() {}\n")
+	writeRepoFile(t, dir, "docs/x.md", "---\ntitle: X\nsummary: Describes X.\ncovers:\n  - main.go\n---\n# X\n\nold behavior.\n")
+	return dir, commitAll(t, dir, "init")
 }
 
 func noToken(context.Context, int64, string) (string, error) { return "", nil }
@@ -334,7 +300,7 @@ func TestStart_VerificationDropsRejectedProposal(t *testing.T) {
 
 	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
 		triageResponse(true),
-		submitResponse(proposalFor("docs/x.md", 2), proposalFor("docs/y.md", 3)),
+		submitResponse(proposalFor("docs/x.md", 2), proposalFor("docs/x.md", 3)),
 		verifyResponse(true),
 		verifyResponse(false),
 	}}
@@ -344,8 +310,8 @@ func TestStart_VerificationDropsRejectedProposal(t *testing.T) {
 		t.Fatalf("Start() = %v, want nil error", err)
 	}
 	proposals, ok := verdict.(review.Proposals)
-	if !ok || len(proposals) != 1 || proposals[0].DocPath != "docs/x.md" {
-		t.Fatalf("Verdict = %#v, want exactly the docs/x.md proposal", verdict)
+	if !ok || len(proposals) != 1 || proposals[0].Anchor.Line != 2 {
+		t.Fatalf("Verdict = %#v, want exactly the first proposal", verdict)
 	}
 }
 
@@ -638,37 +604,15 @@ func TestStart_PromptsFencePatchAndMarkOmittedPatch(t *testing.T) {
 func TestStart_TooManyCandidateDocsIsAnError(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	run := func(args ...string) {
-		t.Helper()
-		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
-		cmd.Dir = dir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, out)
-		}
-	}
-	run("init", "-q", "-b", "main")
-	run("config", "user.email", "test@example.com")
-	run("config", "user.name", "test")
-	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0o700); err != nil {
-		t.Fatalf("mkdir docs: %v", err)
-	}
+	dir := initGitRepo(t)
 	for i := range 11 {
-		doc := fmt.Sprintf("---\ntitle: D%d\nsummary: Describes D.\ncovers:\n  - main.go\n---\n# D\n", i)
-		if err := os.WriteFile(filepath.Join(dir, "docs", fmt.Sprintf("d%d.md", i)), []byte(doc), 0o600); err != nil {
-			t.Fatalf("write doc: %v", err)
-		}
+		writeRepoFile(t, dir, fmt.Sprintf("docs/d%d.md", i), fmt.Sprintf("---\ntitle: D%d\nsummary: Describes D.\ncovers:\n  - main.go\n---\n# D\n", i))
 	}
-	run("add", "-A")
-	run("commit", "-q", "-m", "init")
-	out, err := exec.CommandContext(t.Context(), "git", "-C", dir, "rev-parse", "HEAD").Output() //nolint:gosec // dir is a t.TempDir path
-	if err != nil {
-		t.Fatalf("rev-parse HEAD: %v", err)
-	}
+	headSHA := commitAll(t, dir, "init")
 
 	runner := llmrunner.New(&fakeModel{}, noToken, "triage-model", "draft-model")
 	runner.SetRemote(dir)
-	_, err = runner.Start(t.Context(), testRequest(strings.TrimSpace(string(out))))
+	_, err := runner.Start(t.Context(), testRequest(headSHA))
 	if err == nil || !strings.Contains(err.Error(), "cap of 10") {
 		t.Fatalf("Start() = %v, want an error naming the candidate cap", err)
 	}
@@ -677,21 +621,8 @@ func TestStart_TooManyCandidateDocsIsAnError(t *testing.T) {
 func commitDoc(t *testing.T, dir, relPath, content string) string {
 	t.Helper()
 
-	if err := os.WriteFile(filepath.Join(dir, relPath), []byte(content), 0o600); err != nil {
-		t.Fatalf("write %s: %v", relPath, err)
-	}
-	for _, args := range [][]string{{"add", "-A"}, {"commit", "-q", "-m", "doc"}} {
-		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
-		cmd.Dir = dir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, out)
-		}
-	}
-	out, err := exec.CommandContext(t.Context(), "git", "-C", dir, "rev-parse", "HEAD").Output() //nolint:gosec // dir is a t.TempDir path, not external input
-	if err != nil {
-		t.Fatalf("rev-parse HEAD: %v", err)
-	}
-	return strings.TrimSpace(string(out))
+	writeRepoFile(t, dir, relPath, content)
+	return commitAll(t, dir, "doc")
 }
 
 func TestStart_ProposalCarriesOriginalSectionAndLines(t *testing.T) {

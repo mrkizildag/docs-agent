@@ -1,5 +1,6 @@
 // Package basedocs selects the docs a PR may affect from the docs tree at the
-// PR's base commit, and proposes restoring a covering doc the PR deleted.
+// PR's base commit, proposes restoring a covering doc the PR deleted, and fills
+// a proposal's original section from the doc at head.
 package basedocs
 
 import (
@@ -21,9 +22,11 @@ const maxRestoreReasonPaths = 3
 
 // Selection is the base-docs outcome for a PR. Restores is non-empty only when
 // the PR deleted a covering doc that can be restored; Candidates is then nil.
+// Problems are the base docs that failed to parse and so cannot be candidates.
 type Selection struct {
 	Candidates []string
 	Restores   []review.Proposal
+	Problems   []docs.Problem
 }
 
 // Select matches files against the docs in baseFS.
@@ -38,16 +41,16 @@ func Select(baseFS fs.FS, files []review.ChangedFile) (Selection, error) {
 	}
 	candidates, deleted := baseTree.Candidates(changes)
 	if len(deleted) == 0 {
-		return Selection{Candidates: candidates}, nil
+		return Selection{Candidates: candidates, Problems: baseTree.Problems}, nil
 	}
 	restores, err := restores(baseFS, baseTree, deleted, files)
 	if err != nil {
 		return Selection{}, err
 	}
 	if len(restores) > 0 {
-		return Selection{Restores: restores}, nil
+		return Selection{Restores: restores, Problems: baseTree.Problems}, nil
 	}
-	return Selection{Candidates: candidates}, nil
+	return Selection{Candidates: candidates, Problems: baseTree.Problems}, nil
 }
 
 // restores proposes recreating each deleted base doc from its text at the base

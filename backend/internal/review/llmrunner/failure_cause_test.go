@@ -3,10 +3,7 @@ package llmrunner_test
 import (
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -68,29 +65,11 @@ func TestStart_FailureNamesItsCause(t *testing.T) {
 	}
 }
 
-// commitCoveringDocs commits n more docs that cover main.go on top of dir's
-// HEAD and returns the new commit's SHA.
 func commitCoveringDocs(t *testing.T, dir string, n int) string {
 	t.Helper()
 
-	git := func(args ...string) []byte {
-		t.Helper()
-		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, out)
-		}
-		return out
-	}
-
 	for i := range n {
-		doc := fmt.Sprintf("---\ntitle: Extra %d\nsummary: Describes extra %d.\ncovers:\n  - main.go\n---\n# Extra %d\n", i, i, i)
-		if err := os.WriteFile(filepath.Join(dir, "docs", fmt.Sprintf("extra%d.md", i)), []byte(doc), 0o600); err != nil {
-			t.Fatalf("write extra doc %d: %v", i, err)
-		}
+		writeRepoFile(t, dir, fmt.Sprintf("docs/extra%d.md", i), fmt.Sprintf("---\ntitle: Extra %d\nsummary: Describes extra %d.\ncovers:\n  - main.go\n---\n# Extra %d\n", i, i, i))
 	}
-	git("add", "-A")
-	git("commit", "-q", "-m", "more docs")
-	return strings.TrimSpace(string(git("rev-parse", "HEAD")))
+	return commitAll(t, dir, "more docs")
 }

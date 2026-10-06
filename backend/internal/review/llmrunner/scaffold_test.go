@@ -52,9 +52,9 @@ func startScaffold(t *testing.T, model llm.Model) (review.ScaffoldStarted, error
 func TestStartScaffold_BrokenIndexIsReturnedToModel(t *testing.T) {
 	t.Parallel()
 
-	goodIndex := scaffoldFrontmatter + "[a](architecture.md) [s](guides/setup.md)\n"
+	goodIndex := scaffoldFrontmatter + "## Index\n[a](architecture.md) [s](guides/setup.md)\n"
 	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
-		toolResponse(submitDocsCall("1", scaffoldFrontmatter)),
+		toolResponse(submitDocsCall("1", scaffoldFrontmatter+"## Index\n")),
 		func(req llm.Request) (llm.Response, error) {
 			if res := lastToolResult(req); !res.IsError || !strings.Contains(res.Content, "architecture.md") {
 				t.Errorf("tool result = %+v, want an error naming the missing link", res)
@@ -95,7 +95,7 @@ func TestStartScaffold_ReadsOutsideTheCloneAreToolErrors(t *testing.T) {
 					if !res.IsError || strings.Contains(res.Content, "root:") {
 						t.Errorf("tool result = %+v, want an error with no file content", res)
 					}
-					return llm.Response{ToolCalls: []llm.ToolCall{submitDocsCall("s", scaffoldFrontmatter+"[a](architecture.md) [s](guides/setup.md)\n")}}, nil
+					return llm.Response{ToolCalls: []llm.ToolCall{submitDocsCall("s", scaffoldFrontmatter+"## Index\n[a](architecture.md) [s](guides/setup.md)\n")}}, nil
 				},
 			}}
 
@@ -126,5 +126,25 @@ func TestStartScaffold_StepLimitIsLimitFailure(t *testing.T) {
 	var failedErr *review.FailedError
 	if !errors.As(err, &failedErr) || failedErr.Cause != review.CauseLimit || !errors.Is(err, agent.ErrStepLimit) {
 		t.Fatalf("StartScaffold() = %v, want *FailedError with CauseLimit wrapping agent.ErrStepLimit", err)
+	}
+}
+
+func TestStartScaffold_TokenBudgetOverrideAppliesToScaffold(t *testing.T) {
+	t.Parallel()
+
+	repoDir, sha := newGitRepo(t)
+	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
+		func(llm.Request) (llm.Response, error) {
+			return llm.Response{Text: "thinking", Usage: llm.Usage{InputTokens: 100}}, nil
+		},
+	}}
+	runner := llmrunner.New(model, noToken, "m", "m")
+	runner.SetRemote(repoDir)
+	runner.SetTokenBudget(10)
+
+	_, err := runner.StartScaffold(t.Context(), review.ScaffoldRequest{Owner: "o", Repo: "r", BaseSHA: sha})
+	var failedErr *review.FailedError
+	if !errors.As(err, &failedErr) || failedErr.Cause != review.CauseLimit {
+		t.Fatalf("StartScaffold() = %v, want *FailedError with CauseLimit", err)
 	}
 }

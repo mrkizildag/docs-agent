@@ -44,6 +44,12 @@ type Scaffold struct {
 	Setup        string
 }
 
+// Paths of the scaffold's files; the index is IndexPath.
+const (
+	ArchitecturePath = "docs/architecture.md"
+	SetupPath        = "docs/guides/setup.md"
+)
+
 // ScaffoldFile is one file of a Scaffold at its repo-relative path.
 type ScaffoldFile struct {
 	Path    string
@@ -53,11 +59,7 @@ type ScaffoldFile struct {
 // Files returns the scaffold's files with their paths: the one place those
 // paths are defined for writing.
 func (s Scaffold) Files() []ScaffoldFile {
-	return []ScaffoldFile{
-		{Path: IndexPath, Content: s.Index},
-		{Path: "docs/architecture.md", Content: s.Architecture},
-		{Path: "docs/guides/setup.md", Content: s.Setup},
-	}
+	return ScaffoldDocs{Index: s.Index, Architecture: s.Architecture, Setup: s.Setup}.Files()
 }
 
 func (Pending) isScaffoldStarted()  {}
@@ -69,6 +71,15 @@ type ScaffoldDocs struct {
 	Index        string `json:"index" jsonschema:"Full markdown of docs/README.md, frontmatter included."`
 	Architecture string `json:"architecture" jsonschema:"Full markdown of docs/architecture.md, frontmatter included."`
 	Setup        string `json:"setup" jsonschema:"Full markdown of docs/guides/setup.md, frontmatter included."`
+}
+
+// Files returns the docs with their paths.
+func (d ScaffoldDocs) Files() []ScaffoldFile {
+	return []ScaffoldFile{
+		{Path: IndexPath, Content: d.Index},
+		{Path: ArchitecturePath, Content: d.Architecture},
+		{Path: SetupPath, Content: d.Setup},
+	}
 }
 
 // ScaffoldSchema returns the JSON Schema for ScaffoldDocs.

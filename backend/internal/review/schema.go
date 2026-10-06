@@ -14,6 +14,13 @@ type StructuredOutput struct {
 	Proposals      []Proposal `json:"proposals" jsonschema:"Doc changes the PR needs; empty when the PR has no doc impact."`
 }
 
+// ProposalsArgs is the argument shape of the server runner's submit_proposals
+// finishing tool: an object wrapping the array, since function-calling
+// parameters must be a JSON Schema object.
+type ProposalsArgs struct {
+	Proposals []Proposal `json:"proposals" jsonschema:"Doc changes the PR needs; empty when no doc needs to change."`
+}
+
 // ProposalSchema returns the JSON Schema for Proposal, inferred by
 // reflection from the Go type.
 func ProposalSchema() ([]byte, error) {
@@ -31,10 +38,26 @@ func ResultSchema() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("infer schema for review.StructuredOutput: %w", err)
 	}
+	annotateProposals(schema)
+	return marshalSchema(schema, "review.StructuredOutput")
+}
+
+// ProposalsArgsSchema returns the JSON Schema for ProposalsArgs.
+func ProposalsArgsSchema() ([]byte, error) {
+	schema, err := jsonschema.For[ProposalsArgs](nil)
+	if err != nil {
+		return nil, fmt.Errorf("infer schema for review.ProposalsArgs: %w", err)
+	}
+	annotateProposals(schema)
+	return marshalSchema(schema, "review.ProposalsArgs")
+}
+
+// annotateProposals makes the proposals property a plain array, not nullable,
+// and annotates its items.
+func annotateProposals(schema *jsonschema.Schema) {
 	proposals := schema.Properties["proposals"]
 	proposals.Type, proposals.Types = "array", nil
 	annotate(proposals.Items)
-	return marshalSchema(schema, "review.StructuredOutput")
 }
 
 func marshalSchema(schema *jsonschema.Schema, name string) ([]byte, error) {

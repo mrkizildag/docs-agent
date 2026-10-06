@@ -101,7 +101,7 @@ func (r *Runner) openClone(ctx context.Context, installationID int64, owner, rep
 // objects and returns it as an in-memory fs.FS rooted at the repo
 // root. Nothing is checked out, so the PR's .gitattributes can't rewrite the
 // base docs, and the agent's root over the clone can't reach them. Only regular
-// .md files of at most docs.MaxDocBytes are included.
+// .md and .mdx files of at most docs.MaxDocBytes are included.
 func (c *clone) docsAt(ctx context.Context, baseSHA string) (fs.FS, error) {
 	listing, err := runGit(ctx, c.dir, c.remoteURL, c.token, "ls-tree", "-r", "-z", "--long", baseSHA, "--", "docs")
 	if err != nil {
@@ -111,7 +111,7 @@ func (c *clone) docsAt(ctx context.Context, baseSHA string) (fs.FS, error) {
 	var paths, shas []string
 	for _, entry := range strings.Split(listing, "\x00") {
 		meta, path, ok := strings.Cut(entry, "\t")
-		if !ok || !strings.HasSuffix(path, ".md") {
+		if !ok || !isDocFile(path) {
 			continue
 		}
 		fields := strings.Fields(meta)
@@ -155,6 +155,10 @@ func (c *clone) docsAt(ctx context.Context, baseSHA string) (fs.FS, error) {
 		files[path] = &fstest.MapFile{Data: content[:size], Mode: 0o444}
 	}
 	return files, nil
+}
+
+func isDocFile(p string) bool {
+	return strings.HasSuffix(p, ".md") || strings.HasSuffix(p, ".mdx")
 }
 
 // runGit runs git in dir and returns its stdout.

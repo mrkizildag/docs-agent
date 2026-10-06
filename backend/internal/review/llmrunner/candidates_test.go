@@ -1,9 +1,6 @@
 package llmrunner_test
 
 import (
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -17,38 +14,12 @@ import (
 func TestStart_GlobCoveredNestedFileTriagesOnlyItsDoc(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	run := func(args ...string) string {
-		t.Helper()
-		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
-		cmd.Dir = dir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	write := func(rel, content string) {
-		t.Helper()
-		path := filepath.Join(dir, rel)
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatalf("mkdir %s: %v", rel, err)
-		}
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			t.Fatalf("write %s: %v", rel, err)
-		}
-	}
-
-	run("init", "-q", "-b", "main")
-	run("config", "user.email", "test@example.com")
-	run("config", "user.name", "test")
-	write("src/pkg/deep/x.go", "package deep\n\nfunc X() {}\n")
-	write("other/y.go", "package other\n")
-	write("docs/a.md", "---\ntitle: A\nsummary: Describes A.\ncovers:\n  - src/**/*.go\n---\n# A\n\nold.\n")
-	write("docs/b.md", "---\ntitle: B\nsummary: Describes B.\ncovers:\n  - other/*.go\n---\n# B\n\nold.\n")
-	run("add", "-A")
-	run("commit", "-q", "-m", "init")
-	headSHA := run("rev-parse", "HEAD")
+	dir := initGitRepo(t)
+	writeRepoFile(t, dir, "src/pkg/deep/x.go", "package deep\n\nfunc X() {}\n")
+	writeRepoFile(t, dir, "other/y.go", "package other\n")
+	writeRepoFile(t, dir, "docs/a.md", "---\ntitle: A\nsummary: Describes A.\ncovers:\n  - src/**/*.go\n---\n# A\n\nold.\n")
+	writeRepoFile(t, dir, "docs/b.md", "---\ntitle: B\nsummary: Describes B.\ncovers:\n  - other/*.go\n---\n# B\n\nold.\n")
+	headSHA := commitAll(t, dir, "init")
 
 	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")

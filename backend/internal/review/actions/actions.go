@@ -50,7 +50,8 @@ type WorkflowAPI interface {
 	// ListChangedFiles returns the pull request's files with their head-side hunk ranges.
 	ListChangedFiles(ctx context.Context, installationID int64, owner, repo string, number int) ([]review.ChangedFile, error)
 	// FileAtRef returns the file's content at ref, or ok=false when the file
-	// does not exist there or exceeds docs.MaxDocBytes.
+	// does not exist there. A file over docs.MaxDocBytes is an error wrapping
+	// review.ErrFileTooLarge.
 	FileAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (content []byte, ok bool, err error)
 	// DocsAtRef returns the .md files under docs/ at ref, rooted at the repo root.
 	DocsAtRef(ctx context.Context, installationID int64, owner, repo, ref string) (fs.FS, error)
@@ -151,31 +152,49 @@ func (r *Runner) dispatch(ctx context.Context, installationID int64, owner, repo
 // *review.InvalidResultError when the artifact is for another commit or
 // dispatch, reports an error, or holds docs that fail docs.CheckScaffold.
 func (r *Runner) CollectScaffold(ctx context.Context, c review.Completion) (review.Scaffold, error) {
-	raw, err := r.api.ResultArtifact(ctx, c.InstallationID, c.Owner, c.Repo, c.RunID)
+	out, model, err := collectOutput[review.ScaffoldDocs](ctx, r.api, c, "scaffold run")
 	if err != nil {
-		return review.Scaffold{}, fmt.Errorf("collect actions scaffold run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
+		return review.Scaffold{}, err
 	}
 
-	var art Artifact[review.ScaffoldDocs]
-	if err := json.Unmarshal(raw, &art); err != nil {
-		return review.Scaffold{}, &review.InvalidResultError{Cause: fmt.Errorf("decode result artifact: %w", err)}
+	files := out.Files()
+	scaffold := make([]docs.ScaffoldFile, len(files))
+	for i, f := range files {
+		scaffold[i] = docs.ScaffoldFile(f)
 	}
-
-	out, err := art.output(c)
-	if err != nil {
-		return review.Scaffold{}, &review.InvalidResultError{Cause: err}
-	}
-	if err := docs.CheckScaffold(out.Index, out.Architecture, out.Setup); err != nil {
-		return review.Scaffold{}, &review.InvalidResultError{Cause: errors.New(capText(err.Error()))}
+	if err := docs.CheckScaffold(scaffold, review.IndexPath, review.IndexHeading); err != nil {
+		return review.Scaffold{}, &review.InvalidResultError{Cause: errors.New(review.Truncate(err.Error(), maxCauseText))}
 	}
 
 	return review.Scaffold{
 		Runner:       runnerName,
-		Model:        art.Claude.model(),
+		Model:        model,
 		Index:        out.Index,
 		Architecture: out.Architecture,
 		Setup:        out.Setup,
 	}, nil
+}
+
+// collectOutput reads the run's result artifact and returns its structured
+// output and model. kind names the run in errors. It returns
+// *review.InvalidResultError when the artifact is unusable; failing to read it
+// is transient and returned as an ordinary error.
+func collectOutput[T any](ctx context.Context, api WorkflowAPI, c review.Completion, kind string) (out *T, model string, err error) {
+	raw, err := api.ResultArtifact(ctx, c.InstallationID, c.Owner, c.Repo, c.RunID)
+	if err != nil {
+		return nil, "", fmt.Errorf("collect actions %s %d of %s/%s: %w", kind, c.RunID, c.Owner, c.Repo, err)
+	}
+
+	var art Artifact[T]
+	if err := json.Unmarshal(raw, &art); err != nil {
+		return nil, "", &review.InvalidResultError{Cause: fmt.Errorf("decode result artifact: %w", err)}
+	}
+
+	out, err = art.output(c)
+	if err != nil {
+		return nil, "", &review.InvalidResultError{Cause: err}
+	}
+	return out, art.Claude.model(), nil
 }
 
 // Collect decodes the completed run's result artifact. It returns
@@ -184,22 +203,12 @@ func (r *Runner) CollectScaffold(ctx context.Context, c review.Completion) (revi
 // outside the PR's docs or diff. Failing to list the PR's files is transient
 // and returned as an ordinary error.
 func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Result, error) {
-	raw, err := r.api.ResultArtifact(ctx, c.InstallationID, c.Owner, c.Repo, c.RunID)
+	out, model, err := collectOutput[review.StructuredOutput](ctx, r.api, c, "run")
 	if err != nil {
-		return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
+		return review.Result{}, err
 	}
 
-	var art Artifact[review.StructuredOutput]
-	if err := json.Unmarshal(raw, &art); err != nil {
-		return review.Result{}, &review.InvalidResultError{Cause: fmt.Errorf("decode result artifact: %w", err)}
-	}
-
-	out, err := art.output(c)
-	if err != nil {
-		return review.Result{}, &review.InvalidResultError{Cause: err}
-	}
-
-	result := review.Result{Runner: runnerName, Model: art.Claude.model()}
+	result := review.Result{Runner: runnerName, Model: model}
 	if len(out.Proposals) == 0 {
 		if strings.TrimSpace(out.NoImpactReason) == "" {
 			return review.Result{}, &review.InvalidResultError{Cause: errors.New("no proposals and an empty no_impact_reason")}
@@ -215,12 +224,17 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 
 	proposals := make(review.Proposals, len(out.Proposals))
 	for i, p := range out.Proposals {
+		p.Section = review.NormalizeSection(p.Section)
 		if err := p.Validate(changed); err != nil {
-			return review.Result{}, &review.InvalidResultError{Cause: fmt.Errorf("proposal %d: %s", i, capText(err.Error()))}
+			return review.Result{}, &review.InvalidResultError{Cause: fmt.Errorf("proposal %d: %s", i, review.Truncate(err.Error(), maxCauseText))}
 		}
 		proposals[i] = p
 	}
 	if err := r.fillOriginals(ctx, c, proposals); err != nil {
+		var invalid *review.InvalidResultError
+		if errors.As(err, &invalid) {
+			return review.Result{}, err
+		}
 		return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
 	}
 	result.Verdict = proposals
@@ -228,35 +242,57 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 }
 
 // fillOriginals sets Original and Lines on each proposal that replaces a
-// section, from the doc at the completion's head. A doc or section missing
-// there leaves both empty.
+// section, from the doc at the completion's head. It returns
+// *review.InvalidResultError when the doc is missing there, does not parse, or
+// has no single heading matching the section. A doc over docs.MaxDocBytes
+// leaves both empty.
 func (r *Runner) fillOriginals(ctx context.Context, c review.Completion, proposals review.Proposals) error {
 	parsed := map[string]*docs.Doc{}
-	for i, p := range proposals {
+	for i := range proposals {
+		p := &proposals[i]
 		if p.Section == "" {
 			continue
 		}
+
 		doc, seen := parsed[p.DocPath]
 		if !seen {
-			src, ok, err := r.api.FileAtRef(ctx, c.InstallationID, c.Owner, c.Repo, p.DocPath, c.HeadSHA)
+			d, readable, err := r.headDoc(ctx, c, p.DocPath)
 			if err != nil {
-				return fmt.Errorf("read %s at %s: %w", p.DocPath, c.HeadSHA, err)
+				return err
 			}
-			if ok {
-				if d, err := docs.ParseDoc(p.DocPath, src); err == nil {
-					doc = &d
-				}
+			if readable {
+				doc = &d
 			}
 			parsed[p.DocPath] = doc
 		}
 		if doc == nil {
 			continue
 		}
-		if text, start, end, ok := doc.SectionSpan(p.Section); ok {
-			proposals[i].Original, proposals[i].Lines = text, review.LineRange{Start: start, End: end}
+		if err := basedocs.FillOriginal(p, *doc); err != nil {
+			return &review.InvalidResultError{Cause: fmt.Errorf("proposal for %s: %s", p.DocPath, review.Truncate(err.Error(), maxCauseText))}
 		}
 	}
 	return nil
+}
+
+// headDoc parses docPath at the completion's head. readable is false when the
+// doc is too large to read.
+func (r *Runner) headDoc(ctx context.Context, c review.Completion, docPath string) (doc docs.Doc, readable bool, err error) {
+	src, ok, err := r.api.FileAtRef(ctx, c.InstallationID, c.Owner, c.Repo, docPath, c.HeadSHA)
+	switch {
+	case errors.Is(err, review.ErrFileTooLarge):
+		return docs.Doc{}, false, nil
+	case err != nil:
+		return docs.Doc{}, false, fmt.Errorf("read %s at %s: %w", docPath, c.HeadSHA, err)
+	case !ok:
+		return docs.Doc{}, false, &review.InvalidResultError{Cause: fmt.Errorf("proposal replaces a section of %s, which does not exist at head; leave section empty to create a new doc", docPath)}
+	}
+
+	doc, err = docs.ParseDoc(docPath, src)
+	if err != nil {
+		return docs.Doc{}, false, &review.InvalidResultError{Cause: fmt.Errorf("proposal replaces a section of %s, which does not parse: %s", docPath, review.Truncate(err.Error(), maxCauseText))}
+	}
+	return doc, true, nil
 }
 
 // output returns the structured output of an artifact that belongs to c's
@@ -285,14 +321,7 @@ func (o ClaudeOutput[T]) failure() error {
 		status = strconv.Itoa(*o.APIErrorStatus)
 	}
 	return fmt.Errorf("claude code failed: api_error_status %s (terminal_reason %s, subtype %s)",
-		status, capText(o.TerminalReason), capText(o.Subtype))
-}
-
-func capText(s string) string {
-	if len(s) <= maxCauseText {
-		return s
-	}
-	return strings.ToValidUTF8(s[:maxCauseText], "") + "..."
+		status, review.Truncate(o.TerminalReason, maxCauseText), review.Truncate(o.Subtype, maxCauseText))
 }
 
 func (o ClaudeOutput[T]) model() string {
