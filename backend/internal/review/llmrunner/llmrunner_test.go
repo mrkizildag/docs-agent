@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gitfixture"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
@@ -73,10 +74,10 @@ func testRequest(headSHA string) review.Request {
 func newGitRepo(t *testing.T) (string, string) {
 	t.Helper()
 
-	dir := initGitRepo(t)
-	writeRepoFile(t, dir, "main.go", "package main\n\nfunc main() {}\n")
-	writeRepoFile(t, dir, "docs/x.md", "---\ntitle: X\nsummary: Describes X.\ncovers:\n  - main.go\n---\n# X\n\nold behavior.\n")
-	return dir, commitAll(t, dir, "init")
+	return gitfixture.NewRepo(t, map[string]string{
+		"main.go":   "package main\n\nfunc main() {}\n",
+		"docs/x.md": "---\ntitle: X\nsummary: Describes X.\ncovers:\n  - main.go\n---\n# X\n\nold behavior.\n",
+	})
 }
 
 func noToken(context.Context, int64, string) (string, error) { return "", nil }
@@ -589,11 +590,11 @@ func TestStart_PromptsFencePatchAndMarkOmittedPatch(t *testing.T) {
 func TestStart_TooManyCandidateDocsIsAnError(t *testing.T) {
 	t.Parallel()
 
-	dir := initGitRepo(t)
+	files := map[string]string{}
 	for i := range 11 {
-		writeRepoFile(t, dir, fmt.Sprintf("docs/d%d.md", i), fmt.Sprintf("---\ntitle: D%d\nsummary: Describes D.\ncovers:\n  - main.go\n---\n# D\n", i))
+		files[fmt.Sprintf("docs/d%d.md", i)] = fmt.Sprintf("---\ntitle: D%d\nsummary: Describes D.\ncovers:\n  - main.go\n---\n# D\n", i)
 	}
-	headSHA := commitAll(t, dir, "init")
+	dir, headSHA := gitfixture.NewRepo(t, files)
 
 	runner := llmrunner.New(&llmtest.ScriptedModel{}, noToken, "triage-model", "draft-model")
 	runner.SetRemote(dir)
@@ -606,8 +607,7 @@ func TestStart_TooManyCandidateDocsIsAnError(t *testing.T) {
 func commitDoc(t *testing.T, dir, relPath, content string) string {
 	t.Helper()
 
-	writeRepoFile(t, dir, relPath, content)
-	return commitAll(t, dir, "doc")
+	return gitfixture.Commit(t, dir, map[string]string{relPath: content}, "doc")
 }
 
 func TestStart_ProposalCarriesOriginalSectionAndLines(t *testing.T) {

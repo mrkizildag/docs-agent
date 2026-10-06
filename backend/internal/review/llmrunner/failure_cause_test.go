@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
+	"github.com/mrkizildag/pollux-agent/backend/internal/gitfixture"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
@@ -98,8 +99,9 @@ func TestFailed_ClassifiesEachAgentCauseSeparately(t *testing.T) {
 func commitCoveringDocs(t *testing.T, dir string, n int) string {
 	t.Helper()
 
+	files := map[string]string{}
 	for i := range n {
-		writeRepoFile(t, dir, fmt.Sprintf("docs/extra%d.md", i), fmt.Sprintf("---\ntitle: Extra %d\nsummary: Describes extra %d.\ncovers:\n  - main.go\n---\n# Extra %d\n", i, i, i))
+		files[fmt.Sprintf("docs/extra%d.md", i)] = fmt.Sprintf("---\ntitle: Extra %d\nsummary: Describes extra %d.\ncovers:\n  - main.go\n---\n# Extra %d\n", i, i, i)
 	}
-	return commitAll(t, dir, "more docs")
+	return gitfixture.Commit(t, dir, files, "more docs")
 }

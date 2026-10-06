@@ -82,6 +82,8 @@ type GitHub struct {
 	CommitSHA string
 	// NextCheckRunID is the ID the next created check run gets; 1 when zero.
 	NextCheckRunID int64
+	// DefaultTip is the tip DefaultBranch reports; "tip" when empty.
+	DefaultTip string
 	// ExistingPR is the pull request FindPullRequest reports for any branch, if any.
 	ExistingPR *gate.ScaffoldPR
 	// Fail makes every call of a method fail with the error, by method name.
@@ -90,12 +92,16 @@ type GitHub struct {
 	// error fails the call, and it may block. It is the hook for failing the
 	// nth call, a call naming one ID, or holding a call while the test acts.
 	Before func(Call) error
+	// BeforeContext is Before with the call's context, so a hook can hold a
+	// call until the job running it is cancelled. It runs after Before.
+	BeforeContext func(context.Context, Call) error
 
 	mu          sync.Mutex
 	counts      map[string]int
 	calls       []Call
 	checkRuns   []CheckRun
 	comments    []gate.Comment
+	posted      []gate.Comment
 	reviewNew   []gate.ReviewComment
 	replies     []Reply
 	reactions   map[commentKey]map[int64]gate.Reaction
@@ -130,6 +136,14 @@ func (g *GitHub) SetCommentBody(id int64, body string) {
 	g.setBody(id, body)
 }
 
+// SetPullRequest changes what GetPullRequest returns, as if the pull request
+// had moved on. It counts as no call.
+func (g *GitHub) SetPullRequest(pr gate.PullRequest) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.PullRequest = pr
+}
+
 // CheckRuns returns the check runs in the order they were first seen.
 func (g *GitHub) CheckRuns() []CheckRun {
 	g.mu.Lock()
@@ -146,6 +160,14 @@ func (g *GitHub) Comments() []gate.Comment {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return slices.Clone(g.comments)
+}
+
+// PostedComments returns the pull request's comments as first posted, before
+// any edit, in the order they were posted.
+func (g *GitHub) PostedComments() []gate.Comment {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Clone(g.posted)
 }
 
 // ReviewComments returns the review comments created, as requested.
@@ -237,7 +259,7 @@ func (g *GitHub) begin(ctx context.Context, method string, installationID, id in
 	g.counts[method]++
 	call := Call{Method: method, N: g.counts[method], InstallationID: installationID, ID: id}
 	g.calls = append(g.calls, call)
-	fail, before := g.Fail[method], g.Before
+	fail, before, beforeCtx := g.Fail[method], g.Before, g.BeforeContext
 	g.mu.Unlock()
 
 	if err := ctx.Err(); err != nil {
@@ -247,7 +269,12 @@ func (g *GitHub) begin(ctx context.Context, method string, installationID, id in
 		return fail
 	}
 	if before != nil {
-		return before(call)
+		if err := before(call); err != nil {
+			return err
+		}
+	}
+	if beforeCtx != nil {
+		return beforeCtx(ctx, call)
 	}
 	return nil
 }
@@ -256,6 +283,7 @@ func (g *GitHub) addComment(kind gate.CommentKind, body string) gate.Comment {
 	c := gate.Comment{ID: int64(len(g.comments) + 1), Mine: true, Kind: kind, Body: body}
 	c.URL = fmt.Sprintf("https://gh/%s/%d", kind, c.ID)
 	g.comments = append(g.comments, c)
+	g.posted = append(g.posted, c)
 	return c
 }
 
@@ -501,12 +529,16 @@ func (g *GitHub) ReplyToReviewComment(ctx context.Context, installationID int64,
 	return g.addComment(gate.CommentKindReview, body), nil
 }
 
-// DefaultBranch is always "main" at "tip".
+// DefaultBranch is always "main", at DefaultTip.
 func (g *GitHub) DefaultBranch(ctx context.Context, installationID int64, _, _ string) (string, string, error) {
 	if err := g.begin(ctx, "DefaultBranch", installationID, 0); err != nil {
 		return "", "", err
 	}
-	return "main", "tip", nil
+	tip := g.DefaultTip
+	if tip == "" {
+		tip = "tip"
+	}
+	return "main", tip, nil
 }
 
 func (g *GitHub) CreateBranch(ctx context.Context, installationID int64, _, _, branch, sha string) error {

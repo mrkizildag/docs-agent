@@ -68,6 +68,13 @@ linters:
           allow:
             - $gostd
             - github.com/mrkizildag/pollux-agent/backend/internal/llm
+        gitfixture-stdlib:
+          list-mode: strict
+          files:
+            - "**/internal/gitfixture/**"
+            - "!$test"
+          allow:
+            - $gostd
         jobqueue-stdlib:
           list-mode: strict
           files:

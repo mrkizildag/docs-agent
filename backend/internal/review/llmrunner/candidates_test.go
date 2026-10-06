@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mrkizildag/pollux-agent/backend/internal/gitfixture"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
@@ -15,12 +16,12 @@ import (
 func TestStart_GlobCoveredNestedFileTriagesOnlyItsDoc(t *testing.T) {
 	t.Parallel()
 
-	dir := initGitRepo(t)
-	writeRepoFile(t, dir, "src/pkg/deep/x.go", "package deep\n\nfunc X() {}\n")
-	writeRepoFile(t, dir, "other/y.go", "package other\n")
-	writeRepoFile(t, dir, "docs/a.md", "---\ntitle: A\nsummary: Describes A.\ncovers:\n  - src/**/*.go\n---\n# A\n\nold.\n")
-	writeRepoFile(t, dir, "docs/b.md", "---\ntitle: B\nsummary: Describes B.\ncovers:\n  - other/*.go\n---\n# B\n\nold.\n")
-	headSHA := commitAll(t, dir, "init")
+	dir, headSHA := gitfixture.NewRepo(t, map[string]string{
+		"src/pkg/deep/x.go": "package deep\n\nfunc X() {}\n",
+		"other/y.go":        "package other\n",
+		"docs/a.md":         "---\ntitle: A\nsummary: Describes A.\ncovers:\n  - src/**/*.go\n---\n# A\n\nold.\n",
+		"docs/b.md":         "---\ntitle: B\nsummary: Describes B.\ncovers:\n  - other/*.go\n---\n# B\n\nold.\n",
+	})
 
 	model := &llmtest.ScriptedModel{Script: []func(llm.Request) (llm.Response, error){triageResponse(false)}}
 	runner := llmrunner.New(model, noToken, "triage-model", "draft-model")

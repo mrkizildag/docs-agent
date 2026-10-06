@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mrkizildag/pollux-agent/backend/internal/gitfixture"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm/llmtest"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
@@ -160,8 +161,7 @@ func TestStart_RenamedCoveringDocIsTriagedAtItsNewPath(t *testing.T) {
 func removeFiles(t *testing.T, dir string, paths ...string) string {
 	t.Helper()
 
-	git(t, dir, append([]string{"rm", "-q"}, paths...)...)
-	return commitAll(t, dir, "rm")
+	return gitfixture.Remove(t, dir, "rm", paths...)
 }
 
 func TestStart_DeletedCoveringDocIsRestoredWithoutModelCalls(t *testing.T) {
