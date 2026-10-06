@@ -78,3 +78,17 @@ func TestDocExtensionsAgree(t *testing.T) {
 		}
 	}
 }
+
+// docs cannot import review, so SectionSpan keeps its own heading
+// normalization; this pins it to review.NormalizeSection.
+func TestSectionSpanNormalizesLikeReview(t *testing.T) {
+	t.Parallel()
+
+	doc := docs.ParseBody("docs/a.md", []byte("# Title\n\n## Setup\ntext\n"))
+	for _, in := range []string{"Setup", "## Setup", "  ### Setup  ", "#Setup", "Set up", "setup"} {
+		_, _, _, found := doc.SectionSpan(in)
+		if want := review.NormalizeSection(in) == "Setup"; found != want {
+			t.Errorf("SectionSpan(%q) found = %v, want %v (NormalizeSection = %q)", in, found, want, review.NormalizeSection(in))
+		}
+	}
+}
