@@ -4,8 +4,6 @@
 package github
 
 import (
-	"archive/zip"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -175,12 +173,6 @@ func (c *Client) WorkflowExists(ctx context.Context, installationID int64, owner
 	return true, nil
 }
 
-const (
-	resultArtifactName = "pollux-agent-result"
-	resultFileName     = "result.json"
-	maxArtifactBytes   = 10 << 20
-)
-
 // Dispatch runs the pollux-agent workflow on owner/repo's default branch and
 // returns the ID of the run it started.
 func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo string, in actions.DispatchInputs) (int64, error) {
@@ -207,10 +199,10 @@ func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo
 		github.CreateWorkflowDispatchEventRequest{
 			Ref: defaultBranch,
 			Inputs: map[string]any{
-				"head_sha":  in.HeadSHA,
-				"pr_number": strconv.Itoa(in.PRNumber),
-				"nonce":     in.Nonce,
-				"docs":      string(docsJSON),
+				actions.InputHeadSHA:  in.HeadSHA,
+				actions.InputPRNumber: strconv.Itoa(in.PRNumber),
+				actions.InputNonce:    in.Nonce,
+				actions.InputDocs:     string(docsJSON),
 			},
 			ReturnRunDetails: new(true),
 		})
@@ -224,83 +216,49 @@ func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo
 	return details.GetWorkflowRunID(), nil
 }
 
-// ResultArtifact returns the result.json inside run runID's result artifact.
-func (c *Client) ResultArtifact(ctx context.Context, installationID int64, owner, repo string, runID int64) ([]byte, error) {
+// RunArtifact returns the zip of run runID's artifact called name; the caller
+// closes it.
+func (c *Client) RunArtifact(ctx context.Context, installationID int64, owner, repo string, runID int64, name string) (io.ReadCloser, error) {
 	client, err := c.installationClient(installationID)
 	if err != nil {
-		return nil, fmt.Errorf("fetch result of run %d of %s/%s: %w", runID, owner, repo, err)
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: %w", runID, owner, repo, err)
 	}
 
 	list, _, err := client.Actions.ListWorkflowRunArtifacts(ctx, owner, repo, runID, &github.ListOptions{PerPage: 100})
 	if err != nil {
-		return nil, fmt.Errorf("fetch result of run %d of %s/%s: list artifacts: %w", runID, owner, repo, err)
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: list artifacts: %w", runID, owner, repo, err)
 	}
 
 	var artifactID int64
 	for _, a := range list.Artifacts {
-		if a.GetName() == resultArtifactName && !a.GetExpired() && a.GetWorkflowRun().GetID() == runID {
+		if a.GetName() == name && !a.GetExpired() && a.GetWorkflowRun().GetID() == runID {
 			artifactID = a.GetID()
 			break
 		}
 	}
 	if artifactID == 0 {
-		return nil, fmt.Errorf("fetch result of run %d of %s/%s: no %s artifact", runID, owner, repo, resultArtifactName)
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: no %s artifact", runID, owner, repo, name)
 	}
 
 	archiveURL, _, err := client.Actions.DownloadArtifact(ctx, owner, repo, artifactID, 1)
 	if err != nil {
-		return nil, fmt.Errorf("fetch result of run %d of %s/%s: locate artifact %d: %w", runID, owner, repo, artifactID, err)
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: locate artifact %d: %w", runID, owner, repo, artifactID, err)
 	}
 
-	result, err := c.downloadResult(ctx, archiveURL.String())
+	// The link is pre-signed and takes no installation token.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, archiveURL.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("fetch result of run %d of %s/%s: %w", runID, owner, repo, err)
-	}
-	return result, nil
-}
-
-// downloadResult fetches the zip at archiveURL, a pre-signed link that takes
-// no installation token, and returns its result.json.
-func (c *Client) downloadResult(ctx context.Context, archiveURL string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, archiveURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("download artifact: %w", err)
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: download artifact: %w", runID, owner, repo, err)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("download artifact: %w", err)
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: download artifact: %w", runID, owner, repo, err)
 	}
-	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("download artifact: status %s", resp.Status)
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("fetch artifact of run %d of %s/%s: download artifact: status %s", runID, owner, repo, resp.Status)
 	}
-
-	archive, err := io.ReadAll(io.LimitReader(resp.Body, maxArtifactBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("download artifact: %w", err)
-	}
-	if len(archive) > maxArtifactBytes {
-		return nil, fmt.Errorf("download artifact: larger than %d bytes", maxArtifactBytes)
-	}
-
-	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
-	if err != nil {
-		return nil, fmt.Errorf("open artifact zip: %w", err)
-	}
-	file, err := zr.Open(resultFileName)
-	if err != nil {
-		return nil, fmt.Errorf("open %s in artifact: %w", resultFileName, err)
-	}
-	defer func() { _ = file.Close() }()
-
-	result, err := io.ReadAll(io.LimitReader(file, maxArtifactBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read %s in artifact: %w", resultFileName, err)
-	}
-	if len(result) > maxArtifactBytes {
-		return nil, fmt.Errorf("read %s in artifact: larger than %d bytes", resultFileName, maxArtifactBytes)
-	}
-	return result, nil
+	return resp.Body, nil
 }
 
 func (c *Client) installationClient(installationID int64) (*github.Client, error) {

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"maps"
 	"slices"
@@ -45,8 +46,9 @@ type WorkflowAPI interface {
 	// Dispatch starts the pollux-agent workflow on the repo's default branch and
 	// returns the ID of the run it created.
 	Dispatch(ctx context.Context, installationID int64, owner, repo string, in DispatchInputs) (runID int64, err error)
-	// ResultArtifact returns the result.json bytes of the run's result artifact.
-	ResultArtifact(ctx context.Context, installationID int64, owner, repo string, runID int64) ([]byte, error)
+	// RunArtifact returns the raw zip of the run's artifact called name; the
+	// caller closes it. A missing or expired artifact is an error.
+	RunArtifact(ctx context.Context, installationID int64, owner, repo string, runID int64, name string) (io.ReadCloser, error)
 	// ListChangedFiles returns the pull request's files with their head-side hunk ranges.
 	ListChangedFiles(ctx context.Context, installationID int64, owner, repo string, number int) ([]review.ChangedFile, error)
 	// FileAtRef returns the file's content at ref, or ok=false when the file
@@ -180,7 +182,7 @@ func (r *Runner) CollectScaffold(ctx context.Context, c review.Completion) (revi
 // *review.InvalidResultError when the artifact is unusable; failing to read it
 // is transient and returned as an ordinary error.
 func collectOutput[T any](ctx context.Context, api WorkflowAPI, c review.Completion, kind string) (out *T, model string, err error) {
-	raw, err := api.ResultArtifact(ctx, c.InstallationID, c.Owner, c.Repo, c.RunID)
+	raw, err := resultJSON(ctx, api, c)
 	if err != nil {
 		return nil, "", fmt.Errorf("collect actions %s %d of %s/%s: %w", kind, c.RunID, c.Owner, c.Repo, err)
 	}

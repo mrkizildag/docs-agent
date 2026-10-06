@@ -1,10 +1,13 @@
 package actions_test
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"strings"
 	"testing"
@@ -40,8 +43,23 @@ func (f *fakeAPI) Dispatch(_ context.Context, _ int64, _, _ string, in actions.D
 	return f.runID, f.err
 }
 
-func (f *fakeAPI) ResultArtifact(_ context.Context, _ int64, _, _ string, _ int64) ([]byte, error) {
-	return f.artifact, f.err
+func (f *fakeAPI) RunArtifact(_ context.Context, _ int64, _, _ string, _ int64, name string) (io.ReadCloser, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if name != actions.ArtifactName {
+		return nil, fmt.Errorf("unexpected artifact %q", name)
+	}
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create(actions.ResultFileName)
+	if err == nil {
+		_, err = w.Write(f.artifact)
+	}
+	if err == nil {
+		err = zw.Close()
+	}
+	return io.NopCloser(&buf), err
 }
 
 func (f *fakeAPI) ListChangedFiles(context.Context, int64, string, string, int) ([]review.ChangedFile, error) {

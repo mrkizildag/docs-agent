@@ -1,14 +1,13 @@
 package github_test
 
 import (
-	"archive/zip"
-	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -353,90 +352,20 @@ func TestDispatch(t *testing.T) {
 	}
 }
 
-func TestResultArtifact(t *testing.T) {
+func TestRunArtifact(t *testing.T) {
 	t.Parallel()
 
-	var archive bytes.Buffer
-	zw := zip.NewWriter(&archive)
-	f, err := zw.Create("result.json")
-	if err != nil {
-		t.Fatalf("create zip entry: %v", err)
-	}
-	if _, err := f.Write([]byte(`{"head_sha":"abc"}`)); err != nil {
-		t.Fatalf("write zip entry: %v", err)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatalf("close zip: %v", err)
-	}
-
-	var (
-		client    *ghclient.Client
-		serverURL string
-	)
-	mux := http.NewServeMux()
-	handleAccessToken(t, mux)
-	mux.HandleFunc("GET /repos/o/r/actions/runs/4242/artifacts", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(t, w, http.StatusOK, `{"total_count":2,"artifacts":[{"id":1,"name":"pollux-agent-result","workflow_run":{"id":7}},{"id":3,"name":"other","workflow_run":{"id":4242}},{"id":2,"name":"pollux-agent-result","workflow_run":{"id":4242}}]}`)
-	})
-	mux.HandleFunc("GET /repos/o/r/actions/artifacts/2/zip", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, serverURL+"/blob", http.StatusFound)
-	})
-	mux.HandleFunc("GET /blob", func(w http.ResponseWriter, r *http.Request) {
-		if auth := r.Header.Get("Authorization"); auth != "" {
-			t.Errorf("blob download Authorization = %q, want none", auth)
-		}
-		if _, err := w.Write(archive.Bytes()); err != nil {
-			t.Errorf("write blob: %v", err)
-		}
-	})
-	client, serverURL = newTestClientURL(t, mux)
-
-	got, err := client.ResultArtifact(t.Context(), 99, "o", "r", 4242)
-	if err != nil {
-		t.Fatalf("ResultArtifact() = %v, want nil", err)
-	}
-	if string(got) != `{"head_sha":"abc"}` {
-		t.Errorf("ResultArtifact() = %q, want the result.json bytes", got)
-	}
-}
-
-func zipOf(t *testing.T, name string, content []byte) []byte {
-	t.Helper()
-
-	var archive bytes.Buffer
-	zw := zip.NewWriter(&archive)
-	f, err := zw.Create(name)
-	if err != nil {
-		t.Fatalf("create zip entry: %v", err)
-	}
-	if _, err := f.Write(content); err != nil {
-		t.Fatalf("write zip entry: %v", err)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatalf("close zip: %v", err)
-	}
-	return archive.Bytes()
-}
-
-func TestResultArtifactFailures(t *testing.T) {
-	t.Parallel()
-
-	const capBytes = 10 << 20
-	const listed = `{"total_count":1,"artifacts":[{"id":2,"name":"pollux-agent-result","workflow_run":{"id":4242}}]}`
-
+	const listed = `{"total_count":2,"artifacts":[{"id":1,"name":"pollux-agent-result","workflow_run":{"id":7}},{"id":3,"name":"other","workflow_run":{"id":4242}},{"id":2,"name":"pollux-agent-result","workflow_run":{"id":4242}}]}`
 	tests := []struct {
 		name         string
 		artifacts    string
 		downloadCode int
-		blob         []byte
 		wantErr      string
 	}{
-		{name: "zip over the cap", artifacts: listed, downloadCode: http.StatusOK, blob: make([]byte, capBytes+1), wantErr: "larger than"},
-		{name: "result.json over the cap", artifacts: listed, downloadCode: http.StatusOK, blob: zipOf(t, "result.json", make([]byte, capBytes+1)), wantErr: "read result.json in artifact: larger than"},
+		{name: "downloads the named artifact of the run", artifacts: listed, downloadCode: http.StatusOK},
 		{name: "non-200 download", artifacts: listed, downloadCode: http.StatusForbidden, wantErr: "status 403"},
 		{name: "missing artifact", artifacts: `{"total_count":0,"artifacts":[]}`, wantErr: "no pollux-agent-result artifact"},
 		{name: "expired artifact", artifacts: `{"total_count":1,"artifacts":[{"id":2,"name":"pollux-agent-result","expired":true,"workflow_run":{"id":4242}}]}`, wantErr: "no pollux-agent-result artifact"},
-		{name: "zip without result.json", artifacts: listed, downloadCode: http.StatusOK, blob: zipOf(t, "other.json", []byte("{}")), wantErr: "open result.json in artifact"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -454,17 +383,31 @@ func TestResultArtifactFailures(t *testing.T) {
 			mux.HandleFunc("GET /repos/o/r/actions/artifacts/2/zip", func(w http.ResponseWriter, r *http.Request) {
 				http.Redirect(w, r, serverURL+"/blob", http.StatusFound)
 			})
-			mux.HandleFunc("GET /blob", func(w http.ResponseWriter, _ *http.Request) {
+			mux.HandleFunc("GET /blob", func(w http.ResponseWriter, r *http.Request) {
+				if auth := r.Header.Get("Authorization"); auth != "" {
+					t.Errorf("blob download Authorization = %q, want none", auth)
+				}
 				w.WriteHeader(tc.downloadCode)
-				if _, err := w.Write(tc.blob); err != nil {
+				if _, err := w.Write([]byte("zip bytes")); err != nil {
 					t.Errorf("write blob: %v", err)
 				}
 			})
 			client, serverURL = newTestClientURL(t, mux)
 
-			got, err := client.ResultArtifact(t.Context(), 99, "o", "r", 4242)
-			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Errorf("ResultArtifact() = %q, %v; want an error containing %q", got, err, tc.wantErr)
+			body, err := client.RunArtifact(t.Context(), 99, "o", "r", 4242, actions.ArtifactName)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("RunArtifact() error = %v, want one containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("RunArtifact() = %v, want nil", err)
+			}
+			defer func() { _ = body.Close() }()
+			got, err := io.ReadAll(body)
+			if err != nil || string(got) != "zip bytes" {
+				t.Errorf("RunArtifact() body = %q, %v, want the blob bytes", got, err)
 			}
 		})
 	}
