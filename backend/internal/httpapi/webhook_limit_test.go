@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
 )
@@ -125,6 +126,44 @@ func TestWebhookRateLimitIgnoresForwardedForFromNonLoopbackPeer(t *testing.T) {
 	handler.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusTooManyRequests {
 		t.Fatalf("second with different X-Forwarded-For same peer = %d, want 429", rec2.Code)
+	}
+}
+
+func TestWebhookRateLimitEvictsIdlePerIPBucket(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.DiscardHandler)
+	secret := []byte("test-secret")
+	cfg := tightWebhookRateLimit()
+	cfg.PerIPMaxEntries = 1
+	cfg.PerIPIdle = 20 * time.Millisecond
+	handler := httpapi.NewHandlerWithWebhookRateLimit(logger, secret, newFakeEnqueuer(), fakeRunLookup{}, cfg)
+
+	payload := []byte(`{"zen":"x"}`)
+	sig := sign(secret, payload)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(payload))
+	req.Header.Set("X-GitHub-Event", "ping")
+	req.Header.Set("X-Hub-Signature-256", sig)
+	req.Header.Set("X-Forwarded-For", "198.51.100.1")
+	req.RemoteAddr = "127.0.0.1:1234"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("first IP = %d, want 202", rec.Code)
+	}
+
+	time.Sleep(25 * time.Millisecond)
+
+	req2 := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(payload))
+	req2.Header.Set("X-GitHub-Event", "ping")
+	req2.Header.Set("X-Hub-Signature-256", sig)
+	req2.Header.Set("X-Forwarded-For", "198.51.100.2")
+	req2.RemoteAddr = "127.0.0.1:1234"
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusAccepted {
+		t.Fatalf("second IP after idle eviction = %d, want 202", rec2.Code)
 	}
 }
 

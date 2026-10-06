@@ -16,6 +16,10 @@ type WebhookRateLimitConfig struct {
 	GlobalBurst     int
 	PerIPPerSecond  float64
 	PerIPBurst      int
+	// PerIPMaxEntries caps distinct client IPs tracked at once; zero = default.
+	PerIPMaxEntries int
+	// PerIPIdle drops a per-IP bucket after this long without a request; zero = default.
+	PerIPIdle time.Duration
 }
 
 // DefaultWebhookRateLimitConfig returns limits that should not throttle normal
@@ -42,6 +46,12 @@ func (c WebhookRateLimitConfig) withDefaults() WebhookRateLimitConfig {
 	}
 	if c.PerIPBurst <= 0 {
 		c.PerIPBurst = d.PerIPBurst
+	}
+	if c.PerIPMaxEntries <= 0 {
+		c.PerIPMaxEntries = 2048
+	}
+	if c.PerIPIdle <= 0 {
+		c.PerIPIdle = 15 * time.Minute
 	}
 	return c
 }
@@ -79,11 +89,19 @@ func (b *tokenBucket) allow(now time.Time) bool {
 	return true
 }
 
+type perIPLimiterEntry struct {
+	lim      *tokenBucket
+	lastSeen time.Time
+}
+
 type webhookRateLimiter struct {
 	global     *tokenBucket
 	perIPRate  float64
 	perIPBurst int
-	perIP      sync.Map // string -> *tokenBucket
+	perIPMax   int
+	perIPIdle  time.Duration
+	perIPMu    sync.Mutex
+	perIP      map[string]*perIPLimiterEntry
 }
 
 func newWebhookRateLimiter(cfg WebhookRateLimitConfig) *webhookRateLimiter {
@@ -92,23 +110,55 @@ func newWebhookRateLimiter(cfg WebhookRateLimitConfig) *webhookRateLimiter {
 		global:     newTokenBucket(cfg.GlobalPerSecond, cfg.GlobalBurst),
 		perIPRate:  cfg.PerIPPerSecond,
 		perIPBurst: cfg.PerIPBurst,
+		perIPMax:   cfg.PerIPMaxEntries,
+		perIPIdle:  cfg.PerIPIdle,
+		perIP:      make(map[string]*perIPLimiterEntry),
 	}
 }
 
 func (l *webhookRateLimiter) allow(ip string, now time.Time) bool {
-	if !l.perIPBucket(ip).allow(now) {
+	if !l.perIPBucket(ip, now).allow(now) {
 		return false
 	}
 	return l.global.allow(now)
 }
 
-func (l *webhookRateLimiter) perIPBucket(ip string) *tokenBucket {
-	if v, ok := l.perIP.Load(ip); ok {
-		return v.(*tokenBucket) //nolint:forcetypeassert // map stores only *tokenBucket
+func (l *webhookRateLimiter) perIPBucket(ip string, now time.Time) *tokenBucket {
+	l.perIPMu.Lock()
+	defer l.perIPMu.Unlock()
+	if e, ok := l.perIP[ip]; ok {
+		e.lastSeen = now
+		return e.lim
 	}
-	bucket := newTokenBucket(l.perIPRate, l.perIPBurst)
-	actual, _ := l.perIP.LoadOrStore(ip, bucket)
-	return actual.(*tokenBucket) //nolint:forcetypeassert
+	l.evictPerIP(now)
+	lim := newTokenBucket(l.perIPRate, l.perIPBurst)
+	l.perIP[ip] = &perIPLimiterEntry{lim: lim, lastSeen: now}
+	return lim
+}
+
+func (l *webhookRateLimiter) evictPerIP(now time.Time) {
+	cutoff := now.Add(-l.perIPIdle)
+	for ip, e := range l.perIP {
+		if e.lastSeen.Before(cutoff) {
+			delete(l.perIP, ip)
+		}
+	}
+	for len(l.perIP) >= l.perIPMax {
+		var oldestIP string
+		var oldest time.Time
+		first := true
+		for ip, e := range l.perIP {
+			if first || e.lastSeen.Before(oldest) {
+				oldestIP = ip
+				oldest = e.lastSeen
+				first = false
+			}
+		}
+		if first {
+			return
+		}
+		delete(l.perIP, oldestIP)
+	}
 }
 
 func peerIsLoopback(r *http.Request) bool {
