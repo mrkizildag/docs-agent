@@ -4,6 +4,7 @@ summary: How webhook work is queued, deduplicated, superseded, and recovered aft
 covers:
   - backend/internal/jobqueue/**
   - backend/internal/gate/sqlite/**
+  - backend/internal/httpapi/job.go
 ---
 
 # Job queue

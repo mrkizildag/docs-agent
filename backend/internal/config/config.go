@@ -104,17 +104,15 @@ func Load() (Config, error) {
 	llmTriageModel := os.Getenv("LLM_TRIAGE_MODEL")
 
 	if llmProvider == "" {
-		if llmBaseURL != "" {
-			errs = append(errs, errors.New("LLM_BASE_URL: set but LLM_PROVIDER is unset"))
-		}
-		if llmAPIKey != "" {
-			errs = append(errs, errors.New("LLM_API_KEY: set but LLM_PROVIDER is unset"))
-		}
-		if llmModel != "" {
-			errs = append(errs, errors.New("LLM_MODEL: set but LLM_PROVIDER is unset"))
-		}
-		if llmTriageModel != "" {
-			errs = append(errs, errors.New("LLM_TRIAGE_MODEL: set but LLM_PROVIDER is unset"))
+		for _, v := range []struct{ name, value string }{
+			{"LLM_BASE_URL", llmBaseURL},
+			{"LLM_API_KEY", llmAPIKey},
+			{"LLM_MODEL", llmModel},
+			{"LLM_TRIAGE_MODEL", llmTriageModel},
+		} {
+			if v.value != "" {
+				errs = append(errs, fmt.Errorf("%s: set but LLM_PROVIDER is unset", v.name))
+			}
 		}
 	} else {
 		llm, llmErrs := loadLLM(LLMProvider(llmProvider), llmBaseURL, llmAPIKey, llmModel, llmTriageModel)
