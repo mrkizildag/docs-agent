@@ -383,6 +383,12 @@ func renderSummary(state PRState) string {
 			b.WriteString("**pollux-agent**: the check is skipped.\n\n")
 		case skipActive(state):
 			fmt.Fprintf(&b, "**pollux-agent** proposed %d doc %s; the check is skipped.\n\n", open, noun)
+		case open == 0 && applied > 0:
+			b.WriteString("**pollux-agent**: every proposed doc update is applied.\n\n")
+		case open == 0 && len(state.Proposals) > 0:
+			b.WriteString("**pollux-agent**: no doc updates are needed now; earlier proposals are outdated.\n\n")
+		case open == 0:
+			b.WriteString("**pollux-agent**: no doc updates are needed.\n\n")
 		default:
 			fmt.Fprintf(&b, "**pollux-agent** proposes %d doc %s.\n\n", open, noun)
 		}
@@ -417,6 +423,8 @@ func renderSummary(state PRState) string {
 			b.WriteString("Apply all is not available: this pull request comes from a fork the bot cannot push to.\n")
 		case applied > 0 && open == 0:
 			b.WriteString("✅ All proposals applied.\n")
+		case open == 0:
+			// Every proposal is outdated: there is nothing left to apply.
 		default:
 			b.WriteString(checkbox(false, applyAllLabel) + "\n")
 		}

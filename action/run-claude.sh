@@ -24,7 +24,8 @@ else
     echo "::error::The docs input is not a JSON array of strings or an object with review and uncovered arrays of strings."
     exit 1
   }
-  schema_file="$ACTION_PATH/result.schema.json"
+  jq -c -f "$ACTION_PATH/new-doc-schema.jq" "$ACTION_PATH/result.schema.json" > "$out/result.schema.json"
+  schema_file="$out/result.schema.json"
   awk -f "$ACTION_PATH/numbered-diff.awk" "$out/pr.diff" > "$out/pr.numbered.diff"
   awk -f "$ACTION_PATH/diff-hunks.awk" "$out/pr.diff" | jq -cR 'select(. != "") | split("\t") | {file: .[0], start: (.[1] | tonumber), end: (.[2] | tonumber)}' > "$out/hunks.jsonl"
   if [ -s "$out/hunks.jsonl" ]; then

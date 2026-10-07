@@ -8,13 +8,17 @@ expect:
     - path: docs/guides/*.md
       new: true
       must_say:
-        - "pollux runs as one Docker Compose container on a single host, published on 127.0.0.1:8080 only, with Tailscale Funnel on the host forwarding public HTTPS to it."
-        - "The SQLite database lives in the named volume pollux-data; docker compose down -v deletes it along with the queue and PR state."
-        - "The container runs as uid 65532 on a distroless image with no shell, so the GitHub App private key file must be readable by that uid."
-        - "A systemd user timer polls origin/main every 2 minutes, deploys a new commit with docker compose up --build --wait, and redeploys the last good commit if the build or health check fails."
+        - "pollux runs as a single Docker Compose service."
+        - "Its port is published on 127.0.0.1:8080 only, not on all interfaces."
+        - "The SQLite database is kept on the named volume pollux-data."
+        - "The GitHub App private key file is mounted into the container read-only."
+        - "A systemd user timer deploys new commits of main every 2 minutes."
+        - "When a build or health check fails, the deploy rolls back to the last good commit."
   allow: [docs/architecture.md]
 notes: >
-  The PR adds Dockerfile, compose.yaml, .dockerignore, deploy/ (update timer), and cmd/healthcheck; the human
+  Facts are single claims the code at head states (compose.yaml, deploy/pollux-update.*); operational
+  advice the human added from experience (Tailscale Funnel, `down -v`, key permissions for uid 65532) is
+  left out because the diff does not show it. The PR adds Dockerfile, compose.yaml, .dockerignore, deploy/ (update timer), and cmd/healthcheck; the human
   wrote docs/guides/deploy.md and indexed it. Dockerfile, compose, and deploy/ are uncovered at base, so a new
   guide is the expected proposal (the exact filename is free). The human also added one-line pointers to Deploy in
   github-app.md and setup.md, but neither covers a changed file at base, so neither is reachable or required.
