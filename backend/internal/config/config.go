@@ -57,6 +57,20 @@ type Dashboard struct {
 	SessionKey Secret
 }
 
+// Origin is PublicURL's scheme and lowercased host without the scheme's default
+// port, the value browsers send as Origin.
+func (d Dashboard) Origin() string {
+	host := strings.ToLower(d.PublicURL.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	defaultPort := map[string]string{"https": "443", "http": "80"}[d.PublicURL.Scheme]
+	if port := d.PublicURL.Port(); port != "" && port != defaultPort {
+		host += ":" + port
+	}
+	return d.PublicURL.Scheme + "://" + host
+}
+
 // LLMProvider selects which wire format to speak to the LLM. OpenAI covers any
 // OpenAI-compatible chat completions endpoint: Gemini, GitHub Models,
 // OpenRouter, Ollama.
@@ -139,16 +153,26 @@ func Load() (Config, error) {
 	return cfg, errors.Join(errs...)
 }
 
+// dashboardEnv holds the raw dashboard variables before validation.
+type dashboardEnv struct {
+	clientID, clientSecret, publicURL, sessionKey string
+}
+
 // loadDashboard reads the dashboard variables: all or none.
 func loadDashboard() (*Dashboard, []error) {
-	vars := []struct{ key, value string }{
-		{"GITHUB_CLIENT_ID", os.Getenv("GITHUB_CLIENT_ID")},
-		{"GITHUB_CLIENT_SECRET", os.Getenv("GITHUB_CLIENT_SECRET")},
-		{"PUBLIC_URL", os.Getenv("PUBLIC_URL")},
-		{"SESSION_KEY", os.Getenv("SESSION_KEY")},
+	env := dashboardEnv{
+		clientID:     os.Getenv("GITHUB_CLIENT_ID"),
+		clientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
+		publicURL:    os.Getenv("PUBLIC_URL"),
+		sessionKey:   os.Getenv("SESSION_KEY"),
 	}
 	var set, unset []string
-	for _, v := range vars {
+	for _, v := range []struct{ key, value string }{
+		{"GITHUB_CLIENT_ID", env.clientID},
+		{"GITHUB_CLIENT_SECRET", env.clientSecret},
+		{"PUBLIC_URL", env.publicURL},
+		{"SESSION_KEY", env.sessionKey},
+	} {
 		if v.value == "" {
 			unset = append(unset, v.key)
 		} else {
@@ -163,11 +187,12 @@ func loadDashboard() (*Dashboard, []error) {
 	}
 
 	var errs []error
-	publicURL, err := url.Parse(vars[2].value)
-	if err != nil || publicURL.Scheme != "https" || publicURL.Host == "" || publicURL.RawQuery != "" || publicURL.Fragment != "" {
-		errs = append(errs, errors.New("PUBLIC_URL: must be an absolute https URL without query or fragment"))
+	publicURL, err := url.Parse(env.publicURL)
+	if err != nil || publicURL.Scheme != "https" || publicURL.Host == "" || publicURL.RawQuery != "" || publicURL.Fragment != "" ||
+		(publicURL.Path != "" && publicURL.Path != "/") {
+		errs = append(errs, errors.New("PUBLIC_URL: must be an absolute https URL without path, query, or fragment"))
 	}
-	key, err := base64.StdEncoding.DecodeString(vars[3].value)
+	key, err := base64.StdEncoding.DecodeString(env.sessionKey)
 	if err != nil || len(key) != sessionKeyBytes {
 		errs = append(errs, fmt.Errorf("SESSION_KEY: must be %d bytes, base64-encoded", sessionKeyBytes))
 	}
@@ -175,8 +200,8 @@ func loadDashboard() (*Dashboard, []error) {
 		return nil, errs
 	}
 	return &Dashboard{
-		ClientID:     vars[0].value,
-		ClientSecret: Secret{value: vars[1].value},
+		ClientID:     env.clientID,
+		ClientSecret: Secret{value: env.clientSecret},
 		PublicURL:    publicURL,
 		SessionKey:   Secret{value: string(key)},
 	}, nil

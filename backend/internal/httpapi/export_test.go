@@ -11,3 +11,6 @@ import (
 func RequireRepo(logger *slog.Logger, svc *auth.Service, next func(http.ResponseWriter, *http.Request, auth.Viewer, auth.Repo)) http.HandlerFunc {
 	return requireRepo(logger, svc, next)
 }
+
+// ClientIP exposes clientIP to the external tests.
+func ClientIP(r *http.Request) string { return clientIP(r) }

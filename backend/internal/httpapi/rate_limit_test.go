@@ -209,7 +209,7 @@ func TestWebhookRateLimitGlobalBucket(t *testing.T) {
 func TestAuthRateLimitIsSeparateFromWebhook(t *testing.T) {
 	t.Parallel()
 
-	env := newAuthEnvWithLimit(t, httpapi.RateLimitConfig{PerIPPerSecond: 0.001, PerIPBurst: 2})
+	env := newAuthEnv(t, withLimit(httpapi.RateLimitConfig{PerIPPerSecond: 0.001, PerIPBurst: 2}))
 	const peer = "203.0.113.10:1234"
 	login := func() int {
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/auth/login", nil)

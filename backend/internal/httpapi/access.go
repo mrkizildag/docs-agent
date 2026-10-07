@@ -19,6 +19,8 @@ func requireRepo(logger *slog.Logger, svc *auth.Service, next func(http.Response
 			return
 		}
 		if errors.Is(err, auth.ErrUnauthenticated) {
+			// The cookie stays: a transient refresh failure keeps the session, and a
+			// deleted one is cleared by requireSession on the next request.
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}

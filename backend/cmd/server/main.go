@@ -86,15 +86,19 @@ func run(ctx context.Context) error {
 		<-sweepDone
 	}()
 
+	deps := httpapi.Deps{
+		Logger:        logger,
+		WebhookSecret: []byte(cfg.WebhookSecret.Reveal()),
+		Jobs:          worker,
+		Runs:          store,
+		Auth:          buildAuth(cfg.Dashboard, store, ghHTTPClient, logger),
+	}
+	if cfg.Dashboard != nil {
+		deps.PublicOrigin = cfg.Dashboard.Origin()
+	}
 	srv := &http.Server{
-		Addr: cfg.Addr,
-		Handler: httpapi.NewHandler(httpapi.Deps{
-			Logger:        logger,
-			WebhookSecret: []byte(cfg.WebhookSecret.Reveal()),
-			Jobs:          worker,
-			Runs:          store,
-			Auth:          buildAuth(cfg.Dashboard, store, ghHTTPClient),
-		}),
+		Addr:              cfg.Addr,
+		Handler:           httpapi.NewHandler(deps),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -154,17 +158,18 @@ func sweepDeadlines(ctx context.Context, src httpapi.OverdueSource, jobs httpapi
 
 // buildAuth wires Sign in with GitHub from the dashboard config. A nil dashboard
 // returns nil, which leaves the dashboard routes unregistered.
-func buildAuth(dashboard *config.Dashboard, store auth.Store, httpClient *http.Client) *auth.Service {
+func buildAuth(dashboard *config.Dashboard, store auth.Store, httpClient *http.Client, logger *slog.Logger) *auth.Service {
 	if dashboard == nil {
 		return nil
 	}
+	user := github.NewUserClient(httpClient, dashboard.ClientID, dashboard.ClientSecret.Reveal(), "", "")
 	opts := auth.Options{
 		ClientID:     dashboard.ClientID,
-		AuthorizeURL: "https://github.com/login/oauth/authorize",
+		AuthorizeURL: user.AuthorizeURL(),
 		RedirectURL:  dashboard.PublicURL.JoinPath("auth", "callback").String(),
+		Logger:       logger,
 	}
 	copy(opts.Key[:], dashboard.SessionKey.Reveal())
-	user := github.NewUserClient(httpClient, dashboard.ClientID, dashboard.ClientSecret.Reveal(), "", "")
 	return auth.NewService(store, user, opts)
 }
 

@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -174,32 +175,53 @@ func (l *ipRateLimiter) evictPerIP(now time.Time) {
 	}
 }
 
-func peerIsLoopback(r *http.Request) bool {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return strings.HasPrefix(r.RemoteAddr, "127.") || strings.HasPrefix(r.RemoteAddr, "[::1]")
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+// trustedProxy reports whether a is loopback or a private IPv4 address (RFC
+// 1918, which covers the Docker bridge). IPv6 unique-local and link-local
+// addresses are not trusted: a tailnet client has one and must not be skipped.
+func trustedProxy(a netip.Addr) bool {
+	return a.IsLoopback() || (a.Is4() && a.IsPrivate())
 }
 
-// clientIP is the rate-limit key. Behind Tailscale Funnel the TCP peer is
-// localhost; Funnel sets X-Forwarded-For to the real client. The header is used
-// only when the peer is loopback so direct clients cannot forge it.
-func clientIP(r *http.Request) string {
-	if peerIsLoopback(r) {
-		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-			part, _, _ := strings.Cut(fwd, ",")
-			if ip := strings.TrimSpace(part); ip != "" {
-				return ip
-			}
-		}
+// rateLimitKey is the per-client bucket key: an IPv4 address, or an IPv6
+// client's /64, since one host can pick any address in its prefix.
+func rateLimitKey(a netip.Addr) string {
+	if a.Is6() {
+		return netip.PrefixFrom(a, 64).Masked().String()
 	}
+	return a.String()
+}
+
+// clientIP is the rate-limit key: the canonical address of the client. When the
+// TCP peer is a trusted proxy (Tailscale Funnel or cloudflared on the host, seen
+// as loopback or the Docker bridge gateway), X-Forwarded-For is walked right to
+// left past trusted hops and the first other address is the client. Entries a
+// client forged sit left of the one the proxy appended, so they are never
+// reached. An unparseable entry, or no untrusted entry, falls back to the peer.
+func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	peer, err := netip.ParseAddr(host)
 	if err != nil {
 		return r.RemoteAddr
 	}
-	return host
+	peer = peer.Unmap().WithZone("")
+	if !trustedProxy(peer) {
+		return rateLimitKey(peer)
+	}
+	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		hop, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
+		if err != nil {
+			return rateLimitKey(peer)
+		}
+		hop = hop.Unmap().WithZone("")
+		if !trustedProxy(hop) {
+			return rateLimitKey(hop)
+		}
+	}
+	return rateLimitKey(peer)
 }
 
 func withRateLimit(logger *slog.Logger, name string, limiter *ipRateLimiter, next http.HandlerFunc) http.HandlerFunc {

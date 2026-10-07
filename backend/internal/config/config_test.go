@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -287,6 +288,7 @@ func TestLoadDashboard(t *testing.T) {
 		{name: "client secret missing", env: mergeEnv(full, map[string]string{"GITHUB_CLIENT_SECRET": ""}), wantErr: "GITHUB_CLIENT_SECRET"},
 		{name: "only public url", env: map[string]string{"PUBLIC_URL": "https://pollux.example.com"}, wantErr: "GITHUB_CLIENT_ID"},
 		{name: "http public url", env: mergeEnv(full, map[string]string{"PUBLIC_URL": "http://pollux.example.com"}), wantErr: "PUBLIC_URL"},
+		{name: "public url with path", env: mergeEnv(full, map[string]string{"PUBLIC_URL": "https://pollux.example.com/app"}), wantErr: "PUBLIC_URL"},
 		{name: "session key not base64", env: mergeEnv(full, map[string]string{"SESSION_KEY": "!!!"}), wantErr: "SESSION_KEY"},
 		{name: "session key too short", env: mergeEnv(full, map[string]string{"SESSION_KEY": base64.StdEncoding.EncodeToString(make([]byte, 16))}), wantErr: "SESSION_KEY"},
 	}
@@ -449,5 +451,24 @@ func TestEvalReportLeavesOutPath(t *testing.T) {
 	}
 	if strings.Contains(string(data), "someone") {
 		t.Errorf("json.Marshal(Eval) = %s, want no PATH", data)
+	}
+}
+
+func TestDashboardOrigin(t *testing.T) {
+	t.Parallel()
+	tests := []struct{ publicURL, want string }{
+		{"https://Pollux.Example:443", "https://pollux.example"},
+		{"https://pollux.example", "https://pollux.example"},
+		{"https://pollux.example:8443", "https://pollux.example:8443"},
+		{"https://[2001:DB8::1]:443", "https://[2001:db8::1]"},
+	}
+	for _, tc := range tests {
+		u, err := url.Parse(tc.publicURL)
+		if err != nil {
+			t.Fatalf("url.Parse(%q) = %v", tc.publicURL, err)
+		}
+		if got := (config.Dashboard{PublicURL: u}).Origin(); got != tc.want {
+			t.Errorf("Origin() of %q = %q, want %q", tc.publicURL, got, tc.want)
+		}
 	}
 }

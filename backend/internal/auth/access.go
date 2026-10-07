@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 )
@@ -28,49 +27,88 @@ type accessCache struct {
 }
 
 // Repos returns the pollux-installed repositories the viewer can read, from a
-// cache of AccessTTL, or ErrUnauthenticated when the viewer's tokens are no longer valid.
+// cache of AccessTTL, or ErrUnauthenticated when the viewer's tokens are no
+// longer valid. GitHub rejecting the access token (the user revoked the app)
+// deletes the session. Concurrent misses for one session fetch once.
 func (s *Service) Repos(ctx context.Context, v Viewer) ([]Repo, error) {
-	key := string(v.idHash)
-	now := s.accessNow()
-
-	s.access.mu.Lock()
-	entry, ok := s.access.entries[key]
-	s.access.mu.Unlock()
-	if ok && now.Before(entry.expiresAt) {
-		return slices.Clone(entry.repos), nil
+	if repos, ok := s.cachedRepos(v.idHash); ok {
+		return repos, nil
 	}
 
-	token, err := s.accessToken(ctx, v)
+	defer s.lockSession(v.idHash)()
+	if repos, ok := s.cachedRepos(v.idHash); ok {
+		return repos, nil
+	}
+
+	token, err := s.currentToken(ctx, v.idHash)
 	if err != nil {
 		return nil, fmt.Errorf("token for %s: %w", v.Login, err)
 	}
 	repos, err := s.github.AccessibleRepos(ctx, token)
+	if errors.Is(err, ErrUnauthenticated) {
+		return nil, fmt.Errorf("list repositories for %s: %w", v.Login, errors.Join(err, s.deleteSession(ctx, v.idHash)))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("list repositories for %s: %w", v.Login, err)
 	}
 
+	now := s.opts.Now()
 	s.access.mu.Lock()
-	if s.access.entries == nil {
-		s.access.entries = make(map[string]accessEntry)
+	for k, e := range s.access.entries {
+		if !now.Before(e.expiresAt) {
+			delete(s.access.entries, k)
+		}
 	}
-	s.access.entries[key] = accessEntry{repos: repos, expiresAt: now.Add(AccessTTL)}
+	s.access.entries[string(v.idHash)] = accessEntry{repos: repos, expiresAt: now.Add(AccessTTL)}
 	s.access.mu.Unlock()
 	return slices.Clone(repos), nil
 }
 
+func (s *Service) cachedRepos(idHash []byte) ([]Repo, bool) {
+	s.access.mu.Lock()
+	defer s.access.mu.Unlock()
+	entry, ok := s.access.entries[string(idHash)]
+	if !ok || !s.opts.Now().Before(entry.expiresAt) {
+		return nil, false
+	}
+	return slices.Clone(entry.repos), true
+}
+
 // RepoAccess returns the viewer's repository named owner/repo, matched
-// case-insensitively, or ErrNoAccess.
+// ASCII case-insensitively, or ErrNoAccess. Handlers must use the returned
+// Repo's Owner and Name, never the request's path values.
 func (s *Service) RepoAccess(ctx context.Context, v Viewer, owner, repo string) (Repo, error) {
 	repos, err := s.Repos(ctx, v)
 	if err != nil {
 		return Repo{}, err
 	}
 	for _, r := range repos {
-		if strings.EqualFold(r.Owner, owner) && strings.EqualFold(r.Name, repo) {
+		if equalASCIIFold(r.Owner, owner) && equalASCIIFold(r.Name, repo) {
 			return r, nil
 		}
 	}
 	return Repo{}, fmt.Errorf("%s/%s for %s: %w", owner, repo, v.Login, ErrNoAccess)
+}
+
+// equalASCIIFold compares bytewise, folding only A-Z, so Unicode look-alikes
+// (the Kelvin sign for k) never match.
+func equalASCIIFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range len(a) {
+		if lowerASCII(a[i]) != lowerASCII(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerASCII(c byte) byte {
+	if 'A' <= c && c <= 'Z' {
+		return c + 'a' - 'A'
+	}
+	return c
 }
 
 // forgetAccess drops a session's cached repositories.
@@ -78,11 +116,4 @@ func (s *Service) forgetAccess(idHash []byte) {
 	s.access.mu.Lock()
 	delete(s.access.entries, string(idHash))
 	s.access.mu.Unlock()
-}
-
-func (s *Service) accessNow() time.Time {
-	if s.opts.Now != nil {
-		return s.opts.Now()
-	}
-	return time.Now()
 }

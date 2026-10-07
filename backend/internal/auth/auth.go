@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"sync"
 	"time"
@@ -27,6 +28,17 @@ const (
 	// refreshMargin is how close to expiry an access token is refreshed.
 	refreshMargin = time.Minute
 
+	// loginSweepInterval bounds how often BeginLogin deletes expired rows.
+	loginSweepInterval = time.Minute
+	// rotateTimeout bounds one detached refresh and token swap.
+	rotateTimeout = 15 * time.Second
+	// revokeTimeout bounds the GitHub revoke at logout.
+	revokeTimeout = 10 * time.Second
+	// logoutTimeout bounds the detached session load and delete at logout.
+	logoutTimeout = 10 * time.Second
+	// persistAttempts is how many times a refreshed token pair is sealed and stored.
+	persistAttempts = 3
+
 	randomBytes = 32
 )
 
@@ -35,6 +47,12 @@ var (
 	ErrUnauthenticated = errors.New("not signed in")
 	// ErrInvalidLogin means the callback's state, binding, or code was refused.
 	ErrInvalidLogin = errors.New("invalid login")
+	// ErrRefreshRefused means GitHub rejected the refresh token itself
+	// (bad_refresh_token); the session can never refresh again.
+	ErrRefreshRefused = errors.New("refresh token refused")
+	// ErrRevokeFailed means Logout deleted the session but GitHub did not
+	// revoke the token. The user is signed out; callers log it and answer success.
+	ErrRevokeFailed = errors.New("revoke GitHub token failed")
 )
 
 // Tokens are a GitHub user's tokens. Zero expiry times mean the token does not expire.
@@ -44,6 +62,10 @@ type Tokens struct {
 	AccessExpiresAt  time.Time
 	RefreshExpiresAt time.Time
 }
+
+func (Tokens) String() string { return "auth.Tokens{<redacted>}" }
+
+func (Tokens) LogValue() slog.Value { return slog.StringValue("[redacted]") }
 
 // Profile is the GitHub user a session belongs to.
 type Profile struct {
@@ -96,8 +118,10 @@ type Repo struct {
 }
 
 // GitHubUser is GitHub's OAuth and user API. Exchange wraps ErrInvalidLogin
-// when GitHub refuses the code; Refresh wraps ErrUnauthenticated when GitHub
-// refuses the refresh token.
+// when GitHub refuses the code; Refresh wraps ErrRefreshRefused only when
+// GitHub rejects the refresh token itself, and returns a plain error for
+// transient failures; AccessibleRepos wraps ErrUnauthenticated when GitHub
+// rejects the access token.
 type GitHubUser interface {
 	Exchange(ctx context.Context, code, verifier, redirectURL string) (Tokens, error)
 	Refresh(ctx context.Context, refreshToken string) (Tokens, error)
@@ -115,6 +139,21 @@ type Options struct {
 	Key [32]byte
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
+	// Logger receives persistence failures the caller cannot see; nil discards them.
+	Logger *slog.Logger
+}
+
+func (o Options) String() string {
+	return fmt.Sprintf("auth.Options{ClientID: %q, AuthorizeURL: %q, RedirectURL: %q, Key: <redacted>}", o.ClientID, o.AuthorizeURL, o.RedirectURL)
+}
+
+func (o Options) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("client_id", o.ClientID),
+		slog.String("authorize_url", o.AuthorizeURL),
+		slog.String("redirect_url", o.RedirectURL),
+		slog.String("key", "[redacted]"),
+	)
 }
 
 // Service signs users in with GitHub and tracks their sessions.
@@ -128,13 +167,24 @@ type Service struct {
 	// rotating refresh token is used by one request at a time.
 	locksMu sync.Mutex
 	locks   map[string]*sessionLock
+
+	// sweepMu guards lastSweep, when BeginLogin last deleted expired rows.
+	sweepMu   sync.Mutex
+	lastSweep time.Time
 }
 
 func NewService(store Store, github GitHubUser, opts Options) *Service {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	return &Service{store: store, github: github, opts: opts, locks: map[string]*sessionLock{}}
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.DiscardHandler)
+	}
+	return &Service{
+		store: store, github: github, opts: opts,
+		access: accessCache{entries: map[string]accessEntry{}},
+		locks:  map[string]*sessionLock{},
+	}
 }
 
 // Viewer is the authenticated user of a request.
@@ -144,9 +194,16 @@ type Viewer struct {
 	tokens Tokens
 }
 
+func (v Viewer) String() string { return fmt.Sprintf("auth.Viewer{Login: %q}", v.Login) }
+
+func (v Viewer) LogValue() slog.Value { return slog.GroupValue(slog.String("login", v.Login)) }
+
 // BeginLogin records a login attempt and returns GitHub's authorize URL and the
 // binding value the caller must set as a cookie and present at CompleteLogin.
+// It also deletes expired rows, at most once a minute, so repeated calls cannot
+// grow the login table without bound.
 func (s *Service) BeginLogin(ctx context.Context) (authorizeURL, binding string, err error) {
+	s.sweepExpired(ctx)
 	state, verifier, binding := randomToken(), randomToken(), randomToken()
 	err = s.store.CreateLogin(ctx, hash(state), Login{
 		Verifier:    verifier,
@@ -172,6 +229,25 @@ func (s *Service) BeginLogin(ctx context.Context) (authorizeURL, binding string,
 	return u.String(), binding, nil
 }
 
+// sweepExpired deletes expired logins and sessions at most once per
+// loginSweepInterval; a failure must not block the login.
+func (s *Service) sweepExpired(ctx context.Context) {
+	now := s.opts.Now()
+	s.sweepMu.Lock()
+	due := now.Sub(s.lastSweep) >= loginSweepInterval
+	s.sweepMu.Unlock()
+	if !due {
+		return
+	}
+	if _, err := s.store.DeleteExpired(ctx, now.Add(-SessionIdle), now); err != nil {
+		s.opts.Logger.Error("delete expired logins and sessions", "err", err)
+		return
+	}
+	s.sweepMu.Lock()
+	s.lastSweep = now
+	s.sweepMu.Unlock()
+}
+
 // CompleteLogin consumes the login attempt for state, exchanges code, and
 // returns the new session id for the cookie. The attempt is spent even when
 // binding does not match.
@@ -194,9 +270,6 @@ func (s *Service) CompleteLogin(ctx context.Context, state, binding, code string
 	}
 
 	now := s.opts.Now()
-	// Cleanup is opportunistic; a failure must not block this login.
-	_, _ = s.store.DeleteExpired(ctx, now.Add(-SessionIdle), now)
-
 	id := randomToken()
 	idHash := hash(id)
 	sealed, err := seal(s.opts.Key, idHash, tokens)
@@ -218,7 +291,8 @@ func (s *Service) CompleteLogin(ctx context.Context, state, binding, code string
 }
 
 // Authenticate returns the viewer for a session id, or ErrUnauthenticated. It
-// records the use, at most once a minute.
+// records the use, at most once a minute. A session whose tokens cannot be
+// opened (rotated key, corrupt row) is deleted.
 func (s *Service) Authenticate(ctx context.Context, sessionID string) (Viewer, error) {
 	session, ok, err := s.store.Session(ctx, hash(sessionID))
 	if err != nil {
@@ -230,7 +304,7 @@ func (s *Service) Authenticate(ctx context.Context, sessionID string) (Viewer, e
 	}
 	tokens, err := open(s.opts.Key, session.IDHash, session.SealedTokens)
 	if err != nil {
-		return Viewer{}, err
+		return Viewer{}, s.endSession(ctx, session.IDHash)
 	}
 	if now.Sub(session.LastUsedAt) >= touchInterval {
 		if err := s.store.TouchSession(ctx, session.IDHash, now); err != nil {
@@ -243,16 +317,21 @@ func (s *Service) Authenticate(ctx context.Context, sessionID string) (Viewer, e
 // accessToken returns a valid GitHub access token for the viewer, refreshing it
 // first when it is expired or about to be. GitHub rotates both tokens on every
 // refresh, so refreshes are serialized per session and re-read under the lock.
-// A refused refresh token deletes the session; any failure returns
-// ErrUnauthenticated.
+// A refused refresh token or unreadable tokens delete the session; any failure
+// returns ErrUnauthenticated.
 func (s *Service) accessToken(ctx context.Context, v Viewer) (string, error) {
 	if !s.needsRefresh(v.tokens) {
 		return v.tokens.Access, nil
 	}
 	defer s.lockSession(v.idHash)()
+	return s.currentToken(ctx, v.idHash)
+}
 
+// currentToken reloads the session and returns its access token, refreshing it
+// when due. The caller holds the session lock.
+func (s *Service) currentToken(ctx context.Context, idHash []byte) (string, error) {
 	for {
-		session, ok, err := s.store.Session(ctx, v.idHash)
+		session, ok, err := s.store.Session(ctx, idHash)
 		if err != nil {
 			return "", fmt.Errorf("reload session: %w", err)
 		}
@@ -261,7 +340,7 @@ func (s *Service) accessToken(ctx context.Context, v Viewer) (string, error) {
 		}
 		tokens, err := open(s.opts.Key, session.IDHash, session.SealedTokens)
 		if err != nil {
-			return "", err
+			return "", s.endSession(ctx, session.IDHash)
 		}
 		if !s.needsRefresh(tokens) {
 			return tokens.Access, nil
@@ -270,28 +349,73 @@ func (s *Service) accessToken(ctx context.Context, v Viewer) (string, error) {
 			return "", ErrUnauthenticated
 		}
 
-		fresh, err := s.github.Refresh(ctx, tokens.Refresh)
-		if errors.Is(err, ErrUnauthenticated) {
-			if delErr := s.store.DeleteSession(ctx, session.IDHash); delErr != nil {
-				return "", fmt.Errorf("delete session after refused refresh: %w", delErr)
-			}
-			return "", ErrUnauthenticated
+		fresh, swapped, err := s.rotate(ctx, session, tokens)
+		if errors.Is(err, ErrRefreshRefused) {
+			return "", s.endSession(ctx, session.IDHash)
 		}
-		if err != nil {
-			return "", fmt.Errorf("refresh GitHub token: %w: %w", ErrUnauthenticated, err)
-		}
-		sealed, err := seal(s.opts.Key, session.IDHash, fresh)
 		if err != nil {
 			return "", err
-		}
-		swapped, err := s.store.SwapTokens(ctx, session.IDHash, session.Version, sealed, fresh.AccessExpiresAt, fresh.RefreshExpiresAt)
-		if err != nil {
-			return "", fmt.Errorf("store refreshed tokens: %w", err)
 		}
 		if swapped {
 			return fresh.Access, nil
 		}
 	}
+}
+
+// rotate refreshes tokens and stores the result. It is detached from ctx's
+// cancellation: once GitHub has rotated the tokens, a client disconnect must
+// not lose the new ones.
+func (s *Service) rotate(ctx context.Context, session Session, tokens Tokens) (Tokens, bool, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rotateTimeout)
+	defer cancel()
+
+	fresh, err := s.github.Refresh(ctx, tokens.Refresh)
+	if errors.Is(err, ErrRefreshRefused) {
+		return Tokens{}, false, fmt.Errorf("refresh: %w", err)
+	}
+	if err != nil {
+		return Tokens{}, false, fmt.Errorf("refresh GitHub token: %w: %w", ErrUnauthenticated, err)
+	}
+	var persistErr error
+	for range persistAttempts {
+		var swapped bool
+		swapped, persistErr = s.persist(ctx, session, fresh)
+		if persistErr == nil {
+			return fresh, swapped, nil
+		}
+	}
+	s.opts.Logger.Error("store refreshed tokens", "err", persistErr, "attempts", persistAttempts)
+	return Tokens{}, false, fmt.Errorf("store refreshed tokens: %w: %w", ErrUnauthenticated, persistErr)
+}
+
+func (s *Service) persist(ctx context.Context, session Session, fresh Tokens) (bool, error) {
+	sealed, err := seal(s.opts.Key, session.IDHash, fresh)
+	if err != nil {
+		return false, err
+	}
+	swapped, err := s.store.SwapTokens(ctx, session.IDHash, session.Version, sealed, fresh.AccessExpiresAt, fresh.RefreshExpiresAt)
+	if err != nil {
+		return false, fmt.Errorf("swap tokens: %w", err)
+	}
+	return swapped, nil
+}
+
+// endSession deletes the session and returns ErrUnauthenticated, or the delete error.
+func (s *Service) endSession(ctx context.Context, idHash []byte) error {
+	if err := s.deleteSession(ctx, idHash); err != nil {
+		return err
+	}
+	return ErrUnauthenticated
+}
+
+// deleteSession deletes the session, then drops its cached access, so a cache
+// write that raced the delete is dropped too.
+func (s *Service) deleteSession(ctx context.Context, idHash []byte) error {
+	if err := s.store.DeleteSession(ctx, idHash); err != nil {
+		return fmt.Errorf("delete session: %w", err)
+	}
+	s.forgetAccess(idHash)
+	return nil
 }
 
 func (s *Service) needsRefresh(t Tokens) bool {
@@ -332,11 +456,17 @@ func (s *Service) lockSession(idHash []byte) (unlock func()) {
 	}
 }
 
-// Logout deletes the session, then revokes its GitHub token on a best-effort
-// basis; an unknown id is not an error.
+// Logout deletes the session and its cached access, then revokes its GitHub
+// access token; an unknown id is not an error. When only the revoke fails it returns
+// ErrRevokeFailed wrapping the cause: the session is already gone, so callers
+// log it and still answer success.
 func (s *Service) Logout(ctx context.Context, sessionID string) error {
 	idHash := hash(sessionID)
-	s.forgetAccess(idHash)
+	defer s.lockSession(idHash)()
+
+	// A client disconnect must not leave the session alive.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), logoutTimeout)
+	defer cancel()
 	session, ok, err := s.store.Session(ctx, idHash)
 	if err != nil {
 		return fmt.Errorf("load session: %w", err)
@@ -344,12 +474,17 @@ func (s *Service) Logout(ctx context.Context, sessionID string) error {
 	if !ok {
 		return nil
 	}
-	if err := s.store.DeleteSession(ctx, idHash); err != nil {
-		return fmt.Errorf("delete session: %w", err)
+	if err := s.deleteSession(ctx, idHash); err != nil {
+		return err
 	}
-	if tokens, err := open(s.opts.Key, idHash, session.SealedTokens); err == nil {
-		// The session is already gone; a failed revoke leaves GitHub's token to expire on its own.
-		_ = s.github.Revoke(ctx, tokens.Access)
+	tokens, err := open(s.opts.Key, idHash, session.SealedTokens)
+	if err != nil {
+		return nil
+	}
+	ctx, cancel = context.WithTimeout(ctx, revokeTimeout)
+	defer cancel()
+	if err := s.github.Revoke(ctx, tokens.Access); err != nil {
+		return fmt.Errorf("%w: %w", ErrRevokeFailed, err)
 	}
 	return nil
 }

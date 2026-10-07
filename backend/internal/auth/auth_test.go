@@ -4,8 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/url"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,6 +27,14 @@ type fakeGitHub struct {
 	refreshErr   error
 	revoked      atomic.Value
 	exchanged    auth.Tokens
+	// onRefresh runs inside Refresh, before it answers.
+	onRefresh func()
+
+	mu        sync.Mutex
+	repos     []auth.Repo
+	reposErr  error
+	repoCalls int
+	repoDelay time.Duration
 }
 
 func (f *fakeGitHub) Exchange(context.Context, string, string, string) (auth.Tokens, error) {
@@ -30,6 +43,9 @@ func (f *fakeGitHub) Exchange(context.Context, string, string, string) (auth.Tok
 
 func (f *fakeGitHub) Refresh(context.Context, string) (auth.Tokens, error) {
 	n := f.refreshCalls.Add(1)
+	if f.onRefresh != nil {
+		f.onRefresh()
+	}
 	if f.refreshErr != nil {
 		return auth.Tokens{}, f.refreshErr
 	}
@@ -50,7 +66,42 @@ func (*fakeGitHub) User(context.Context, string) (auth.Profile, error) {
 	return auth.Profile{Login: "octocat"}, nil
 }
 
-func (*fakeGitHub) AccessibleRepos(context.Context, string) ([]auth.Repo, error) { return nil, nil }
+func (f *fakeGitHub) AccessibleRepos(context.Context, string) ([]auth.Repo, error) {
+	f.mu.Lock()
+	f.repoCalls++
+	repos := slices.Clone(f.repos)
+	reposErr, delay := f.reposErr, f.repoDelay
+	f.mu.Unlock()
+	time.Sleep(delay)
+	return repos, reposErr
+}
+
+func (f *fakeGitHub) setRepos(repos ...auth.Repo) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.repos = repos
+}
+
+func (f *fakeGitHub) fetches() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.repoCalls
+}
+
+// countingStore counts DeleteExpired calls.
+type countingStore struct {
+	*sqlite.Store
+	sweeps atomic.Int32
+}
+
+func (c *countingStore) DeleteExpired(ctx context.Context, idleBefore, now time.Time) (int64, error) {
+	c.sweeps.Add(1)
+	n, err := c.Store.DeleteExpired(ctx, idleBefore, now)
+	if err != nil {
+		return n, fmt.Errorf("delete expired: %w", err)
+	}
+	return n, nil
+}
 
 type env struct {
 	svc   *auth.Service
@@ -202,7 +253,7 @@ func TestAccessToken(t *testing.T) {
 		id := e.login(t)
 		*e.now = t0().Add(9 * time.Hour)
 		v, _ := e.svc.Authenticate(t.Context(), id)
-		e.gh.refreshErr = errors.Join(errors.New("bad_refresh_token"), auth.ErrUnauthenticated)
+		e.gh.refreshErr = errors.Join(errors.New("bad_refresh_token"), auth.ErrRefreshRefused)
 
 		if _, err := e.svc.AccessToken(t.Context(), v); !errors.Is(err, auth.ErrUnauthenticated) {
 			t.Fatalf("AccessToken() = %v, want ErrUnauthenticated", err)
@@ -225,6 +276,66 @@ func TestAccessToken(t *testing.T) {
 		}
 		if _, err := e.svc.Authenticate(t.Context(), id); err != nil {
 			t.Errorf("Authenticate() after a failed refresh = %v, want the session kept", err)
+		}
+	})
+}
+
+func TestAccessTokenRefreshSurvivesCancel(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	id := e.login(t)
+	*e.now = t0().Add(9 * time.Hour)
+	v, err := e.svc.Authenticate(t.Context(), id)
+	if err != nil {
+		t.Fatalf("Authenticate() = %v, want nil error", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	e.gh.onRefresh = cancel
+	if got, err := e.svc.AccessToken(ctx, v); err != nil || got != "access-1" {
+		t.Fatalf("AccessToken() with the client gone = %q, %v, want access-1", got, err)
+	}
+
+	e.gh.onRefresh = nil
+	v, err = e.svc.Authenticate(t.Context(), id)
+	if err != nil {
+		t.Fatalf("Authenticate() after refresh = %v, want nil error", err)
+	}
+	if got, err := e.svc.AccessToken(t.Context(), v); err != nil || got != "access-1" || e.gh.refreshCalls.Load() != 1 {
+		t.Errorf("AccessToken() = %q, %v with %d refreshes, want the stored access-1 and one refresh", got, err, e.gh.refreshCalls.Load())
+	}
+}
+
+func TestUnreadableTokensDeleteSession(t *testing.T) {
+	t.Parallel()
+
+	rotated := func(e *env) *auth.Service {
+		return auth.NewService(e.store, e.gh, auth.Options{Key: [32]byte{2}, Now: func() time.Time { return *e.now }})
+	}
+
+	t.Run("Authenticate", func(t *testing.T) {
+		t.Parallel()
+		e := newEnv(t)
+		id := e.login(t)
+		if _, err := rotated(e).Authenticate(t.Context(), id); !errors.Is(err, auth.ErrUnauthenticated) {
+			t.Fatalf("Authenticate() with a rotated key = %v, want ErrUnauthenticated", err)
+		}
+		if _, err := e.svc.Authenticate(t.Context(), id); !errors.Is(err, auth.ErrUnauthenticated) {
+			t.Errorf("Authenticate() with the old key after = %v, want the session deleted", err)
+		}
+	})
+
+	t.Run("accessToken", func(t *testing.T) {
+		t.Parallel()
+		e := newEnv(t)
+		id := e.login(t)
+		v, _ := e.svc.Authenticate(t.Context(), id)
+		*e.now = t0().Add(9 * time.Hour)
+		if _, err := rotated(e).AccessToken(t.Context(), v); !errors.Is(err, auth.ErrUnauthenticated) {
+			t.Fatalf("AccessToken() with a rotated key = %v, want ErrUnauthenticated", err)
+		}
+		if _, err := e.svc.Authenticate(t.Context(), id); !errors.Is(err, auth.ErrUnauthenticated) {
+			t.Errorf("Authenticate() after = %v, want the session deleted", err)
 		}
 	})
 }
@@ -265,8 +376,9 @@ func TestLogout(t *testing.T) {
 	e := newEnv(t)
 	id := e.login(t)
 
-	if err := e.svc.Logout(t.Context(), id); err != nil {
-		t.Fatalf("Logout() = %v, want nil error despite a failed revoke", err)
+	err := e.svc.Logout(t.Context(), id)
+	if !errors.Is(err, auth.ErrRevokeFailed) {
+		t.Fatalf("Logout() = %v, want ErrRevokeFailed from the failed revoke", err)
 	}
 	if _, err := e.svc.Authenticate(t.Context(), id); !errors.Is(err, auth.ErrUnauthenticated) {
 		t.Errorf("Authenticate() after logout = %v, want ErrUnauthenticated", err)
@@ -279,7 +391,63 @@ func TestLogout(t *testing.T) {
 	}
 }
 
-func TestCompleteLoginCleansExpiredSessions(t *testing.T) {
+func TestBeginLoginSweepsOncePerMinute(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	store := &countingStore{Store: e.store}
+	svc := auth.NewService(store, e.gh, auth.Options{AuthorizeURL: "https://github.example/authorize", Now: func() time.Time { return *e.now }})
+
+	begin := func() {
+		t.Helper()
+		if _, _, err := svc.BeginLogin(t.Context()); err != nil {
+			t.Fatalf("BeginLogin() = %v, want nil error", err)
+		}
+	}
+	begin()
+	begin()
+	if n := store.sweeps.Load(); n != 1 {
+		t.Errorf("DeleteExpired calls after two logins = %d, want 1", n)
+	}
+	*e.now = e.now.Add(time.Minute + time.Second)
+	begin()
+	if n := store.sweeps.Load(); n != 2 {
+		t.Errorf("DeleteExpired calls a minute later = %d, want 2", n)
+	}
+}
+
+func TestSecretsAreRedacted(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	v, err := e.svc.Authenticate(t.Context(), e.login(t))
+	if err != nil {
+		t.Fatalf("Authenticate() = %v, want nil error", err)
+	}
+	opts := auth.Options{ClientID: "cid", Key: [32]byte{0x41, 0x42}}
+	tokens := e.gh.exchanged
+
+	for name, val := range map[string]any{"Tokens": tokens, "&Tokens": &tokens, "Viewer": v, "Options": opts} {
+		for _, verb := range []string{"%v", "%+v"} {
+			out := fmt.Sprintf(verb, val)
+			for _, secret := range []string{"access-0", "refresh-0", "AB", "65 66"} {
+				if strings.Contains(out, secret) {
+					t.Errorf("Sprintf(%q, %s) = %q, want no %q", verb, name, out, secret)
+				}
+			}
+		}
+		var buf strings.Builder
+		slog.New(slog.NewJSONHandler(&buf, nil)).Info("x", "v", val)
+		for _, secret := range []string{"access-0", "refresh-0", "AB", "65,66"} {
+			if strings.Contains(buf.String(), secret) {
+				t.Errorf("slog of %s = %s, want no %q", name, buf.String(), secret)
+			}
+		}
+	}
+	if got := fmt.Sprintf("%+v", v); !strings.Contains(got, "octocat") {
+		t.Errorf("Sprintf(%%+v, Viewer) = %q, want the login", got)
+	}
+}
+
+func TestBeginLoginCleansExpiredSessions(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	old := e.login(t)
@@ -293,5 +461,161 @@ func TestCompleteLoginCleansExpiredSessions(t *testing.T) {
 	}
 	if n, err := e.store.DeleteExpired(t.Context(), e.now.Add(-auth.SessionIdle), *e.now); err != nil || n != 0 {
 		t.Errorf("DeleteExpired() after login = %d, %v, want 0: the idle session is already gone", n, err)
+	}
+}
+
+// flakyStore fails the next swapFailures SwapTokens and sweepFailures
+// DeleteExpired calls, and counts the sweeps.
+type flakyStore struct {
+	*sqlite.Store
+	swapFailures  atomic.Int32
+	sweepFailures atomic.Int32
+	sweeps        atomic.Int32
+}
+
+func (f *flakyStore) SwapTokens(ctx context.Context, idHash []byte, prev int64, sealed []byte, accessExp, refreshExp time.Time) (bool, error) {
+	if f.swapFailures.Add(-1) >= 0 {
+		return false, errors.New("disk full")
+	}
+	ok, err := f.Store.SwapTokens(ctx, idHash, prev, sealed, accessExp, refreshExp)
+	if err != nil {
+		return ok, fmt.Errorf("swap tokens: %w", err)
+	}
+	return ok, nil
+}
+
+func (f *flakyStore) DeleteExpired(ctx context.Context, idleBefore, now time.Time) (int64, error) {
+	f.sweeps.Add(1)
+	if f.sweepFailures.Add(-1) >= 0 {
+		return 0, errors.New("database locked")
+	}
+	n, err := f.Store.DeleteExpired(ctx, idleBefore, now)
+	if err != nil {
+		return n, fmt.Errorf("delete expired: %w", err)
+	}
+	return n, nil
+}
+
+// syncBuffer is a log sink safe for concurrent writes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, _ = b.buf.Write(p) // strings.Builder.Write always returns a nil error
+	return len(p), nil
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// withFlakyStore swaps e's service for one over a flakyStore that logs to logs.
+func withFlakyStore(e *env, logs io.Writer) *flakyStore {
+	store := &flakyStore{Store: e.store}
+	e.svc = auth.NewService(store, e.gh, auth.Options{
+		AuthorizeURL: "https://github.example/authorize",
+		Key:          [32]byte{1},
+		Now:          func() time.Time { return *e.now },
+		Logger:       slog.New(slog.NewTextHandler(logs, nil)),
+	})
+	return store
+}
+
+func TestRefreshRetriesFailedStore(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	var logs syncBuffer
+	store := withFlakyStore(e, &logs)
+	e.gh.setRepos(auth.Repo{Owner: "acme", Name: "widgets", InstallationID: 7})
+	id := e.login(t)
+	*e.now = t0().Add(9 * time.Hour)
+	v, err := e.svc.Authenticate(t.Context(), id)
+	if err != nil {
+		t.Fatalf("Authenticate() = %v, want nil error", err)
+	}
+
+	store.swapFailures.Store(1)
+	if _, err := e.svc.RepoAccess(t.Context(), v, "acme", "widgets"); err != nil {
+		t.Fatalf("RepoAccess() after one failed store = %v, want nil error", err)
+	}
+	v, err = e.svc.Authenticate(t.Context(), id)
+	if err != nil {
+		t.Fatalf("Authenticate() after refresh = %v, want nil error", err)
+	}
+	if got, err := e.svc.AccessToken(t.Context(), v); err != nil || got != "access-1" || e.gh.refreshCalls.Load() != 1 {
+		t.Errorf("AccessToken() = %q, %v with %d refreshes, want the stored access-1 and one refresh", got, err, e.gh.refreshCalls.Load())
+	}
+}
+
+func TestRefreshStoreAlwaysFailing(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	var logs syncBuffer
+	store := withFlakyStore(e, &logs)
+	id := e.login(t)
+	*e.now = t0().Add(9 * time.Hour)
+	v, err := e.svc.Authenticate(t.Context(), id)
+	if err != nil {
+		t.Fatalf("Authenticate() = %v, want nil error", err)
+	}
+
+	store.swapFailures.Store(1000)
+	if _, err := e.svc.AccessToken(t.Context(), v); !errors.Is(err, auth.ErrUnauthenticated) {
+		t.Fatalf("AccessToken() with a failing store = %v, want ErrUnauthenticated", err)
+	}
+	if got := logs.String(); !strings.Contains(got, "level=ERROR") || !strings.Contains(got, "store refreshed tokens") {
+		t.Errorf("logs = %q, want an error about the failed store", got)
+	}
+}
+
+func TestFailedSweepRetriesAndLogs(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	var logs syncBuffer
+	store := withFlakyStore(e, &logs)
+	store.sweepFailures.Store(1)
+
+	for range 2 {
+		if _, _, err := e.svc.BeginLogin(t.Context()); err != nil {
+			t.Fatalf("BeginLogin() = %v, want nil error", err)
+		}
+	}
+	if n := store.sweeps.Load(); n != 2 {
+		t.Errorf("DeleteExpired calls after a failed sweep and a retry = %d, want 2", n)
+	}
+	if got := logs.String(); !strings.Contains(got, "database locked") {
+		t.Errorf("logs = %q, want the failed sweep", got)
+	}
+}
+
+func TestCompleteLoginDoesNotSweep(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	var logs syncBuffer
+	store := withFlakyStore(e, &logs)
+	e.login(t)
+	if n := store.sweeps.Load(); n != 1 {
+		t.Errorf("DeleteExpired calls for BeginLogin plus CompleteLogin = %d, want 1", n)
+	}
+}
+
+func TestLogoutSurvivesCancelledContext(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	id := e.login(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := e.svc.Logout(ctx, id); err != nil && !errors.Is(err, auth.ErrRevokeFailed) {
+		t.Fatalf("Logout() with the client gone = %v, want nil or ErrRevokeFailed", err)
+	}
+	if _, err := e.svc.Authenticate(t.Context(), id); !errors.Is(err, auth.ErrUnauthenticated) {
+		t.Errorf("Authenticate() after logout with the client gone = %v, want ErrUnauthenticated", err)
 	}
 }

@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,28 +134,38 @@ func TestUserClientRefresh(t *testing.T) {
 		}
 	})
 
-	t.Run("bad_refresh_token is unauthenticated", func(t *testing.T) {
-		t.Parallel()
-		client := newUserClient(t, func(w http.ResponseWriter, _ *http.Request) {
-			if _, err := fmt.Fprint(w, `{"error":"bad_refresh_token"}`); err != nil {
-				t.Errorf("write response: %v", err)
+	for _, tc := range []struct {
+		name        string
+		status      int
+		body        string
+		wantRefused bool
+	}{
+		{name: "bad_refresh_token", status: http.StatusOK, body: `{"error":"bad_refresh_token"}`, wantRefused: true},
+		{name: "incorrect_client_credentials", status: http.StatusOK, body: `{"error":"incorrect_client_credentials"}`},
+		{name: "rate limited", status: http.StatusTooManyRequests, body: `{"message":"slow down"}`},
+		{name: "forbidden", status: http.StatusForbidden, body: `{"message":"no"}`},
+		{name: "server error", status: http.StatusBadGateway},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			client := newUserClient(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				if _, err := fmt.Fprint(w, tc.body); err != nil {
+					t.Errorf("write response: %v", err)
+				}
+			})
+			_, err := client.Refresh(t.Context(), "ghr_a")
+			if err == nil {
+				t.Fatal("Refresh() = nil error, want an error")
+			}
+			if got := errors.Is(err, auth.ErrRefreshRefused); got != tc.wantRefused {
+				t.Errorf("Refresh() error = %v, ErrRefreshRefused = %v, want %v", err, got, tc.wantRefused)
+			}
+			if errors.Is(err, auth.ErrUnauthenticated) {
+				t.Errorf("Refresh() error = %v, must not wrap auth.ErrUnauthenticated", err)
 			}
 		})
-		if _, err := client.Refresh(t.Context(), "ghr_a"); !errors.Is(err, auth.ErrUnauthenticated) {
-			t.Errorf("Refresh() error = %v, want auth.ErrUnauthenticated", err)
-		}
-	})
-
-	t.Run("server error is not a refusal", func(t *testing.T) {
-		t.Parallel()
-		client := newUserClient(t, func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusBadGateway)
-		})
-		_, err := client.Refresh(t.Context(), "ghr_a")
-		if err == nil || errors.Is(err, auth.ErrUnauthenticated) {
-			t.Errorf("Refresh() error = %v, want a non-refusal error", err)
-		}
-	})
+	}
 }
 
 func TestUserClientRevoke(t *testing.T) {
@@ -174,7 +186,7 @@ func TestUserClientRevoke(t *testing.T) {
 				id, secret, ok := r.BasicAuth()
 				body, _ := io.ReadAll(r.Body)
 				if r.Method != http.MethodDelete || r.URL.Path != "/applications/cid/token" || !ok || id != "cid" || secret != "csecret" ||
-					string(body) != `{"access_token":"ghu_a"}` {
+					strings.TrimSpace(string(body)) != `{"access_token":"ghu_a"}` {
 					t.Errorf("request = %s %s basic %q:%q body %s, want DELETE /applications/cid/token with client credentials", r.Method, r.URL.Path, id, secret, body)
 				}
 				w.WriteHeader(tc.status)
@@ -184,5 +196,25 @@ func TestUserClientRevoke(t *testing.T) {
 				t.Errorf("Revoke() error = %v, wantErr %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestUserClientAuthorizeURL(t *testing.T) {
+	t.Parallel()
+	c := ghclient.NewUserClient(&http.Client{Timeout: time.Second}, "cid", "csecret", "https://oauth.example/", "")
+	if got, want := c.AuthorizeURL(), "https://oauth.example/login/oauth/authorize"; got != want {
+		t.Errorf("AuthorizeURL() = %q, want %q", got, want)
+	}
+}
+
+func TestUserClientRedactsSecret(t *testing.T) {
+	t.Parallel()
+	c := ghclient.NewUserClient(&http.Client{Timeout: time.Second}, "cid", "csecret", "", "")
+	var buf strings.Builder
+	slog.New(slog.NewTextHandler(&buf, nil)).Info("client", "c", c)
+	for _, out := range []string{fmt.Sprint(c), fmt.Sprintf("%#v", c), buf.String()} {
+		if strings.Contains(out, "csecret") {
+			t.Errorf("output %q leaks the client secret", out)
+		}
 	}
 }

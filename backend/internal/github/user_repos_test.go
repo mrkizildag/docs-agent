@@ -1,6 +1,7 @@
 package github_test
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,9 @@ func TestAccessibleRepos(t *testing.T) {
 			t.Errorf("write response: %v", err)
 		}
 	}
+	nextPage := func(w http.ResponseWriter, r *http.Request, page int) {
+		w.Header().Set("Link", fmt.Sprintf(`<http://%s%s?per_page=100&page=%d>; rel="next"`, r.Host, r.URL.Path, page))
+	}
 	mux.HandleFunc("GET /user/installations", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer tok" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -31,11 +35,12 @@ func TestAccessibleRepos(t *testing.T) {
 			t.Errorf("per_page = %q, want 100", r.URL.Query().Get("per_page"))
 		}
 		switch r.URL.Query().Get("page") {
-		case "1":
+		case "", "1":
 			ids := []string{`{"id":1}`, `{"id":2}`}
 			for i := range 98 {
 				ids = append(ids, fmt.Sprintf(`{"id":%d}`, 1000+i))
 			}
+			nextPage(w, r, 2)
 			reply(w, `{"installations":[`+strings.Join(ids, ",")+`]}`)
 		case "2":
 			reply(w, `{"installations":[{"id":3}]}`)
@@ -45,11 +50,12 @@ func TestAccessibleRepos(t *testing.T) {
 	})
 	mux.HandleFunc("GET /user/installations/1/repositories", func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("page") {
-		case "1":
+		case "", "1":
 			repos := make([]string, 100)
 			for i := range repos {
 				repos[i] = fmt.Sprintf(`{"name":"r%d","owner":{"login":"acme"}}`, i)
 			}
+			nextPage(w, r, 2)
 			reply(w, `{"repositories":[`+strings.Join(repos, ",")+`]}`)
 		case "2":
 			reply(w, `{"repositories":[{"name":"last","owner":{"login":"acme"}}]}`)
@@ -59,6 +65,10 @@ func TestAccessibleRepos(t *testing.T) {
 	})
 	mux.HandleFunc("GET /user/installations/3/repositories", func(w http.ResponseWriter, _ *http.Request) {
 		reply(w, `{"repositories":[{"name":"tools","owner":{"login":"octo"}}]}`)
+	})
+	mux.HandleFunc("GET /user/installations/2/repositories", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		reply(w, `{"message":"Resource protected by organization SAML enforcement."}`)
 	})
 	mux.HandleFunc("GET /user/installations/{id}/repositories", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -96,7 +106,7 @@ func TestAccessibleReposRefusal(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	c := ghclient.NewUserClient(&http.Client{Timeout: 5 * time.Second}, "cid", "secret", srv.URL, srv.URL)
-	if _, err := c.AccessibleRepos(t.Context(), "bad"); err == nil {
-		t.Error("AccessibleRepos() with a refused token = nil error, want an error")
+	if _, err := c.AccessibleRepos(t.Context(), "bad"); !errors.Is(err, auth.ErrUnauthenticated) {
+		t.Errorf("AccessibleRepos() error = %v, want auth.ErrUnauthenticated", err)
 	}
 }

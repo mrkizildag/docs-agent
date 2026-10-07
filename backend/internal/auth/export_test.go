@@ -13,3 +13,10 @@ func (s *Service) SessionLocks() int {
 	defer s.locksMu.Unlock()
 	return len(s.locks)
 }
+
+// AccessEntries is how many sessions have a cached repository list.
+func (s *Service) AccessEntries() int {
+	s.access.mu.Lock()
+	defer s.access.mu.Unlock()
+	return len(s.access.entries)
+}

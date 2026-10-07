@@ -1,21 +1,27 @@
 package httpapi_test
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/auth"
+	"github.com/mrkizildag/pollux-agent/backend/internal/config"
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
 	ghclient "github.com/mrkizildag/pollux-agent/backend/internal/github"
 	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
@@ -62,38 +68,128 @@ func fakeGitHub(t *testing.T, challenge *string) *httptest.Server {
 	return srv
 }
 
+// fakeUser is a configurable auth.GitHubUser. Its tokens expire relative to
+// evalT0, the start of an env's clock.
+type fakeUser struct {
+	refreshErr error
+	reposErr   error
+	revokeErr  error
+	repos      []auth.Repo
+}
+
+func newFakeUser() *fakeUser {
+	return &fakeUser{repos: []auth.Repo{{Owner: "acme", Name: "widgets", InstallationID: 7}}}
+}
+
+func (g *fakeUser) Exchange(context.Context, string, string, string) (auth.Tokens, error) {
+	return auth.Tokens{
+		Access: "ghu_secret_access", Refresh: "ghr_secret_refresh",
+		AccessExpiresAt: evalT0().Add(8 * time.Hour), RefreshExpiresAt: evalT0().Add(4000 * time.Hour),
+	}, nil
+}
+
+func (g *fakeUser) Refresh(context.Context, string) (auth.Tokens, error) {
+	return auth.Tokens{}, g.refreshErr
+}
+func (g *fakeUser) Revoke(context.Context, string) error { return g.revokeErr }
+func (g *fakeUser) User(context.Context, string) (auth.Profile, error) {
+	return auth.Profile{Login: "octocat"}, nil
+}
+
+func (g *fakeUser) AccessibleRepos(context.Context, string) ([]auth.Repo, error) {
+	if g.reposErr != nil {
+		return nil, g.reposErr
+	}
+	return g.repos, nil
+}
+
+func evalT0() time.Time { return time.Unix(1_800_000_000, 0) }
+
+const publicOrigin = "https://pollux.example"
+
+// authEnv is the real handler over a real sqlite store. By default GitHub is
+// the fakeGitHub server behind the real user client; withGitHub swaps in a fake
+// user, and withClock gives the service a clock the test moves through now.
 type authEnv struct {
 	handler   http.Handler
 	challenge string
+	now       *time.Time
+	dir       string
 }
 
-func newAuthEnv(t *testing.T) *authEnv {
-	t.Helper()
-	return newAuthEnvWithLimit(t, httpapi.RateLimitConfig{})
+type authEnvConfig struct {
+	user  auth.GitHubUser
+	clock bool
+	limit httpapi.RateLimitConfig
+	log   io.Writer
+	// origin overrides the handler's public origin.
+	origin string
 }
 
-func newAuthEnvWithLimit(t *testing.T, authLimit httpapi.RateLimitConfig) *authEnv {
+type authEnvOption func(*authEnvConfig)
+
+func withGitHub(u auth.GitHubUser) authEnvOption { return func(c *authEnvConfig) { c.user = u } }
+func withClock() authEnvOption                   { return func(c *authEnvConfig) { c.clock = true } }
+func withPublicOrigin(o string) authEnvOption    { return func(c *authEnvConfig) { c.origin = o } }
+func withLogOutput(w io.Writer) authEnvOption    { return func(c *authEnvConfig) { c.log = w } }
+func withLimit(l httpapi.RateLimitConfig) authEnvOption {
+	return func(c *authEnvConfig) { c.limit = l }
+}
+
+func newAuthEnv(t *testing.T, options ...authEnvOption) *authEnv {
 	t.Helper()
-	env := &authEnv{}
+	var cfg authEnvConfig
+	for _, o := range options {
+		o(&cfg)
+	}
+	env := &authEnv{dir: t.TempDir()}
 	gh := fakeGitHub(t, &env.challenge)
 
-	store, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "state.db"))
+	store, err := sqlite.Open(t.Context(), filepath.Join(env.dir, "state.db"))
 	if err != nil {
 		t.Fatalf("sqlite.Open() = %v, want nil error", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	user := ghclient.NewUserClient(&http.Client{Timeout: 5 * time.Second}, "cid", "csecret", gh.URL, gh.URL)
-	opts := auth.Options{ClientID: "cid", AuthorizeURL: gh.URL + "/login/oauth/authorize", RedirectURL: "https://pollux.example/auth/callback"}
+	user := cfg.user
+	if user == nil {
+		user = ghclient.NewUserClient(&http.Client{Timeout: 5 * time.Second}, "cid", "csecret", gh.URL, gh.URL)
+	}
+	opts := auth.Options{ClientID: "cid", AuthorizeURL: gh.URL + "/login/oauth/authorize", RedirectURL: publicOrigin + "/auth/callback"}
 	opts.Key[0] = 1
-	env.handler = httpapi.NewHandler(httpapi.Deps{
-		Logger:        slog.New(slog.DiscardHandler),
+	if cfg.clock {
+		now := evalT0()
+		env.now = &now
+		opts.Now = func() time.Time { return now }
+	}
+	origin := publicOrigin
+	if cfg.origin != "" {
+		origin = cfg.origin
+	}
+	logger := slog.New(slog.DiscardHandler)
+	if cfg.log != nil {
+		logger = slog.New(slog.NewTextHandler(cfg.log, nil))
+	}
+	opts.Logger = logger
+	svc := auth.NewService(store, user, opts)
+	api := httpapi.NewHandler(httpapi.Deps{
+		Logger:        logger,
 		WebhookSecret: []byte("secret"),
 		Jobs:          newFakeEnqueuer(),
 		Runs:          fakeRunLookup{},
-		Auth:          auth.NewService(store, user, opts),
-		AuthRateLimit: authLimit,
+		Auth:          svc,
+		AuthRateLimit: cfg.limit,
+		PublicOrigin:  origin,
 	})
+	mux := http.NewServeMux()
+	mux.Handle("/", api)
+	mux.HandleFunc("GET /api/repos/{owner}/{repo}", httpapi.RequireRepo(logger, svc,
+		func(w http.ResponseWriter, _ *http.Request, _ auth.Viewer, repo auth.Repo) {
+			if _, err := fmt.Fprintf(w, "%s/%s#%d", repo.Owner, repo.Name, repo.InstallationID); err != nil {
+				t.Errorf("write response: %v", err)
+			}
+		}))
+	env.handler = mux
 	return env
 }
 
@@ -106,6 +202,30 @@ func (e *authEnv) do(t *testing.T, method, target string, cookies ...*http.Cooki
 	rec := httptest.NewRecorder()
 	e.handler.ServeHTTP(rec, req)
 	return rec
+}
+
+// signIn runs a whole login and returns the session cookie. extra cookies ride
+// along on the callback, such as a session left over from an earlier login.
+func (e *authEnv) signIn(t *testing.T, extra ...*http.Cookie) *http.Cookie {
+	t.Helper()
+	state, binding := e.login(t)
+	rec := e.do(t, http.MethodGet, "/auth/callback?code="+fakeCode+"&state="+url.QueryEscape(state), append([]*http.Cookie{binding}, extra...)...)
+	if c := sessionCookieOf(rec); c != nil {
+		return c
+	}
+	t.Fatalf("callback = %d, set no session cookie", rec.Code)
+	return nil
+}
+
+// sessionCookieOf returns the last session Set-Cookie of rec, the one a browser keeps.
+func sessionCookieOf(rec *httptest.ResponseRecorder) *http.Cookie {
+	var last *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie {
+			last = c
+		}
+	}
+	return last
 }
 
 // login runs GET /auth/login and returns the state, the binding cookie, and
@@ -122,7 +242,7 @@ func (e *authEnv) login(t *testing.T) (state string, binding *http.Cookie) {
 	}
 	q := loc.Query()
 	if loc.Path != "/login/oauth/authorize" || q.Get("client_id") != "cid" || q.Get("code_challenge_method") != "S256" ||
-		q.Get("redirect_uri") != "https://pollux.example/auth/callback" || q.Get("state") == "" || q.Get("code_challenge") == "" {
+		q.Get("redirect_uri") != publicOrigin+"/auth/callback" || q.Get("state") == "" || q.Get("code_challenge") == "" {
 		t.Fatalf("authorize URL = %s, want client_id, redirect_uri, state, and an S256 challenge", loc)
 	}
 	e.challenge = q.Get("code_challenge")
@@ -190,6 +310,154 @@ func TestSignInFlow(t *testing.T) {
 	}
 	if rec := env.do(t, http.MethodGet, "/api/me", session); rec.Code != http.StatusUnauthorized {
 		t.Errorf("GET /api/me with the logged-out cookie = %d, want 401", rec.Code)
+	}
+}
+
+func TestLogoutRefusesForeignOrigin(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		origin string
+		want   int
+	}{
+		{name: "foreign origin", origin: "https://evil.example", want: http.StatusForbidden},
+		{name: "null origin", origin: "null", want: http.StatusForbidden},
+		{name: "public origin", origin: publicOrigin, want: http.StatusNoContent},
+		{name: "no origin", want: http.StatusNoContent},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := newAuthEnv(t)
+			session := env.signIn(t)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/auth/logout", nil)
+			req.AddCookie(session)
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			rec := httptest.NewRecorder()
+			env.handler.ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("POST /auth/logout with Origin %q = %d, want %d", tc.origin, rec.Code, tc.want)
+			}
+			wantAfter := http.StatusOK
+			if tc.want == http.StatusNoContent {
+				wantAfter = http.StatusUnauthorized
+			}
+			if rec := env.do(t, http.MethodGet, "/api/me", session); rec.Code != wantAfter {
+				t.Errorf("GET /api/me after logout with Origin %q = %d, want %d", tc.origin, rec.Code, wantAfter)
+			}
+		})
+	}
+}
+
+func TestLogoutAcceptsNormalizedPublicOrigin(t *testing.T) {
+	t.Parallel()
+
+	u, err := url.Parse("https://Pollux.Example:443")
+	if err != nil {
+		t.Fatalf("url.Parse() = %v, want nil error", err)
+	}
+	dashboard := config.Dashboard{PublicURL: u}
+	env := newAuthEnv(t, withPublicOrigin(dashboard.Origin()))
+	session := env.signIn(t)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/auth/logout", nil)
+	req.AddCookie(session)
+	req.Header.Set("Origin", "https://pollux.example")
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("POST /auth/logout from %s with PUBLIC_URL %s = %d, want 204", "https://pollux.example", u, rec.Code)
+	}
+}
+
+func TestLogoutComparesOriginCaseInsensitively(t *testing.T) {
+	t.Parallel()
+
+	env := newAuthEnv(t)
+	session := env.signIn(t)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/auth/logout", nil)
+	req.AddCookie(session)
+	req.Header.Set("Origin", "https://POLLUX.example")
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("POST /auth/logout with Origin https://POLLUX.example = %d, want 204", rec.Code)
+	}
+}
+
+func TestLogoutSucceedsWhenRevokeFails(t *testing.T) {
+	t.Parallel()
+
+	gh := newFakeUser()
+	gh.revokeErr = errors.New("GitHub answered HTTP 502")
+	env := newAuthEnv(t, withClock(), withGitHub(gh))
+	session := env.signIn(t)
+
+	rec := env.do(t, http.MethodPost, "/auth/logout", session)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("POST /auth/logout with a failing revoke = %d, want 204", rec.Code)
+	}
+	if c := sessionCookieOf(rec); c == nil || c.MaxAge >= 0 {
+		t.Errorf("logout session cookie = %+v, want a clearing cookie", c)
+	}
+	if rec := env.do(t, http.MethodGet, "/api/me", session); rec.Code != http.StatusUnauthorized {
+		t.Errorf("GET /api/me after logout = %d, want 401", rec.Code)
+	}
+}
+
+func TestSignInAgainEndsTheOldSession(t *testing.T) {
+	t.Parallel()
+
+	env := newAuthEnv(t)
+	old := env.signIn(t)
+
+	fresh := env.signIn(t, old)
+
+	if rec := env.do(t, http.MethodGet, "/api/me", old); rec.Code != http.StatusUnauthorized {
+		t.Errorf("GET /api/me with the pre-login session = %d, want 401", rec.Code)
+	}
+	if rec := env.do(t, http.MethodGet, "/api/me", fresh); rec.Code != http.StatusOK {
+		t.Errorf("GET /api/me with the new session = %d, want 200", rec.Code)
+	}
+}
+
+// syncBuffer is a log sink safe for the handler's concurrent writes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, _ = b.buf.Write(p) // strings.Builder.Write always returns a nil error
+	return len(p), nil
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestSignInAgainLogsFailedRevokeOfTheOldSession(t *testing.T) {
+	t.Parallel()
+
+	gh := newFakeUser()
+	gh.revokeErr = errors.New("GitHub answered HTTP 502")
+	var logs syncBuffer
+	env := newAuthEnv(t, withClock(), withGitHub(gh), withLogOutput(&logs))
+	old := env.signIn(t)
+
+	fresh := env.signIn(t, old)
+
+	if rec := env.do(t, http.MethodGet, "/api/me", fresh); rec.Code != http.StatusOK {
+		t.Errorf("GET /api/me with the new session = %d, want 200", rec.Code)
+	}
+	if got := logs.String(); !strings.Contains(got, "level=WARN") || !strings.Contains(got, "re-login") {
+		t.Errorf("logs after a failed revoke on re-login = %q, want a re-login warning", got)
 	}
 }
 

@@ -47,6 +47,9 @@ type Deps struct {
 	AuthRateLimit RateLimitConfig
 	// Auth turns the dashboard's sign-in routes on; nil leaves them unregistered.
 	Auth *auth.Service
+	// PublicOrigin is the scheme and host browsers reach pollux at, such as
+	// https://pollux.example.com; it is required when Auth is set.
+	PublicOrigin string
 }
 
 func NewHandler(deps Deps) *http.ServeMux {
@@ -60,7 +63,7 @@ func NewHandler(deps Deps) *http.ServeMux {
 	webhookLimit := newIPRateLimiter(deps.WebhookRateLimit, DefaultWebhookRateLimitConfig())
 	mux.HandleFunc("POST /webhook", withRateLimit(deps.Logger, "webhook", webhookLimit, webhookHandler(deps.Logger, deps.WebhookSecret, deps.Jobs, deps.Runs)))
 	if deps.Auth != nil {
-		mountAuth(mux, deps.Logger, deps.Auth, newIPRateLimiter(deps.AuthRateLimit, DefaultAuthRateLimitConfig()))
+		mountAuth(mux, deps.Logger, deps.Auth, newIPRateLimiter(deps.AuthRateLimit, DefaultAuthRateLimitConfig()), deps.PublicOrigin)
 	}
 	return mux
 }
