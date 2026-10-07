@@ -208,6 +208,21 @@ func scoreRun(ctx context.Context, judge judgeFunc, c evalCase, res review.Resul
 		s.Pass = s.VerdictOK
 		return s, nil
 	}
+	if c.Expect.Verdict == verdictEither {
+		s.VerdictOK = true
+		props, _ := res.Verdict.(review.Proposals)
+		s.Precision = scoreProposals(c.Expect, props).precision
+		// Every proposal must stay inside its doc's listed sections, not just one.
+		for _, p := range props {
+			for _, d := range c.Expect.Docs {
+				if matchesDoc(d, p) && len(d.Sections) > 0 && !anySectionListed([]review.Proposal{p}, d.Sections) {
+					s.SectionsOK = false
+				}
+			}
+		}
+		s.Pass = s.Precision == 1 && s.SectionsOK
+		return s, nil
+	}
 
 	props, _ := res.Verdict.(review.Proposals)
 	st := scoreProposals(c.Expect, props)
@@ -372,6 +387,30 @@ func TestScoreRun(t *testing.T) {
 		got, _ = scoreRun(t.Context(), modelJudge(&fakeModel{}, "judge"), evalCase{Expect: evalExpect{Verdict: verdictNoImpact}}, res)
 		if got.Pass {
 			t.Errorf("scoreRun() with proposals pass = true, want false")
+		}
+	})
+
+	t.Run("either", func(t *testing.T) {
+		t.Parallel()
+		either := evalCase{Expect: evalExpect{Verdict: verdictEither, Docs: []evalDoc{{Path: "docs/a.md", Sections: []string{"A"}}}}}
+		for _, tc := range []struct {
+			name string
+			res  review.Result
+			want bool
+		}{
+			{name: "no impact", res: review.Result{Verdict: review.NoImpact{Reason: "x"}}, want: true},
+			{name: "listed doc and section", res: res, want: true},
+			{name: "listed doc, other section", res: review.Result{Verdict: review.Proposals{{DocPath: "docs/a.md", Section: "B", Content: "x"}}}},
+			{name: "unlisted doc", res: review.Result{Verdict: review.Proposals{{DocPath: "docs/b.md", Section: "A", Content: "x"}}}},
+			{name: "listed section plus an unlisted one", res: review.Result{Verdict: review.Proposals{
+				{DocPath: "docs/a.md", Section: "A", Content: "x"},
+				{DocPath: "docs/a.md", Section: "B", Content: "y"},
+			}}},
+		} {
+			// A judge call would fail the fake model: either cases never judge facts.
+			if got, _ := scoreRun(t.Context(), modelJudge(&fakeModel{}, "judge"), either, tc.res); got.Pass != tc.want {
+				t.Errorf("%s: scoreRun() pass = %v, want %v", tc.name, got.Pass, tc.want)
+			}
 		}
 	})
 }

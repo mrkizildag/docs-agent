@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -1078,18 +1079,60 @@ func TestActionGroupsAnchorsByFile(t *testing.T) {
 	}
 }
 
-func TestActionFallsBackToStaticSchemaWhenAnchorsAreTooLarge(t *testing.T) {
+func TestActionDropsAnchorRangesWhenTheSchemaIsTooLarge(t *testing.T) {
 	t.Parallel()
 
 	raw, out := runClaudeWithStub(t, manyHunksDiff(2, 4000))
-	static, err := os.ReadFile("../../../../action/result.schema.json")
-	if err != nil {
-		t.Fatalf("read result.schema.json: %v", err)
+	if len(raw) > 100<<10 || strings.Contains(string(raw), `"minimum"`) {
+		t.Errorf("--json-schema = %d bytes, want the schema without per-file anchors", len(raw))
 	}
-	if got, want := string(raw), strings.TrimRight(string(static), "\n"); got != want {
-		t.Errorf("--json-schema = %d bytes, want the static result.schema.json (%d bytes)", len(got), len(want))
-	}
+	requireNewDocIndexEntry(t, raw)
 	if _, err := os.Stat(filepath.Join(out, "result.json")); err != nil {
 		t.Errorf("result.json: %v", err)
 	}
+}
+
+// requireNewDocIndexEntry checks the schema carries review.Proposal.Validate's
+// rule that index_entry is set iff section is empty.
+func requireNewDocIndexEntry(t *testing.T, raw []byte) {
+	t.Helper()
+	var schema struct {
+		Properties struct {
+			Proposals struct {
+				Items struct {
+					If struct {
+						Properties struct {
+							Section struct {
+								Const *string `json:"const"`
+							} `json:"section"`
+						} `json:"properties"`
+					} `json:"if"`
+					Then struct {
+						Required []string `json:"required"`
+					} `json:"then"`
+					Else struct {
+						Properties struct {
+							IndexEntry struct {
+								MaxLength *int `json:"maxLength"`
+							} `json:"index_entry"`
+						} `json:"properties"`
+					} `json:"else"`
+				} `json:"items"`
+			} `json:"proposals"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("decode --json-schema: %v", err)
+	}
+	items := schema.Properties.Proposals.Items
+	if c := items.If.Properties.Section.Const; c == nil || *c != "" || !slices.Contains(items.Then.Required, "index_entry") || items.Else.Properties.IndexEntry.MaxLength == nil || *items.Else.Properties.IndexEntry.MaxLength != 0 {
+		t.Errorf("--json-schema proposal items = %+v, want index_entry required iff section is empty", items)
+	}
+}
+
+func TestActionSchemaRequiresIndexEntryForNewDocs(t *testing.T) {
+	t.Parallel()
+
+	raw, _ := runClaudeWithStub(t, manyHunksDiff(1, 2))
+	requireNewDocIndexEntry(t, raw)
 }

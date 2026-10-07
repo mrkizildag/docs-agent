@@ -3,9 +3,13 @@ source: "commit fde18d0 (PR #36)"
 base: f6abe253058138ac51d3cda72a496ac3bbf67cb8
 head: fde18d05c0619d0d5385fe04e84539e3e51388df
 expect:
-  verdict: no_impact
+  verdict: either
+  docs:
+    - path: docs/features/actions-runner.md
+      sections: ["Flow"]
 notes: >
-  BORDERLINE: an Actions result with no proposals and a blank no_impact_reason is now an invalid result. At base,
+  EITHER (borderline): "no impact" and a proposal limited to the listed doc and section both pass;
+  anything else fails. An Actions result with no proposals and a blank no_impact_reason is now an invalid result. At base,
   actions-runner.md Flow step 6 already says a no-impact result concludes success "with a reason", and the
   "Never stuck in progress" invariant says an invalid result ends the check neutral, so the doc stays true; it just
   does not list every way a result can be invalid. No doc was edited for it later. A proposal adding "an empty

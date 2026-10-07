@@ -50,8 +50,8 @@ A run passes when all of these hold:
 - **Precision**: every proposal targets a required doc or one in `allow`.
 - **Facts**: a judge model confirms the proposed content states each `must_say` fact and contradicts nothing.
 
-A no-impact case passes on the verdict alone. Low scores never fail the command; only a broken case or harness does.
+A no-impact case passes on the verdict alone. A borderline case uses `verdict: either`: "no impact" passes, and so do proposals that stay inside its listed docs and sections (a listed doc without sections allows any section; `allow` and `must_say` are not used); it counts in the overall pass rate but in neither the impact nor the no-impact rate. Low scores never fail the command; only a broken case or harness does.
 
 ## Adding a case
 
-Add `eval/cases/<id>.yaml`; the schema is in any existing case. Good sources are merged PRs that changed code and docs together (the docs diff is the label) and code-only commits whose docs were fixed later. Keep a share of no-impact cases, since history leans toward changes that needed docs. Write `must_say` as the facts a reader needs, not the human's wording, and put docs that may change but need not in `allow`. Run `make eval-check` before committing.
+Add `eval/cases/<id>.yaml`; the schema is in any existing case. Good sources are merged PRs that changed code and docs together (the docs diff is the label) and code-only commits whose docs were fixed later. Keep a share of no-impact cases, since history leans toward changes that needed docs. Write `must_say` as single claims the code at `head` supports, not the human's wording or operational advice the diff does not show; use `either` when both "no impact" and a small edit are defensible, and put docs that may change but need not in `allow`. Run `make eval-check` before committing.
