@@ -22,6 +22,8 @@ The webhook handler never does GitHub or LLM work itself. It stores the delivery
 
 ## Storage notes
 
+The same database holds the analysis and Apply/Skip history, written with each PR's state; it relies on a PR's jobs running serially (see [Analysis history](analysis-history.md)).
+
 Timestamps are stored as RFC3339Nano text, which drops trailing zeros in the fraction, so text order is not time order. Compare or order them with `julianday()` in SQL, or parse them in Go.
 
 Migrations apply by position, tracked by SQLite's `user_version`. Append new ones at the end and never edit, reorder, or remove one: a migration inserted mid-list is silently skipped on every existing database.

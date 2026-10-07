@@ -203,7 +203,7 @@ func TestOnApply(t *testing.T) {
 		gate.ProposalState{ID: "p2", State: gate.ProposalOpen},
 		gate.ProposalState{ID: "p3", State: gate.ProposalOutdated})
 
-	got := gate.OnApply(prev, []string{"p1", "p3"}, "sha9")
+	got, history := gate.OnApply(prev, []string{"p1", "p3"}, "sha9", "alice")
 
 	want := map[string]gate.ProposalStatus{"p1": gate.ProposalApplied, "p2": gate.ProposalOpen, "p3": gate.ProposalOutdated}
 	for _, p := range got.Proposals {
@@ -216,6 +216,59 @@ func TestOnApply(t *testing.T) {
 	}
 	if prev.Proposals[0].State != gate.ProposalOpen {
 		t.Error("OnApply mutated its input")
+	}
+
+	wantEvents := []gate.PREvent{{Key: "applied/p1/sha9", Kind: gate.EventApplied, Actor: "alice", ProposalID: "p1", CommitSHA: "sha9", HeadSHA: "head1"}}
+	if diff := cmp.Diff(wantEvents, history.Events); diff != "" {
+		t.Errorf("history.Events (-want +got):\n%s", diff)
+	}
+	if _, replay := gate.OnApply(got, []string{"p1", "p2"}, "sha10", "bob"); len(replay.Events) != 1 || replay.Events[0].ProposalID != "p2" {
+		t.Errorf("replay history.Events = %+v, want one new for p2 only", replay.Events)
+	}
+	if _, again := gate.OnApply(got, []string{"p1"}, "sha10", "bob"); len(again.Events) != 0 {
+		t.Errorf("OnApply of an applied proposal emitted %d events, want none", len(again.Events))
+	}
+}
+
+func TestHandleCommentApplyRecordsEventsOncePerProposal(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{stored: threeState(), live: true}
+	comments := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
+	svc := gate.NewService(apiWithComments(), comments, store, gate.Runners{}, nil, nil)
+
+	if err := svc.HandleComment(t.Context(), summaryTick("Apply all")); err != nil {
+		t.Fatalf("HandleComment() = %v, want nil", err)
+	}
+	applied := func() (keys []string) {
+		for _, h := range store.histories {
+			for _, e := range h.Events {
+				if e.Kind == gate.EventApplied && e.Actor == "dev" {
+					keys = append(keys, e.Key)
+				}
+			}
+		}
+		return keys
+	}
+	if got := len(applied()); got == 0 {
+		t.Fatal("no applied events saved, want one per proposal")
+	}
+	seen := map[string]bool{}
+	for _, k := range applied() {
+		seen[k] = true
+	}
+	if len(seen) != 3 {
+		t.Errorf("distinct applied events = %d, want 3", len(seen))
+	}
+
+	before := len(store.histories)
+	if err := svc.HandleComment(t.Context(), summaryTick("Apply all")); err != nil {
+		t.Fatalf("replayed HandleComment() = %v, want nil", err)
+	}
+	for _, h := range store.histories[before:] {
+		if len(h.Events) != 0 {
+			t.Errorf("replay saved events %+v, want none", h.Events)
+		}
 	}
 }
 
@@ -248,7 +301,7 @@ func TestReconcileKeepsApplied(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			state, writes := gate.Reconcile(gate.PRState{Proposals: []gate.ProposalState{applied}}, testPR(), tc.verdict, nil, existing)
+			state, writes, _ := gate.Reconcile(gate.PRState{Proposals: []gate.ProposalState{applied}}, testPR(), tc.verdict, nil, existing)
 
 			got := state.Proposals[0]
 			if got.State != tc.wantState || got.AppliedSHA != tc.wantSHA || got.ReplyID != tc.wantReply {
@@ -275,7 +328,7 @@ func TestReconcileStoresEdit(t *testing.T) {
 
 	p := proposal("docs/a.md", "A")
 	p.IndexEntry = "- [A](a.md)"
-	state, _ := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
+	state, _, _ := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
 
 	want := gate.ProposalState{
 		ID: gate.ProposalID("docs/a.md", "A"), DocPath: "docs/a.md", Section: "A", State: gate.ProposalOpen,

@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"database/sql"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -280,8 +281,8 @@ type savedStore struct {
 	saved chan gate.PRState
 }
 
-func (s *savedStore) SavePR(ctx context.Context, state gate.PRState) error {
-	if err := s.Store.SavePR(ctx, state); err != nil {
+func (s *savedStore) SavePR(ctx context.Context, state gate.PRState, history gate.History) error {
+	if err := s.Store.SavePR(ctx, state, history); err != nil {
 		return fmt.Errorf("save pr: %w", err)
 	}
 	s.saved <- state
@@ -608,7 +609,7 @@ func (f *commentGitHub) EditIssueComment(_ context.Context, _ int64, _, _ string
 type proposalRunner struct{ proposals review.Proposals }
 
 func (r proposalRunner) Start(context.Context, review.Request) (review.Started, error) {
-	return review.Result{Runner: "fake", Verdict: r.proposals}, nil
+	return review.Result{Verdict: r.proposals}, nil
 }
 
 func (proposalRunner) StartScaffold(context.Context, review.ScaffoldRequest) (review.ScaffoldStarted, error) {
@@ -909,7 +910,7 @@ func (f *statefulGitHub) snapshot() (comments []gate.Comment, creates, edits int
 }
 
 // scriptedRunner plays one queued outcome per run: a review.Verdict is a
-// finished analysis, a review.Pending is an external run, an error is a failed
+// finished analysis, a review.Result one that also names its model, a review.Pending is an external run, an error is a failed
 // one. Collect never finds a result, which is what a failed workflow run leaves.
 type scriptedRunner struct{ outcomes chan any }
 
@@ -939,12 +940,14 @@ func (r scriptedRunner) Start(ctx context.Context, rq review.Request) (review.St
 		close(o.started)
 		select {
 		case <-o.release:
-			return review.Result{Runner: "fake", Verdict: review.NoImpact{Reason: "held run done"}}, nil
+			return review.Result{Verdict: review.NoImpact{Reason: "held run done"}}, nil
 		case <-ctx.Done():
 			return nil, &review.FailedError{Cause: review.CauseTimeout, Err: ctx.Err()}
 		}
+	case review.Result:
+		return o, nil
 	case review.Verdict:
-		return review.Result{Runner: "fake", Verdict: o}, nil
+		return review.Result{Verdict: o}, nil
 	case review.Pending:
 		return o, nil
 	case error:
@@ -975,12 +978,14 @@ type pushHarness struct {
 	secret  []byte
 	deliver int
 	queued  chan any
+	dbPath  string
 }
 
 func newPushHarness(t *testing.T, outcomes ...any) *pushHarness {
 	t.Helper()
 
-	store, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "pollux.db"))
+	dbPath := filepath.Join(t.TempDir(), "pollux.db")
+	store, err := sqlite.Open(t.Context(), dbPath)
 	if err != nil {
 		t.Fatalf("sqlite.Open() error = %v", err)
 	}
@@ -1010,7 +1015,7 @@ func newPushHarness(t *testing.T, outcomes ...any) *pushHarness {
 	})
 
 	secret := []byte("test-secret")
-	return &pushHarness{t: t, gh: gh, store: store, handler: httpapi.NewHandler(logger, secret, worker, store), secret: secret, queued: queued}
+	return &pushHarness{t: t, gh: gh, store: store, handler: httpapi.NewHandler(logger, secret, worker, store), secret: secret, queued: queued, dbPath: dbPath}
 }
 
 // push delivers a synchronize webhook for sha and returns the check run and the
@@ -1038,21 +1043,26 @@ func (h *pushHarness) send(sha string) {
 func (h *pushHarness) sendWith(sha string, o pushOpts) {
 	h.t.Helper()
 
+	h.deliver++
+	h.sendAs(fmt.Sprintf("d%d", h.deliver), sha, o)
+}
+
+// resend redelivers the synchronize webhook for sha under an earlier deliveryID.
+func (h *pushHarness) resend(deliveryID, sha string) {
+	h.t.Helper()
+
+	h.sendAs(deliveryID, sha, pushOpts{})
+}
+
+func (h *pushHarness) sendAs(deliveryID, sha string, o pushOpts) {
+	h.t.Helper()
+
 	h.gh.mu.Lock()
 	h.gh.head = sha
 	h.gh.mu.Unlock()
 
-	h.deliver++
 	body := bytes.Replace(e2ePullRequestFrom(h.t, 1, sha, o), []byte(`"opened"`), []byte(`"synchronize"`), 1)
-	req := httptest.NewRequestWithContext(h.t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
-	req.Header.Set("X-GitHub-Event", "pull_request")
-	req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("d%d", h.deliver))
-	req.Header.Set("X-Hub-Signature-256", sign(h.secret, body))
-	rec := httptest.NewRecorder()
-	h.handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusAccepted {
-		h.t.Fatalf("POST /webhook for %s = %d, want %d", sha, rec.Code, http.StatusAccepted)
-	}
+	h.deliverAs("pull_request", deliveryID, body)
 }
 
 // waitConcluded waits for the next concluded check run and the saved state of sha.
@@ -1306,7 +1316,7 @@ func TestWebhookReconcilesProposalCommentsAcrossPushes(t *testing.T) {
 			state.Proposals[i].CommentID = 0
 			state.Proposals[i].CommentURL = ""
 		}
-		if err := h.store.SavePR(t.Context(), state); err != nil {
+		if err := h.store.SavePR(t.Context(), state, gate.History{}); err != nil {
 			t.Fatalf("SavePR() error = %v", err)
 		}
 
@@ -1349,9 +1359,15 @@ func (h *pushHarness) deliverEvent(event string, body []byte) {
 	h.t.Helper()
 
 	h.deliver++
+	h.deliverAs(event, fmt.Sprintf("d%d", h.deliver), body)
+}
+
+func (h *pushHarness) deliverAs(event, deliveryID string, body []byte) {
+	h.t.Helper()
+
 	req := httptest.NewRequestWithContext(h.t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-GitHub-Event", event)
-	req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("d%d", h.deliver))
+	req.Header.Set("X-GitHub-Delivery", deliveryID)
 	req.Header.Set("X-Hub-Signature-256", sign(h.secret, body))
 	rec := httptest.NewRecorder()
 	h.handler.ServeHTTP(rec, req)
@@ -2039,6 +2055,58 @@ func (unusedCommentGitHub) CommitAt(context.Context, int64, string, string, stri
 
 func (f *statefulGitHub) CommitAt(context.Context, int64, string, string, string) (gate.Commit, error) {
 	return gate.Commit{}, nil
+}
+
+func TestWebhookToAnalysisHistoryEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	result := func() review.Result {
+		return review.Result{Model: "fake-model", Verdict: review.NoImpact{Reason: "typo fix"}}
+	}
+	h := newPushHarness(t, result(), result())
+
+	h.sendWith("sha1", pushOpts{})
+	if run, _ := h.waitConcluded("sha1"); run.Conclusion != gate.ConclusionSuccess {
+		t.Errorf("check run conclusion = %q, want %q", run.Conclusion, gate.ConclusionSuccess)
+	}
+	h.resend("d1", "sha1")
+	// A later push is a barrier: once it concludes, a duplicate job for sha1 would have run too.
+	h.push("sha2")
+
+	db, err := sql.Open("sqlite", h.dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open(%q) error = %v", h.dbPath, err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	rows, err := db.QueryContext(t.Context(), `SELECT runner, verdict, reason, head_sha, model, proposals, started_at, finished_at FROM analyses WHERE number = 1 ORDER BY id`)
+	if err != nil {
+		t.Fatalf("query analyses: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var got [][]any
+	for rows.Next() {
+		var runner, verdict, reason, head, model, started, finished string
+		var proposals int
+		if err := rows.Scan(&runner, &verdict, &reason, &head, &model, &proposals, &started, &finished); err != nil {
+			t.Fatalf("scan analyses: %v", err)
+		}
+		got = append(got, []any{runner, verdict, reason, head, model, proposals})
+		for _, ts := range []string{started, finished} {
+			if _, err := time.Parse(time.RFC3339Nano, ts); err != nil {
+				t.Errorf("analysis time %q does not parse: %v", ts, err)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read analyses: %v", err)
+	}
+	want := [][]any{
+		{"server", "no_impact", "typo fix", "sha1", "fake-model", 0},
+		{"server", "no_impact", "typo fix", "sha2", "fake-model", 0},
+	}
+	if diff := gocmp.Diff(want, got); diff != "" {
+		t.Errorf("analyses of PR 1 mismatch (-want +got):\n%s", diff)
+	}
 }
 
 // retired is the marker a proposal comment carries once its thread is resolved.

@@ -83,9 +83,29 @@ type Pending struct {
 
 // Result is a finished analysis.
 type Result struct {
-	Runner  string
+	// Model is the model that produced the verdict; empty when none ran.
 	Model   string
 	Verdict Verdict
+	// Usage is what the analysis consumed; nil when the runner did not report it.
+	Usage *Usage
+}
+
+// Usage is what one analysis consumed. Tokens is nil when the runner reported
+// no token count; CostUSD is nil when it has no cost figure; CostBasis says how
+// a reported cost was derived ("list" for a list-price estimate) and is empty
+// when unknown.
+type Usage struct {
+	Tokens    *Tokens
+	CostUSD   *float64
+	CostBasis string
+}
+
+// Tokens is a token count by kind.
+type Tokens struct {
+	Input      int64
+	Output     int64
+	CacheRead  int64
+	CacheWrite int64
 }
 
 func (Pending) isStarted() {}

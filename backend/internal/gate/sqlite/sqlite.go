@@ -146,6 +146,48 @@ func migrations() []string {
 			UNIQUE (owner, repo, check_run_id)
 		)`,
 		`ALTER TABLE pull_requests ADD COLUMN run_base_sha TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pull_requests ADD COLUMN run_started_at TEXT NOT NULL DEFAULT '';
+		ALTER TABLE pull_requests ADD COLUMN run_runner TEXT NOT NULL DEFAULT '';
+		CREATE TABLE analyses (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			owner TEXT NOT NULL,
+			repo TEXT NOT NULL,
+			number INTEGER NOT NULL,
+			run_nonce TEXT NOT NULL,
+			head_sha TEXT NOT NULL,
+			runner TEXT NOT NULL,
+			model TEXT NOT NULL,
+			verdict TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			proposals INTEGER NOT NULL,
+			started_at TEXT,
+			finished_at TEXT NOT NULL,
+			input_tokens INTEGER,
+			output_tokens INTEGER,
+			cache_read_tokens INTEGER,
+			cache_write_tokens INTEGER,
+			cost_usd REAL,
+			cost_basis TEXT NOT NULL DEFAULT '',
+			run_id INTEGER NOT NULL,
+			UNIQUE (owner, repo, number, run_nonce)
+		);
+		CREATE TABLE pr_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			owner TEXT NOT NULL,
+			repo TEXT NOT NULL,
+			number INTEGER NOT NULL,
+			key TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			actor TEXT NOT NULL,
+			proposal_id TEXT NOT NULL,
+			scope TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			commit_sha TEXT NOT NULL,
+			head_sha TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			UNIQUE (owner, repo, number, key)
+		);
+		UPDATE pull_requests SET run_runner = 'actions' WHERE run_nonce != '' AND run_id != 0`,
 	}
 }
 

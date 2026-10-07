@@ -159,7 +159,7 @@ func TestStartDispatchesBaseCandidates(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Start() = %v, want nil", err)
 		}
-		want := review.Result{Runner: "actions", Verdict: review.NoImpact{Reason: basedocs.NothingToReview}}
+		want := review.Result{Verdict: review.NoImpact{Reason: basedocs.NothingToReview}}
 		if diff := cmp.Diff(review.Started(want), started); diff != "" {
 			t.Errorf("Start() (-want +got):\n%s", diff)
 		}
@@ -261,6 +261,8 @@ func artifact(t *testing.T, head, nonce string, claude map[string]any) []byte {
 	return b
 }
 
+func ptr[T any](v T) *T { return &v }
+
 func validProposal() map[string]any {
 	return map[string]any{
 		"doc_path": "docs/a.md", "section": "Usage", "anchor": map[string]any{"file": "main.go", "line": 3},
@@ -305,17 +307,144 @@ func TestCollect(t *testing.T) {
 				"modelUsage":        map[string]any{"claude-sonnet-4-5": map[string]any{}},
 				"structured_output": map[string]any{"no_impact_reason": "internal refactor", "proposals": []any{}},
 			}),
-			want: review.Result{Runner: "actions", Model: "claude-sonnet-4-5", Verdict: review.NoImpact{Reason: "internal refactor"}},
+			want: review.Result{Model: "claude-sonnet-4-5", Verdict: review.NoImpact{Reason: "internal refactor"}},
 		},
 		{
 			name: "proposals",
 			raw: artifact(t, "abc", "n1", map[string]any{
 				"structured_output": map[string]any{"proposals": []any{proposal}},
 			}),
-			want: review.Result{Runner: "actions", Model: "claude-code", Verdict: review.Proposals{{
+			want: review.Result{Model: "claude-code", Verdict: review.Proposals{{
 				DocPath: "docs/a.md", Section: "Usage", Anchor: review.Anchor{File: "main.go", Line: 3},
 				Reason: "flag renamed", Content: "new text",
 			}}},
+		},
+		{
+			name: "usage and cost",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"total_cost_usd": 0.056967,
+				"usage": map[string]any{
+					"input_tokens": 4, "output_tokens": 966, "cache_read_input_tokens": 6475, "cache_creation_input_tokens": 11501,
+					"iterations": []any{map[string]any{"input_tokens": 2, "output_tokens": 637}},
+				},
+				"modelUsage":        map[string]any{"claude-sonnet-5-5": map[string]any{"costBasis": "list"}, "claude-haiku": map[string]any{"costBasis": "list"}},
+				"structured_output": map[string]any{"no_impact_reason": "internal refactor", "proposals": []any{}},
+			}),
+			want: review.Result{
+				Model: "claude-haiku", Verdict: review.NoImpact{Reason: "internal refactor"},
+				Usage: &review.Usage{Tokens: &review.Tokens{Input: 4, Output: 966, CacheRead: 6475, CacheWrite: 11501}, CostUSD: ptr(0.056967), CostBasis: "list"},
+			},
+		},
+		{
+			name: "usage without cost and with differing bases",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"usage":             map[string]any{"input_tokens": 1, "output_tokens": 2},
+				"modelUsage":        map[string]any{"a": map[string]any{"costBasis": "list"}, "b": map[string]any{}},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "a", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{Tokens: &review.Tokens{Input: 1, Output: 2}}},
+		},
+		{
+			name: "modelUsage entry not an object",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"modelUsage":        map[string]any{"m": "n/a"},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "m", Verdict: review.NoImpact{Reason: "x"}},
+		},
+		{
+			name: "modelUsage not an object",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"modelUsage":        "n/a",
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
+		},
+		{
+			name: "costBasis not a string",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"usage":             map[string]any{"input_tokens": 1},
+				"modelUsage":        map[string]any{"m": map[string]any{"costBasis": map[string]any{}}},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "m", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{Tokens: &review.Tokens{Input: 1}}},
+		},
+		{
+			name: "token count not a number",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"usage":             map[string]any{"input_tokens": "12"},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
+		},
+		{
+			name: "one malformed token count drops every count",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"usage":             map[string]any{"input_tokens": "12", "output_tokens": 5},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
+		},
+		{
+			name: "cost not a number",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"total_cost_usd":    "free",
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
+		},
+		{
+			name: "cost without a usage block",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"total_cost_usd":    0.5,
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{CostUSD: ptr(0.5)}},
+		},
+		{
+			name: "null cost and a null token count are not reported",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"total_cost_usd":    nil,
+				"usage":             map[string]any{"input_tokens": nil, "output_tokens": 3},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
+		},
+		{
+			name: "all null usage is nil",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"total_cost_usd":    nil,
+				"usage":             map[string]any{"input_tokens": nil},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
+		},
+		{
+			name: "negative tokens and cost",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"total_cost_usd":    -1,
+				"usage":             map[string]any{"input_tokens": -5, "output_tokens": 7},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
+		},
+		{
+			name: "absurd tokens and cost",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"total_cost_usd":    2e6,
+				"usage":             map[string]any{"input_tokens": 2e12, "output_tokens": 7},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
+		},
+		{
+			name: "model name and cost basis over their caps",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"usage":             map[string]any{"input_tokens": 1},
+				"modelUsage":        map[string]any{strings.Repeat("m", 300): map[string]any{"costBasis": strings.Repeat("b", 33)}},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: strings.Repeat("m", 200), Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{Tokens: &review.Tokens{Input: 1}}},
 		},
 		{name: "head mismatch", raw: artifact(t, "other", "n1", map[string]any{"structured_output": map[string]any{}}), wantInvalid: true},
 		{name: "nonce mismatch", raw: artifact(t, "abc", "stale", map[string]any{"structured_output": map[string]any{}}), wantInvalid: true},

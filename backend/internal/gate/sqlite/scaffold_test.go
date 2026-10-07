@@ -200,7 +200,7 @@ func TestOverdueRuns_IncludesAwaitedScaffolds(t *testing.T) {
 	ctx := t.Context()
 	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
-	if err := store.SavePR(ctx, gate.PRState{Owner: "acme", Repo: "widgets", Number: 1, HeadSHA: "a", CheckRunID: 1, Run: &gate.AwaitingRun{RunID: 1, Nonce: "n1", Deadline: base}}); err != nil {
+	if err := store.SavePR(ctx, gate.PRState{Owner: "acme", Repo: "widgets", Number: 1, HeadSHA: "a", CheckRunID: 1, Run: &gate.AwaitingRun{RunID: 1, Nonce: "n1", Deadline: base}}, gate.History{}); err != nil {
 		t.Fatalf("SavePR() = %v, want nil error", err)
 	}
 	for _, st := range []gate.ScaffoldState{

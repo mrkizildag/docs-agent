@@ -17,9 +17,9 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 	state := gate.PRState{Owner: owner, Repo: repo, Number: number}
 
 	var run gate.AwaitingRun
-	var deadline string
+	var deadline, startedAt string
 	row := s.db.QueryRowContext(ctx,
-		`SELECT installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, run_base_sha, summary_comment_id, head_ref, proposals_sha,
+		`SELECT installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, run_base_sha, run_started_at, run_runner, summary_comment_id, head_ref, proposals_sha,
 			fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha, failure_cause, pending_apply
 		FROM pull_requests WHERE owner = ? AND repo = ? AND number = ?`,
 		owner, repo, number)
@@ -27,7 +27,7 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 	var pending gate.SkipAsk
 	var skip gate.Skip
 	var pendingApply string
-	if err := row.Scan(&state.InstallationID, &state.HeadSHA, &state.CheckRunID, &run.RunID, &run.Nonce, &deadline, &run.BaseSHA, &state.SummaryCommentID, &state.HeadRef, &state.ProposalsSHA,
+	if err := row.Scan(&state.InstallationID, &state.HeadSHA, &state.CheckRunID, &run.RunID, &run.Nonce, &deadline, &run.BaseSHA, &startedAt, &run.Runner, &state.SummaryCommentID, &state.HeadRef, &state.ProposalsSHA,
 		&state.Fork, &pending.User, &pending.Scope, &skip.User, &skip.Scope, &skip.Reason, &skip.HeadSHA, &state.FailureCause, &pendingApply); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return state, nil
@@ -55,6 +55,11 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 			return gate.PRState{}, fmt.Errorf("load pr %s/%s#%d: parse run deadline %q: %w", owner, repo, number, deadline, err)
 		}
 		run.Deadline = parsed
+		if startedAt != "" {
+			if run.StartedAt, err = time.Parse(time.RFC3339Nano, startedAt); err != nil {
+				return gate.PRState{}, fmt.Errorf("load pr %s/%s#%d: parse run start %q: %w", owner, repo, number, startedAt, err)
+			}
+		}
 		state.Run = &run
 	}
 
@@ -82,13 +87,16 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 }
 
 // SavePR upserts state, keyed by owner/repo/number, replacing the PR's
-// proposal rows in the same transaction.
-func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
+// proposal rows, and records history, all in one transaction.
+func (s *Store) SavePR(ctx context.Context, state gate.PRState, history gate.History) error {
 	var run gate.AwaitingRun
-	var deadline string
+	var deadline, startedAt string
 	if state.Run != nil {
 		run = *state.Run
 		deadline = run.Deadline.UTC().Format(time.RFC3339Nano)
+		if !run.StartedAt.IsZero() {
+			startedAt = run.StartedAt.UTC().Format(time.RFC3339Nano)
+		}
 	}
 
 	var pending gate.SkipAsk
@@ -115,9 +123,9 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO pull_requests (owner, repo, number, installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, run_base_sha, summary_comment_id, head_ref, proposals_sha,
+		INSERT INTO pull_requests (owner, repo, number, installation_id, head_sha, check_run_id, run_id, run_nonce, run_deadline, run_base_sha, run_started_at, run_runner, summary_comment_id, head_ref, proposals_sha,
 			fork, pending_skip_user, pending_skip_scope, skip_user, skip_scope, skip_reason, skip_head_sha, failure_cause, pending_apply)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (owner, repo, number) DO UPDATE SET
 			installation_id = excluded.installation_id,
 			head_sha = excluded.head_sha,
@@ -126,6 +134,8 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 			run_nonce = excluded.run_nonce,
 			run_deadline = excluded.run_deadline,
 			run_base_sha = excluded.run_base_sha,
+			run_started_at = excluded.run_started_at,
+			run_runner = excluded.run_runner,
 			summary_comment_id = excluded.summary_comment_id,
 			head_ref = excluded.head_ref,
 			proposals_sha = excluded.proposals_sha,
@@ -139,7 +149,7 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 			failure_cause = excluded.failure_cause,
 			pending_apply = excluded.pending_apply`,
 		state.Owner, state.Repo, state.Number, state.InstallationID, state.HeadSHA,
-		state.CheckRunID, run.RunID, run.Nonce, deadline, run.BaseSHA, state.SummaryCommentID, state.HeadRef, state.ProposalsSHA,
+		state.CheckRunID, run.RunID, run.Nonce, deadline, run.BaseSHA, startedAt, run.Runner, state.SummaryCommentID, state.HeadRef, state.ProposalsSHA,
 		state.Fork, pending.User, pending.Scope, skip.User, skip.Scope, skip.Reason, skip.HeadSHA, state.FailureCause, string(pendingApply))
 	if err != nil {
 		return fmt.Errorf("save pr %s/%s#%d: %w", state.Owner, state.Repo, state.Number, err)
@@ -162,8 +172,73 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 		}
 	}
 
+	for _, a := range history.Analyses {
+		if err := upsertAnalysis(ctx, tx, state, a); err != nil {
+			return err
+		}
+	}
+	for _, e := range history.Events {
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO pr_events (owner, repo, number, key, kind, actor, proposal_id, scope, reason, commit_sha, head_sha, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (owner, repo, number, key) DO UPDATE SET reason = excluded.reason`,
+			state.Owner, state.Repo, state.Number, e.Key, e.Kind, e.Actor, e.ProposalID, e.Scope, e.Reason, e.CommitSHA, e.HeadSHA, now())
+		if err != nil {
+			return fmt.Errorf("save pr %s/%s#%d: event %s: %w", state.Owner, state.Repo, state.Number, e.Key, err)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("save pr %s/%s#%d: commit: %w", state.Owner, state.Repo, state.Number, err)
+	}
+	return nil
+}
+
+// upsertAnalysis writes a for the pull request state describes; a later save
+// of the same run nonce replaces the earlier row.
+func upsertAnalysis(ctx context.Context, tx *sql.Tx, state gate.PRState, a gate.Analysis) error {
+	var input, output, cacheRead, cacheWrite sql.NullInt64
+	var cost sql.NullFloat64
+	var basis string
+	if u := a.Usage; u != nil {
+		if t := u.Tokens; t != nil {
+			input, output = sql.NullInt64{Int64: t.Input, Valid: true}, sql.NullInt64{Int64: t.Output, Valid: true}
+			cacheRead, cacheWrite = sql.NullInt64{Int64: t.CacheRead, Valid: true}, sql.NullInt64{Int64: t.CacheWrite, Valid: true}
+		}
+		if u.CostUSD != nil {
+			cost = sql.NullFloat64{Float64: *u.CostUSD, Valid: true}
+		}
+		basis = u.CostBasis
+	}
+	var startedAt sql.NullString
+	if !a.StartedAt.IsZero() {
+		startedAt = sql.NullString{String: a.StartedAt.UTC().Format(time.RFC3339Nano), Valid: true}
+	}
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO analyses (owner, repo, number, run_nonce, head_sha, runner, model, verdict, reason, proposals, started_at, finished_at, run_id,
+			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, cost_basis)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (owner, repo, number, run_nonce) DO UPDATE SET
+			head_sha = excluded.head_sha,
+			runner = excluded.runner,
+			model = excluded.model,
+			verdict = excluded.verdict,
+			reason = excluded.reason,
+			proposals = excluded.proposals,
+			started_at = excluded.started_at,
+			finished_at = excluded.finished_at,
+			run_id = excluded.run_id,
+			input_tokens = excluded.input_tokens,
+			output_tokens = excluded.output_tokens,
+			cache_read_tokens = excluded.cache_read_tokens,
+			cache_write_tokens = excluded.cache_write_tokens,
+			cost_usd = excluded.cost_usd,
+			cost_basis = excluded.cost_basis`,
+		state.Owner, state.Repo, state.Number, a.Nonce, a.HeadSHA, a.Runner, a.Model, a.Verdict, a.Reason, a.Proposals,
+		startedAt, a.FinishedAt.UTC().Format(time.RFC3339Nano), a.RunID,
+		input, output, cacheRead, cacheWrite, cost, basis)
+	if err != nil {
+		return fmt.Errorf("save pr %s/%s#%d: analysis %s: %w", state.Owner, state.Repo, state.Number, a.Nonce, err)
 	}
 	return nil
 }

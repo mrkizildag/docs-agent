@@ -94,7 +94,7 @@ func TestProposalCommentOffersApplyOnlyOffAFork(t *testing.T) {
 
 			pr := testPR()
 			pr.Fork = tc.fork
-			_, writes := gate.Reconcile(gate.PRState{}, pr, review.Proposals{p}, nil, nil)
+			_, writes, _ := gate.Reconcile(gate.PRState{}, pr, review.Proposals{p}, nil, nil)
 
 			body := writes[0].Review.Body
 			if got := strings.Contains(body, "- [ ] Apply this change"); got != tc.wantCheckbox {
@@ -115,7 +115,7 @@ func TestSuggestionCommentNotesForkOnly(t *testing.T) {
 	for _, fork := range []bool{false, true} {
 		pr := testPR()
 		pr.Fork = fork
-		_, writes := gate.Reconcile(gate.PRState{}, pr, review.Proposals{p}, changed, nil)
+		_, writes, _ := gate.Reconcile(gate.PRState{}, pr, review.Proposals{p}, changed, nil)
 
 		body := writes[0].Review.Body
 		if !strings.Contains(body, "```suggestion") {
@@ -135,7 +135,7 @@ func TestOutdatedProposalCommentOnlySwapsItsMarkerAndResolves(t *testing.T) {
 	prev := gate.PRState{Proposals: []gate.ProposalState{{ID: id, DocPath: "docs/a.md", Section: "A", CommentID: 1, State: gate.ProposalOpen}}}
 	existing := []gate.Comment{{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: old}}
 
-	state, writes := gate.Reconcile(prev, testPR(), review.NoImpact{Reason: "x"}, nil, existing)
+	state, writes, _ := gate.Reconcile(prev, testPR(), review.NoImpact{Reason: "x"}, nil, existing)
 
 	want := "<!-- pollux-agent:superseded:" + id + " -->\n\nflag renamed\n\n- [ ] Apply this change\n"
 	if w := writes[0]; w.ID != 1 || !w.Resolve || w.Body != want {
@@ -155,7 +155,7 @@ func TestSupersededProposalCommentOnlySwapsItsMarker(t *testing.T) {
 	p := proposal("docs/a.md", "A")
 	p.Content = "## A\nnewer\n"
 
-	_, writes := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, []gate.Comment{{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: old}})
+	_, writes, _ := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, []gate.Comment{{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: old}})
 
 	want := "<!-- pollux-agent:superseded:" + id + " -->\n\nflag renamed\n\n- [x] Apply this change\n"
 	if got := writes[0].Body; got != want {
@@ -168,12 +168,12 @@ func TestSupersededSuggestionCommentLosesItsSuggestionFence(t *testing.T) {
 
 	p := review.Proposal{DocPath: "docs/a.md", Section: "Usage", Reason: "r", Lines: review.LineRange{Start: 3, End: 4}, Original: "## Usage\nold\n", Content: "## Usage\nnew\n"}
 	changed := []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 10}}}}
-	_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, changed, nil)
+	_, writes, _ := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, changed, nil)
 	live := writes[0].Review.Body
 	id := gate.ProposalID("docs/a.md", "Usage")
 	prev := gate.PRState{Proposals: []gate.ProposalState{{ID: id, DocPath: "docs/a.md", Section: "Usage", CommentID: 1, State: gate.ProposalOpen, Content: "## Usage\nold\n"}}}
 
-	_, retired := gate.Reconcile(prev, testPR(), review.NoImpact{Reason: "x"}, nil, []gate.Comment{{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: live}})
+	_, retired, _ := gate.Reconcile(prev, testPR(), review.NoImpact{Reason: "x"}, nil, []gate.Comment{{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: live}})
 
 	want := strings.Replace(strings.Replace(live, "proposal", "superseded", 1), "```suggestion\n", "```\n", 1)
 	if got := retired[0].Body; got != want || strings.Contains(got, "suggestion\n") {

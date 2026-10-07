@@ -64,8 +64,10 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (Response, error)
 		Text:      text.String(),
 		ToolCalls: toolCalls,
 		Usage: Usage{
-			InputTokens:  wireResp.Usage.InputTokens,
-			OutputTokens: wireResp.Usage.OutputTokens,
+			InputTokens:      wireResp.Usage.InputTokens,
+			OutputTokens:     wireResp.Usage.OutputTokens,
+			CacheReadTokens:  wireResp.Usage.CacheReadInputTokens,
+			CacheWriteTokens: wireResp.Usage.CacheCreationInputTokens,
 		},
 	}, nil
 }
@@ -103,8 +105,10 @@ type anthropicTool struct {
 type anthropicResponse struct {
 	Content []anthropicBlock `json:"content"`
 	Usage   struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 	} `json:"usage"`
 }
 

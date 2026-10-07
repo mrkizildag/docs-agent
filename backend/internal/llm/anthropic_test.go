@@ -64,3 +64,22 @@ func TestAnthropicComplete_DefaultMaxTokens(t *testing.T) {
 		t.Errorf("max_tokens = %d, want 8192", got.MaxTokens)
 	}
 }
+
+func TestAnthropicComplete_CacheUsage(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":3,"output_tokens":4,"cache_read_input_tokens":5,"cache_creation_input_tokens":6}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	model := llm.NewAnthropic(&http.Client{Timeout: 5 * time.Second}, srv.URL, "k")
+	resp, err := model.Complete(t.Context(), llm.Request{Model: "m"})
+	if err != nil {
+		t.Fatalf("Complete() = %v, want nil", err)
+	}
+	want := llm.Usage{InputTokens: 3, OutputTokens: 4, CacheReadTokens: 5, CacheWriteTokens: 6}
+	if resp.Usage != want {
+		t.Errorf("Usage = %+v, want %+v", resp.Usage, want)
+	}
+}

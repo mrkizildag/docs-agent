@@ -52,6 +52,10 @@ The runner classifies every failure once, at the point it starts, into a fixed c
 
 The agent loop logs one record per tool call (step, tool, the path or pattern truncated to 120 characters, tokens of that step; never file contents or submitted text) and one at the end with steps, tokens, duration, and outcome. Triage, new-doc, and verification calls log their tokens. Records carry `repo`, `pr`, and `head_sha` (scaffold runs `repo` and `scaffold_sha`), so one PR's run is a grep of the server log. The logger is passed into `llmrunner.New` and `agent.Task.Log`.
 
+## Usage
+
+The result reports the tokens of every model call in the analysis (triage, new-doc, the agent loop, verification), cache read and write tokens included where the Anthropic adapter returns them (the OpenAI-compatible adapter reports none). There is no cost: the runner has no pricing table. A result that called no model (a restore, no changed files, nothing to review) reports no usage. The result's model is the one that produced the verdict: the triage model when triage or verification ended the run, the main model when the agent loop did, none when no model ran.
+
 ## Size limits
 
 Before any review LLM call or dispatch, the gate rejects a PR with more than 50 changed files or more than 1 MiB of patch text, for both runners; the check ends neutral "PR too large to analyze" naming the limit. A text file whose patch GitHub omitted (it reports changes but no patch) counts as over, since its size is unknown; a binary file has no patch and does not. Partial analysis of a large PR is not attempted. The file limit is one named constant so a per-plan value can replace it later; at 50 files the listing is far below GitHub's 3000-file cap, so a truncated listing cannot reach analysis.

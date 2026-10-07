@@ -322,7 +322,7 @@ func TestEnqueueDeadlineJobsIsIdempotent(t *testing.T) {
 		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1", CheckRunID: 5,
 		Run: &gate.AwaitingRun{RunID: 9, Nonce: "n1", Deadline: deadline},
 	}
-	if err := store.SavePR(t.Context(), state); err != nil {
+	if err := store.SavePR(t.Context(), state, gate.History{}); err != nil {
 		t.Fatalf("SavePR() = %v", err)
 	}
 
@@ -370,7 +370,7 @@ func TestDeadlineJobFailedConcludeIsRetriedByLaterSweep(t *testing.T) {
 		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1", CheckRunID: 5,
 		Run: &gate.AwaitingRun{RunID: 9, Nonce: "n1", Deadline: deadline},
 	}
-	if err := store.SavePR(t.Context(), state); err != nil {
+	if err := store.SavePR(t.Context(), state, gate.History{}); err != nil {
 		t.Fatalf("SavePR() = %v", err)
 	}
 
