@@ -274,10 +274,10 @@ type cloneHead struct{ root *os.Root }
 
 var _ finalize.Head = cloneHead{}
 
-// lstat reports ok=false when nothing is at path. A path under a symlinked
-// directory is unusable rather than absent; it is reported as taken.
+// lstat reports ok=false when nothing is at path. A path under a file or a
+// symlink is unusable rather than absent; it is reported as taken.
 func (h cloneHead) lstat(path string) (info fs.FileInfo, ok, taken bool, err error) {
-	if h.underSymlink(path) {
+	if h.blockedByAncestor(path) {
 		return nil, false, true, nil
 	}
 	info, err = h.root.Lstat(path)
@@ -290,12 +290,17 @@ func (h cloneHead) lstat(path string) (info fs.FileInfo, ok, taken bool, err err
 	return nil, false, false, fmt.Errorf("lstat %s at head: %w", path, err)
 }
 
-// underSymlink reports whether a parent directory of p is a symlink. Such a
-// path can't be created as a doc, and os.Root follows links that stay inside
-// the clone, so it is checked before the lookup.
-func (h cloneHead) underSymlink(p string) bool {
+// blockedByAncestor reports whether the nearest existing parent directory of p
+// is not a directory (a file or a symlink). Such a path can't be created as a
+// doc, and os.Root follows links that stay inside the clone, so it is checked
+// before the lookup.
+func (h cloneHead) blockedByAncestor(p string) bool {
 	for dir := pathpkg.Dir(p); dir != "." && dir != "/"; dir = pathpkg.Dir(dir) {
-		if info, err := h.root.Lstat(dir); err == nil && info.Mode()&fs.ModeSymlink != 0 {
+		info, err := h.root.Lstat(dir)
+		if err == nil {
+			return !info.IsDir()
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
 			return true
 		}
 	}

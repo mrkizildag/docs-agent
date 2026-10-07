@@ -127,3 +127,17 @@ func TestStart_HeadReadErrorFailsTheRun(t *testing.T) {
 		t.Errorf("model calls = %d, want 3 (no retry after the head read failed)", len(model.calls))
 	}
 }
+
+func TestStart_NewDocUnderAnExistingFileIsReturnedToModel(t *testing.T) {
+	t.Parallel()
+
+	repoDir, headSHA := newGitRepo(t)
+	proposal := newDocProposal("other.go")
+	proposal["doc_path"] = "docs/x.md/new.md"
+	changed := []review.ChangedFile{mainGoChange(), otherGoChange()}
+	_, model := startOnRepo(t, repoDir, headSHA, changed,
+		triageResponse(true), newDocResponse(true), submitResponse(proposal), submitResponse(), verifyResponse(true))
+	if got := returnedToModel(t, model); !strings.Contains(got, "proposal 0:") || !strings.Contains(got, "already exists") {
+		t.Errorf("tool error = %q, want proposal 0 reported as already existing", got)
+	}
+}

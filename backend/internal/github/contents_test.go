@@ -143,6 +143,7 @@ func TestPathAtRef(t *testing.T) {
 		{path: "docs", want: true},
 		{path: "docs/missing.md"},
 		{path: "docs/link/new.md", want: true},
+		{path: "docs/a.md/new.md", want: true},
 		{path: "docs/boom.md", wantErr: true},
 	}
 	for _, tc := range tests {

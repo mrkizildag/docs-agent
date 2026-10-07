@@ -55,13 +55,14 @@ func (c *Client) PathAtRef(ctx context.Context, installationID int64, owner, rep
 		return false, fmt.Errorf("stat %s of %s/%s at %s: %w", path, owner, repo, ref, err)
 	}
 
-	// A path under a symlinked directory reads as missing but can't be created;
-	// the nearest existing parent decides.
+	// A path under a file, symlink, or submodule reads as missing but can't be
+	// created; the nearest existing parent decides. Only a directory lists
+	// entries, which leaves file nil.
 	for dir := pathpkg.Dir(path); dir != "." && dir != "/"; dir = pathpkg.Dir(dir) {
 		file, _, resp, err := client.Repositories.GetContents(ctx, owner, repo, dir, opts)
 		switch {
 		case err == nil:
-			return file.GetType() == "symlink", nil
+			return file != nil, nil
 		case !isNotFound(resp):
 			return false, fmt.Errorf("stat %s of %s/%s at %s: %w", dir, owner, repo, ref, err)
 		}
