@@ -1,0 +1,11 @@
+id: doc-link-source-files
+source: "commit 83eb325 (PR #49)"
+base: 33a357bf3a0bd7b3e942158ce354240230e3234b
+head: 83eb3250ee5d6925f8ad295e0ef846481ef06f94
+expect:
+  verdict: no_impact
+notes: >
+  The absolute-doc-link check in internal/docs/doc.go now flags a GitHub URL only when it points at a markdown file
+  under a docs segment, so links to source like backend/internal/docs/doc.go are allowed. At base, scaffold.md and
+  actions-runner.md say new docs must not link "/docs/... paths or GitHub URLs to its docs", and docs/README.md and
+  0002 say docs link each other relatively; the fix narrows the check to exactly that, so no text becomes wrong.

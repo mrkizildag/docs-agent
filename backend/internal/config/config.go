@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Secret redacts its value in fmt, slog, and JSON/text encodings so it never
@@ -97,27 +98,20 @@ func Load() (Config, error) {
 	}
 	cfg.WebhookSecret = Secret{value: webhookSecret}
 
-	llmProvider := os.Getenv("LLM_PROVIDER")
-	llmBaseURL := os.Getenv("LLM_BASE_URL")
-	llmAPIKey := os.Getenv("LLM_API_KEY")
-	llmModel := os.Getenv("LLM_MODEL")
-	llmTriageModel := os.Getenv("LLM_TRIAGE_MODEL")
-
-	if llmProvider == "" {
-		if llmBaseURL != "" {
-			errs = append(errs, errors.New("LLM_BASE_URL: set but LLM_PROVIDER is unset"))
-		}
-		if llmAPIKey != "" {
-			errs = append(errs, errors.New("LLM_API_KEY: set but LLM_PROVIDER is unset"))
-		}
-		if llmModel != "" {
-			errs = append(errs, errors.New("LLM_MODEL: set but LLM_PROVIDER is unset"))
-		}
-		if llmTriageModel != "" {
-			errs = append(errs, errors.New("LLM_TRIAGE_MODEL: set but LLM_PROVIDER is unset"))
+	env := loadLLMEnv()
+	if env.provider == "" {
+		for _, v := range []struct{ key, value string }{
+			{"LLM_BASE_URL", env.baseURL},
+			{"LLM_API_KEY", env.apiKey},
+			{"LLM_MODEL", env.model},
+			{"LLM_TRIAGE_MODEL", env.triageModel},
+		} {
+			if v.value != "" {
+				errs = append(errs, fmt.Errorf("%s: set but LLM_PROVIDER is unset", v.key))
+			}
 		}
 	} else {
-		llm, llmErrs := loadLLM(LLMProvider(llmProvider), llmBaseURL, llmAPIKey, llmModel, llmTriageModel)
+		llm, llmErrs := env.validate()
 		errs = append(errs, llmErrs...)
 		cfg.LLM = llm
 	}
@@ -125,10 +119,129 @@ func Load() (Config, error) {
 	return cfg, errors.Join(errs...)
 }
 
-// loadLLM validates the LLM_* variables once LLM_PROVIDER is set and returns
-// the resulting LLM, or nil and the collected errors.
-func loadLLM(provider LLMProvider, baseURL, apiKey, model, triageModel string) (*LLM, []error) {
+// llmEnv holds the raw LLM_* variables before validation.
+type llmEnv struct {
+	provider, baseURL, apiKey, model, triageModel string
+}
+
+func loadLLMEnv() llmEnv {
+	return llmEnv{
+		provider:    os.Getenv("LLM_PROVIDER"),
+		baseURL:     os.Getenv("LLM_BASE_URL"),
+		apiKey:      os.Getenv("LLM_API_KEY"),
+		model:       os.Getenv("LLM_MODEL"),
+		triageModel: os.Getenv("LLM_TRIAGE_MODEL"),
+	}
+}
+
+// EvalRunner selects which runner the eval harness scores.
+type EvalRunner string
+
+const (
+	// EvalRunnerServer scores the server runner against the configured LLM.
+	EvalRunnerServer EvalRunner = "server"
+	// EvalRunnerActions scores the Actions runner by running the action's Claude
+	// step locally on a Claude credential.
+	EvalRunnerActions EvalRunner = "actions"
+)
+
+// Eval configures the live eval harness: the runner under test, its LLM (server
+// runner) or Claude credential (Actions runner), the judge model, how many runs
+// per case, how many run at once, and an optional case filter.
+type Eval struct {
+	Runner EvalRunner
+	// LLM is set for the server runner only.
+	LLM LLM
+	// ClaudeOAuthToken and AnthropicAPIKey are set for the Actions runner; at
+	// least one is non-empty.
+	ClaudeOAuthToken Secret
+	AnthropicAPIKey  Secret
+	// JudgeModel is empty for the Actions runner to use Claude Code's default.
+	JudgeModel string
+	// Path is the PATH the runners' child processes get.
+	Path     string
+	Runs     int
+	Parallel int
+	Cases    []string
+}
+
+// LoadEval reads the EVAL_* variables, plus the LLM_* variables for the server
+// runner or the Claude credential for the Actions runner, and returns one error
+// listing every invalid variable.
+func LoadEval() (Eval, error) {
 	var errs []error
+
+	var eval Eval
+	eval.Runner = EvalRunner(envOr("EVAL_RUNNER", string(EvalRunnerServer)))
+	eval.Path = os.Getenv("PATH")
+	switch eval.Runner {
+	case EvalRunnerServer:
+		env := loadLLMEnv()
+		if env.provider == "" {
+			errs = append(errs, errors.New("LLM_PROVIDER is required"))
+		} else {
+			llm, llmErrs := env.validate()
+			errs = append(errs, llmErrs...)
+			if llm != nil {
+				eval.LLM = *llm
+			}
+		}
+		eval.JudgeModel = envOr("EVAL_JUDGE_MODEL", eval.LLM.Model)
+	case EvalRunnerActions:
+		oauth, apiKey := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"), os.Getenv("ANTHROPIC_API_KEY")
+		if oauth == "" && apiKey == "" {
+			errs = append(errs, errors.New("CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY is required when EVAL_RUNNER=actions"))
+		}
+		eval.ClaudeOAuthToken = Secret{value: oauth}
+		eval.AnthropicAPIKey = Secret{value: apiKey}
+		eval.JudgeModel = os.Getenv("EVAL_JUDGE_MODEL")
+	default:
+		errs = append(errs, fmt.Errorf("EVAL_RUNNER: unknown runner %q", eval.Runner))
+	}
+
+	var err error
+	eval.Runs, err = positiveIntOr("EVAL_RUNS", 3)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	eval.Parallel, err = positiveIntOr("EVAL_PARALLEL", 2)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	for id := range strings.SplitSeq(os.Getenv("EVAL_CASE"), ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			eval.Cases = append(eval.Cases, id)
+		}
+	}
+
+	return eval, errors.Join(errs...)
+}
+
+func positiveIntOr(key string, fallback int) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
+	}
+	n, err := parsePositive(key, v)
+	if err != nil {
+		return fallback, err
+	}
+	return int(n), nil
+}
+
+func parsePositive(key, v string) (int64, error) {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s: must be a positive integer", key)
+	}
+	return n, nil
+}
+
+// validate checks the variables once LLM_PROVIDER is set and returns the
+// resulting LLM, or nil and the collected errors.
+func (e llmEnv) validate() (*LLM, []error) {
+	var errs []error
+	provider, baseURL, apiKey, model, triageModel := LLMProvider(e.provider), e.baseURL, e.apiKey, e.model, e.triageModel
 
 	switch provider {
 	case LLMProviderAnthropic:
@@ -195,11 +308,7 @@ func requireInt64(key string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	n, err := strconv.ParseInt(v, 10, 64)
-	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("%s: must be a positive integer", key)
-	}
-	return n, nil
+	return parsePositive(key, v)
 }
 
 // loadPrivateKey reads the PEM file GitHub generates for the app (PKCS#1, "RSA

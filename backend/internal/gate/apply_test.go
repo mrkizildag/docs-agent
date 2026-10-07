@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -241,7 +242,7 @@ func TestReconcileKeepsApplied(t *testing.T) {
 	}{
 		{name: "same content stays applied", verdict: review.Proposals{p}, wantState: gate.ProposalApplied, wantSHA: "abc", wantReply: 7},
 		{name: "absent stays applied", verdict: review.NoImpact{Reason: "x"}, wantState: gate.ProposalApplied, wantSHA: "abc", wantReply: 7},
-		{name: "different content reopens", verdict: review.Proposals{changed}, wantState: gate.ProposalOpen, wantEdits: 1},
+		{name: "different content reopens", verdict: review.Proposals{changed}, wantState: gate.ProposalOpen, wantEdits: 2},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -321,6 +322,22 @@ func TestHandleComment(t *testing.T) {
 	}{
 		{
 			name: "apply one", event: reviewTick(1),
+			wantMessage: singleMsg, wantFiles: map[string]string{"docs/a.md": "# A\n\n## Usage\nnew\n\n## Other\nx\n"},
+			wantApplied: []string{"p1"}, wantReplies: []int64{1},
+			wantReact: gate.ReactionDone,
+		},
+		{
+			name: "content without a trailing newline keeps the next heading on its own line", event: reviewTick(1),
+			state: func(s *gate.PRState) {
+				s.Proposals[0].Original, s.Proposals[0].Content = "## Usage\nold\n\n", "## Usage\nnew"
+			},
+			wantMessage: singleMsg, wantFiles: map[string]string{"docs/a.md": "# A\n\n## Usage\nnew\n\n## Other\nx\n"},
+			wantApplied: []string{"p1"}, wantReplies: []int64{1},
+			wantReact: gate.ReactionDone,
+		},
+		{
+			name: "content with extra trailing newlines keeps the doc's spacing", event: reviewTick(1),
+			state:       func(s *gate.PRState) { s.Proposals[0].Content = "## Usage\nnew\n\n\n" },
 			wantMessage: singleMsg, wantFiles: map[string]string{"docs/a.md": "# A\n\n## Usage\nnew\n\n## Other\nx\n"},
 			wantApplied: []string{"p1"}, wantReplies: []int64{1},
 			wantReact: gate.ReactionDone,
@@ -568,6 +585,9 @@ func TestHandleComment(t *testing.T) {
 				t.Errorf("user-facing replies = %q, want one containing %q", says, tc.wantSay)
 			}
 			for _, id := range tc.wantReplies {
+				if !slices.Contains(api.resolved, id) {
+					t.Errorf("thread of comment %d not resolved after its Applied reply; resolved %v", id, api.resolved)
+				}
 				for _, p := range store.stored.Proposals {
 					if p.CommentID == id && p.ReplyID == 0 {
 						t.Errorf("proposal %s has no ReplyID after its reply", p.ID)
@@ -611,15 +631,128 @@ func TestHandleCommentSideEffects(t *testing.T) {
 
 		store := &fakeStore{stored: threeState(), live: true}
 		gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
-		svc := gate.NewService(apiWithComments(), gh, store, gate.Runners{}, nil, nil)
+		api := apiWithComments()
+		svc := gate.NewService(api, gh, store, gate.Runners{}, nil, nil)
 
 		for range 2 {
 			if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
 				t.Fatalf("HandleComment() error = %v", err)
 			}
 		}
+		if len(api.resolved) == 0 || slices.Contains(api.resolved, 2) {
+			t.Errorf("resolved threads = %v, want only comment 1's, repeated harmlessly on redelivery", api.resolved)
+		}
 		if len(gh.commits) != 1 || len(gh.replies) != 1 {
 			t.Errorf("commits %d, replies %d, want 1 and 1", len(gh.commits), len(gh.replies))
+		}
+	})
+}
+
+func TestHandleCommentResolvesOnlyThreadsAppliedNow(t *testing.T) {
+	t.Parallel()
+
+	state := threeState()
+	state.Proposals[1].State, state.Proposals[1].AppliedSHA, state.Proposals[1].ReplyID = gate.ProposalApplied, "earlier1234567", 7
+	gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
+	api := apiWithComments()
+	svc := gate.NewService(api, gh, &fakeStore{stored: state, live: true}, gate.Runners{}, nil, nil)
+
+	if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
+		t.Fatalf("HandleComment() error = %v", err)
+	}
+	if diff := cmp.Diff([]int64{1}, api.resolved); diff != "" {
+		t.Errorf("resolved threads (-want +got):\n%s", diff)
+	}
+}
+
+func TestHandleCommentResolveFailureDoesNotFailApply(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
+	api := apiWithComments()
+	api.resolveErr = errors.New("resolve failed")
+	svc := gate.NewService(api, gh, &fakeStore{stored: threeState(), live: true}, gate.Runners{}, nil, nil)
+
+	if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
+		t.Fatalf("HandleComment() error = %v, want nil", err)
+	}
+	if len(gh.replies) != 1 || len(gh.commits) != 1 {
+		t.Errorf("replies %d, commits %d, want 1 and 1", len(gh.replies), len(gh.commits))
+	}
+	if diff := cmp.Diff([]gate.Reaction{gate.ReactionDone}, gh.reactionsOn(gate.CommentKindReview, 1)); diff != "" {
+		t.Errorf("reactions (-want +got):\n%s", diff)
+	}
+}
+
+func TestHandleCommentApplyAllReplayResolvesOnlyTheLatestApply(t *testing.T) {
+	t.Parallel()
+
+	state := threeState()
+	state.Proposals[0].State, state.Proposals[0].AppliedSHA, state.Proposals[0].ReplyID = gate.ProposalApplied, "sha1aaaaaaaaa", 7
+	state.Proposals[1].State, state.Proposals[1].AppliedSHA, state.Proposals[1].ReplyID = gate.ProposalApplied, "sha2bbbbbbbbb", 8
+	state.Proposals[2].State = gate.ProposalOutdated
+	gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
+	api := apiWithComments()
+	svc := gate.NewService(api, gh, &fakeStore{stored: state, live: true}, gate.Runners{}, nil, nil)
+
+	if err := svc.HandleComment(t.Context(), summaryTick("Apply all")); err != nil {
+		t.Fatalf("HandleComment() error = %v", err)
+	}
+	if diff := cmp.Diff([]int64{2}, api.resolved); diff != "" {
+		t.Errorf("resolved threads (-want +got):\n%s", diff)
+	}
+}
+
+func TestHandleCommentTickOnRetiredCommentIsRefused(t *testing.T) {
+	t.Parallel()
+
+	const retired = "<!-- pollux-agent:superseded:p1 -->\n\nproposal\n- [x] Apply this change\n"
+	tick := reviewTick(1)
+	tick.Body = retired
+
+	t.Run("the bot's own retired comment", func(t *testing.T) {
+		t.Parallel()
+
+		state := threeState()
+		state.Proposals[0].CommentID = 5
+		gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
+		api := apiWithComments()
+		api.edit(1, retired)
+		svc := gate.NewService(api, gh, &fakeStore{stored: state, live: true}, gate.Runners{}, nil, nil)
+
+		if err := svc.HandleComment(t.Context(), tick); err != nil {
+			t.Fatalf("HandleComment() error = %v", err)
+		}
+		if len(gh.replies) != 1 || !strings.Contains(gh.replies[0].body, "newer comment replaced this proposal") || len(gh.commits) != 0 {
+			t.Errorf("replies = %v, commits = %d, want one refusal and no commit", gh.replies, len(gh.commits))
+		}
+		if diff := cmp.Diff([]gate.Reaction{gate.ReactionRefused}, gh.reactionsOn(gate.CommentKindReview, 1)); diff != "" {
+			t.Errorf("reactions (-want +got):\n%s", diff)
+		}
+		if got, want := api.comments[0].Body, strings.Replace(retired, "[x]", "[ ]", 1); got != want {
+			t.Errorf("comment 1 body = %q, want %q (unticked, marker kept)", got, want)
+		}
+	})
+
+	t.Run("someone else's comment", func(t *testing.T) {
+		t.Parallel()
+
+		gh := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
+		api := apiWithComments()
+		api.edit(1, retired)
+		api.comments[0].Mine = false
+		state := threeState()
+		state.Proposals[0].CommentID = 5
+		svc := gate.NewService(api, gh, &fakeStore{stored: state, live: true}, gate.Runners{}, nil, nil)
+
+		if err := svc.HandleComment(t.Context(), tick); err != nil {
+			t.Fatalf("HandleComment() error = %v", err)
+		}
+		if len(gh.replies) != 0 || api.editReview != 0 {
+			t.Errorf("replies = %v, review edits = %d, want none", gh.replies, api.editReview)
+		}
+		if gh.permissionCalls != 0 || len(gh.reactionLog) != 0 {
+			t.Errorf("permission calls = %d, reactions = %v, want none for a comment that is not ours", gh.permissionCalls, gh.reactionLog)
 		}
 	})
 }

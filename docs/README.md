@@ -14,10 +14,12 @@ Start here. Each entry is one file with a one-line summary; open only what the t
 - [Job queue](features/job-queue.md): how webhook work is queued, deduplicated, superseded, and recovered after a restart.
 - [Actions runner](features/actions-runner.md): how analysis runs in the repo's own GitHub Actions, and the invariants that keep its result trustworthy and its check from sticking.
 - [Server runner](features/server-runner.md): how the server decides whether a PR makes docs stale, why its tools are read-only, and its limits.
-- [Proposal output](features/proposal-output.md): what a PR gets for proposed doc edits (review comments, summary) and how re-runs keep them stable.
+- [Proposal output](features/proposal-output.md): what a PR gets for proposed doc edits (review comments, summary) and how re-runs edit, retire, or replace them.
 - [Apply and Skip](features/apply-skip.md): how proposals are applied or the gate waived, who may, what is refused, and why a repeated delivery commits at most once.
 - [Docs scaffold](features/scaffold.md): how a repo with no `docs/` gets one starting docs PR, exactly once, and what waiting checks say.
 - [Setup](guides/setup.md): run, test, and lint the backend locally.
+- [Eval](guides/eval.md): measure either runner's docs-impact quality against labeled cases from this repo's history.
+- [Sandbox repo](guides/sandbox.md): the private repo pollux is tested on end to end, what is set up there, and how to run a test PR.
 - [Registering the GitHub App](guides/github-app.md): create the GitHub App, set its webhook and permissions, and install it.
 - [Using the Actions runner](guides/actions-runner.md): set up a target repo so analysis runs in its own GitHub Actions with its own Claude credential.
 - [Deploy](guides/deploy.md): run pollux in Docker on one host and expose its webhook through Tailscale Funnel.

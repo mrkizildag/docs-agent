@@ -20,11 +20,12 @@ Requires Go (version in `backend/go.mod`) and golangci-lint v2. To run it in pro
 | `make lint`  | golangci-lint, including formatting and import rules. Its cache is per worktree, in `.cache/`. |
 | `make fmt`   | Apply gofmt and goimports.                             |
 | `make generate` | Regenerate the three schemas in `action/` (proposal, result, scaffold) from the `internal/review` types; a test fails when any is stale. |
-| `make check` | lint, test, and govulncheck; what CI runs.             |
+| `make check` | lint, test, and govulncheck; what CI runs, plus `make eval-check`. |
+| `make eval`, `make eval-check` | Score a runner on labeled cases, or validate them offline; see [Eval](eval.md). |
 
 ## Configuration
 
-Only `backend/internal/config` reads the environment (forbidigo enforces it). The one exemption is the server runner's `git` subprocess, which forwards `PATH` from the server's environment (see [Server runner](../features/server-runner.md)). Copy `backend/.env.example` for the variables. Secret variables load into `config.Secret`, which prints and logs as `[redacted]`; call `Reveal()` only in `cmd/server` where the value is handed to its consumer.
+Only `backend/internal/config` reads the environment (forbidigo enforces it). The one exemption is the server runner's `git` subprocess, which forwards `PATH` from the server's environment (see [Server runner](../features/server-runner.md)). Copy `backend/.env.example` for the variables. Secret variables load into `config.Secret`, which prints and logs as `[redacted]`; call `Reveal()` only where the value is handed to its consumer: `cmd/server`, and the eval harness (`llmrunner/eval_*_test.go`), which wires runners the same way.
 
 | Variable                      | Default  | Meaning                                                        |
 |-------------------------------|----------|-----------------------------------------------------------------|

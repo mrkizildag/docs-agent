@@ -9,6 +9,7 @@ covers:
   - backend/internal/review/llmrunner/scaffold.go
   - backend/internal/review/llmrunner/prompt.go
   - backend/internal/review/actions/actions.go
+  - action/run-claude.sh
   - backend/internal/docs/doc.go
   - backend/internal/gate/gate.go
   - backend/internal/httpapi/handler.go

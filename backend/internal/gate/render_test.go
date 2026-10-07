@@ -123,7 +123,7 @@ func TestSuggestionCommentNotesForkOnly(t *testing.T) {
 	}
 }
 
-func TestOutdatedProposalCommentHasNoApplyBox(t *testing.T) {
+func TestOutdatedProposalCommentOnlySwapsItsMarkerAndResolves(t *testing.T) {
 	t.Parallel()
 
 	id := gate.ProposalID("docs/a.md", "A")
@@ -131,14 +131,49 @@ func TestOutdatedProposalCommentHasNoApplyBox(t *testing.T) {
 	prev := gate.PRState{Proposals: []gate.ProposalState{{ID: id, DocPath: "docs/a.md", Section: "A", CommentID: 1, State: gate.ProposalOpen}}}
 	existing := []gate.Comment{{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: old}}
 
-	_, writes := gate.Reconcile(prev, testPR(), review.NoImpact{Reason: "x"}, nil, existing)
+	state, writes := gate.Reconcile(prev, testPR(), review.NoImpact{Reason: "x"}, nil, existing)
 
-	body := writes[0].Body
-	if !strings.Contains(body, "flag renamed") || !strings.Contains(body, "Outdated") {
-		t.Errorf("outdated body = %q, want the old text under an outdated notice", body)
+	want := "<!-- pollux-agent:superseded:" + id + " -->\n\nflag renamed\n\n- [ ] Apply this change\n"
+	if w := writes[0]; w.ID != 1 || !w.Resolve || w.Body != want {
+		t.Errorf("write = %+v, want comment 1 with only its marker swapped, thread resolved", w)
 	}
-	if strings.Contains(body, "[ ]") || strings.Contains(body, "[x]") {
-		t.Errorf("outdated body = %q, want no checkbox", body)
+	if got := state.Proposals[0]; got.State != gate.ProposalOutdated || got.CommentID != 1 {
+		t.Errorf("proposal = %+v, want outdated and still pointing at comment 1 so a tick is refused", got)
+	}
+}
+
+func TestSupersededProposalCommentOnlySwapsItsMarker(t *testing.T) {
+	t.Parallel()
+
+	id := gate.ProposalID("docs/a.md", "A")
+	old := "<!-- pollux-agent:proposal:" + id + " -->\n\nflag renamed\n\n- [x] Apply this change\n"
+	prev := gate.PRState{Proposals: []gate.ProposalState{{ID: id, DocPath: "docs/a.md", Section: "A", CommentID: 1, State: gate.ProposalApplied, Content: "## A\nold\n"}}}
+	p := proposal("docs/a.md", "A")
+	p.Content = "## A\nnewer\n"
+
+	_, writes := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, []gate.Comment{{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: old}})
+
+	want := "<!-- pollux-agent:superseded:" + id + " -->\n\nflag renamed\n\n- [x] Apply this change\n"
+	if got := writes[0].Body; got != want {
+		t.Errorf("superseded body = %q, want %q", got, want)
+	}
+}
+
+func TestSupersededSuggestionCommentLosesItsSuggestionFence(t *testing.T) {
+	t.Parallel()
+
+	p := review.Proposal{DocPath: "docs/a.md", Section: "Usage", Reason: "r", Lines: review.LineRange{Start: 3, End: 4}, Original: "## Usage\nold\n", Content: "## Usage\nnew\n"}
+	changed := []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 10}}}}
+	_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, changed, nil)
+	live := writes[0].Review.Body
+	id := gate.ProposalID("docs/a.md", "Usage")
+	prev := gate.PRState{Proposals: []gate.ProposalState{{ID: id, DocPath: "docs/a.md", Section: "Usage", CommentID: 1, State: gate.ProposalOpen, Content: "## Usage\nold\n"}}}
+
+	_, retired := gate.Reconcile(prev, testPR(), review.NoImpact{Reason: "x"}, nil, []gate.Comment{{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: live}})
+
+	want := strings.Replace(strings.Replace(live, "proposal", "superseded", 1), "```suggestion\n", "```\n", 1)
+	if got := retired[0].Body; got != want || strings.Contains(got, "suggestion\n") {
+		t.Errorf("retired body = %q, want %q", got, want)
 	}
 }
 
@@ -203,7 +238,7 @@ func TestSummaryRendering(t *testing.T) {
 		{
 			name:  "pending commit skip",
 			state: gate.PRState{PendingSkip: &gate.SkipAsk{User: "ann", Scope: gate.SkipCommit}},
-			want:  []string{"- [x] Skip this commit", "- [ ] Skip this PR", "Waiting for @ann to reply with a reason."},
+			want:  []string{"- [x] Skip this commit", "- [ ] Skip this PR", "Waiting for @ann to post the reason as a new comment on this PR."},
 		},
 		{
 			name:  "pending pr skip",

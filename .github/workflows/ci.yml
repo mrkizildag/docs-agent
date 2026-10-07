@@ -16,6 +16,8 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v7
         with:
           go-version-file: backend/go.mod
@@ -25,4 +27,6 @@ jobs:
           version: v2.12
           working-directory: backend
       - run: go test -race ./...
+      - run: make eval-check
+        working-directory: .
       - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

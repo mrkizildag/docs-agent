@@ -1,0 +1,21 @@
+id: docker-deploy-new-doc
+source: "PR #25"
+base: 6c783c0ab0cb44b242ba0baacd0250b0157234e2
+head: c78c4dc49c9d5165f735fffa316368a529dc3bef
+expect:
+  verdict: proposals
+  docs:
+    - path: docs/guides/*.md
+      new: true
+      must_say:
+        - "pollux runs as one Docker Compose container on a single host, published on 127.0.0.1:8080 only, with Tailscale Funnel on the host forwarding public HTTPS to it."
+        - "The SQLite database lives in the named volume pollux-data; docker compose down -v deletes it along with the queue and PR state."
+        - "The container runs as uid 65532 on a distroless image with no shell, so the GitHub App private key file must be readable by that uid."
+        - "A systemd user timer polls origin/main every 2 minutes, deploys a new commit with docker compose up --build --wait, and redeploys the last good commit if the build or health check fails."
+  allow: [docs/architecture.md]
+notes: >
+  The PR adds Dockerfile, compose.yaml, .dockerignore, deploy/ (update timer), and cmd/healthcheck; the human
+  wrote docs/guides/deploy.md and indexed it. Dockerfile, compose, and deploy/ are uncovered at base, so a new
+  guide is the expected proposal (the exact filename is free). The human also added one-line pointers to Deploy in
+  github-app.md and setup.md, but neither covers a changed file at base, so neither is reachable or required.
+  architecture.md is a candidate via backend/** (healthcheck) and is allowed.

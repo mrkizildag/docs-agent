@@ -1,0 +1,21 @@
+id: import-boundaries
+source: "PR #41"
+base: 14c3a4665f72f7d02bb07fa7e7885b04f1719096
+head: 6ee06012d367f46aa1c110cda39de9325e565c0e
+expect:
+  verdict: proposals
+  docs:
+    - path: docs/architecture.md
+      new: false
+      sections: ["Parts"]
+      must_say:
+        - "The backend's import boundaries (gate imports only internal/review, no runner imports internal/github, and the rest) are enforced by depguard in backend/.golangci.yml, so make lint fails on a violation."
+  allow: [docs/guides/setup.md]
+notes: >
+  BORDERLINE: the only changed file is backend/.golangci.yml, covered at base by setup.md (explicitly) and
+  architecture.md (backend/**). The change tightens depguard (gate may import internal/review but not its
+  subpackages; the runner rule now covers every internal/review/* package) and widens the forbidigo env-read
+  pattern. No doc text becomes wrong: architecture.md already states these boundaries, it just never says they
+  are lint-enforced. The human added that sentence to architecture.md's Parts and an exemption note to
+  setup.md (the git subprocess's os.Environ nolint already existed at base), so setup.md is only allowed.
+  A no_impact answer is defensible; the label follows the human's architecture.md edit.
