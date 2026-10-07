@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -136,7 +137,7 @@ func (f *e2eGitHub) UpdateCheckRun(context.Context, int64, string, string, int64
 	return nil
 }
 
-const baseGreetingDoc = "---\ntitle: Greeting\nsummary: Greets users.\ncovers:\n  - \"src/**\"\n---\n# Greeting\n\n## Greeting\n\nHi.\n"
+const baseGreetingDoc = "---\ntitle: Greeting\nsummary: Greets users.\ncovers:\n  - \"src/**\"\n---\n# Greetings\n\n## Greeting\n\nHi.\n"
 
 func e2ePullRequestBody(t *testing.T, number int, sha string) []byte {
 	t.Helper()
@@ -362,6 +363,13 @@ func (f *fakeActionsGitHub) handler() http.Handler {
 	})
 	mux.HandleFunc("GET /repos/acme/widgets/contents/.github/workflows/pollux-agent.yml", func(w http.ResponseWriter, _ *http.Request) {
 		f.json(w, http.StatusOK, `{"type":"file","name":"pollux-agent.yml","path":".github/workflows/pollux-agent.yml"}`)
+	})
+	mux.HandleFunc("GET /repos/acme/widgets/contents/docs/features", func(w http.ResponseWriter, _ *http.Request) {
+		f.json(w, http.StatusOK, `[{"type":"file","name":"greeting.md","path":"docs/features/greeting.md"}]`)
+	})
+	mux.HandleFunc("GET /repos/acme/widgets/contents/docs/features/greeting.md", func(w http.ResponseWriter, _ *http.Request) {
+		f.json(w, http.StatusOK, fmt.Sprintf(`{"type":"file","encoding":"base64","size":%d,"path":"docs/features/greeting.md","content":%q}`,
+			len(baseGreetingDoc), base64.StdEncoding.EncodeToString([]byte(baseGreetingDoc))))
 	})
 	mux.HandleFunc("GET /repos/acme/widgets/contents/docs", func(w http.ResponseWriter, _ *http.Request) {
 		f.json(w, http.StatusOK, `[{"type":"file","name":"README.md","path":"docs/README.md"}]`)
