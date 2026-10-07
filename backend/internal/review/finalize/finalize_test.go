@@ -3,6 +3,7 @@ package finalize_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -161,9 +162,23 @@ func TestProposals(t *testing.T) {
 		{
 			name:     "new doc refused without selection",
 			head:     &fakeHead{},
-			rules:    finalize.Rules{Changed: changedFiles(), AllowNewDoc: true},
+			rules:    finalize.Rules{Changed: changedFiles()},
 			raw:      []review.Proposal{newDoc("docs/t.md")},
 			problems: map[int][]string{0: {"not allowed"}},
+		},
+		{
+			name:     "whitespace-only section is not a new doc",
+			head:     &fakeHead{},
+			rules:    finalize.Rules{Changed: changedFiles(), Selection: sel, AllowNewDoc: true},
+			raw:      []review.Proposal{func() review.Proposal { p := newDoc("docs/t.md"); p.Section = "   "; return p }()},
+			problems: map[int][]string{0: {"must name a heading"}},
+		},
+		{
+			name:     "hash-only section rejected",
+			head:     &fakeHead{files: map[string]string{"docs/g.md": guide}},
+			rules:    finalize.Rules{Changed: changedFiles()},
+			raw:      []review.Proposal{edit("docs/g.md", " ## ")},
+			problems: map[int][]string{0: {"must name a heading"}},
 		},
 		{
 			name:  "every problem is reported with its index, one line, no content",
@@ -239,5 +254,59 @@ func TestNoImpactReason(t *testing.T) {
 	got := finalize.NoImpactReason(strings.Repeat("x", 1000))
 	if len(got) != 303 || !strings.HasSuffix(got, "...") {
 		t.Errorf("len = %d", len(got))
+	}
+}
+
+func TestProposalsUnknownHeadingKeepsWholeHeadingList(t *testing.T) {
+	var doc strings.Builder
+	for i := range 40 {
+		fmt.Fprintf(&doc, "## Heading number %02d\n\ntext\n\n", i)
+	}
+	head := &fakeHead{files: map[string]string{"docs/g.md": doc.String()}}
+
+	_, problems, err := finalize.Proposals(t.Context(), head, finalize.Rules{Changed: changedFiles()}, []review.Proposal{edit("docs/g.md", "Nope")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(problems) != 1 || !strings.Contains(problems[0].Err.Error(), `"Heading number 39"`) {
+		t.Errorf("problems = %v", problems)
+	}
+}
+
+func TestProposalsCapsQuotedModelText(t *testing.T) {
+	head := &fakeHead{files: map[string]string{"docs/g.md": guide}}
+
+	_, problems, err := finalize.Proposals(t.Context(), head, finalize.Rules{Changed: changedFiles()}, []review.Proposal{edit("docs/g.md", strings.Repeat("x", 1000))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(problems) != 1 || len(problems[0].Err.Error()) > 600 {
+		t.Errorf("problems = %v", problems)
+	}
+}
+
+func TestProposalsTooMany(t *testing.T) {
+	head := &fakeHead{files: map[string]string{"docs/g.md": guide}}
+	raw := make([]review.Proposal, finalize.MaxProposals+1)
+	for i := range raw {
+		raw[i] = edit("docs/g.md", "Usage")
+	}
+
+	got, problems, err := finalize.Proposals(t.Context(), head, finalize.Rules{Changed: changedFiles()}, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil || len(problems) != 1 || problems[0].Index != finalize.MaxProposals || !strings.Contains(problems[0].Err.Error(), "too many proposals: 21") {
+		t.Errorf("got %v, problems = %v", got, problems)
+	}
+	if len(head.reads) != 0 {
+		t.Errorf("reads = %v, want none", head.reads)
+	}
+}
+
+func TestProposalsAllowNewDocNeedsSelection(t *testing.T) {
+	_, _, err := finalize.Proposals(t.Context(), &fakeHead{}, finalize.Rules{Changed: changedFiles(), AllowNewDoc: true}, []review.Proposal{newDoc("docs/t.md")})
+	if err == nil {
+		t.Error("err = nil, want programming error")
 	}
 }

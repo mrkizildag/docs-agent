@@ -40,6 +40,13 @@ func TestFileAtRef(t *testing.T) {
 	mux.HandleFunc("GET /repos/o/r/contents/docs/boom.md", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	})
+	mux.HandleFunc("GET /repos/o/r/contents/docs/huge.md", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		if _, err := fmt.Fprint(w, `{"message":"too large","errors":[{"resource":"Blob","field":"data","code":"too_large"}]}`); err != nil {
+			t.Errorf("write contents response: %v", err)
+		}
+	})
 	mux.HandleFunc("/", http.NotFound)
 
 	srv := httptest.NewServer(mux)
@@ -59,6 +66,7 @@ func TestFileAtRef(t *testing.T) {
 		{path: "docs/a.md", want: "# A\n", wantOK: true},
 		{path: "docs/missing.md"},
 		{path: "docs/big.md"},
+		{path: "docs/huge.md"},
 		{path: "docs/boom.md", wantErr: true},
 	}
 	for _, tc := range tests {
@@ -85,14 +93,34 @@ func TestPathAtRef(t *testing.T) {
 			t.Errorf("write contents response: %v", err)
 		}
 	})
+	mux.HandleFunc("GET /repos/o/r/contents/docs/boom.md", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	mux.HandleFunc("GET /repos/o/r/contents/docs/link", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprint(w, `{"type":"symlink","target":"real","path":"docs/link"}`); err != nil {
+			t.Errorf("write contents response: %v", err)
+		}
+	})
 	mux.HandleFunc("GET /repos/o/r/contents/docs", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if _, err := fmt.Fprint(w, `[{"type":"file","name":"a.md","path":"docs/a.md"}]`); err != nil {
 			t.Errorf("write contents response: %v", err)
 		}
 	})
-	mux.HandleFunc("GET /repos/o/r/contents/docs/boom.md", func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "boom", http.StatusInternalServerError)
+	mux.HandleFunc("GET /repos/o/r/contents/docs/huge.bin", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		if _, err := fmt.Fprint(w, `{"message":"too large","errors":[{"resource":"Blob","field":"data","code":"too_large"}]}`); err != nil {
+			t.Errorf("write contents response: %v", err)
+		}
+	})
+	mux.HandleFunc("GET /repos/o/r/contents/docs/forbidden.md", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		if _, err := fmt.Fprint(w, `{"message":"forbidden"}`); err != nil {
+			t.Errorf("write contents response: %v", err)
+		}
 	})
 	mux.HandleFunc("/", http.NotFound)
 
@@ -109,9 +137,12 @@ func TestPathAtRef(t *testing.T) {
 		want    bool
 		wantErr bool
 	}{
+		{path: "docs/huge.bin", want: true},
+		{path: "docs/forbidden.md", wantErr: true},
 		{path: "docs/a.md", want: true},
 		{path: "docs", want: true},
 		{path: "docs/missing.md"},
+		{path: "docs/link/new.md", want: true},
 		{path: "docs/boom.md", wantErr: true},
 	}
 	for _, tc := range tests {

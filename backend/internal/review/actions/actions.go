@@ -246,13 +246,14 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 		return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
 	}
 
-	rules := finalize.Rules{Changed: changed, Repo: c.Owner + "/" + c.Repo, AllowNewDoc: c.BaseSHA != ""}
+	rules := finalize.Rules{Changed: changed, Repo: c.Owner + "/" + c.Repo}
 	if c.BaseSHA != "" {
 		selection, err := r.selectAtBase(ctx, c.InstallationID, c.Owner, c.Repo, c.BaseSHA, changed)
 		if err != nil {
 			return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
 		}
 		rules.Selection = &selection
+		rules.AllowNewDoc = true
 	}
 
 	proposals, problems, err := finalize.Proposals(ctx, headAt{api: r.api, c: c}, rules, out.Proposals)
@@ -260,7 +261,7 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 		return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
 	}
 	if len(problems) > 0 {
-		return review.Result{}, &review.InvalidResultError{Cause: errors.New(capJoined(problems.Error()))}
+		return review.Result{}, &review.InvalidResultError{Cause: errors.New(capTo(problems.Error(), maxProblemsText))}
 	}
 	result.Verdict = review.Proposals(proposals)
 	return result, nil
@@ -311,10 +312,6 @@ func (o ClaudeOutput[T]) failure() error {
 
 func capText(s string) string {
 	return capTo(s, maxCauseText)
-}
-
-func capJoined(s string) string {
-	return capTo(s, maxProblemsText)
 }
 
 func capTo(s string, limit int) string {

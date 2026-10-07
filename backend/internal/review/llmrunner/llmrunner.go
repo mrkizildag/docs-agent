@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	pathpkg "path"
 	"strings"
 	"syscall"
 	"time"
@@ -273,23 +274,43 @@ type cloneHead struct{ root *os.Root }
 
 var _ finalize.Head = cloneHead{}
 
-func (h cloneHead) Exists(_ context.Context, path string) (bool, error) {
-	if _, err := h.root.Lstat(path); err != nil {
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
-			return false, nil
-		}
-		return false, fmt.Errorf("lstat %s at head: %w", path, err)
+// lstat reports ok=false when nothing is at path. A path under a symlinked
+// directory is unusable rather than absent; it is reported as taken.
+func (h cloneHead) lstat(path string) (info fs.FileInfo, ok, taken bool, err error) {
+	if h.underSymlink(path) {
+		return nil, false, true, nil
 	}
-	return true, nil
+	info, err = h.root.Lstat(path)
+	switch {
+	case err == nil:
+		return info, true, true, nil
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR):
+		return nil, false, false, nil
+	}
+	return nil, false, false, fmt.Errorf("lstat %s at head: %w", path, err)
+}
+
+// underSymlink reports whether a parent directory of p is a symlink. Such a
+// path can't be created as a doc, and os.Root follows links that stay inside
+// the clone, so it is checked before the lookup.
+func (h cloneHead) underSymlink(p string) bool {
+	for dir := pathpkg.Dir(p); dir != "." && dir != "/"; dir = pathpkg.Dir(dir) {
+		if info, err := h.root.Lstat(dir); err == nil && info.Mode()&fs.ModeSymlink != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (h cloneHead) Exists(_ context.Context, path string) (bool, error) {
+	_, _, taken, err := h.lstat(path)
+	return taken, err
 }
 
 func (h cloneHead) ReadFile(_ context.Context, path string) ([]byte, bool, error) {
-	info, err := h.root.Lstat(path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
-			return nil, false, nil
-		}
-		return nil, false, fmt.Errorf("lstat %s at head: %w", path, err)
+	info, ok, _, err := h.lstat(path)
+	if err != nil || !ok {
+		return nil, false, err
 	}
 	if !info.Mode().IsRegular() || info.Size() > docs.MaxDocBytes {
 		return nil, false, nil
@@ -478,6 +499,9 @@ func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, ind
 
 	rules := finalize.Rules{Changed: req.ChangedFiles, Selection: &sel, Repo: req.Owner + "/" + req.Repo, AllowNewDoc: allowNewDoc}
 	var finalized []review.Proposal
+	var headErr error
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	task := agent.Task{
 		Model:  r.model,
@@ -490,11 +514,14 @@ func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, ind
 			if err := json.Unmarshal(args, &parsed); err != nil {
 				return fmt.Errorf("decode submit_proposals arguments: %w", err)
 			}
-			out, problems, err := finalize.Proposals(ctx, cloneHead{root}, rules, parsed.Proposals)
+			out, problems, err := finalize.Proposals(runCtx, cloneHead{root}, rules, parsed.Proposals)
 			if err != nil {
-				return fmt.Errorf("finalize proposals: %w", err)
+				// The model cannot fix a failed read of the clone: end the loop.
+				headErr = fmt.Errorf("finalize proposals: %w", err)
+				cancel()
+				return errors.New("the server could not read the repository; submission not accepted")
 			}
-			if problems != nil {
+			if len(problems) > 0 {
 				return problems
 			}
 			finalized = out
@@ -504,7 +531,11 @@ func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, ind
 		Log:      log,
 	}
 
-	if _, _, err := agent.Run(ctx, r.m, task, budget); err != nil {
+	_, _, err = agent.Run(runCtx, r.m, task, budget)
+	if headErr != nil {
+		return nil, fmt.Errorf("draft proposals: %w", headErr)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("draft proposals: %w: %w", errProvider, err)
 	}
 	return finalized, nil

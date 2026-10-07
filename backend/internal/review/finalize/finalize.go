@@ -16,7 +16,11 @@ import (
 
 const (
 	maxReasonLen  = 300
-	maxProblemLen = 500
+	maxProblemLen = 4096 // backstop; the heading list and commentable ranges the model needs must fit.
+	maxQuotedLen  = 200  // cap on each model-supplied path or section interpolated into a problem.
+
+	// MaxProposals is the most proposals Proposals accepts in one batch.
+	MaxProposals = 20
 )
 
 // Head reads the PR's head commit.
@@ -32,13 +36,17 @@ type Rules struct {
 	Changed []review.ChangedFile
 	// Selection nil means no base selection: proposals get Proposal.Validate
 	// only, and every new doc is refused.
-	Selection   *basedocs.Selection
-	Repo        string // owner/repo, for doc-link checks
+	Selection *basedocs.Selection
+	Repo      string // owner/repo, for doc-link checks
+	// AllowNewDoc permits new docs; it requires a non-nil Selection, since
+	// their covers cannot be checked without one.
 	AllowNewDoc bool
 }
 
 // Problem is one reason proposal Index cannot be accepted. Its text is one
-// line, bounded, and never quotes the proposal's Content field.
+// line and bounded. It may quote the model-supplied paths, section names and
+// link targets and the headings of the head doc, but never the proposal's
+// Content field.
 type Problem struct {
 	Index int
 	Err   error
@@ -62,8 +70,16 @@ type readFile struct {
 
 // Proposals returns the finalized proposals and every problem found (nil when
 // none); callers reject the batch on any problem. err is set only when a head
-// read fails, which is transient.
+// read fails, which is transient, or when rules allow new docs without a
+// Selection. More than MaxProposals proposals yield one problem and no reads.
 func Proposals(ctx context.Context, head Head, rules Rules, raw []review.Proposal) ([]review.Proposal, Problems, error) {
+	if rules.AllowNewDoc && rules.Selection == nil {
+		return nil, nil, errors.New("finalize rules: AllowNewDoc requires a Selection")
+	}
+	if len(raw) > MaxProposals {
+		return nil, Problems{{Index: MaxProposals, Err: fmt.Errorf("too many proposals: %d, max %d", len(raw), MaxProposals)}}, nil
+	}
+
 	out := make([]review.Proposal, len(raw))
 	read := map[string]readFile{}
 
@@ -74,13 +90,6 @@ func Proposals(ctx context.Context, head Head, rules Rules, raw []review.Proposa
 			problems = append(problems, Problem{Index: i, Err: errors.New(oneLine(fmt.Sprintf(format, args...), maxProblemLen))})
 		}
 
-		p.Section = normalizeSection(p.Section)
-		if p.Section == "" && strings.TrimSpace(raw[i].Section) != "" {
-			fail("section: must name a heading")
-			out[i] = p
-			continue
-		}
-
 		out[i] = p
 
 		if err := validate(p, rules); err != nil {
@@ -88,9 +97,12 @@ func Proposals(ctx context.Context, head Head, rules Rules, raw []review.Proposa
 			continue
 		}
 
+		p.Section = docs.NormalizeHeading(p.Section)
+		out[i] = p
+
 		if p.Section == "" {
 			if !rules.AllowNewDoc {
-				fail("doc_path %q: new docs are not allowed here", p.DocPath)
+				fail("doc_path %q: new docs are not allowed here", quoted(p.DocPath))
 				continue
 			}
 			exists, err := head.Exists(ctx, p.DocPath)
@@ -98,7 +110,7 @@ func Proposals(ctx context.Context, head Head, rules Rules, raw []review.Proposa
 				return nil, nil, fmt.Errorf("check %s at head: %w", p.DocPath, err)
 			}
 			if exists {
-				fail("doc_path %q: already exists at head", p.DocPath)
+				fail("doc_path %q: already exists at head", quoted(p.DocPath))
 			}
 			continue
 		}
@@ -116,15 +128,15 @@ func Proposals(ctx context.Context, head Head, rules Rules, raw []review.Proposa
 			read[p.DocPath] = f
 		}
 		if !f.ok {
-			fail("doc_path %q: no such doc at head, or it is over %d bytes", p.DocPath, docs.MaxDocBytes)
+			fail("doc_path %q: no such doc at head, or it is over %d bytes", quoted(p.DocPath), docs.MaxDocBytes)
 			continue
 		}
 
 		switch n := countHeading(f.doc, p.Section); {
 		case n == 0:
-			fail("section %q: no such heading in %s; its headings are %s", p.Section, p.DocPath, headings(f.doc))
+			fail("section %q: no such heading in %q; its headings are %s", quoted(p.Section), quoted(p.DocPath), headings(f.doc))
 		case n > 1:
-			fail("section %q: ambiguous, %d headings of %s match; its headings are %s", p.Section, n, p.DocPath, headings(f.doc))
+			fail("section %q: ambiguous, %d headings of %q match; its headings are %s", quoted(p.Section), n, quoted(p.DocPath), headings(f.doc))
 		default:
 			p.Original, p.Lines.Start, p.Lines.End, _ = f.doc.SectionSpan(p.Section)
 			out[i] = p
@@ -143,17 +155,11 @@ func validate(p review.Proposal, rules Rules) error {
 	if rules.Selection != nil {
 		return rules.Selection.ValidateProposal(p, rules.Changed, rules.Repo) //nolint:wrapcheck // the caller names the proposal.
 	}
-	if err := p.Validate(rules.Changed); err != nil {
-		return err //nolint:wrapcheck // the caller names the proposal.
-	}
-	if p.Section == "" {
-		return errors.New("new docs are not allowed without a base docs selection")
-	}
-	return nil
+	return p.Validate(rules.Changed) //nolint:wrapcheck // the caller names the proposal.
 }
 
-func normalizeSection(s string) string {
-	return strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(s), "#"))
+func quoted(s string) string {
+	return oneLine(s, maxQuotedLen)
 }
 
 func countHeading(d docs.Doc, heading string) int {
