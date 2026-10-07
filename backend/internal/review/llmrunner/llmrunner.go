@@ -11,9 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/agent"
@@ -21,6 +23,7 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/llm"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/basedocs"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/finalize"
 )
 
 const runnerName = "llmrunner"
@@ -171,7 +174,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		if _, ok := index[docPath]; ok {
 			continue
 		}
-		d, err := headDoc(root, docPath)
+		d, err := headDoc(ctx, root, docPath)
 		if err != nil {
 			return review.Result{}, err
 		}
@@ -220,7 +223,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		if len(candidates) > 0 {
 			prefix = "no candidate doc is affected: "
 		}
-		return noImpact(oneLine(prefix+strings.Join(reasons, "; "), maxReasonLen), r.triageModel, budget), nil
+		return noImpact(finalize.NoImpactReason(prefix+strings.Join(reasons, "; ")), r.triageModel, budget), nil
 	}
 
 	proposals, err := r.draft(ctx, log, root, index, budget, fence, req, selection, impacted, allowNewDoc, patch)
@@ -234,7 +237,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	var kept []review.Proposal
 	var rejected []string
 	for _, p := range proposals {
-		supported, why, err := r.verify(ctx, log, index, budget, fence, p, patch)
+		supported, why, err := r.verify(ctx, log, budget, fence, p, patch)
 		if err != nil {
 			return review.Result{}, fmt.Errorf("verify proposal %s: %w", p.DocPath, err)
 		}
@@ -245,7 +248,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		}
 	}
 	if len(kept) == 0 {
-		return noImpact(oneLine("verification rejected every proposal: "+strings.Join(rejected, "; "), maxReasonLen), r.triageModel, budget), nil
+		return noImpact(finalize.NoImpactReason("verification rejected every proposal: "+strings.Join(rejected, "; ")), r.triageModel, budget), nil
 	}
 
 	return review.Result{Model: r.model, Verdict: review.Proposals(kept), Usage: usageOf(budget)}, nil
@@ -253,30 +256,59 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 
 // headDoc reads docPath from the head clone for a candidate that docs.Parse
 // left out, such as one with broken frontmatter, so a PR can't opt a doc out of
-// triage by breaking it. It never reads through a symlink.
-func headDoc(root *os.Root, docPath string) (docs.Doc, error) {
-	info, err := root.Lstat(docPath)
+// triage by breaking it.
+func headDoc(ctx context.Context, root *os.Root, docPath string) (docs.Doc, error) {
+	src, ok, err := cloneHead{root}.ReadFile(ctx, docPath)
 	if err != nil {
-		return docs.Doc{}, fmt.Errorf("candidate doc %s is missing at head: %w", docPath, err)
+		return docs.Doc{}, err
 	}
-	if !info.Mode().IsRegular() {
-		return docs.Doc{}, fmt.Errorf("candidate doc %s at head is not a regular file (mode %s)", docPath, info.Mode())
+	if !ok {
+		return docs.Doc{}, fmt.Errorf("candidate doc %s at head is missing, not a regular file, or over %d bytes", docPath, docs.MaxDocBytes)
+	}
+	return docs.ParseBody(docPath, src), nil
+}
+
+// cloneHead is the finalize.Head over the head clone. It never reads through a symlink.
+type cloneHead struct{ root *os.Root }
+
+var _ finalize.Head = cloneHead{}
+
+func (h cloneHead) Exists(_ context.Context, path string) (bool, error) {
+	if _, err := h.root.Lstat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return false, nil
+		}
+		return false, fmt.Errorf("lstat %s at head: %w", path, err)
+	}
+	return true, nil
+}
+
+func (h cloneHead) ReadFile(_ context.Context, path string) ([]byte, bool, error) {
+	info, err := h.root.Lstat(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("lstat %s at head: %w", path, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > docs.MaxDocBytes {
+		return nil, false, nil
 	}
 
-	f, err := root.Open(docPath)
+	f, err := h.root.Open(path)
 	if err != nil {
-		return docs.Doc{}, fmt.Errorf("open %s at head: %w", docPath, err)
+		return nil, false, fmt.Errorf("open %s at head: %w", path, err)
 	}
 	defer func() { _ = f.Close() }() // read-only handle
 
 	src, err := io.ReadAll(io.LimitReader(f, docs.MaxDocBytes+1))
 	if err != nil {
-		return docs.Doc{}, fmt.Errorf("read %s at head: %w", docPath, err)
+		return nil, false, fmt.Errorf("read %s at head: %w", path, err)
 	}
 	if len(src) > docs.MaxDocBytes {
-		return docs.Doc{}, fmt.Errorf("candidate doc %s at head exceeds %d bytes", docPath, docs.MaxDocBytes)
+		return nil, false, nil
 	}
-	return docs.ParseBody(docPath, src), nil
+	return src, true, nil
 }
 
 // headReadme reads docs/README.md from the head clone, empty when it is
@@ -304,9 +336,8 @@ func headReadme(root *os.Root) (string, error) {
 	return string(src), nil
 }
 
-const maxReasonLen = 300
-
-// oneLine collapses s onto a single line and truncates it to max bytes.
+// oneLine collapses s onto a single line and truncates it to max bytes. It
+// caps log and error text; no-impact reasons use finalize.NoImpactReason.
 func oneLine(s string, max int) string {
 	s = strings.Join(strings.Fields(s), " ")
 	if len(s) > max {
@@ -402,19 +433,10 @@ func (r *Runner) decideNewDoc(ctx context.Context, log *slog.Logger, budget *age
 
 // verify asks the triage model whether p is supported by the patch, given the
 // doc section p replaces.
-func (r *Runner) verify(ctx context.Context, log *slog.Logger, index docIndex, budget *agent.Budget, f fence, p review.Proposal, patch string) (supported bool, reason string, err error) {
-	section := "(new doc)"
-	if p.Section != "" {
-		doc, ok := index[p.DocPath]
-		if ok {
-			text, _, found := lookupSection(doc, p.Section)
-			if !found {
-				text = string(doc.Source)
-			}
-			section = text
-		} else {
-			section = "(doc does not exist)"
-		}
+func (r *Runner) verify(ctx context.Context, log *slog.Logger, budget *agent.Budget, f fence, p review.Proposal, patch string) (supported bool, reason string, err error) {
+	section := p.Original
+	if p.Section == "" {
+		section = "(new doc)"
 	}
 
 	var v verifyVerdict
@@ -426,42 +448,6 @@ func (r *Runner) verify(ctx context.Context, log *slog.Logger, index docIndex, b
 		return false, "", fmt.Errorf("%w: verify verdict has no \"supported\" field in reply %q", errProvider, oneLine(reply, 200))
 	}
 	return *v.Supported, v.Reason, nil
-}
-
-// normalizeSection strips leading '#'s and surrounding spaces from a section
-// heading as models write it.
-func normalizeSection(section string) string {
-	return strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(section), "#"))
-}
-
-// lookupSection returns the markdown under the heading titled heading. When
-// none matches it returns the quoted headings of the doc instead.
-func lookupSection(doc docs.Doc, heading string) (text string, headings []string, found bool) {
-	want := normalizeSection(heading)
-	for _, s := range doc.Sections {
-		if s.Level == 0 {
-			continue
-		}
-		if s.Heading == want {
-			return string(doc.Source[s.Start:s.End]), nil, true
-		}
-		headings = append(headings, fmt.Sprintf("%q", s.Heading))
-	}
-	return "", headings, false
-}
-
-// checkSection reports an error listing the doc's headings when section names
-// none of them. A doc missing at the head commit has no headings to check.
-func checkSection(index docIndex, docPath, section string) error {
-	doc, ok := index[docPath]
-	if !ok {
-		return nil
-	}
-	_, headings, found := lookupSection(doc, section)
-	if found {
-		return nil
-	}
-	return fmt.Errorf("section %q: no such heading in %s; headings are: %s", section, docPath, strings.Join(headings, ", "))
 }
 
 // submitProposalsArgs is the argument shape of the submit_proposals finishing
@@ -490,6 +476,9 @@ func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, ind
 		newDocFiles = sel.Uncovered
 	}
 
+	rules := finalize.Rules{Changed: req.ChangedFiles, Selection: &sel, Repo: req.Owner + "/" + req.Repo, AllowNewDoc: allowNewDoc}
+	var finalized []review.Proposal
+
 	task := agent.Task{
 		Model:  r.model,
 		System: draftSystemPrompt,
@@ -501,53 +490,24 @@ func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, ind
 			if err := json.Unmarshal(args, &parsed); err != nil {
 				return fmt.Errorf("decode submit_proposals arguments: %w", err)
 			}
-			for _, p := range parsed.Proposals {
-				p.Section = normalizeSection(p.Section)
-				if p.Section == "" {
-					if !allowNewDoc {
-						return fmt.Errorf("proposal %s: a new doc is not allowed here; use \"section\" to replace a section of an impacted doc", p.DocPath)
-					}
-					if _, exists := index[p.DocPath]; exists {
-						return fmt.Errorf("proposal %s: %s already exists at head; pick a new doc_path or use \"section\" to replace a section of it", p.DocPath, p.DocPath)
-					}
-				}
-				if err := sel.ValidateProposal(p, req.ChangedFiles, req.Owner+"/"+req.Repo); err != nil {
-					return fmt.Errorf("proposal %s: %w", p.DocPath, err)
-				}
-				if p.Section == "" {
-					continue
-				}
-				if err := checkSection(index, p.DocPath, p.Section); err != nil {
-					return fmt.Errorf("proposal %s: %w", p.DocPath, err)
-				}
+			out, problems, err := finalize.Proposals(ctx, cloneHead{root}, rules, parsed.Proposals)
+			if err != nil {
+				return fmt.Errorf("finalize proposals: %w", err)
 			}
+			if problems != nil {
+				return problems
+			}
+			finalized = out
 			return nil
 		},
 		MaxSteps: stepCap,
 		Log:      log,
 	}
 
-	raw, _, err := agent.Run(ctx, r.m, task, budget)
-	if err != nil {
+	if _, _, err := agent.Run(ctx, r.m, task, budget); err != nil {
 		return nil, fmt.Errorf("draft proposals: %w: %w", errProvider, err)
 	}
-
-	var parsed submitProposalsArgs
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, fmt.Errorf("decode accepted submit_proposals arguments: %w", err)
-	}
-
-	for i := range parsed.Proposals {
-		p := &parsed.Proposals[i]
-		p.Section = normalizeSection(p.Section)
-		if p.Section == "" {
-			continue
-		}
-		if text, start, end, ok := index[p.DocPath].SectionSpan(p.Section); ok {
-			p.Original, p.Lines = text, review.LineRange{Start: start, End: end}
-		}
-	}
-	return parsed.Proposals, nil
+	return finalized, nil
 }
 
 func submitProposalsTool() (llm.Tool, error) {

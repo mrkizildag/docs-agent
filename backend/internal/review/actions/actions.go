@@ -20,6 +20,7 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/docs"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/basedocs"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/finalize"
 )
 
 const (
@@ -35,6 +36,8 @@ const (
 	// maxCauseText bounds model-controlled text in an InvalidResultError, which
 	// becomes a public check-run summary.
 	maxCauseText = 200
+	// maxProblemsText bounds the joined per-proposal problems of one batch.
+	maxProblemsText = 1024
 )
 
 // DispatchInputs are the workflow_dispatch inputs of the pollux-agent workflow.
@@ -61,6 +64,8 @@ type WorkflowAPI interface {
 	// FileAtRef returns the file's content at ref, or ok=false when the file
 	// does not exist there or exceeds docs.MaxDocBytes.
 	FileAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (content []byte, ok bool, err error)
+	// PathAtRef reports whether anything (file of any size, directory, symlink) is at path at ref.
+	PathAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (exists bool, err error)
 	// DocsAtRef returns the .md files under docs/ at ref, rooted at the repo root.
 	DocsAtRef(ctx context.Context, installationID int64, owner, repo, ref string) (fs.FS, error)
 }
@@ -232,7 +237,7 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 		if strings.TrimSpace(out.NoImpactReason) == "" {
 			return review.Result{}, &review.InvalidResultError{Cause: errors.New("no proposals and an empty no_impact_reason")}
 		}
-		result.Verdict = review.NoImpact{Reason: out.NoImpactReason}
+		result.Verdict = review.NoImpact{Reason: finalize.NoImpactReason(out.NoImpactReason)}
 		return result, nil
 	}
 
@@ -241,75 +246,38 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 		return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
 	}
 
-	// A run started before its merge base was stored can't have a new doc's
-	// covers checked, so new docs from it are refused rather than trusted.
-	validate := func(p review.Proposal) error {
-		if p.Section == "" {
-			return errors.New("new doc: the run has no stored merge base to check its covers against")
-		}
-		return p.Validate(changed)
-	}
+	rules := finalize.Rules{Changed: changed, Repo: c.Owner + "/" + c.Repo, AllowNewDoc: c.BaseSHA != ""}
 	if c.BaseSHA != "" {
 		selection, err := r.selectAtBase(ctx, c.InstallationID, c.Owner, c.Repo, c.BaseSHA, changed)
 		if err != nil {
 			return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
 		}
-		validate = func(p review.Proposal) error { return selection.ValidateProposal(p, changed, c.Owner+"/"+c.Repo) }
+		rules.Selection = &selection
 	}
 
-	proposals := make(review.Proposals, len(out.Proposals))
-	for i, p := range out.Proposals {
-		if err := validate(p); err != nil {
-			return review.Result{}, &review.InvalidResultError{Cause: fmt.Errorf("proposal %d: %s", i, capText(err.Error()))}
-		}
-		if p.Section == "" {
-			_, exists, err := r.api.FileAtRef(ctx, c.InstallationID, c.Owner, c.Repo, p.DocPath, c.HeadSHA)
-			if err != nil {
-				return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: read %s at %s: %w", c.RunID, c.Owner, c.Repo, p.DocPath, c.HeadSHA, err)
-			}
-			if exists {
-				return review.Result{}, &review.InvalidResultError{Cause: fmt.Errorf("proposal %d: new doc %s already exists at head", i, p.DocPath)}
-			}
-		}
-		proposals[i] = p
-	}
-	if err := r.fillOriginals(ctx, c, proposals); err != nil {
+	proposals, problems, err := finalize.Proposals(ctx, headAt{api: r.api, c: c}, rules, out.Proposals)
+	if err != nil {
 		return review.Result{}, fmt.Errorf("collect actions run %d of %s/%s: %w", c.RunID, c.Owner, c.Repo, err)
 	}
-	result.Verdict = proposals
+	if len(problems) > 0 {
+		return review.Result{}, &review.InvalidResultError{Cause: errors.New(capJoined(problems.Error()))}
+	}
+	result.Verdict = review.Proposals(proposals)
 	return result, nil
 }
 
-// fillOriginals sets Original and Lines on each proposal that replaces a
-// section, from the doc at the completion's head. A doc or section missing
-// there leaves both empty.
-func (r *Runner) fillOriginals(ctx context.Context, c review.Completion, proposals review.Proposals) error {
-	parsed := map[string]*docs.Doc{}
-	for i, p := range proposals {
-		if p.Section == "" {
-			continue
-		}
-		doc, seen := parsed[p.DocPath]
-		if !seen {
-			src, ok, err := r.api.FileAtRef(ctx, c.InstallationID, c.Owner, c.Repo, p.DocPath, c.HeadSHA)
-			if err != nil {
-				return fmt.Errorf("read %s at %s: %w", p.DocPath, c.HeadSHA, err)
-			}
-			if ok {
-				if d, err := docs.ParseDoc(p.DocPath, src); err == nil {
-					doc = &d
-				}
-			}
-			parsed[p.DocPath] = doc
-		}
-		if doc == nil {
-			continue
-		}
-		if text, start, end, ok := doc.SectionSpan(p.Section); ok {
-			proposals[i].Original, proposals[i].Lines = text, review.LineRange{Start: start, End: end}
-		}
-	}
-	return nil
+// headAt reads the PR's head commit through the workflow API.
+type headAt struct {
+	api WorkflowAPI
+	c   review.Completion
+}
+
+func (h headAt) Exists(ctx context.Context, path string) (bool, error) {
+	return h.api.PathAtRef(ctx, h.c.InstallationID, h.c.Owner, h.c.Repo, path, h.c.HeadSHA) //nolint:wrapcheck // finalize names the path.
+}
+
+func (h headAt) ReadFile(ctx context.Context, path string) ([]byte, bool, error) {
+	return h.api.FileAtRef(ctx, h.c.InstallationID, h.c.Owner, h.c.Repo, path, h.c.HeadSHA) //nolint:wrapcheck // finalize names the path.
 }
 
 // output returns the structured output of an artifact that belongs to c's
@@ -342,10 +310,18 @@ func (o ClaudeOutput[T]) failure() error {
 }
 
 func capText(s string) string {
-	if len(s) <= maxCauseText {
+	return capTo(s, maxCauseText)
+}
+
+func capJoined(s string) string {
+	return capTo(s, maxProblemsText)
+}
+
+func capTo(s string, limit int) string {
+	if len(s) <= limit {
 		return s
 	}
-	return strings.ToValidUTF8(s[:maxCauseText], "") + "..."
+	return strings.ToValidUTF8(s[:limit], "") + "..."
 }
 
 // reviewUsage is nil when the run reported no valid token count or cost.

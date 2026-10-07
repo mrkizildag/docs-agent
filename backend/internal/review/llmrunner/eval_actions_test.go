@@ -233,6 +233,14 @@ func (w *localWorkflow) FileAtRef(ctx context.Context, _ int64, _, _, path, ref 
 	return gitFileAt(ctx, w.in.Dir, ref, path)
 }
 
+func (w *localWorkflow) PathAtRef(ctx context.Context, _ int64, _, _, path, ref string) (bool, error) {
+	entry, err := runEvalGit(ctx, w.in.Dir, nil, "ls-tree", "-z", ref, "--", path)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(entry) != "", nil
+}
+
 func (w *localWorkflow) DocsAtRef(ctx context.Context, _ int64, _, _, ref string) (fs.FS, error) {
 	names, err := runEvalGit(ctx, w.in.Dir, nil, "ls-tree", "-r", "-z", "--name-only", ref, "--", "docs")
 	if err != nil {

@@ -367,8 +367,8 @@ func TestStart_NewDocWhoseCoversMissTheUncoveredFilesIsReturnedToModel(t *testin
 	)
 	last := model.calls[len(model.calls)-1].Messages
 	results := last[len(last)-1].ToolResults
-	if len(results) != 1 || !results[0].IsError || !strings.Contains(results[0].Content, "docs/other.md") {
-		t.Errorf("tool results = %+v, want an error naming docs/other.md", results)
+	if len(results) != 1 || !results[0].IsError || !strings.Contains(results[0].Content, "proposal 0: covers match none") {
+		t.Errorf("tool results = %+v, want a proposal 0 error about covers", results)
 	}
 }
 
@@ -393,8 +393,8 @@ func TestStart_HashOnlySectionCannotBypassNewDocChecks(t *testing.T) {
 	verdict, _, model := startCoveredOnly(t, triageResponse(true), submitResponse(proposal), submitResponse())
 	last := model.calls[len(model.calls)-1].Messages
 	results := last[len(last)-1].ToolResults
-	if len(results) != 1 || !results[0].IsError || !strings.Contains(results[0].Content, "not allowed") {
-		t.Errorf("tool results = %+v, want an error rejecting the new doc", results)
+	if len(results) != 1 || !results[0].IsError || !strings.Contains(results[0].Content, "proposal 0: section: must name a heading") {
+		t.Errorf("tool results = %+v, want an error rejecting the empty heading", results)
 	}
 	if _, ok := verdict.(review.NoImpact); !ok {
 		t.Errorf("Verdict = %#v, want NoImpact, no new doc", verdict)
@@ -506,7 +506,7 @@ func TestStart_VerificationDropsRejectedProposal(t *testing.T) {
 
 	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
 		triageResponse(true),
-		submitResponse(proposalFor("docs/x.md", 2), proposalFor("docs/y.md", 3)),
+		submitResponse(proposalFor("docs/x.md", 2), proposalFor("docs/x.md", 3)),
 		verifyResponse(true),
 		verifyResponse(false),
 	}}
@@ -516,8 +516,8 @@ func TestStart_VerificationDropsRejectedProposal(t *testing.T) {
 		t.Fatalf("Start() = %v, want nil error", err)
 	}
 	proposals, ok := verdict.(review.Proposals)
-	if !ok || len(proposals) != 1 || proposals[0].DocPath != "docs/x.md" {
-		t.Fatalf("Verdict = %#v, want exactly the docs/x.md proposal", verdict)
+	if !ok || len(proposals) != 1 || proposals[0].Anchor.Line != 2 {
+		t.Fatalf("Verdict = %#v, want exactly the first proposal", verdict)
 	}
 }
 
@@ -600,7 +600,7 @@ func TestStart_InvalidProposalIsReturnedToModel(t *testing.T) {
 		submitResponse(bad),
 		func(req llm.Request) (llm.Response, error) {
 			last := req.Messages[len(req.Messages)-1]
-			if len(last.ToolResults) != 1 || !last.ToolResults[0].IsError || !strings.Contains(last.ToolResults[0].Content, `anchor.line 99: not a numbered line in the diff of "main.go"; commentable lines: 1-3`) {
+			if len(last.ToolResults) != 1 || !last.ToolResults[0].IsError || !strings.Contains(last.ToolResults[0].Content, `proposal 0: anchor.line 99: not a numbered line in the diff of "main.go"; commentable lines: 1-3`) {
 				t.Errorf("last message = %+v, want a validation error tool result listing the commentable lines", last)
 			}
 			return submitResponse(proposalFor("docs/x.md", 2))(req)
@@ -1019,5 +1019,101 @@ func TestCombinedPatchCapCutsAtALineEnd(t *testing.T) {
 	}
 	if last := before[strings.LastIndexByte(before, '\n')+1:]; !strings.HasSuffix(last, " END") {
 		t.Errorf("last line before the truncation note = %q, want a whole numbered line", last)
+	}
+}
+
+// startOnRepo runs Start over a repo the caller prepared and returns the
+// verdict and the model.
+func startOnRepo(t *testing.T, repoDir, headSHA string, changed []review.ChangedFile, script ...func(llm.Request) (llm.Response, error)) (review.Verdict, *fakeModel) {
+	t.Helper()
+
+	model := &fakeModel{script: script}
+	runner := llmrunner.New(model, noToken, "triage-model", "draft-model", slog.New(slog.DiscardHandler))
+	runner.SetRemote(repoDir)
+	req := testRequest(headSHA)
+	req.ChangedFiles = changed
+	started, err := runner.Start(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Start() = %v, want nil error", err)
+	}
+	result, ok := started.(review.Result)
+	if !ok {
+		t.Fatalf("Start() = %T, want review.Result", started)
+	}
+	return result.Verdict, model
+}
+
+// returnedToModel is the error text of the tool result the model got after its
+// first submission.
+func returnedToModel(t *testing.T, model *fakeModel) string {
+	t.Helper()
+
+	for _, call := range model.calls {
+		for _, m := range call.Messages {
+			for _, r := range m.ToolResults {
+				if r.IsError {
+					return r.Content
+				}
+			}
+		}
+	}
+	t.Fatal("model never received an error tool result")
+	return ""
+}
+
+func TestStart_DuplicateHeadingIsReturnedToModelAsAmbiguous(t *testing.T) {
+	t.Parallel()
+
+	repoDir, _ := newGitRepo(t)
+	headSHA := commitDoc(t, repoDir, "docs/x.md", "---\ntitle: X\nsummary: Describes X.\ncovers:\n  - main.go\n---\n# Top\n\n## X\none\n\n## X\ntwo\n")
+
+	_, model := startOnRepo(t, repoDir, headSHA, testRequest(headSHA).ChangedFiles,
+		triageResponse(true), submitResponse(proposalFor("docs/x.md", 2)), submitResponse())
+	if got := returnedToModel(t, model); !strings.Contains(got, "proposal 0:") || !strings.Contains(got, "ambiguous") {
+		t.Errorf("tool error = %q, want proposal 0 reported as ambiguous", got)
+	}
+}
+
+func TestStart_SectionEditOfDocMissingAtHeadIsReturnedToModel(t *testing.T) {
+	t.Parallel()
+
+	repoDir, headSHA := newGitRepo(t)
+	_, model := startOnRepo(t, repoDir, headSHA, testRequest(headSHA).ChangedFiles,
+		triageResponse(true), submitResponse(proposalFor("docs/y.md", 2)), submitResponse())
+	if got := returnedToModel(t, model); !strings.Contains(got, "proposal 0:") || !strings.Contains(got, "no such doc at head") {
+		t.Errorf("tool error = %q, want proposal 0 reported as a doc missing at head", got)
+	}
+}
+
+func TestStart_NewDocAtADirectoryPathIsReturnedToModel(t *testing.T) {
+	t.Parallel()
+
+	repoDir, _ := newGitRepo(t)
+	if err := os.MkdirAll(filepath.Join(repoDir, "docs", "other.md"), 0o700); err != nil {
+		t.Fatalf("mkdir docs/other.md: %v", err)
+	}
+	headSHA := commitDoc(t, repoDir, "docs/other.md/keep.txt", "keep\n")
+
+	changed := []review.ChangedFile{mainGoChange(), otherGoChange()}
+	_, model := startOnRepo(t, repoDir, headSHA, changed,
+		triageResponse(true), newDocResponse(true), submitResponse(newDocProposal("other.go")), submitResponse(), verifyResponse(true))
+	if got := returnedToModel(t, model); !strings.Contains(got, "proposal 0:") || !strings.Contains(got, "already exists") {
+		t.Errorf("tool error = %q, want proposal 0 reported as already existing", got)
+	}
+}
+
+func TestStart_EveryBadProposalIsReturnedToModelWithItsIndex(t *testing.T) {
+	t.Parallel()
+
+	_, _, model := startCoveredOnly(t, triageResponse(true),
+		submitResponse(proposalFor("docs/y.md", 2), proposalFor("docs/x.md", 2), proposalFor("docs/z.md", 2)), submitResponse())
+	got := returnedToModel(t, model)
+	for _, want := range []string{"proposal 0:", "proposal 2:"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("tool error = %q, want it to contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, "proposal 1:") {
+		t.Errorf("tool error = %q, want no problem for the valid proposal 1", got)
 	}
 }

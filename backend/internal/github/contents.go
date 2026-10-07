@@ -34,3 +34,21 @@ func (c *Client) FileAtRef(ctx context.Context, installationID int64, owner, rep
 	}
 	return []byte(text), true, nil
 }
+
+// PathAtRef reports whether anything (file of any size, directory, symlink) is
+// at path in owner/repo at ref.
+func (c *Client) PathAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (exists bool, err error) {
+	client, err := c.installationClient(installationID)
+	if err != nil {
+		return false, fmt.Errorf("stat %s of %s/%s at %s: %w", path, owner, repo, ref, err)
+	}
+
+	_, _, resp, err := client.Repositories.GetContents(ctx, owner, repo, path, &github.RepositoryContentGetOptions{Ref: ref})
+	if err != nil {
+		if isNotFound(resp) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat %s of %s/%s at %s: %w", path, owner, repo, ref, err)
+	}
+	return true, nil
+}

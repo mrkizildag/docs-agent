@@ -68,3 +68,56 @@ func TestFileAtRef(t *testing.T) {
 		}
 	}
 }
+
+func TestPathAtRef(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /app/installations/{id}/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprintf(w, `{"token":"ghs_test","expires_at":%q}`, time.Now().Add(time.Hour).Format(time.RFC3339)); err != nil {
+			t.Errorf("write access_tokens response: %v", err)
+		}
+	})
+	mux.HandleFunc("GET /repos/o/r/contents/docs/a.md", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprint(w, `{"type":"file","encoding":"none","size":2000000,"content":""}`); err != nil {
+			t.Errorf("write contents response: %v", err)
+		}
+	})
+	mux.HandleFunc("GET /repos/o/r/contents/docs", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprint(w, `[{"type":"file","name":"a.md","path":"docs/a.md"}]`); err != nil {
+			t.Errorf("write contents response: %v", err)
+		}
+	})
+	mux.HandleFunc("GET /repos/o/r/contents/docs/boom.md", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/", http.NotFound)
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	client, err := ghclient.NewClient(&http.Client{Timeout: 5 * time.Second}, 1, testPrivateKeyPEM(t), srv.URL)
+	if err != nil {
+		t.Fatalf("NewClient() = %v, want nil error", err)
+	}
+
+	tests := []struct {
+		path    string
+		want    bool
+		wantErr bool
+	}{
+		{path: "docs/a.md", want: true},
+		{path: "docs", want: true},
+		{path: "docs/missing.md"},
+		{path: "docs/boom.md", wantErr: true},
+	}
+	for _, tc := range tests {
+		got, err := client.PathAtRef(t.Context(), 1, "o", "r", tc.path, "abc")
+		if (err != nil) != tc.wantErr || got != tc.want {
+			t.Errorf("PathAtRef(%q) = %v, %v; want %v, error=%v", tc.path, got, err, tc.want, tc.wantErr)
+		}
+	}
+}
