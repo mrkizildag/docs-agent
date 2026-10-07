@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	pathpkg "path"
 
 	"github.com/google/go-github/v92/github"
 
@@ -38,36 +37,26 @@ func (c *Client) FileAtRef(ctx context.Context, installationID int64, owner, rep
 	return []byte(text), true, nil
 }
 
-// PathAtRef reports whether anything (file of any size, directory, symlink) is
-// at path in owner/repo at ref.
-func (c *Client) PathAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (exists bool, err error) {
+// PathAtRef reports what is at path itself in owner/repo at ref: nothing, a
+// directory, or anything else (a file of any size, symlink, submodule). It
+// does not look at parent paths.
+func (c *Client) PathAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (exists, dir bool, err error) {
 	client, err := c.installationClient(installationID)
 	if err != nil {
-		return false, fmt.Errorf("stat %s of %s/%s at %s: %w", path, owner, repo, ref, err)
+		return false, false, fmt.Errorf("stat %s of %s/%s at %s: %w", path, owner, repo, ref, err)
 	}
 
-	opts := &github.RepositoryContentGetOptions{Ref: ref}
-	_, _, resp, err := client.Repositories.GetContents(ctx, owner, repo, path, opts)
+	file, _, resp, err := client.Repositories.GetContents(ctx, owner, repo, path, &github.RepositoryContentGetOptions{Ref: ref})
 	switch {
-	case err == nil, isTooLarge(err):
-		return true, nil
-	case !isNotFound(resp):
-		return false, fmt.Errorf("stat %s of %s/%s at %s: %w", path, owner, repo, ref, err)
+	case err == nil:
+		// Only a directory lists entries, which leaves file nil.
+		return true, file == nil, nil
+	case isTooLarge(err):
+		return true, false, nil
+	case isNotFound(resp):
+		return false, false, nil
 	}
-
-	// A path under a file, symlink, or submodule reads as missing but can't be
-	// created; the nearest existing parent decides. Only a directory lists
-	// entries, which leaves file nil.
-	for dir := pathpkg.Dir(path); dir != "." && dir != "/"; dir = pathpkg.Dir(dir) {
-		file, _, resp, err := client.Repositories.GetContents(ctx, owner, repo, dir, opts)
-		switch {
-		case err == nil:
-			return file != nil, nil
-		case !isNotFound(resp):
-			return false, fmt.Errorf("stat %s of %s/%s at %s: %w", dir, owner, repo, ref, err)
-		}
-	}
-	return false, nil
+	return false, false, fmt.Errorf("stat %s of %s/%s at %s: %w", path, owner, repo, ref, err)
 }
 
 // isTooLarge reports whether the contents API refused a file over 100 MB, which

@@ -64,8 +64,10 @@ type WorkflowAPI interface {
 	// FileAtRef returns the file's content at ref, or ok=false when the file
 	// does not exist there or exceeds docs.MaxDocBytes.
 	FileAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (content []byte, ok bool, err error)
-	// PathAtRef reports whether anything (file of any size, directory, symlink) is at path at ref.
-	PathAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (exists bool, err error)
+	// PathAtRef reports what is at path itself at ref, without looking at its
+	// parents: exists is false when nothing is there; dir is true for a
+	// directory, false for a file of any size, symlink, or submodule.
+	PathAtRef(ctx context.Context, installationID int64, owner, repo, path, ref string) (exists, dir bool, err error)
 	// DocsAtRef returns the .md files under docs/ at ref, rooted at the repo root.
 	DocsAtRef(ctx context.Context, installationID int64, owner, repo, ref string) (fs.FS, error)
 }
@@ -273,12 +275,25 @@ type headAt struct {
 	c   review.Completion
 }
 
-func (h headAt) Exists(ctx context.Context, path string) (bool, error) {
-	return h.api.PathAtRef(ctx, h.c.InstallationID, h.c.Owner, h.c.Repo, path, h.c.HeadSHA) //nolint:wrapcheck // finalize names the path.
+func (h headAt) Stat(ctx context.Context, path string) (finalize.Kind, error) {
+	exists, dir, err := h.api.PathAtRef(ctx, h.c.InstallationID, h.c.Owner, h.c.Repo, path, h.c.HeadSHA)
+	switch {
+	case err != nil:
+		return finalize.Missing, fmt.Errorf("stat %s at %s: %w", path, h.c.HeadSHA, err)
+	case !exists:
+		return finalize.Missing, nil
+	case dir:
+		return finalize.Dir, nil
+	}
+	return finalize.Other, nil
 }
 
 func (h headAt) ReadFile(ctx context.Context, path string) ([]byte, bool, error) {
-	return h.api.FileAtRef(ctx, h.c.InstallationID, h.c.Owner, h.c.Repo, path, h.c.HeadSHA) //nolint:wrapcheck // finalize names the path.
+	src, ok, err := h.api.FileAtRef(ctx, h.c.InstallationID, h.c.Owner, h.c.Repo, path, h.c.HeadSHA)
+	if err != nil {
+		return nil, false, fmt.Errorf("read %s at %s: %w", path, h.c.HeadSHA, err)
+	}
+	return src, ok, nil
 }
 
 // output returns the structured output of an artifact that belongs to c's

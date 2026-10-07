@@ -364,6 +364,9 @@ func (f *fakeActionsGitHub) handler() http.Handler {
 	mux.HandleFunc("GET /repos/acme/widgets/contents/.github/workflows/pollux-agent.yml", func(w http.ResponseWriter, _ *http.Request) {
 		f.json(w, http.StatusOK, `{"type":"file","name":"pollux-agent.yml","path":".github/workflows/pollux-agent.yml"}`)
 	})
+	mux.HandleFunc("GET /repos/acme/widgets/contents/docs/features", func(w http.ResponseWriter, _ *http.Request) {
+		f.json(w, http.StatusOK, `[{"type":"file","name":"greeting.md","path":"docs/features/greeting.md"}]`)
+	})
 	mux.HandleFunc("GET /repos/acme/widgets/contents/docs/features/greeting.md", func(w http.ResponseWriter, _ *http.Request) {
 		f.json(w, http.StatusOK, fmt.Sprintf(`{"type":"file","encoding":"base64","size":%d,"path":"docs/features/greeting.md","content":%q}`,
 			len(baseGreetingDoc), base64.StdEncoding.EncodeToString([]byte(baseGreetingDoc))))

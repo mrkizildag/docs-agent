@@ -23,10 +23,20 @@ const (
 	MaxProposals = 20
 )
 
-// Head reads the PR's head commit.
+// Kind is what a Head finds at one path.
+type Kind int
+
+const (
+	Missing Kind = iota
+	Dir
+	Other // a file of any size, a symlink, a submodule
+)
+
+// Head reads the PR's head commit one path at a time; Proposals owns the
+// rules about parent directories.
 type Head interface {
-	// Exists reports whether anything (file of any size, directory, symlink) is at path.
-	Exists(ctx context.Context, path string) (bool, error)
+	// Stat reports what is at path itself; it must not follow a symlink at path.
+	Stat(ctx context.Context, path string) (Kind, error)
 	// ReadFile returns a regular file; ok is false when there is none or it is over docs.MaxDocBytes.
 	ReadFile(ctx context.Context, path string) (src []byte, ok bool, err error)
 }
@@ -82,6 +92,7 @@ func Proposals(ctx context.Context, head Head, rules Rules, raw []review.Proposa
 
 	out := make([]review.Proposal, len(raw))
 	read := map[string]readFile{}
+	view := &headView{head: head, stats: map[string]Kind{}}
 
 	var problems Problems
 
@@ -92,7 +103,13 @@ func Proposals(ctx context.Context, head Head, rules Rules, raw []review.Proposa
 
 		out[i] = p
 
-		if err := validate(p, rules); err != nil {
+		var err error
+		if rules.Selection != nil {
+			err = rules.Selection.ValidateProposal(p, rules.Changed, rules.Repo)
+		} else {
+			err = p.Validate(rules.Changed)
+		}
+		if err != nil {
 			fail("%v", err)
 			continue
 		}
@@ -105,21 +122,31 @@ func Proposals(ctx context.Context, head Head, rules Rules, raw []review.Proposa
 				fail("doc_path %q: new docs are not allowed here", quoted(p.DocPath))
 				continue
 			}
-			exists, err := head.Exists(ctx, p.DocPath)
+			pk, err := view.parents(ctx, p.DocPath)
 			if err != nil {
-				return nil, nil, fmt.Errorf("check %s at head: %w", p.DocPath, err)
+				return nil, nil, err
 			}
-			if exists {
+			if pk == Other {
 				fail("doc_path %q: already exists at head", quoted(p.DocPath))
+				continue
+			}
+			if pk == Dir {
+				k, err := view.stat(ctx, p.DocPath)
+				if err != nil {
+					return nil, nil, err
+				}
+				if k != Missing {
+					fail("doc_path %q: already exists at head", quoted(p.DocPath))
+				}
 			}
 			continue
 		}
 
 		f, seen := read[p.DocPath]
 		if !seen {
-			src, ok, err := head.ReadFile(ctx, p.DocPath)
+			src, ok, err := view.readDoc(ctx, p.DocPath)
 			if err != nil {
-				return nil, nil, fmt.Errorf("read %s at head: %w", p.DocPath, err)
+				return nil, nil, err
 			}
 			f = readFile{ok: ok}
 			if ok {
@@ -149,13 +176,6 @@ func Proposals(ctx context.Context, head Head, rules Rules, raw []review.Proposa
 // NoImpactReason collapses s to one trimmed line of at most maxReasonLen bytes.
 func NoImpactReason(s string) string {
 	return oneLine(s, maxReasonLen)
-}
-
-func validate(p review.Proposal, rules Rules) error {
-	if rules.Selection != nil {
-		return rules.Selection.ValidateProposal(p, rules.Changed, rules.Repo) //nolint:wrapcheck // the caller names the proposal.
-	}
-	return p.Validate(rules.Changed) //nolint:wrapcheck // the caller names the proposal.
 }
 
 func quoted(s string) string {
@@ -191,4 +211,55 @@ func oneLine(s string, limit int) string {
 		s = strings.ToValidUTF8(s[:limit], "") + "..."
 	}
 	return s
+}
+
+// ReadDoc reads docPath at head the way a section edit's doc is read: only when
+// every parent is a directory, so a doc is never reached through a symlink or a
+// file. ok is false when there is no such regular file within docs.MaxDocBytes.
+func ReadDoc(ctx context.Context, head Head, docPath string) (src []byte, ok bool, err error) {
+	return (&headView{head: head, stats: map[string]Kind{}}).readDoc(ctx, docPath)
+}
+
+// headView caches Stat results for one pass over a head.
+type headView struct {
+	head  Head
+	stats map[string]Kind
+}
+
+func (v *headView) stat(ctx context.Context, path string) (Kind, error) {
+	if k, ok := v.stats[path]; ok {
+		return k, nil
+	}
+	k, err := v.head.Stat(ctx, path)
+	if err != nil {
+		return Missing, fmt.Errorf("check %s at head: %w", path, err)
+	}
+	v.stats[path] = k
+	return k, nil
+}
+
+// parents walks docPath's parent directories top-down and stops at the first
+// that is not a directory, so nothing is looked up below a symlink or a file.
+// It returns Dir when every parent is one.
+func (v *headView) parents(ctx context.Context, docPath string) (Kind, error) {
+	segs := strings.Split(docPath, "/")
+	for i := 1; i < len(segs); i++ {
+		k, err := v.stat(ctx, strings.Join(segs[:i], "/"))
+		if err != nil || k != Dir {
+			return k, err
+		}
+	}
+	return Dir, nil
+}
+
+func (v *headView) readDoc(ctx context.Context, docPath string) ([]byte, bool, error) {
+	pk, err := v.parents(ctx, docPath)
+	if err != nil || pk != Dir {
+		return nil, false, err
+	}
+	src, ok, err := v.head.ReadFile(ctx, docPath)
+	if err != nil {
+		return nil, false, fmt.Errorf("read %s at head: %w", docPath, err)
+	}
+	return src, ok, nil
 }

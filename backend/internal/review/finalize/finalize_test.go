@@ -14,14 +14,34 @@ import (
 
 type fakeHead struct {
 	files map[string]string
-	other map[string]bool // paths that exist but are not readable files
+	other map[string]bool          // paths that exist but are not readable files
+	kinds map[string]finalize.Kind // explicit kinds, overriding the derived ones
 	reads map[string]int
+	stats map[string]int
 	err   error
 }
 
-func (h *fakeHead) Exists(_ context.Context, path string) (bool, error) {
-	_, ok := h.files[path]
-	return ok || h.other[path], h.err
+// Stat derives directories from the parents of files and other.
+func (h *fakeHead) Stat(_ context.Context, path string) (finalize.Kind, error) {
+	if h.stats == nil {
+		h.stats = map[string]int{}
+	}
+	h.stats[path]++
+	if h.err != nil {
+		return finalize.Missing, h.err
+	}
+	if k, ok := h.kinds[path]; ok {
+		return k, nil
+	}
+	if _, ok := h.files[path]; ok || h.other[path] {
+		return finalize.Other, nil
+	}
+	for p := range h.files {
+		if strings.HasPrefix(p, path+"/") {
+			return finalize.Dir, nil
+		}
+	}
+	return finalize.Missing, nil
 }
 
 func (h *fakeHead) ReadFile(_ context.Context, path string) ([]byte, bool, error) {
@@ -141,7 +161,7 @@ func TestProposals(t *testing.T) {
 		},
 		{
 			name:     "new doc at existing directory",
-			head:     &fakeHead{other: map[string]bool{"docs/t.md": true}},
+			head:     &fakeHead{other: map[string]bool{"docs/t.md": true}, kinds: map[string]finalize.Kind{"docs": finalize.Dir}},
 			rules:    finalize.Rules{Changed: changedFiles(), Selection: sel, AllowNewDoc: true},
 			raw:      []review.Proposal{newDoc("docs/t.md")},
 			problems: map[int][]string{0: {"already exists at head"}},
@@ -234,6 +254,62 @@ func TestProposalsReadsEachDocOnce(t *testing.T) {
 	}
 	if head.reads["docs/g.md"] != 1 {
 		t.Errorf("reads = %d, want 1", head.reads["docs/g.md"])
+	}
+}
+
+func TestProposalsParentRule(t *testing.T) {
+	sel := &basedocs.Selection{Uncovered: []string{"a.go"}}
+	tests := []struct {
+		name    string
+		kinds   map[string]finalize.Kind
+		raw     review.Proposal
+		problem string // empty means accepted
+		noStat  []string
+	}{
+		{name: "new doc under a file parent", kinds: map[string]finalize.Kind{"docs": finalize.Dir, "docs/x": finalize.Other}, raw: newDoc("docs/x/t.md"), problem: "already exists at head", noStat: []string{"docs/x/t.md"}},
+		{name: "new doc under a symlink parent", kinds: map[string]finalize.Kind{"docs": finalize.Other}, raw: newDoc("docs/a/t.md"), problem: "already exists at head", noStat: []string{"docs/a", "docs/a/t.md"}},
+		{name: "new doc under a missing parent", kinds: map[string]finalize.Kind{"docs": finalize.Missing}, raw: newDoc("docs/a/t.md"), noStat: []string{"docs/a", "docs/a/t.md"}},
+		{name: "new doc under directories", kinds: map[string]finalize.Kind{"docs": finalize.Dir, "docs/a": finalize.Dir}, raw: newDoc("docs/a/t.md")},
+		{name: "section edit under an other parent", kinds: map[string]finalize.Kind{"docs": finalize.Other}, raw: edit("docs/a/g.md", "Usage"), problem: "no such doc at head", noStat: []string{"docs/a", "docs/a/g.md"}},
+		{name: "section edit under a missing parent", kinds: map[string]finalize.Kind{"docs": finalize.Dir, "docs/a": finalize.Missing}, raw: edit("docs/a/g.md", "Usage"), problem: "no such doc at head"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			head := &fakeHead{kinds: tc.kinds}
+			if tc.raw.Section != "" {
+				head.files = map[string]string{tc.raw.DocPath: guide}
+			}
+			_, problems, err := finalize.Proposals(t.Context(), head, finalize.Rules{Changed: changedFiles(), Selection: sel, AllowNewDoc: true}, []review.Proposal{tc.raw})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.problem == "" && len(problems) != 0 || tc.problem != "" && !strings.Contains(problems.Error(), tc.problem) {
+				t.Errorf("problems = %v, want %q", problems, tc.problem)
+			}
+			if tc.raw.Section != "" && tc.problem != "" && head.reads[tc.raw.DocPath] != 0 {
+				t.Errorf("ReadFile called %d times, want 0", head.reads[tc.raw.DocPath])
+			}
+			for _, p := range tc.noStat {
+				if head.stats[p] != 0 {
+					t.Errorf("Stat(%q) called %d times, want 0", p, head.stats[p])
+				}
+			}
+		})
+	}
+}
+
+func TestProposalsStatsEachPathOnce(t *testing.T) {
+	head := &fakeHead{files: map[string]string{"docs/g.md": guide}}
+	raw := []review.Proposal{edit("docs/g.md", "Usage"), edit("docs/g.md", "Setup"), newDoc("docs/t.md"), newDoc("docs/t.md")}
+	rules := finalize.Rules{Changed: changedFiles(), Selection: &basedocs.Selection{Uncovered: []string{"a.go"}}, AllowNewDoc: true}
+
+	if _, _, err := finalize.Proposals(t.Context(), head, rules, raw); err != nil {
+		t.Fatal(err)
+	}
+	for path, n := range head.stats {
+		if n != 1 {
+			t.Errorf("Stat(%q) called %d times, want 1", path, n)
+		}
 	}
 }
 

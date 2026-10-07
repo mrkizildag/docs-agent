@@ -30,8 +30,10 @@ type fakeAPI struct {
 	changed    []review.ChangedFile
 	changedErr error
 	files      map[string][]byte
-	// paths are extra paths PathAtRef reports as existing: directories and files FileAtRef refuses.
-	paths     map[string]bool
+	// paths are extra non-directory paths PathAtRef reports: files FileAtRef refuses, symlinks.
+	paths map[string]bool
+	// dirs are directories PathAtRef reports besides the parents of files.
+	dirs      map[string]bool
 	fileReads map[string]int
 	docsAt    map[string]fstest.MapFS
 }
@@ -62,9 +64,22 @@ func (f *fakeAPI) FileAtRef(_ context.Context, _ int64, _, _, path, ref string) 
 	return src, ok, nil
 }
 
-func (f *fakeAPI) PathAtRef(_ context.Context, _ int64, _, _, path, _ string) (bool, error) {
-	_, isFile := f.files[path]
-	return isFile || f.paths[path], f.err
+func (f *fakeAPI) PathAtRef(_ context.Context, _ int64, _, _, path, _ string) (exists, dir bool, err error) {
+	if f.err != nil {
+		return false, false, f.err
+	}
+	if _, isFile := f.files[path]; isFile || f.paths[path] {
+		return true, false, nil
+	}
+	if f.dirs[path] {
+		return true, true, nil
+	}
+	for p := range f.files {
+		if strings.HasPrefix(p, path+"/") {
+			return true, true, nil
+		}
+	}
+	return false, false, nil
 }
 
 func TestStart(t *testing.T) {
@@ -838,9 +853,11 @@ func TestCollectNewDocAlreadyAtHead(t *testing.T) {
 		name  string
 		files map[string][]byte
 		paths map[string]bool
+		dirs  map[string]bool
 	}{
 		{name: "file", files: map[string][]byte{"docs/new.md": []byte("# existing\n")}},
-		{name: "directory or oversized file", paths: map[string]bool{"docs/new.md": true}},
+		{name: "directory or oversized file", paths: map[string]bool{"docs/new.md": true}, dirs: map[string]bool{"docs": true}},
+		{name: "parent is a file", paths: map[string]bool{"docs": true}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -851,6 +868,7 @@ func TestCollectNewDocAlreadyAtHead(t *testing.T) {
 				changed:  []review.ChangedFile{{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 5}}}},
 				files:    tc.files,
 				paths:    tc.paths,
+				dirs:     tc.dirs,
 				docsAt:   map[string]fstest.MapFS{"base": {"docs/a.md": coverDoc("[other.go]")}},
 			}
 			c := review.Completion{Owner: "o", Repo: "r", HeadSHA: "abc", BaseSHA: "base", RunID: 99, Nonce: "n1"}

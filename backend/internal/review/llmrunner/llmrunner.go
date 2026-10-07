@@ -14,7 +14,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	pathpkg "path"
 	"strings"
 	"syscall"
 	"time"
@@ -259,9 +258,9 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 // left out, such as one with broken frontmatter, so a PR can't opt a doc out of
 // triage by breaking it.
 func headDoc(ctx context.Context, root *os.Root, docPath string) (docs.Doc, error) {
-	src, ok, err := cloneHead{root: root}.ReadFile(ctx, docPath)
+	src, ok, err := finalize.ReadDoc(ctx, cloneHead{root: root}, docPath)
 	if err != nil {
-		return docs.Doc{}, err
+		return docs.Doc{}, fmt.Errorf("candidate doc %s: %w", docPath, err)
 	}
 	if !ok {
 		return docs.Doc{}, fmt.Errorf("candidate doc %s at head is missing, not a regular file, or over %d bytes", docPath, docs.MaxDocBytes)
@@ -269,8 +268,9 @@ func headDoc(ctx context.Context, root *os.Root, docPath string) (docs.Doc, erro
 	return docs.ParseBody(docPath, src), nil
 }
 
-// cloneHead is the finalize.Head over the head clone. It never reads through a
-// symlink. gitlink, when set, reports whether a path is a submodule entry.
+// cloneHead is the finalize.Head over the head clone. It never follows a
+// symlink at the path it is asked about. gitlink, when set, reports whether a
+// path is a submodule entry.
 type cloneHead struct {
 	root    *os.Root
 	gitlink func(ctx context.Context, path string) (bool, error)
@@ -278,41 +278,31 @@ type cloneHead struct {
 
 var _ finalize.Head = cloneHead{}
 
-// lstat reports ok=false when nothing is at path. A path under a file or a
-// symlink is unusable rather than absent; it is reported as taken.
-func (h cloneHead) lstat(path string) (info fs.FileInfo, ok, taken bool, err error) {
-	if _, blocked := h.nearestAncestor(path); blocked {
-		return nil, false, true, nil
-	}
-	info, err = h.root.Lstat(path)
+func (h cloneHead) Stat(ctx context.Context, path string) (finalize.Kind, error) {
+	info, err := h.root.Lstat(path)
 	switch {
-	case err == nil:
-		return info, true, true, nil
 	case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR):
-		return nil, false, false, nil
+		return finalize.Missing, nil
+	case err != nil:
+		return finalize.Missing, fmt.Errorf("lstat %s at head: %w", path, err)
+	case !info.IsDir():
+		return finalize.Other, nil
 	}
-	return nil, false, false, fmt.Errorf("lstat %s at head: %w", path, err)
+	// A clone checks a submodule out as an empty directory.
+	if h.gitlink == nil || !h.emptyDir(path) {
+		return finalize.Dir, nil
+	}
+	isLink, err := h.gitlink(ctx, path)
+	if err != nil {
+		return finalize.Missing, err
+	}
+	if isLink {
+		return finalize.Other, nil
+	}
+	return finalize.Dir, nil
 }
 
-// nearestAncestor returns the nearest existing parent directory of p, and
-// blocked when that parent is not a directory (a file or a symlink). Such a
-// path can't be created as a doc, and os.Root follows links that stay inside
-// the clone, so it is checked before the lookup.
-func (h cloneHead) nearestAncestor(p string) (dir string, blocked bool) {
-	for dir := pathpkg.Dir(p); dir != "." && dir != "/"; dir = pathpkg.Dir(dir) {
-		info, err := h.root.Lstat(dir)
-		if err == nil {
-			return dir, !info.IsDir()
-		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			return dir, true
-		}
-	}
-	return "", false
-}
-
-// emptyDir reports whether dir has no entries; a clone checks a submodule out
-// as an empty directory.
+// emptyDir reports whether dir has no entries.
 func (h cloneHead) emptyDir(dir string) bool {
 	f, err := h.root.Open(dir)
 	if err != nil {
@@ -323,22 +313,13 @@ func (h cloneHead) emptyDir(dir string) bool {
 	return errors.Is(err, io.EOF) && len(entries) == 0
 }
 
-func (h cloneHead) Exists(ctx context.Context, path string) (bool, error) {
-	_, _, taken, err := h.lstat(path)
-	if err != nil || taken || h.gitlink == nil {
-		return taken, err
-	}
-	dir, _ := h.nearestAncestor(path)
-	if dir == "" || !h.emptyDir(dir) {
-		return false, nil
-	}
-	return h.gitlink(ctx, dir)
-}
-
 func (h cloneHead) ReadFile(_ context.Context, path string) ([]byte, bool, error) {
-	info, ok, _, err := h.lstat(path)
-	if err != nil || !ok {
-		return nil, false, err
+	info, err := h.root.Lstat(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, fmt.Errorf("lstat %s at head: %w", path, err)
 	}
 	if !info.Mode().IsRegular() || info.Size() > docs.MaxDocBytes {
 		return nil, false, nil

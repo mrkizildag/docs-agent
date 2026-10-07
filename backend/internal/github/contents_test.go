@@ -133,23 +133,24 @@ func TestPathAtRef(t *testing.T) {
 	}
 
 	tests := []struct {
-		path    string
-		want    bool
-		wantErr bool
+		path       string
+		wantExists bool
+		wantDir    bool
+		wantErr    bool
 	}{
-		{path: "docs/huge.bin", want: true},
+		{path: "docs/huge.bin", wantExists: true},
 		{path: "docs/forbidden.md", wantErr: true},
-		{path: "docs/a.md", want: true},
-		{path: "docs", want: true},
+		{path: "docs/a.md", wantExists: true},
+		{path: "docs/link", wantExists: true},
+		{path: "docs", wantExists: true, wantDir: true},
 		{path: "docs/missing.md"},
-		{path: "docs/link/new.md", want: true},
-		{path: "docs/a.md/new.md", want: true},
+		{path: "docs/a.md/new.md"},
 		{path: "docs/boom.md", wantErr: true},
 	}
 	for _, tc := range tests {
-		got, err := client.PathAtRef(t.Context(), 1, "o", "r", tc.path, "abc")
-		if (err != nil) != tc.wantErr || got != tc.want {
-			t.Errorf("PathAtRef(%q) = %v, %v; want %v, error=%v", tc.path, got, err, tc.want, tc.wantErr)
+		exists, dir, err := client.PathAtRef(t.Context(), 1, "o", "r", tc.path, "abc")
+		if (err != nil) != tc.wantErr || exists != tc.wantExists || dir != tc.wantDir {
+			t.Errorf("PathAtRef(%q) = %v, %v, %v; want %v, %v, error=%v", tc.path, exists, dir, err, tc.wantExists, tc.wantDir, tc.wantErr)
 		}
 	}
 }

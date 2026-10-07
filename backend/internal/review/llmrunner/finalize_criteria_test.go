@@ -146,23 +146,22 @@ func TestStart_NewDocUnderAnExistingFileIsReturnedToModel(t *testing.T) {
 func TestStart_NewDocInsideASubmoduleIsReturnedToModel(t *testing.T) {
 	t.Parallel()
 
-	repoDir, baseSHA := newGitRepo(t)
-	// A gitlink entry: the clone checks it out as an empty directory.
-	for _, args := range [][]string{
-		{"update-index", "--add", "--cacheinfo", "160000," + baseSHA + ",docs/sub"},
-		{"commit", "-q", "-m", "add submodule"},
-	} {
-		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
+	repoDir, _ := newGitRepo(t)
+	// A gitlink entry: the clone checks it out as an empty directory. Git
+	// accepts a gitlink to a commit that is not in the repository.
+	const gitlinkSHA = "0123456789abcdef0123456789abcdef01234567"
+	runInRepo := func(cmd *exec.Cmd) string {
+		t.Helper()
 		cmd.Dir = repoDir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, out)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%v: %v: %s", cmd.Args, err, out)
 		}
+		return strings.TrimSpace(string(out))
 	}
-	out, err := exec.CommandContext(t.Context(), "git", "-C", repoDir, "rev-parse", "HEAD").Output() //nolint:gosec // repoDir is a t.TempDir path
-	if err != nil {
-		t.Fatalf("rev-parse HEAD: %v", err)
-	}
-	headSHA := strings.TrimSpace(string(out))
+	runInRepo(exec.CommandContext(t.Context(), "git", "update-index", "--add", "--cacheinfo", "160000,"+gitlinkSHA+",docs/sub"))
+	runInRepo(exec.CommandContext(t.Context(), "git", "commit", "-q", "-m", "add submodule"))
+	headSHA := runInRepo(exec.CommandContext(t.Context(), "git", "rev-parse", "HEAD"))
 
 	proposal := newDocProposal("other.go")
 	proposal["doc_path"] = "docs/sub/new.md"
