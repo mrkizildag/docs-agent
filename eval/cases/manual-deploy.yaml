@@ -1,0 +1,19 @@
+id: manual-deploy
+source: "PR #26"
+base: c78c4dc49c9d5165f735fffa316368a529dc3bef
+head: c7fba247e0aee3a4e22c210000ecd5ec09b5a3e7
+expect:
+  verdict: proposals
+  docs:
+    - path: docs/guides/deploy.md
+      new: false
+      sections: ["Updates", "First deploy", "Troubleshooting"]
+      must_say:
+        - "Deploys are manual: after merging to main, run pollux-deploy on the host; there is no automatic update timer."
+        - "pollux-deploy fetches origin/main, checks it out detached, and runs docker compose up -d --build --wait."
+        - "If the build fails or the new container never turns healthy, pollux-deploy checks the previous commit out again, brings it back up, and exits non-zero."
+notes: >
+  The PR deletes the systemd pollux-update timer, service, and script and adds deploy/pollux-deploy.sh, so
+  deploy.md's Updates section (timer every 2 minutes, failed-commit file, systemctl install) is wrong. The human
+  rewrote Updates and fixed the timer mentions in First deploy step 3 and in Troubleshooting; any of the three
+  sections is acceptable. AGENTS.md also changed but is not under docs/.

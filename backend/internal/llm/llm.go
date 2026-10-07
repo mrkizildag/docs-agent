@@ -80,6 +80,18 @@ type Usage struct {
 	OutputTokens int
 }
 
+// New returns the adapter for provider, "openai" or "anthropic".
+func New(provider string, hc *http.Client, baseURL, apiKey string) (Model, error) { //nolint:ireturn // choosing the adapter is the point; callers only need Model
+	switch provider {
+	case "openai":
+		return NewOpenAI(hc, baseURL, apiKey), nil
+	case "anthropic":
+		return NewAnthropic(hc, baseURL, apiKey), nil
+	default:
+		return nil, fmt.Errorf("unknown LLM provider %q", provider)
+	}
+}
+
 const maxResponseBytes = 8 << 20
 
 // postJSON POSTs body as JSON to url with headers and returns the response

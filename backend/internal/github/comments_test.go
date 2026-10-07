@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -325,5 +326,88 @@ func TestCommentsAPIError(t *testing.T) {
 				t.Errorf("%s error = %q, want it to contain %q", tc.name, err, tc.want)
 			}
 		})
+	}
+}
+
+func TestResolveReviewThread(t *testing.T) {
+	t.Parallel()
+
+	page := func(hasNext bool, end string, nodes string) string {
+		return fmt.Sprintf(`{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":%t,"endCursor":%q},"nodes":[%s]}}}}}`, hasNext, end, nodes)
+	}
+	thread := func(id string, resolved bool, commentID int64) string {
+		return fmt.Sprintf(`{"id":%q,"isResolved":%t,"comments":{"nodes":[{"fullDatabaseId":"%d"}]}}`, id, resolved, commentID)
+	}
+
+	tests := []struct {
+		name         string
+		pages        []string
+		wantResolved []string
+	}{
+		{name: "resolves the thread on a later page", pages: []string{page(true, "c1", thread("T1", false, 1)), page(false, "", thread("T2", false, 4205541822))}, wantResolved: []string{"T2"}},
+		{name: "already resolved is skipped", pages: []string{page(false, "", thread("T1", true, 4205541822))}},
+		{name: "missing thread is not an error", pages: []string{page(false, "", thread("T1", false, 1))}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var mu sync.Mutex
+			var resolved []string
+			calls := 0
+			client := newCommentsClient(t, map[string]http.HandlerFunc{
+				"POST /graphql": func(w http.ResponseWriter, r *http.Request) {
+					var req struct {
+						Query     string         `json:"query"`
+						Variables map[string]any `json:"variables"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+						t.Errorf("decode graphql request: %v", err)
+					}
+					mu.Lock()
+					defer mu.Unlock()
+					w.Header().Set("Content-Type", "application/json")
+					body := `{"data":{"resolveReviewThread":{"thread":{"id":"x"}}}}`
+					if strings.Contains(req.Query, "resolveReviewThread") {
+						resolved = append(resolved, fmt.Sprint(req.Variables["id"]))
+					} else {
+						body = tc.pages[calls]
+						calls++
+					}
+					if _, err := fmt.Fprint(w, body); err != nil {
+						t.Errorf("write graphql response: %v", err)
+					}
+				},
+			})
+
+			if err := client.ResolveReviewThread(t.Context(), 99, "o", "r", 7, 4205541822); err != nil {
+				t.Fatalf("ResolveReviewThread() = %v, want nil error", err)
+			}
+			if diff := cmp.Diff(tc.wantResolved, resolved); diff != "" {
+				t.Errorf("resolved threads (-want +got):\n%s", diff)
+			}
+			if calls != len(tc.pages) {
+				t.Errorf("thread pages read = %d, want %d", calls, len(tc.pages))
+			}
+		})
+	}
+}
+
+func TestResolveReviewThreadGraphQLError(t *testing.T) {
+	t.Parallel()
+
+	client := newCommentsClient(t, map[string]http.HandlerFunc{
+		"POST /graphql": func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if _, err := fmt.Fprint(w, `{"errors":[{"message":"nope"}]}`); err != nil {
+				t.Errorf("write graphql response: %v", err)
+			}
+		},
+	})
+
+	err := client.ResolveReviewThread(t.Context(), 99, "o", "r", 7, 55)
+	if err == nil || !strings.Contains(err.Error(), "nope") {
+		t.Errorf("ResolveReviewThread() = %v, want an error carrying the GraphQL message", err)
 	}
 }

@@ -2,7 +2,9 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"github.com/google/go-github/v92/github"
 
@@ -95,6 +97,69 @@ func (c *Client) EditReviewComment(ctx context.Context, installationID int64, ow
 		return fmt.Errorf("edit review comment %s/%s %d: %w", owner, repo, id, err)
 	}
 	return nil
+}
+
+const reviewThreadsQuery = `query($owner:String!,$repo:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{id isResolved comments(first:1){nodes{fullDatabaseId}}}}}}}`
+
+const resolveThreadMutation = `mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id}}}`
+
+// ResolveReviewThread resolves the review thread that starts with review
+// comment commentID. A thread that is already resolved, or gone with its
+// comment, is not an error.
+func (c *Client) ResolveReviewThread(ctx context.Context, installationID int64, owner, repo string, number int, commentID int64) error {
+	client, err := c.installationClient(installationID)
+	if err != nil {
+		return fmt.Errorf("resolve review thread %s/%s#%d comment %d: %w", owner, repo, number, commentID, err)
+	}
+
+	wantID := strconv.FormatInt(commentID, 10)
+	var cursor *string
+	for {
+		var data struct {
+			Repository struct {
+				PullRequest struct {
+					ReviewThreads struct {
+						PageInfo struct {
+							HasNextPage bool   `json:"hasNextPage"`
+							EndCursor   string `json:"endCursor"`
+						} `json:"pageInfo"`
+						Nodes []struct {
+							ID         string `json:"id"`
+							IsResolved bool   `json:"isResolved"`
+							Comments   struct {
+								Nodes []struct {
+									FullDatabaseID json.Number `json:"fullDatabaseId"`
+								} `json:"nodes"`
+							} `json:"comments"`
+						} `json:"nodes"`
+					} `json:"reviewThreads"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
+		}
+		vars := map[string]any{"owner": owner, "repo": repo, "number": number, "cursor": cursor}
+		if err := graphQL(ctx, client, reviewThreadsQuery, vars, &data); err != nil {
+			return fmt.Errorf("list review threads %s/%s#%d: %w", owner, repo, number, err)
+		}
+
+		threads := data.Repository.PullRequest.ReviewThreads
+		for _, th := range threads.Nodes {
+			if len(th.Comments.Nodes) == 0 || th.Comments.Nodes[0].FullDatabaseID.String() != wantID {
+				continue
+			}
+			if th.IsResolved {
+				return nil
+			}
+			var resolved struct{}
+			if err := graphQL(ctx, client, resolveThreadMutation, map[string]any{"id": th.ID}, &resolved); err != nil {
+				return fmt.Errorf("resolve review thread %s/%s#%d comment %d: %w", owner, repo, number, commentID, err)
+			}
+			return nil
+		}
+		if !threads.PageInfo.HasNextPage {
+			return nil
+		}
+		cursor = &threads.PageInfo.EndCursor
+	}
 }
 
 // CreateIssueComment creates a comment on the conversation of owner/repo#number.

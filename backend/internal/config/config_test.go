@@ -68,6 +68,7 @@ func envVars() []string {
 		"ADDR", "LOG_LEVEL", "DATABASE_PATH", "GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY_FILE",
 		"GITHUB_WEBHOOK_SECRET",
 		"LLM_PROVIDER", "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL", "LLM_TRIAGE_MODEL",
+		"EVAL_RUNNER", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "EVAL_JUDGE_MODEL", "EVAL_RUNS", "EVAL_PARALLEL", "EVAL_CASE",
 	}
 }
 
@@ -259,6 +260,83 @@ func TestLoad(t *testing.T) {
 				if got.LLM.APIKey.Reveal() != tc.wantLLMAPIKey {
 					t.Errorf("LLM.APIKey.Reveal() = %q, want %q", got.LLM.APIKey.Reveal(), tc.wantLLMAPIKey)
 				}
+			}
+		})
+	}
+}
+
+func TestLoadEval(t *testing.T) {
+	llmEnv := map[string]string{"LLM_PROVIDER": "anthropic", "LLM_API_KEY": "k", "LLM_MODEL": "big", "LLM_TRIAGE_MODEL": "small"}
+	llmOpt := cmpopts.IgnoreFields(config.LLM{}, "APIKey")
+	secretOpt := cmpopts.IgnoreFields(config.Eval{}, "ClaudeOAuthToken", "AnthropicAPIKey", "Path")
+
+	tests := []struct {
+		name    string
+		env     map[string]string
+		want    config.Eval
+		wantErr bool
+	}{
+		{
+			name: "defaults",
+			env:  llmEnv,
+			want: config.Eval{
+				Runner:     config.EvalRunnerServer,
+				LLM:        config.LLM{Provider: config.LLMProviderAnthropic, Model: "big", TriageModel: "small"},
+				JudgeModel: "big", Runs: 3, Parallel: 2,
+			},
+		},
+		{
+			name: "overrides",
+			env:  mergeEnv(llmEnv, map[string]string{"EVAL_JUDGE_MODEL": "judge", "EVAL_RUNS": "5", "EVAL_PARALLEL": "1", "EVAL_CASE": "a, b,,"}),
+			want: config.Eval{
+				Runner:     config.EvalRunnerServer,
+				LLM:        config.LLM{Provider: config.LLMProviderAnthropic, Model: "big", TriageModel: "small"},
+				JudgeModel: "judge", Runs: 5, Parallel: 1, Cases: []string{"a", "b"},
+			},
+		},
+		{name: "provider required", env: map[string]string{}, wantErr: true},
+		{
+			name: "actions runner with oauth token",
+			env:  map[string]string{"EVAL_RUNNER": "actions", "CLAUDE_CODE_OAUTH_TOKEN": "t"},
+			want: config.Eval{Runner: config.EvalRunnerActions, Runs: 3, Parallel: 2},
+		},
+		{
+			name: "actions runner with api key and judge model",
+			env:  map[string]string{"EVAL_RUNNER": "actions", "ANTHROPIC_API_KEY": "k", "EVAL_JUDGE_MODEL": "judge"},
+			want: config.Eval{Runner: config.EvalRunnerActions, JudgeModel: "judge", Runs: 3, Parallel: 2},
+		},
+		{name: "actions runner needs a credential", env: map[string]string{"EVAL_RUNNER": "actions"}, wantErr: true},
+		{name: "unknown runner", env: mergeEnv(llmEnv, map[string]string{"EVAL_RUNNER": "cloud"}), wantErr: true},
+		{name: "runs not positive", env: mergeEnv(llmEnv, map[string]string{"EVAL_RUNS": "0"}), wantErr: true},
+		{name: "parallel not a number", env: mergeEnv(llmEnv, map[string]string{"EVAL_PARALLEL": "many"}), wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, k := range envVars() {
+				t.Setenv(k, "")
+			}
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+
+			t.Setenv("PATH", "/eval/bin")
+
+			got, err := config.LoadEval()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("LoadEval() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadEval() error = %v", err)
+			}
+			if diff := cmp.Diff(tc.want, got, llmOpt, secretOpt); diff != "" {
+				t.Errorf("LoadEval() mismatch (-want +got):\n%s", diff)
+			}
+			if got.Path != "/eval/bin" {
+				t.Errorf("LoadEval() Path = %q, want %q", got.Path, "/eval/bin")
 			}
 		})
 	}

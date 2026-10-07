@@ -46,6 +46,8 @@ type fakeGitHub struct {
 	onCreateIssue            func()
 	createIssueFailures      int // creates that fail before they start succeeding
 	editReviewErr            error
+	resolveErr               error
+	resolved                 []int64
 	editIssueErr             error
 }
 
@@ -137,6 +139,12 @@ func (f *fakeGitHub) EditReviewComment(_ context.Context, _ int64, _, _ string, 
 	return nil
 }
 
+func (f *fakeGitHub) ResolveReviewThread(_ context.Context, _ int64, _, _ string, _ int, commentID int64) error {
+	f.ops = append(f.ops, "resolve-review")
+	f.resolved = append(f.resolved, commentID)
+	return f.resolveErr
+}
+
 func (f *fakeGitHub) CreateIssueComment(_ context.Context, _ int64, _, _ string, _ int, body string) (gate.Comment, error) {
 	f.createIssue++
 	f.ops = append(f.ops, "create-issue")
@@ -207,6 +215,7 @@ type fakeStore struct {
 	saved       *gate.PRState
 	saveCtxErrs []error
 	live        bool // SavePR also replaces stored, as a real store would
+	onSave      func()
 }
 
 type loadPRCall struct {
@@ -259,6 +268,9 @@ func (f *fakeStore) SavePR(ctx context.Context, state gate.PRState) error {
 	f.saveCtxErrs = append(f.saveCtxErrs, ctx.Err())
 	f.saveCalls = append(f.saveCalls, state)
 	f.saved = &state
+	if f.onSave != nil {
+		f.onSave()
+	}
 	if f.live {
 		f.stored = state
 	}
@@ -1172,10 +1184,12 @@ func TestReconcile(t *testing.T) {
 
 	pr := gate.PullRequest{InstallationID: 1, Owner: "o", Repo: "r", Number: 3, HeadSHA: "0123456789"}
 	a, b := proposal("docs/a.md", "A"), proposal("docs/b.md", "B")
+	aNew := a
+	aNew.Content = "## A\nnewer\n"
 	idA, idB := gate.ProposalID("docs/a.md", "A"), gate.ProposalID("docs/b.md", "B")
 	prev := gate.PRState{SummaryCommentID: 90, Proposals: []gate.ProposalState{
-		{ID: idA, DocPath: "docs/a.md", Section: "A", CommentID: 1, CommentURL: "u1", State: gate.ProposalOpen},
-		{ID: idB, DocPath: "docs/b.md", Section: "B", CommentID: 2, CommentURL: "u2", State: gate.ProposalOpen},
+		{ID: idA, DocPath: "docs/a.md", Section: "A", CommentID: 1, CommentURL: "u1", State: gate.ProposalOpen, Content: a.Content},
+		{ID: idB, DocPath: "docs/b.md", Section: "B", CommentID: 2, CommentURL: "u2", State: gate.ProposalOpen, Content: b.Content},
 	}}
 	old := []gate.Comment{
 		{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: "<!-- pollux-agent:proposal:" + idA + " -->\n\nold A body"},
@@ -1224,7 +1238,11 @@ func TestReconcile(t *testing.T) {
 			name:    "outdated returns and reopens",
 			prev:    gate.PRState{SummaryCommentID: 90, Proposals: []gate.ProposalState{{ID: idA, DocPath: "docs/a.md", Section: "A", CommentID: 1, State: gate.ProposalOutdated}}},
 			verdict: review.Proposals{a}, existing: []gate.Comment{old[0], old[2]},
-			wantEdits: 2, wantStates: map[string]gate.ProposalStatus{"docs/a.md#A": "open"}, wantSummary: true, wantSumID: 90,
+			wantCreates: 1, wantEdits: 2, wantStates: map[string]gate.ProposalStatus{"docs/a.md#A": "open"}, wantSummary: true, wantSumID: 90,
+		},
+		{
+			name: "open returns changed gets a new comment", verdict: review.Proposals{aNew, b}, prev: prev, existing: old,
+			wantCreates: 1, wantEdits: 3, wantStates: map[string]gate.ProposalStatus{"docs/a.md#A": "open", "docs/b.md#B": "open"}, wantSummary: true, wantSumID: 90,
 		},
 		{
 			name: "deleted open proposal is recreated", prev: prev, verdict: review.Proposals{a, b}, existing: []gate.Comment{old[0], old[2]},
@@ -1264,13 +1282,69 @@ func TestReconcile(t *testing.T) {
 			for _, want := range tc.wantOutdated {
 				found := false
 				for _, w := range writes {
-					found = found || (strings.Contains(w.Body, want) && strings.Contains(w.Body, "Outdated: no longer needed as of 0123456") && strings.Contains(w.Body, "<details>"))
+					found = found || (w.Resolve && strings.Contains(w.Body, want) && strings.HasPrefix(w.Body, "<!-- pollux-agent:superseded:"))
 				}
 				if !found {
 					t.Errorf("no outdated write keeping %q in %+v", want, writes)
 				}
 			}
 		})
+	}
+}
+
+func TestReconcileReopenedAppliedGetsNewComment(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/a.md", "A")
+	p.Content = "## A\nnewer\n"
+	id := gate.ProposalID("docs/a.md", "A")
+	prev := gate.PRState{Proposals: []gate.ProposalState{{
+		ID: id, DocPath: "docs/a.md", Section: "A", CommentID: 1, CommentURL: "u1", State: gate.ProposalApplied,
+		Content: "## A\nold\n", AppliedSHA: "abc", ReplyID: 7,
+	}}}
+	oldBody := "<!-- pollux-agent:proposal:" + id + " -->\n\nreason\n\n- [x] Apply this change\n"
+	existing := []gate.Comment{{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: oldBody}}
+
+	state, writes := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, existing)
+
+	var proposalWrites []gate.CommentWrite
+	for _, w := range writes {
+		if !w.Summary {
+			proposalWrites = append(proposalWrites, w)
+		}
+	}
+	if len(proposalWrites) != 2 {
+		t.Fatalf("proposal writes = %+v, want a superseding edit then a create", proposalWrites)
+	}
+	if w := proposalWrites[0]; w.ID != 1 || !w.Resolve || w.Body != strings.Replace(oldBody, "proposal", "superseded", 1) {
+		t.Errorf("first write = %+v, want edit of comment 1 with only its marker swapped, resolving its thread", w)
+	}
+	if w := proposalWrites[1]; w.ID != 0 || w.Review.Body == "" {
+		t.Errorf("second write = %+v, want a create", w)
+	}
+	got := state.Proposals[0]
+	if got.State != gate.ProposalOpen || got.CommentID != 0 || got.CommentURL != "" || got.AppliedSHA != "" || got.ReplyID != 0 {
+		t.Errorf("proposal = %+v, want open with no comment, applied SHA or reply", got)
+	}
+}
+
+func TestReconcileNeverAdoptsSupersededComment(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/a.md", "A")
+	id := gate.ProposalID("docs/a.md", "A")
+	prev := gate.PRState{Proposals: []gate.ProposalState{{ID: id, DocPath: "docs/a.md", Section: "A", State: gate.ProposalOpen}}}
+	existing := []gate.Comment{{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: "<!-- pollux-agent:superseded:" + id + " -->\n\nold"}}
+
+	state, writes := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, existing)
+
+	if got := state.Proposals[0].CommentID; got != 0 {
+		t.Errorf("CommentID = %d, want 0: a superseded comment is not adopted", got)
+	}
+	for _, w := range writes {
+		if w.ID == 1 {
+			t.Errorf("write %+v targets the superseded comment", w)
+		}
 	}
 }
 
@@ -1350,7 +1424,7 @@ func TestReconcileEditKeepsVariantSafe(t *testing.T) {
 	}
 	id := gate.ProposalID(p.DocPath, p.Section)
 	inDiff := []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 20}}}}
-	prev := gate.PRState{Proposals: []gate.ProposalState{{ID: id, DocPath: p.DocPath, Section: p.Section, CommentID: 1, State: gate.ProposalOpen}}}
+	prev := gate.PRState{Proposals: []gate.ProposalState{{ID: id, DocPath: p.DocPath, Section: p.Section, CommentID: 1, State: gate.ProposalOpen, Content: p.Content}}}
 	onCode := gate.Comment{ID: 1, Mine: true, Kind: gate.CommentKindReview, Path: "a.go", Line: 4}
 	onDoc := gate.Comment{ID: 1, Mine: true, Kind: gate.CommentKindReview, Path: "docs/a.md", StartLine: 9, Line: 10}
 	moved := gate.Comment{ID: 1, Mine: true, Kind: gate.CommentKindReview, Path: "docs/a.md", StartLine: 5, Line: 6}
@@ -1428,8 +1502,8 @@ func TestHandlePullRequestRerunEditsInPlace(t *testing.T) {
 	}
 
 	proposalService(t, gh, store, review.Proposals{both[0]})
-	if len(gh.comments) != 3 || !strings.Contains(gh.comments[2].Body, "Outdated") || !strings.Contains(gh.comments[0].Body, "outdated") {
-		t.Errorf("partial re-run comments = %+v, want comment 2 and summary outdated, none added", gh.comments)
+	if len(gh.comments) != 3 || !strings.HasPrefix(gh.comments[2].Body, "<!-- pollux-agent:superseded:") || !slices.Contains(gh.resolved, gh.comments[2].ID) || !strings.Contains(gh.comments[0].Body, "outdated") {
+		t.Errorf("partial re-run comments = %+v (resolved %v), want comment 2 retired and resolved, summary outdated, none added", gh.comments, gh.resolved)
 	}
 
 	proposalService(t, gh, store, review.NoImpact{Reason: "x"})
@@ -1470,6 +1544,26 @@ func TestHandlePullRequestRecoversUnrecordedComments(t *testing.T) {
 	}
 }
 
+func TestHandlePullRequestResolveFailureDoesNotBlockProposals(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{checkRunID: 555}
+	store := &fakeStore{}
+	proposalService(t, gh, store, review.Proposals{proposal("docs/a.md", "A")})
+
+	gh.resolveErr = errors.New("resolve failed")
+	changed := proposal("docs/a.md", "A")
+	changed.Content = "## A\nnewer\n"
+	proposalService(t, gh, store, review.Proposals{changed})
+
+	if gh.createReview != 2 || len(gh.comments) != 3 || !strings.HasPrefix(gh.comments[1].Body, "<!-- pollux-agent:superseded:") {
+		t.Errorf("create review = %d, comments = %+v, want the old comment retired and a new one created", gh.createReview, gh.comments)
+	}
+	if n := len(gh.updates); n == 0 || gh.updates[n-1].run.Conclusion != gate.ConclusionActionRequired {
+		t.Errorf("check updates = %+v, want the last to conclude action_required", gh.updates)
+	}
+}
+
 func TestHandlePullRequestOutdatesCommentsPostedByACrashedRun(t *testing.T) {
 	t.Parallel()
 
@@ -1483,8 +1577,8 @@ func TestHandlePullRequestOutdatesCommentsPostedByACrashedRun(t *testing.T) {
 
 	gh.editIssueErr = nil
 	proposalService(t, gh, store, review.NoImpact{Reason: "x"})
-	if len(gh.comments) != 2 || !strings.Contains(gh.comments[1].Body, "Outdated") {
-		t.Errorf("comments after no-impact run = %+v, want the crashed run's comment marked outdated", gh.comments)
+	if len(gh.comments) != 2 || !strings.HasPrefix(gh.comments[1].Body, "<!-- pollux-agent:superseded:") || !slices.Contains(gh.resolved, gh.comments[1].ID) {
+		t.Errorf("comments after no-impact run = %+v (resolved %v), want the crashed run's comment retired and resolved", gh.comments, gh.resolved)
 	}
 }
 
@@ -1522,7 +1616,7 @@ func TestHandleRunCompletedRetriesFailedPosts(t *testing.T) {
 	runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A"), proposal("docs/b.md", "B")}}}
 	state := awaitingState()
 	state.CheckRunID = 5
-	store := &fakeStore{stored: state}
+	store := &fakeStore{stored: state, live: true}
 	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil).WithCollectBackoff(0)
 
 	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
@@ -2320,7 +2414,7 @@ func TestPostCommentsTransientFailureEndsConcluded(t *testing.T) {
 	gh := &fakeGitHub{changed: []review.ChangedFile{{Path: "docs/a.md", Hunks: []review.LineRange{{Start: 1, End: 20}}, Patch: "@@"}}}
 	gh.createIssueFailures = 1
 	runner := &fakeRunner{result: review.Result{Verdict: review.Proposals{proposal("docs/a.md", "A")}}}
-	store := &fakeStore{stored: awaitingState()}
+	store := &fakeStore{stored: awaitingState(), live: true}
 	svc := gate.NewService(gh, nil, store, gate.Runners{Actions: runner}, nil, nil).WithCollectBackoff(0)
 	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
 		t.Fatalf("HandleRunCompleted() = %v, want nil after the retry", err)
@@ -2394,5 +2488,149 @@ func TestHandlePullRequestConcludesAfterALongAnalysis(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+func TestReconcileRetiresOutdatedCommentThatStillHasTheLiveMarker(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/a.md", "A")
+	id := gate.ProposalID("docs/a.md", "A")
+	prev := gate.PRState{Proposals: []gate.ProposalState{{ID: id, DocPath: "docs/a.md", Section: "A", CommentID: 1, State: gate.ProposalOutdated, Content: p.Content}}}
+	body := "<!-- pollux-agent:proposal:" + id + " -->\n\nold"
+	existing := []gate.Comment{{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: body}}
+
+	state, writes := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, existing)
+
+	if len(writes) < 2 || writes[0].ID != 1 || !writes[0].Resolve || writes[0].Body != strings.Replace(body, "proposal", "superseded", 1) || writes[1].ID != 0 {
+		t.Errorf("writes = %+v, want a retire of comment 1 then a create", writes)
+	}
+	if got := state.Proposals[0]; got.State != gate.ProposalOpen || got.CommentID != 0 {
+		t.Errorf("proposal = %+v, want open with no comment", got)
+	}
+}
+
+func TestReconcileEmitsRetiresFirst(t *testing.T) {
+	t.Parallel()
+
+	a, b := proposal("docs/a.md", "A"), proposal("docs/b.md", "B")
+	bNew := b
+	bNew.Content = "## B\nnewer\n"
+	idA, idB := gate.ProposalID("docs/a.md", "A"), gate.ProposalID("docs/b.md", "B")
+	prev := gate.PRState{SummaryCommentID: 90, Proposals: []gate.ProposalState{
+		{ID: idA, DocPath: "docs/a.md", Section: "A", CommentID: 1, State: gate.ProposalOpen, Content: a.Content},
+		{ID: idB, DocPath: "docs/b.md", Section: "B", CommentID: 2, State: gate.ProposalOpen, Content: b.Content},
+	}}
+	existing := []gate.Comment{
+		{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: "<!-- pollux-agent:proposal:" + idA + " -->\nA"},
+		{ID: 2, Mine: true, Kind: gate.CommentKindReview, Body: "<!-- pollux-agent:proposal:" + idB + " -->\nB"},
+		{ID: 90, Mine: true, Kind: gate.CommentKindIssue, Body: "<!-- pollux-agent:summary -->"},
+	}
+
+	_, writes := gate.Reconcile(prev, testPR(), review.Proposals{a, bNew}, nil, existing)
+
+	if len(writes) != 4 || !writes[0].Resolve || writes[0].ID != 2 || writes[1].ID != 1 || writes[2].ID != 0 || !writes[3].Summary {
+		t.Errorf("writes = %+v, want retire of 2, edit of 1, create, summary", writes)
+	}
+}
+
+func TestReconcileSameContent(t *testing.T) {
+	t.Parallel()
+
+	section := func(content string) review.Proposal {
+		p := proposal("docs/a.md", "A")
+		p.Content = content
+		return p
+	}
+	newDoc := func(content string) review.Proposal {
+		return review.Proposal{DocPath: "docs/c.md", Reason: "why", Anchor: review.Anchor{File: "a.go", Line: 4}, Content: content}
+	}
+	tests := []struct {
+		name        string
+		prior, got  review.Proposal
+		wantCreates int
+	}{
+		{name: "section trailing newlines", prior: section("## A\nnew\n\n"), got: section("## A\nnew"), wantCreates: 0},
+		{name: "section trailing whitespace", prior: section("## A\nnew  \n"), got: section("## A\nnew\n\n\n"), wantCreates: 0},
+		{name: "section heading marks", prior: section("### A\nnew\n"), got: section("## A \nnew\n"), wantCreates: 0},
+		{name: "section body differs", prior: section("## A\nnew\n"), got: section("## A\nnewer\n"), wantCreates: 1},
+		{name: "new doc trailing newlines", prior: newDoc("# C\nx\n\n"), got: newDoc("# C\nx"), wantCreates: 0},
+		{name: "new doc heading marks differ", prior: newDoc("## C\nx\n"), got: newDoc("# C\nx\n"), wantCreates: 1},
+		{name: "new doc heading text differs", prior: newDoc("# C\nx\n"), got: newDoc("# D\nx\n"), wantCreates: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			id := gate.ProposalID(tc.got.DocPath, tc.got.Section)
+			prev := gate.PRState{SummaryCommentID: 2, Proposals: []gate.ProposalState{{ID: id, DocPath: tc.got.DocPath, Section: tc.got.Section, CommentID: 1, State: gate.ProposalOpen, Content: tc.prior.Content}}}
+			existing := []gate.Comment{
+				{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: "<!-- pollux-agent:proposal:" + id + " -->\nold"},
+				{ID: 2, Mine: true, Kind: gate.CommentKindIssue, Body: "<!-- pollux-agent:summary -->\nold"},
+			}
+
+			_, writes := gate.Reconcile(prev, testPR(), review.Proposals{tc.got}, nil, existing)
+
+			if creates, _ := countWrites(writes); creates != tc.wantCreates {
+				t.Errorf("creates = %d, want %d", creates, tc.wantCreates)
+			}
+		})
+	}
+}
+
+func TestReconcileAppliedIgnoresTrailingWhitespace(t *testing.T) {
+	t.Parallel()
+
+	p := proposal("docs/a.md", "A")
+	p.Content = "## A\nnew"
+	id := gate.ProposalID("docs/a.md", "A")
+	prev := gate.PRState{Proposals: []gate.ProposalState{{ID: id, DocPath: "docs/a.md", Section: "A", CommentID: 1, State: gate.ProposalApplied, Content: "## A\nnew\n\n", AppliedSHA: "abc", ReplyID: 7}}}
+
+	state, writes := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, nil)
+
+	if got := state.Proposals[0]; got.State != gate.ProposalApplied || got.ReplyID != 7 {
+		t.Errorf("proposal = %+v, want it to stay applied", got)
+	}
+	for _, w := range writes {
+		if !w.Summary {
+			t.Errorf("write %+v, want none for an applied proposal repeated", w)
+		}
+	}
+}
+
+func TestRetryReconcilesFromTheLatestSavedState(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{}
+	store := &fakeStore{}
+	p, q := proposal("docs/a.md", "A"), proposal("docs/b.md", "B")
+	proposalService(t, gh, store, review.Proposals{p})
+
+	changed := p
+	changed.Content = "## A\nnewer\n"
+	gh.failReviewCreate = gh.createReview + 2
+	runner := &fakeRunner{started: review.Result{Verdict: review.Proposals{changed, q}}}
+	svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner}, nil, nil).WithCollectBackoff(0)
+	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
+		t.Fatalf("HandlePullRequest() = %v, want nil after the inline retry", err)
+	}
+
+	for _, section := range []string{"A", "B"} {
+		id := gate.ProposalID("docs/"+strings.ToLower(section)+".md", section)
+		var live []int64
+		for _, c := range gh.comments {
+			if strings.HasPrefix(c.Body, "<!-- pollux-agent:proposal:"+id+" -->") {
+				live = append(live, c.ID)
+			}
+		}
+		var stored gate.ProposalState
+		for _, ps := range store.saved.Proposals {
+			if ps.ID == id {
+				stored = ps
+			}
+		}
+		if len(live) != 1 || stored.CommentID != live[0] {
+			t.Errorf("proposal %s: live comments %v, state points at %d, want exactly one and state at it", section, live, stored.CommentID)
+		}
 	}
 }

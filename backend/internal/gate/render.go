@@ -2,6 +2,7 @@ package gate
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"unicode"
 
@@ -14,6 +15,10 @@ const forkApplyNote = "Apply is not available: this pull request comes from a fo
 
 func proposalMarker(id string) string {
 	return "<!-- pollux-agent:proposal:" + id + " -->"
+}
+
+func supersededMarker(id string) string {
+	return "<!-- pollux-agent:superseded:" + id + " -->"
 }
 
 // proposalComment is the review comment for p: a suggestion on the doc's own
@@ -61,18 +66,27 @@ func renderSuggestion(id string, p review.Proposal, fork bool) string {
 	return body
 }
 
-// renderOutdated keeps the old comment body readable under an outdated notice,
-// without its Apply box: ticking it would apply a proposal that no longer holds.
-func renderOutdated(id, headSHA, old string) string {
-	old = strings.TrimSpace(withoutCheckbox(strings.ReplaceAll(old, proposalMarker(id), ""), applyLabel))
-	var b strings.Builder
-	b.WriteString(proposalMarker(id))
-	fmt.Fprintf(&b, "\n\n**Outdated: no longer needed as of %s**\n", shortSHA(headSHA))
-	if old != "" {
-		b.WriteString("\n<details>\n<summary>Original proposal</summary>\n\n" + old + "\n\n</details>\n")
-	}
-	return b.String()
+// isSuperseded reports whether the first line of body is a superseded marker.
+func isSuperseded(body string) bool {
+	first, _, _ := strings.Cut(body, "\n")
+	first = strings.TrimRight(first, "\r")
+	return strings.HasPrefix(first, "<!-- pollux-agent:superseded:") && strings.HasSuffix(first, " -->")
 }
+
+// renderSuperseded swaps the marker of a retired proposal comment, so the gate
+// never adopts it as the live comment again, and closes the suggestion fence
+// into a plain one so GitHub no longer offers to commit the stale text.
+func renderSuperseded(id, old string) string {
+	body := strings.Replace(old, proposalMarker(id), supersededMarker(id), 1)
+	loc := suggestionFence.FindStringSubmatchIndex(body)
+	if loc == nil {
+		return body
+	}
+	return body[:loc[3]] + body[loc[1]:]
+}
+
+// suggestionFence matches the opening line of a suggestion block; group 1 is its backtick fence.
+var suggestionFence = regexp.MustCompile("(?m)^(`{3,})suggestion$")
 
 // renderCheckbox is the checkbox-variant review comment body: the edit as a
 // diff of the section's old lines against the proposed ones.
@@ -123,17 +137,6 @@ func setCheckbox(body, label string, ticked bool) (string, bool) {
 		}
 	}
 	return body, false
-}
-
-// withoutCheckbox is body without the lines of the box labelled label, ticked or not.
-func withoutCheckbox(body, label string) string {
-	var kept []string
-	for l := range strings.SplitSeq(body, "\n") {
-		if t := strings.TrimSpace(l); t != checkbox(false, label) && t != checkbox(true, label) {
-			kept = append(kept, l)
-		}
-	}
-	return strings.Join(kept, "\n")
 }
 
 func proposalTarget(p review.Proposal) string {

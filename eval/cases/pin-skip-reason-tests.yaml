@@ -1,0 +1,9 @@
+id: pin-skip-reason-tests
+source: "commit c007477 (PR #43)"
+base: cf6f55b578d400832387ca0268877d1d79b186fa
+head: c0074772867f04c59ca6c7aea6d1280d96a0ee59
+expect:
+  verdict: no_impact
+notes: >
+  Test-only: adds cases to gate/escape_eval_test.go for skip reasons and issue references. No production code
+  changes, so no doc can become wrong.

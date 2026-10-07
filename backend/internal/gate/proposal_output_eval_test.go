@@ -1,6 +1,7 @@
 package gate_test
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -14,7 +15,7 @@ func TestRerunWithRespelledHeadingEditsInPlace(t *testing.T) {
 	store := &fakeStore{}
 	first := proposal("docs/a.md", "Usage")
 	again := proposal("docs/a.md", "## Usage ")
-	again.Reason = "reworded reason"
+	again.Content, again.Reason = first.Content, "reworded reason"
 
 	proposalService(t, gh, store, review.Proposals{first})
 	proposalService(t, gh, store, review.Proposals{again})
@@ -26,7 +27,7 @@ func TestRerunWithRespelledHeadingEditsInPlace(t *testing.T) {
 	}
 }
 
-func TestOutdatedProposalThatReturnsReopensItsComment(t *testing.T) {
+func TestOutdatedProposalThatReturnsGetsANewComment(t *testing.T) {
 	t.Parallel()
 
 	gh := &fakeGitHub{}
@@ -35,18 +36,43 @@ func TestOutdatedProposalThatReturnsReopensItsComment(t *testing.T) {
 
 	proposalService(t, gh, store, review.Proposals{a, b})
 	proposalService(t, gh, store, review.Proposals{a})
-	if !strings.Contains(gh.comments[2].Body, "Outdated") {
-		t.Fatalf("b not outdated after dropping it:\n%s", gh.comments[2].Body)
+	if !strings.HasPrefix(gh.comments[2].Body, "<!-- pollux-agent:superseded:") || !slices.Contains(gh.resolved, int64(3)) {
+		t.Fatalf("b not retired after dropping it (resolved %v):\n%s", gh.resolved, gh.comments[2].Body)
 	}
 	proposalService(t, gh, store, review.Proposals{a, b})
-	if len(gh.comments) != 3 || gh.createReview != 2 {
-		t.Fatalf("comments %d creates %d, want 3 and 2", len(gh.comments), gh.createReview)
+	if len(gh.comments) != 4 || gh.createReview != 3 {
+		t.Fatalf("comments %d creates %d, want 4 and 3", len(gh.comments), gh.createReview)
 	}
-	if strings.Contains(gh.comments[2].Body, "Outdated") {
-		t.Errorf("returned proposal still outdated:\n%s", gh.comments[2].Body)
+	if !strings.HasPrefix(gh.comments[3].Body, "<!-- pollux-agent:proposal:") {
+		t.Errorf("returned proposal's new comment lacks the live marker:\n%s", gh.comments[3].Body)
 	}
 	summary := gh.comments[0].Body
 	if strings.Contains(summary, "outdated") || strings.Count(summary, "| open |") != 2 {
 		t.Errorf("summary should show two open rows:\n%s", summary)
+	}
+}
+
+func TestChangedProposalRetiresItsOldCommentBeforeSavingWithoutIt(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHub{}
+	store := &fakeStore{onSave: func() { gh.ops = append(gh.ops, "save") }}
+	changed := proposal("docs/a.md", "A")
+	changed.Content = "## A\nnewer\n"
+
+	proposalService(t, gh, store, review.Proposals{proposal("docs/a.md", "A")})
+	gh.ops = nil
+	proposalService(t, gh, store, review.Proposals{changed})
+
+	resolve := slices.Index(gh.ops, "resolve-review")
+	if resolve < 0 {
+		t.Fatalf("ops = %v, want the old thread resolved", gh.ops)
+	}
+	after := gh.ops[resolve:]
+	if save, create := slices.Index(after, "save"), slices.Index(after, "create-review"); save < 0 || create < save {
+		t.Errorf("ops = %v, want resolve-review before the pre-create save and the create", gh.ops)
+	}
+	if !strings.HasPrefix(gh.comments[1].Body, "<!-- pollux-agent:superseded:") {
+		t.Errorf("old comment = %q, want its marker swapped", gh.comments[1].Body)
 	}
 }

@@ -1,0 +1,9 @@
+id: pin-new-doc-covers-tests
+source: "commit a1c782b (PR #46)"
+base: 4c1e3603df522192f807cb7c6baaafe27c5b2fab
+head: a1c782b99297163bbb58d8cfd224b340b0df88ae
+expect:
+  verdict: no_impact
+notes: >
+  Test-only: adds basedocs/newdoc_covers_test.go and llmrunner/mixed_newdoc_test.go cases pinning existing
+  behavior. No production code changes, so no doc can become wrong.

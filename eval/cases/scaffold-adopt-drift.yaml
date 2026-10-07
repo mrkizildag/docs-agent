@@ -1,0 +1,20 @@
+id: scaffold-adopt-drift
+source: "commit 2869a6a (PR #36)"
+base: 5e77bd567fbea75b176e84bd27b7a86d8e9ab680
+head: 2869a6a84350b237d18dae8c383def88721ade60
+expect:
+  verdict: proposals
+  docs:
+    - path: docs/features/scaffold.md
+      new: false
+      sections: ["Opening the PR"]
+      must_say:
+        - "Before resetting the pollux-agent/docs-scaffold branch, pollux looks up a pull request opened from it."
+        - "A pull request from the branch opened by a bot is adopted instead of resetting the branch, so no second scaffold PR is opened."
+        - "A pull request from the branch by anyone else fails the attempt without changing the branch; the branch is force-reset only when no pull request exists from it."
+notes: >
+  Code-only commit: force-resetting the scaffold branch closed the bot's open scaffold PR, so it now looks up a PR
+  from the branch first. scaffold.md's "Opening the PR" says pollux force-resets an existing branch at another
+  commit, which became wrong. The doc was fixed in the very next commit, 886d12c (same PR, not bada169 as the brief
+  said; bada169's scaffold.md change is about link conventions); must_say keeps only what 2869a6a itself does, not
+  886d12c's later exact-login match.

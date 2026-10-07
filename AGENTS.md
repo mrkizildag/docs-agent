@@ -6,6 +6,7 @@ A GitHub App that reviews pull requests, proposes updates to the repo's docs, an
 
 - `make check`: lint, test, and vulnerability scan. Run before every commit.
 - `make test`, `make lint`, `make fmt`, `make run`: see [docs/guides/setup.md](docs/guides/setup.md).
+- `make eval`, `make eval-check`: score either runner on labeled cases in `eval/cases/`; see [docs/guides/eval.md](docs/guides/eval.md).
 
 ## Docs
 

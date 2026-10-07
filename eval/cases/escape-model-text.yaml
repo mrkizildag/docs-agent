@@ -1,0 +1,20 @@
+id: escape-model-text
+source: "PR #43"
+base: 14c3a4665f72f7d02bb07fa7e7885b04f1719096
+head: c0074772867f04c59ca6c7aea6d1280d96a0ee59
+expect:
+  verdict: proposals
+  docs:
+    - path: docs/features/proposal-output.md
+      new: false
+      sections: []
+      must_say:
+        - "Model-written text is untrusted and is rendered inert in the check run, proposal comments, the summary, and replies."
+        - "A reason is collapsed to one line, capped at 1000 characters, and has bidi and control characters dropped."
+        - "HTML, links, images, @-mentions, URLs, and issue references (#N, GH-N) in model text are escaped or broken so they cannot render, ping, or link; the model's own inline code spans stay."
+  allow: [docs/features/apply-skip.md]
+notes: >
+  The gate now escapes model-written reasons and paths everywhere it renders them, and skip reasons go through
+  the same escaping. proposal-output.md (covers gate/**) had no description of this; the human added a paragraph
+  in the intro, under the H1, so any section is accepted. apply-skip.md's Skip section was updated to point at the
+  shared escaping; its base text (@ and "- [" broken) is still true, so it is allowed, not required.
