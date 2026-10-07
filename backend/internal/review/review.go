@@ -130,7 +130,7 @@ func (Proposals) isVerdict() {}
 type Proposal struct {
 	DocPath    string `json:"doc_path" jsonschema:"Repo-relative path, under docs/, of the doc this proposal changes or creates."`
 	Section    string `json:"section" jsonschema:"Heading of the section to replace, or empty to create a new doc."`
-	Anchor     Anchor `json:"anchor" jsonschema:"Line in the PR diff that caused this proposal."`
+	Anchor     Anchor `json:"anchor" jsonschema:"Changed file and a head-side line number shown in the numbered diff; the review comment goes on that line."`
 	Reason     string `json:"reason" jsonschema:"One-line explanation of why this doc change is needed."`
 	Content    string `json:"content" jsonschema:"Full replacement for the section including its heading line, or the full content of a new doc."`
 	IndexEntry string `json:"index_entry,omitempty" jsonschema:"Entry to add to the docs index; set iff section is empty."`
@@ -142,10 +142,11 @@ type Proposal struct {
 	Lines LineRange `json:"-"`
 }
 
-// Anchor is the line in the PR diff that caused a proposal.
+// Anchor is the changed file and a numbered head-side diff line that caused a
+// proposal; its review comment goes on that line.
 type Anchor struct {
 	File string `json:"file" jsonschema:"Path of the changed file the anchor points into."`
-	Line int    `json:"line" jsonschema:"Head-side, 1-based line number within the changed file."`
+	Line int    `json:"line" jsonschema:"Head-side line number printed in the numbered diff of the file."`
 }
 
 // Request is what a runner reviews.

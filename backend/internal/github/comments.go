@@ -60,8 +60,8 @@ func (c *Client) ListComments(ctx context.Context, installationID int64, owner, 
 	}
 }
 
-// CreateReviewComment creates a review comment on the right side of c.Path at
-// c.CommitSHA.
+// CreateReviewComment creates a review comment on the right side of rc.Path at
+// rc.CommitSHA, or a file-level comment when rc.File is set.
 func (c *Client) CreateReviewComment(ctx context.Context, installationID int64, owner, repo string, number int, rc gate.ReviewComment) (gate.Comment, error) {
 	client, err := c.installationClient(installationID)
 	if err != nil {
@@ -72,8 +72,12 @@ func (c *Client) CreateReviewComment(ctx context.Context, installationID int64, 
 		Body:     rc.Body,
 		CommitID: rc.CommitSHA,
 		Path:     rc.Path,
-		Line:     &rc.Line,
-		Side:     new("RIGHT"),
+	}
+	if rc.File {
+		req.SubjectType = new("file")
+	} else {
+		req.Line = &rc.Line
+		req.Side = new("RIGHT")
 	}
 	if rc.StartLine != 0 {
 		req.StartLine = &rc.StartLine

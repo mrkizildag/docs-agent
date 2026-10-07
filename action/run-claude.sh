@@ -25,6 +25,14 @@ else
     exit 1
   }
   schema_file="$ACTION_PATH/result.schema.json"
+  awk -f "$ACTION_PATH/numbered-diff.awk" "$out/pr.diff" > "$out/pr.numbered.diff"
+  awk -f "$ACTION_PATH/diff-hunks.awk" "$out/pr.diff" | jq -cR 'select(. != "") | split("\t") | {file: .[0], start: (.[1] | tonumber), end: (.[2] | tonumber)}' > "$out/hunks.jsonl"
+  if [ -s "$out/hunks.jsonl" ]; then
+    jq -c --slurpfile hunks "$out/hunks.jsonl" -f "$ACTION_PATH/anchor-schema.jq" "$schema_file" > "$out/review.schema.json"
+    if [ "$(wc -c < "$out/review.schema.json")" -le 102400 ]; then
+      schema_file="$out/review.schema.json"
+    fi
+  fi
   prompt="$(cat "$ACTION_PATH/prompt.md")
 
 ## Pull request
@@ -37,7 +45,7 @@ else
 $docs_list
 - Changed files no doc covers (JSON-quoted paths):
 $uncovered_list
-- Diff of the head against the merge base, unified format: $out/pr.diff"
+- Diff of the head against the merge base, with head-side line numbers: $out/pr.numbered.diff"
 fi
 
 status=0

@@ -23,7 +23,7 @@ The eval runs the [server runner](../features/server-runner.md) or the [Actions 
 `EVAL_RUNNER` picks which runner is scored:
 
 - `server` (default): the server runner, with the same `LLM_PROVIDER`, `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, and `LLM_TRIAGE_MODEL` as the server (see [Setup](setup.md)). Costs API calls.
-- `actions`: the [Actions runner](../features/actions-runner.md), run on this machine instead of in GitHub Actions. It needs `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`, so it runs on a Claude subscription) or `ANTHROPIC_API_KEY`, plus `claude`, `jq`, and `bash` on `PATH`. Set it in `backend/.env` (see `backend/.env.example`) and export it: `CLAUDE_CODE_OAUTH_TOKEN=… EVAL_RUNNER=actions make eval`.
+- `actions`: the [Actions runner](../features/actions-runner.md), run on this machine instead of in GitHub Actions. It needs `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`, so it runs on a Claude subscription) or `ANTHROPIC_API_KEY`, plus `claude`, `jq`, `awk`, and `bash` on `PATH`. Set it in `backend/.env` (see `backend/.env.example`) and export it: `CLAUDE_CODE_OAUTH_TOKEN=… EVAL_RUNNER=actions make eval`.
 
 | Variable           | Default       | Meaning |
 |--------------------|---------------|---------|
@@ -32,7 +32,7 @@ The eval runs the [server runner](../features/server-runner.md) or the [Actions 
 | `EVAL_CASE`        | all           | Comma-separated case ids to run. |
 | `EVAL_JUDGE_MODEL` | `LLM_MODEL`; Claude Code's default for `actions` | Model that checks whether proposals state the expected facts. With `actions` the judge also runs through `claude -p`, so nothing needs an API key. |
 
-The run needs this repo's full history: cases name commits by SHA. Each run writes `eval/results/<time>-<model>/` (`<time>-actions-<judge>/` for `actions`) with `report.json`, `summary.md` (also printed), and per-run logs under `logs/` (ignored by git): runner logs for `server`, the action's output and Claude transcript for `actions`. The summary shows deltas against the previous report. Commit a report when it is a baseline worth comparing against.
+The run needs this repo's full history: cases name commits by SHA. Each run writes `eval/results/<time>-<model>/` (`<time>-actions-<judge>/` for `actions`) with `report.json`, `summary.md` (also printed), and per-run logs under `logs/`: runner logs for `server`, the action's output and Claude transcript for `actions`. The summary shows deltas against the newest earlier report in that folder. Results stay local (`eval/results/` is ignored by git): they hold model output and are only compared on the machine that ran them. Reports never hold credentials or local paths: a config field that holds either is redacted or left out of `report.json`.
 
 ## How a case is run
 

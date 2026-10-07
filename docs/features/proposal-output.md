@@ -4,6 +4,7 @@ summary: What a PR gets when analysis proposes doc edits (check run, one review 
 covers:
   - backend/internal/gate/**
   - backend/internal/review/review.go
+  - backend/internal/review/validate.go
   - backend/internal/github/comments.go
   - backend/internal/review/basedocs/**
 ---
@@ -31,7 +32,7 @@ A proposal's content replaces the whole section, heading line included, because 
 ## Two comment variants
 
 - **Suggestion.** Used only when the whole section, trailing blank lines included, lies inside one head-side hunk of that doc in the PR diff. GitHub only accepts review comments on diff lines, so this is the one case where the comment can sit on the doc's own lines. It is a GitHub `suggestion` block replacing exactly those lines, with the reason and no checkbox; on a fork it ends with the sentence that Apply is not available because the bot cannot push to the fork. The suggestion restates the section's trailing blank lines, otherwise applying it would eat the gap before the next heading. The code fence is made longer than any backtick run in the content so proposed code fences cannot close it early.
-- **Checkbox.** Used for everything else: the doc is not in the diff, the section only partly overlaps a hunk or spans two, or the doc is new. The comment sits on the proposal's anchor line (a changed code line) and holds the reason, the doc path and section, the edit as a `diff` block (old section lines `-`, new lines `+`; a new doc shows only added lines plus its index entry), and an unticked "Apply this change" task-list item.
+- **Checkbox.** Used for everything else: the doc is not in the diff, the section only partly overlaps a hunk or spans two, or the doc is new. The comment sits on the proposal's anchor line: the model names the changed file and one of the head-side line numbers printed in the numbered diff it is shown, and validation rejects a line outside the file's hunks. The gate never moves an anchor. Both runners reject an anchor outside the hunks before the gate sees it (the server runner sends the error back to the model, the Actions runner's schema makes Claude Code re-prompt, and `Collect` rejects what still gets through), so the gate's file-level review comment for such an anchor is a defensive fallback only. It holds the reason, the doc path and section, the edit as a `diff` block (old section lines `-`, new lines `+`; a new doc shows only added lines plus its index entry), and an unticked "Apply this change" task-list item.
 
 ## Identity and re-runs
 
@@ -56,5 +57,5 @@ Every proposal comment starts with a hidden `<!-- pollux-agent:proposal:ID -->` 
 
 ## Known limits
 
-- If a later push deletes the anchor line, GitHub shows its own "Outdated" badge on a still-open proposal; the gate's state is unaffected.
+- If a later push deletes the line the comment sits on, GitHub shows its own "Outdated" badge on a still-open proposal; the gate's state is unaffected.
 - The two GitHub comment APIs (review and issue) have separate ID spaces and edit endpoints, so the gate tracks which kind each comment is.

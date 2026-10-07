@@ -259,7 +259,19 @@ func TestProposalValidate(t *testing.T) {
 				return p
 			},
 			changed:     validChanged(),
-			wantErrPart: "anchor.line",
+			wantErrPart: `anchor.line 100: not a numbered line in the diff of "backend/cmd/server/main.go"; commentable lines: 1-10`,
+		},
+		{
+			name:     "anchor on a removed file",
+			proposal: validProposal,
+			changed: func() []review.ChangedFile {
+				c := validChanged()
+				for i := range c {
+					c[i].Removed = true
+				}
+				return c
+			}(),
+			wantErrPart: "no head-side lines",
 		},
 		{
 			name: "reason empty",

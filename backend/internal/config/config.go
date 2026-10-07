@@ -158,8 +158,9 @@ type Eval struct {
 	AnthropicAPIKey  Secret
 	// JudgeModel is empty for the Actions runner to use Claude Code's default.
 	JudgeModel string
-	// Path is the PATH the runners' child processes get.
-	Path     string
+	// Path is the PATH the runners' child processes get. Kept out of reports:
+	// it holds the developer's local layout.
+	Path     string `json:"-"`
 	Runs     int
 	Parallel int
 	Cases    []string

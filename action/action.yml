@@ -63,7 +63,7 @@ runs:
         fi
         mkdir -p "$RUNNER_TEMP/pollux-agent"
         [ "$PR_NUMBER" != "0" ] || exit 0
-        git diff "origin/$DEFAULT_BRANCH...HEAD" > "$RUNNER_TEMP/pollux-agent/pr.diff"
+        git -c core.quotePath=false diff "origin/$DEFAULT_BRANCH...HEAD" > "$RUNNER_TEMP/pollux-agent/pr.diff"
 
     - name: Run Claude
       shell: bash
