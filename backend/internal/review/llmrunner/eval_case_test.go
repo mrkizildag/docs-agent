@@ -25,6 +25,9 @@ import (
 const (
 	verdictProposals = "proposals"
 	verdictNoImpact  = "no_impact"
+	// verdictEither is a borderline case: "no impact" passes, and so do
+	// proposals that only touch the listed docs and sections.
+	verdictEither = "either"
 )
 
 // evalCommitEnv is the fixed identity for every commit the harness makes.
@@ -88,8 +91,16 @@ func parseEvalCase(name string, data []byte) (evalCase, error) {
 		if len(c.Expect.Docs) == 0 {
 			return evalCase{}, fmt.Errorf("case %s: a proposals case lists at least one doc", name)
 		}
+	case verdictEither:
+		if len(c.Expect.Docs) == 0 {
+			return evalCase{}, fmt.Errorf("case %s: an either case lists at least one doc", name)
+		}
+		// An either case is scored on targets only: facts and allow would be silently ignored.
+		if len(c.Expect.Allow) > 0 || slices.ContainsFunc(c.Expect.Docs, func(d evalDoc) bool { return len(d.MustSay) > 0 || d.New }) {
+			return evalCase{}, fmt.Errorf("case %s: an either case lists docs and sections only (no allow, must_say, or new)", name)
+		}
 	default:
-		return evalCase{}, fmt.Errorf("case %s: verdict %q must be %s or %s", name, c.Expect.Verdict, verdictProposals, verdictNoImpact)
+		return evalCase{}, fmt.Errorf("case %s: verdict %q must be %s, %s, or %s", name, c.Expect.Verdict, verdictProposals, verdictNoImpact, verdictEither)
 	}
 
 	globs := slices.Clone(c.Expect.Allow)
@@ -416,6 +427,10 @@ func TestEvalCasesParse(t *testing.T) {
 		{name: "unknown verdict", file: "x.yaml", body: header + "expect:\n  verdict: maybe\n", wantErr: true},
 		{name: "no impact with docs", file: "x.yaml", body: header + "expect:\n  verdict: no_impact\n  docs:\n    - path: docs/a.md\n", wantErr: true},
 		{name: "proposals without docs", file: "x.yaml", body: header + "expect:\n  verdict: proposals\n", wantErr: true},
+		{name: "either", file: "x.yaml", body: header + "expect:\n  verdict: either\n  docs:\n    - path: docs/a.md\n"},
+		{name: "either without docs", file: "x.yaml", body: header + "expect:\n  verdict: either\n", wantErr: true},
+		{name: "either with facts", file: "x.yaml", body: header + "expect:\n  verdict: either\n  docs:\n    - path: docs/a.md\n      must_say: [\"x\"]\n", wantErr: true},
+		{name: "either with allow", file: "x.yaml", body: header + "expect:\n  verdict: either\n  docs:\n    - path: docs/a.md\n  allow: [docs/b.md]\n", wantErr: true},
 		{name: "bad glob", file: "x.yaml", body: header + "expect:\n  verdict: proposals\n  docs:\n    - path: \"docs/[\"\n", wantErr: true},
 	}
 	for _, tc := range tests {

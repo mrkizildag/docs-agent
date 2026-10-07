@@ -229,9 +229,21 @@ func TestSummaryRendering(t *testing.T) {
 			not:   []string{"All proposals applied", "[x] Apply all"},
 		},
 		{
-			name:  "none applied leaves apply all unticked",
+			name:  "only outdated proposals: no apply all, says none are needed",
 			state: gate.PRState{Proposals: []gate.ProposalState{prop(gate.ProposalOutdated)}},
-			want:  []string{"- [ ] Apply all"},
+			want:  []string{"| outdated |", "no doc updates are needed now; earlier proposals are outdated."},
+			not:   []string{"Apply all", "proposes 0"},
+		},
+		{
+			name:  "all applied says so in the heading",
+			state: gate.PRState{Proposals: []gate.ProposalState{prop(gate.ProposalApplied)}},
+			want:  []string{"every proposed doc update is applied."},
+			not:   []string{"proposes 0"},
+		},
+		{
+			name:  "open and outdated still offers apply all",
+			state: gate.PRState{Proposals: []gate.ProposalState{prop(gate.ProposalOpen), prop(gate.ProposalOutdated)}},
+			want:  []string{"proposes 1 doc update.", "- [ ] Apply all"},
 		},
 		{
 			name:  "fork has no apply all",
