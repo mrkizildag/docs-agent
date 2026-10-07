@@ -22,7 +22,7 @@
           "description": "Head-side, 1-based line number within the changed file."
         }
       },
-      "description": "Line in the PR diff that caused this proposal.",
+      "description": "Changed file (not a deleted one) and head-side line that caused this proposal; the comment is placed on the nearest diff line of that file.",
       "required": [
         "file",
         "line"

@@ -380,3 +380,15 @@ func TestSecretRedacted(t *testing.T) {
 		t.Errorf("json.Marshal leaked secret: %q", string(b))
 	}
 }
+
+func TestEvalReportLeavesOutPath(t *testing.T) {
+	t.Parallel()
+
+	data, err := json.Marshal(config.Eval{Path: "/home/someone/bin"})
+	if err != nil {
+		t.Fatalf("json.Marshal(Eval) error = %v", err)
+	}
+	if strings.Contains(string(data), "someone") {
+		t.Errorf("json.Marshal(Eval) = %s, want no PATH", data)
+	}
+}

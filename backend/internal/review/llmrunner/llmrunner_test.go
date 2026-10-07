@@ -593,9 +593,11 @@ func TestStart_UnparseableTriageReplyErrorsWithReply(t *testing.T) {
 func TestStart_InvalidProposalIsReturnedToModel(t *testing.T) {
 	t.Parallel()
 
+	bad := proposalFor("docs/x.md", 2)
+	bad["anchor"] = map[string]any{"file": "unchanged.go", "line": 1}
 	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
 		triageResponse(true),
-		submitResponse(proposalFor("docs/x.md", 99)),
+		submitResponse(bad),
 		func(req llm.Request) (llm.Response, error) {
 			last := req.Messages[len(req.Messages)-1]
 			if len(last.ToolResults) != 1 || !last.ToolResults[0].IsError || !strings.Contains(last.ToolResults[0].Content, "docs/x.md") {

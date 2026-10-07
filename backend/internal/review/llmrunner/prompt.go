@@ -85,8 +85,9 @@ const draftSystemPrompt = `You propose documentation updates for a pull request.
 	`whole section of a doc with corrected content rather than many small edits. Conventions, ` +
 	`exactly: "section" is the heading text of an existing section without the leading '#'s, exactly as it ` +
 	`appears in the doc; "content" is the full replacement for that section including its heading line; ` +
-	`"anchor" is a head-side line number inside one of the listed hunk ranges of the changed file that caused ` +
-	`the staleness, never an unchanged line outside them. Propose a new doc only when the prompt lists changed ` +
+	`"anchor" is the changed file that caused the staleness (not a deleted one) and the head-side line ` +
+	`the change is about; the comment is placed on the nearest line of the listed hunk ranges of that ` +
+	`file. Propose a new doc only when the prompt lists changed ` +
 	`files no doc covers and no existing doc can hold the behavior. Then "section" is "", "content" is the whole doc ` +
 	`including frontmatter with a non-empty "title" and "summary" and "covers" (globs of the source files it describes; at least ` +
 	`one must match a listed uncovered file); links to other docs in this repo are relative paths, never "/docs/..." paths or GitHub URLs to this repo's docs; "doc_path" is a new .md path under docs/, and "index_entry" is the ` +

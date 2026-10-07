@@ -283,6 +283,11 @@ func TestCollect(t *testing.T) {
 		"reason": "x", "content": "y",
 	}
 
+	unchangedAnchor := map[string]any{
+		"doc_path": "docs/a.md", "section": "Usage", "anchor": map[string]any{"file": "other.go", "line": 3},
+		"reason": "x", "content": "y",
+	}
+
 	wrongType := validProposal()
 	wrongType["anchor"] = map[string]any{"line": "three", "file": "main.go"}
 	missingContent := validProposal()
@@ -322,9 +327,19 @@ func TestCollect(t *testing.T) {
 		{name: "missing structured output", raw: artifact(t, "abc", "n1", map[string]any{}), wantInvalid: true},
 		{name: "bad json", raw: []byte("{"), wantInvalid: true},
 		{
-			name: "anchor outside diff",
+			name: "anchor outside the hunks of a changed file is accepted for the gate to place",
 			raw: artifact(t, "abc", "n1", map[string]any{
 				"structured_output": map[string]any{"proposals": []any{farAnchor}},
+			}),
+			want: review.Result{Runner: "actions", Model: "claude-code", Verdict: review.Proposals{{
+				DocPath: "docs/a.md", Section: "Usage", Anchor: review.Anchor{File: "main.go", Line: 50},
+				Reason: "x", Content: "y",
+			}}},
+		},
+		{
+			name: "anchor on a file the PR did not change",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"structured_output": map[string]any{"proposals": []any{unchangedAnchor}},
 			}),
 			wantInvalid: true,
 		},

@@ -23,7 +23,7 @@ func supersededMarker(id string) string {
 
 // proposalComment is the review comment for p: a suggestion on the doc's own
 // lines when they lie within one head-side hunk of the PR diff, else the
-// checkbox variant on the anchor line.
+// checkbox variant on the diff line nearest the anchor.
 func proposalComment(headSHA, id string, p review.Proposal, changed []review.ChangedFile, fork bool) ReviewComment {
 	if suggestable(p, changed) {
 		rc := ReviewComment{CommitSHA: headSHA, Path: p.DocPath, Line: p.Lines.End, Body: renderSuggestion(id, p, fork)}
@@ -32,7 +32,8 @@ func proposalComment(headSHA, id string, p review.Proposal, changed []review.Cha
 		}
 		return rc
 	}
-	return ReviewComment{CommitSHA: headSHA, Path: p.Anchor.File, Line: p.Anchor.Line, Body: renderCheckbox(id, p, fork)}
+	at, _ := p.Anchor.Snap(changed)
+	return ReviewComment{CommitSHA: headSHA, Path: at.File, Line: at.Line, Body: renderCheckbox(id, p, fork)}
 }
 
 func suggestable(p review.Proposal, changed []review.ChangedFile) bool {

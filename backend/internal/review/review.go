@@ -110,7 +110,7 @@ func (Proposals) isVerdict() {}
 type Proposal struct {
 	DocPath    string `json:"doc_path" jsonschema:"Repo-relative path, under docs/, of the doc this proposal changes or creates."`
 	Section    string `json:"section" jsonschema:"Heading of the section to replace, or empty to create a new doc."`
-	Anchor     Anchor `json:"anchor" jsonschema:"Line in the PR diff that caused this proposal."`
+	Anchor     Anchor `json:"anchor" jsonschema:"Changed file (not a deleted one) and head-side line that caused this proposal; the comment is placed on the nearest diff line of that file."`
 	Reason     string `json:"reason" jsonschema:"One-line explanation of why this doc change is needed."`
 	Content    string `json:"content" jsonschema:"Full replacement for the section including its heading line, or the full content of a new doc."`
 	IndexEntry string `json:"index_entry,omitempty" jsonschema:"Entry to add to the docs index; set iff section is empty."`
@@ -122,10 +122,34 @@ type Proposal struct {
 	Lines LineRange `json:"-"`
 }
 
-// Anchor is the line in the PR diff that caused a proposal.
+// Anchor is the changed file and line that caused a proposal; its review
+// comment goes on the nearest diff line (Snap).
 type Anchor struct {
 	File string `json:"file" jsonschema:"Path of the changed file the anchor points into."`
 	Line int    `json:"line" jsonschema:"Head-side, 1-based line number within the changed file."`
+}
+
+// Snap returns a on the nearest head-side diff line of a.File, where GitHub
+// accepts a review comment; ok is false when a.File has no such line.
+func (a Anchor) Snap(changed []ChangedFile) (Anchor, bool) {
+	for _, file := range changed {
+		if file.Path != a.File {
+			continue
+		}
+		if file.Removed || len(file.Hunks) == 0 {
+			return a, false
+		}
+		best, bestDist := 0, -1
+		for _, h := range file.Hunks {
+			line := min(max(a.Line, h.Start), h.End)
+			if dist := max(a.Line-line, line-a.Line); bestDist < 0 || dist < bestDist || (dist == bestDist && line < best) {
+				best, bestDist = line, dist
+			}
+		}
+		a.Line = best
+		return a, true
+	}
+	return a, false
 }
 
 // Request is what a runner reviews.

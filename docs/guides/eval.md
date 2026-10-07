@@ -32,7 +32,7 @@ The eval runs the [server runner](../features/server-runner.md) or the [Actions 
 | `EVAL_CASE`        | all           | Comma-separated case ids to run. |
 | `EVAL_JUDGE_MODEL` | `LLM_MODEL`; Claude Code's default for `actions` | Model that checks whether proposals state the expected facts. With `actions` the judge also runs through `claude -p`, so nothing needs an API key. |
 
-The run needs this repo's full history: cases name commits by SHA. Each run writes `eval/results/<time>-<model>/` (`<time>-actions-<judge>/` for `actions`) with `report.json`, `summary.md` (also printed), and per-run logs under `logs/` (ignored by git): runner logs for `server`, the action's output and Claude transcript for `actions`. The summary shows deltas against the previous report. Commit a report when it is a baseline worth comparing against.
+The run needs this repo's full history: cases name commits by SHA. Each run writes `eval/results/<time>-<model>/` (`<time>-actions-<judge>/` for `actions`) with `report.json`, `summary.md` (also printed), and per-run logs under `logs/` (ignored by git): runner logs for `server`, the action's output and Claude transcript for `actions`. The summary shows deltas against the previous report. Commit a report when it is a baseline worth comparing against. Reports never hold credentials or local paths: a config field that holds either is redacted or left out of `report.json`.
 
 ## How a case is run
 

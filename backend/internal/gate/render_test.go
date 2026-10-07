@@ -588,3 +588,19 @@ func TestSpanDocPathIsLiteralInCheckSummary(t *testing.T) {
 		}
 	}
 }
+
+func TestProposalCommentSitsOnTheDiffLineNearestItsAnchor(t *testing.T) {
+	t.Parallel()
+
+	changed := []review.ChangedFile{{Path: "a.go", Hunks: []review.LineRange{{Start: 3, End: 9}}}}
+	p := review.Proposal{DocPath: "docs/a.md", Section: "A", Reason: "r", Anchor: review.Anchor{File: "a.go", Line: 279}, Content: "## A\nnew\n"}
+
+	_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, changed, nil)
+
+	if len(writes) == 0 {
+		t.Fatal("Reconcile wrote nothing, want the proposal comment")
+	}
+	if got := writes[0].Review; got.Path != "a.go" || got.Line != 9 {
+		t.Errorf("comment at %s:%d, want a.go:9 (the diff line nearest line 279)", got.Path, got.Line)
+	}
+}

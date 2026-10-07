@@ -4,12 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 	"unicode"
 )
 
 // Validate reports every way p is malformed given the files changed in the
-// pull request: a bad DocPath, an Anchor outside the diff, missing Reason or
+// pull request: a bad DocPath, an Anchor on a file the PR does not change or
+// deletes, missing Reason or
 // Content, a multi-line Reason, or an IndexEntry that doesn't match whether
 // Section is empty.
 func (p Proposal) Validate(changed []ChangedFile) error {
@@ -64,19 +66,16 @@ func validateDocPath(docPath string) error {
 	return nil
 }
 
+// validateAnchor checks only the anchor's file, by the same rule Snap places
+// by, so every valid anchor yields a comment on a diff line.
 func validateAnchor(anchor Anchor, changed []ChangedFile) error {
-	for _, file := range changed {
-		if file.Path != anchor.File {
-			continue
-		}
-		for _, hunk := range file.Hunks {
-			if anchor.Line >= hunk.Start && anchor.Line <= hunk.End {
-				return nil
-			}
-		}
-		return fmt.Errorf("anchor.line %d: outside the diff hunks of %q", anchor.Line, anchor.File)
+	if !slices.ContainsFunc(changed, func(f ChangedFile) bool { return f.Path == anchor.File }) {
+		return fmt.Errorf("anchor.file %q: not a changed file", anchor.File)
 	}
-	return fmt.Errorf("anchor.file %q: not a changed file", anchor.File)
+	if _, ok := anchor.Snap(changed); !ok {
+		return fmt.Errorf("anchor.file %q: has no head-side lines in the diff", anchor.File)
+	}
+	return nil
 }
 
 // ValidateTarget checks the parts of p that decide what Apply writes: the doc

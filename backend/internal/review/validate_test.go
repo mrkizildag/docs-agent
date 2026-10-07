@@ -252,14 +252,25 @@ func TestProposalValidate(t *testing.T) {
 			wantErrPart: "anchor.file",
 		},
 		{
-			name: "anchor line outside hunks",
+			name: "anchor line outside hunks is placed by the gate",
 			proposal: func() review.Proposal {
 				p := validProposal()
 				p.Anchor.Line = 100
 				return p
 			},
-			changed:     validChanged(),
-			wantErrPart: "anchor.line",
+			changed: validChanged(),
+		},
+		{
+			name:     "anchor on a removed file",
+			proposal: validProposal,
+			changed: func() []review.ChangedFile {
+				c := validChanged()
+				for i := range c {
+					c[i].Removed = true
+				}
+				return c
+			}(),
+			wantErrPart: "no head-side lines",
 		},
 		{
 			name: "reason empty",
@@ -346,5 +357,61 @@ func TestProposalValidateTarget(t *testing.T) {
 	err := p.ValidateTarget()
 	if err == nil || !strings.Contains(err.Error(), "doc_path") || !strings.Contains(err.Error(), "section") {
 		t.Fatalf("ValidateTarget(%+v) = %v, want doc_path and section errors", p, err)
+	}
+}
+
+func TestAnchorSnap(t *testing.T) {
+	t.Parallel()
+
+	changed := []review.ChangedFile{
+		{Path: "a.go", Hunks: []review.LineRange{{Start: 10, End: 20}, {Start: 30, End: 40}}},
+		{Path: "gone.go", Removed: true, Hunks: []review.LineRange{{Start: 1, End: 5}}},
+		{Path: "empty.go"},
+	}
+
+	tests := []struct {
+		name   string
+		anchor review.Anchor
+		want   int
+		wantOK bool
+	}{
+		{name: "inside a hunk", anchor: review.Anchor{File: "a.go", Line: 15}, want: 15, wantOK: true},
+		{name: "before the first hunk", anchor: review.Anchor{File: "a.go", Line: 3}, want: 10, wantOK: true},
+		{name: "between hunks nearer the first", anchor: review.Anchor{File: "a.go", Line: 22}, want: 20, wantOK: true},
+		{name: "between hunks nearer the second", anchor: review.Anchor{File: "a.go", Line: 28}, want: 30, wantOK: true},
+		{name: "between hunks tie takes the earlier line", anchor: review.Anchor{File: "a.go", Line: 25}, want: 20, wantOK: true},
+		{name: "after the last hunk", anchor: review.Anchor{File: "a.go", Line: 99}, want: 40, wantOK: true},
+		{name: "line zero", anchor: review.Anchor{File: "a.go", Line: 0}, want: 10, wantOK: true},
+		{name: "negative line", anchor: review.Anchor{File: "a.go", Line: -4}, want: 10, wantOK: true},
+		{name: "file not changed", anchor: review.Anchor{File: "other.go", Line: 7}, want: 7},
+		{name: "removed file", anchor: review.Anchor{File: "gone.go", Line: 9}, want: 9},
+		{name: "file without hunks", anchor: review.Anchor{File: "empty.go", Line: 9}, want: 9},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, ok := tc.anchor.Snap(changed)
+			if got.File != tc.anchor.File || got.Line != tc.want || ok != tc.wantOK {
+				t.Errorf("Snap(%+v) = %+v, %v, want line %d, %v", tc.anchor, got, ok, tc.want, tc.wantOK)
+			}
+			// Validation accepts exactly the anchors Snap can place, so a valid
+			// proposal always gets its comment on a diff line.
+			p := validProposal()
+			p.Anchor = tc.anchor
+			if valid := p.Validate(changed) == nil; valid != ok {
+				t.Errorf("Validate accepts %+v = %v, but Snap ok = %v", tc.anchor, valid, ok)
+			}
+		})
+	}
+}
+
+func TestAnchorSnapTieIgnoresHunkOrder(t *testing.T) {
+	t.Parallel()
+
+	changed := []review.ChangedFile{{Path: "a.go", Hunks: []review.LineRange{{Start: 30, End: 40}, {Start: 10, End: 20}}}}
+	if got, _ := (review.Anchor{File: "a.go", Line: 25}).Snap(changed); got.Line != 20 {
+		t.Errorf("Snap(line 25) = line %d, want 20 (the earlier line on a tie)", got.Line)
 	}
 }
