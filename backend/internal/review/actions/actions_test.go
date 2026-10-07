@@ -373,12 +373,12 @@ func TestCollect(t *testing.T) {
 			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
 		},
 		{
-			name: "one malformed token count keeps the rest",
+			name: "one malformed token count drops every count",
 			raw: artifact(t, "abc", "n1", map[string]any{
 				"usage":             map[string]any{"input_tokens": "12", "output_tokens": 5},
 				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
 			}),
-			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{Tokens: &review.Tokens{Output: 5}}},
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
 		},
 		{
 			name: "cost not a number",
@@ -397,13 +397,13 @@ func TestCollect(t *testing.T) {
 			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{CostUSD: ptr(0.5)}},
 		},
 		{
-			name: "null cost and tokens are not reported",
+			name: "null cost and a null token count are not reported",
 			raw: artifact(t, "abc", "n1", map[string]any{
 				"total_cost_usd":    nil,
 				"usage":             map[string]any{"input_tokens": nil, "output_tokens": 3},
 				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
 			}),
-			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{Tokens: &review.Tokens{Output: 3}}},
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
 		},
 		{
 			name: "all null usage is nil",
@@ -421,7 +421,7 @@ func TestCollect(t *testing.T) {
 				"usage":             map[string]any{"input_tokens": -5, "output_tokens": 7},
 				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
 			}),
-			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{Tokens: &review.Tokens{Output: 7}}},
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
 		},
 		{
 			name: "absurd tokens and cost",
@@ -430,7 +430,7 @@ func TestCollect(t *testing.T) {
 				"usage":             map[string]any{"input_tokens": 2e12, "output_tokens": 7},
 				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
 			}),
-			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{Tokens: &review.Tokens{Output: 7}}},
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
 		},
 		{
 			name: "model name and cost basis over their caps",

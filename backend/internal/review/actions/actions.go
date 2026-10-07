@@ -349,13 +349,19 @@ func capText(s string) string {
 }
 
 // reviewUsage is nil when the run reported no valid token count or cost.
-// Negative or implausible values count as not reported.
+// Negative or implausible values count as not reported. A count that is present
+// but invalid drops all four, so a stored zero is always a reported zero.
 func (o ClaudeOutput[T]) reviewUsage() *review.Usage {
 	fields := decodeObject(o.Usage)
-	tokensReported := false
+	tokensReported, tokensValid := false, true
 	count := func(key string) int64 {
-		n, ok := boundedNumber(fields[key], maxTokens)
+		raw, present := fields[key]
+		if !present {
+			return 0
+		}
+		n, ok := boundedNumber(raw, maxTokens)
 		tokensReported = tokensReported || ok
+		tokensValid = tokensValid && ok
 		return int64(n)
 	}
 	tokens := review.Tokens{
@@ -365,7 +371,7 @@ func (o ClaudeOutput[T]) reviewUsage() *review.Usage {
 		CacheWrite: count("cache_creation_input_tokens"),
 	}
 	u := review.Usage{CostBasis: o.costBasis()}
-	if tokensReported {
+	if tokensReported && tokensValid {
 		u.Tokens = &tokens
 	}
 	if cost, ok := boundedNumber(o.TotalCostUSD, maxCostUSD); ok {
