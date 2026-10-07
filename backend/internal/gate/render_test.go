@@ -599,7 +599,7 @@ func TestProposalCommentSitsOnItsAnchorLine(t *testing.T) {
 	changed := []review.ChangedFile{{Path: "a.go", Hunks: []review.LineRange{{Start: 3, End: 9}}}}
 	p := review.Proposal{DocPath: "docs/a.md", Section: "A", Reason: "r", Anchor: review.Anchor{File: "a.go", Line: 5}, Content: "## A\nnew\n"}
 
-	_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, changed, nil)
+	_, writes, _ := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, changed, nil)
 
 	if len(writes) == 0 {
 		t.Fatal("Reconcile wrote nothing, want the proposal comment")
@@ -615,7 +615,7 @@ func TestProposalCommentOutsideHunksIsFileLevel(t *testing.T) {
 	changed := []review.ChangedFile{{Path: "a.go", Hunks: []review.LineRange{{Start: 3, End: 9}}}}
 	p := review.Proposal{DocPath: "docs/a.md", Section: "A", Reason: "r", Anchor: review.Anchor{File: "a.go", Line: 279}, Content: "## A\nnew\n"}
 
-	_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, changed, nil)
+	_, writes, _ := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, changed, nil)
 
 	if len(writes) == 0 {
 		t.Fatal("Reconcile wrote nothing, want the proposal comment")
