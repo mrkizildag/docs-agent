@@ -157,6 +157,15 @@ func (c *clone) docsAt(ctx context.Context, baseSHA string) (fs.FS, error) {
 	return files, nil
 }
 
+// isGitlink reports whether path is a submodule entry in the checked-out commit.
+func (c *clone) isGitlink(ctx context.Context, path string) (bool, error) {
+	out, err := runGit(ctx, c.dir, c.remoteURL, c.token, "ls-tree", "-z", "HEAD", "--", path)
+	if err != nil {
+		return false, fmt.Errorf("look up %s at head: %w", path, err)
+	}
+	return strings.HasPrefix(out, "160000 "), nil
+}
+
 // runGit runs git in dir and returns its stdout.
 func runGit(ctx context.Context, dir, remoteURL, token string, args ...string) (string, error) {
 	return runGitStdin(ctx, dir, remoteURL, token, "", args...)

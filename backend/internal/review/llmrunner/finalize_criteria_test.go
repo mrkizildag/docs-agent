@@ -3,6 +3,7 @@ package llmrunner_test
 import (
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -134,6 +135,37 @@ func TestStart_NewDocUnderAnExistingFileIsReturnedToModel(t *testing.T) {
 	repoDir, headSHA := newGitRepo(t)
 	proposal := newDocProposal("other.go")
 	proposal["doc_path"] = "docs/x.md/new.md"
+	changed := []review.ChangedFile{mainGoChange(), otherGoChange()}
+	_, model := startOnRepo(t, repoDir, headSHA, changed,
+		triageResponse(true), newDocResponse(true), submitResponse(proposal), submitResponse(), verifyResponse(true))
+	if got := returnedToModel(t, model); !strings.Contains(got, "proposal 0:") || !strings.Contains(got, "already exists") {
+		t.Errorf("tool error = %q, want proposal 0 reported as already existing", got)
+	}
+}
+
+func TestStart_NewDocInsideASubmoduleIsReturnedToModel(t *testing.T) {
+	t.Parallel()
+
+	repoDir, baseSHA := newGitRepo(t)
+	// A gitlink entry: the clone checks it out as an empty directory.
+	for _, args := range [][]string{
+		{"update-index", "--add", "--cacheinfo", "160000," + baseSHA + ",docs/sub"},
+		{"commit", "-q", "-m", "add submodule"},
+	} {
+		cmd := exec.CommandContext(t.Context(), "git", args...) //nolint:gosec // test-fixture git args are literals in this file
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	out, err := exec.CommandContext(t.Context(), "git", "-C", repoDir, "rev-parse", "HEAD").Output() //nolint:gosec // repoDir is a t.TempDir path
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	headSHA := strings.TrimSpace(string(out))
+
+	proposal := newDocProposal("other.go")
+	proposal["doc_path"] = "docs/sub/new.md"
 	changed := []review.ChangedFile{mainGoChange(), otherGoChange()}
 	_, model := startOnRepo(t, repoDir, headSHA, changed,
 		triageResponse(true), newDocResponse(true), submitResponse(proposal), submitResponse(), verifyResponse(true))

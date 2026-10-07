@@ -227,7 +227,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		return noImpact(finalize.NoImpactReason(prefix+strings.Join(reasons, "; ")), r.triageModel, budget), nil
 	}
 
-	proposals, err := r.draft(ctx, log, root, index, budget, fence, req, selection, impacted, allowNewDoc, patch)
+	proposals, err := r.draft(ctx, log, root, c.isGitlink, index, budget, fence, req, selection, impacted, allowNewDoc, patch)
 	if err != nil {
 		return review.Result{}, err
 	}
@@ -259,7 +259,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 // left out, such as one with broken frontmatter, so a PR can't opt a doc out of
 // triage by breaking it.
 func headDoc(ctx context.Context, root *os.Root, docPath string) (docs.Doc, error) {
-	src, ok, err := cloneHead{root}.ReadFile(ctx, docPath)
+	src, ok, err := cloneHead{root: root}.ReadFile(ctx, docPath)
 	if err != nil {
 		return docs.Doc{}, err
 	}
@@ -269,15 +269,19 @@ func headDoc(ctx context.Context, root *os.Root, docPath string) (docs.Doc, erro
 	return docs.ParseBody(docPath, src), nil
 }
 
-// cloneHead is the finalize.Head over the head clone. It never reads through a symlink.
-type cloneHead struct{ root *os.Root }
+// cloneHead is the finalize.Head over the head clone. It never reads through a
+// symlink. gitlink, when set, reports whether a path is a submodule entry.
+type cloneHead struct {
+	root    *os.Root
+	gitlink func(ctx context.Context, path string) (bool, error)
+}
 
 var _ finalize.Head = cloneHead{}
 
 // lstat reports ok=false when nothing is at path. A path under a file or a
 // symlink is unusable rather than absent; it is reported as taken.
 func (h cloneHead) lstat(path string) (info fs.FileInfo, ok, taken bool, err error) {
-	if h.blockedByAncestor(path) {
+	if _, blocked := h.nearestAncestor(path); blocked {
 		return nil, false, true, nil
 	}
 	info, err = h.root.Lstat(path)
@@ -290,26 +294,45 @@ func (h cloneHead) lstat(path string) (info fs.FileInfo, ok, taken bool, err err
 	return nil, false, false, fmt.Errorf("lstat %s at head: %w", path, err)
 }
 
-// blockedByAncestor reports whether the nearest existing parent directory of p
-// is not a directory (a file or a symlink). Such a path can't be created as a
-// doc, and os.Root follows links that stay inside the clone, so it is checked
-// before the lookup.
-func (h cloneHead) blockedByAncestor(p string) bool {
+// nearestAncestor returns the nearest existing parent directory of p, and
+// blocked when that parent is not a directory (a file or a symlink). Such a
+// path can't be created as a doc, and os.Root follows links that stay inside
+// the clone, so it is checked before the lookup.
+func (h cloneHead) nearestAncestor(p string) (dir string, blocked bool) {
 	for dir := pathpkg.Dir(p); dir != "." && dir != "/"; dir = pathpkg.Dir(dir) {
 		info, err := h.root.Lstat(dir)
 		if err == nil {
-			return !info.IsDir()
+			return dir, !info.IsDir()
 		}
 		if !errors.Is(err, fs.ErrNotExist) {
-			return true
+			return dir, true
 		}
 	}
-	return false
+	return "", false
 }
 
-func (h cloneHead) Exists(_ context.Context, path string) (bool, error) {
+// emptyDir reports whether dir has no entries; a clone checks a submodule out
+// as an empty directory.
+func (h cloneHead) emptyDir(dir string) bool {
+	f, err := h.root.Open(dir)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }() // read-only handle
+	entries, err := f.ReadDir(1)
+	return errors.Is(err, io.EOF) && len(entries) == 0
+}
+
+func (h cloneHead) Exists(ctx context.Context, path string) (bool, error) {
 	_, _, taken, err := h.lstat(path)
-	return taken, err
+	if err != nil || taken || h.gitlink == nil {
+		return taken, err
+	}
+	dir, _ := h.nearestAncestor(path)
+	if dir == "" || !h.emptyDir(dir) {
+		return false, nil
+	}
+	return h.gitlink(ctx, dir)
 }
 
 func (h cloneHead) ReadFile(_ context.Context, path string) ([]byte, bool, error) {
@@ -486,7 +509,7 @@ type submitProposalsArgs struct {
 // draft runs the agent loop that drafts proposals for the impacted docs. It
 // may propose a new doc only when allowNewDoc, the new-doc decision for
 // sel.Uncovered, is true.
-func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, index docIndex, budget *agent.Budget, f fence, req review.Request, sel basedocs.Selection, impacted []string, allowNewDoc bool, patch string) ([]review.Proposal, error) {
+func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, gitlink func(context.Context, string) (bool, error), index docIndex, budget *agent.Budget, f fence, req review.Request, sel basedocs.Selection, impacted []string, allowNewDoc bool, patch string) ([]review.Proposal, error) {
 	finish, err := submitProposalsTool()
 	if err != nil {
 		return nil, err
@@ -519,7 +542,7 @@ func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, ind
 			if err := json.Unmarshal(args, &parsed); err != nil {
 				return fmt.Errorf("decode submit_proposals arguments: %w", err)
 			}
-			out, problems, err := finalize.Proposals(runCtx, cloneHead{root}, rules, parsed.Proposals)
+			out, problems, err := finalize.Proposals(runCtx, cloneHead{root: root, gitlink: gitlink}, rules, parsed.Proposals)
 			if err != nil {
 				// The model cannot fix a failed read of the clone: end the loop.
 				headErr = fmt.Errorf("finalize proposals: %w", err)
