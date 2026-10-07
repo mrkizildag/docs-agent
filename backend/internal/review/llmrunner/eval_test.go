@@ -89,13 +89,14 @@ func computeTotals(cases []reportCase) totals {
 			if r.Score.Pass {
 				passes++
 			}
-			if c.Expect == verdictProposals {
+			switch c.Expect {
+			case verdictProposals:
 				impactRuns++
 				coverage += r.Score.FactCoverage
 				if r.Score.Pass {
 					impactPasses++
 				}
-			} else {
+			case verdictNoImpact:
 				noImpactRuns++
 				if r.Score.Pass {
 					noImpactPasses++
@@ -121,6 +122,13 @@ func failureReasons(expect string, r reportRun) []string {
 	case r.Score.Pass:
 	case !r.Score.VerdictOK:
 		reasons = append(reasons, "wrong verdict")
+	case expect == verdictEither:
+		if !r.Score.SectionsOK {
+			reasons = append(reasons, "wrong section")
+		}
+		if r.Score.Precision < 1 {
+			reasons = append(reasons, "unexpected doc")
+		}
 	case expect == verdictProposals:
 		for _, f := range []struct {
 			bad  bool
