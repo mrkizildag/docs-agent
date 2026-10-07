@@ -76,7 +76,7 @@ func TestStart_GlobCoveredNestedFileTriagesOnlyItsDoc(t *testing.T) {
 		t.Fatalf("model saw %d calls, want exactly 1 triage call (docs/a.md only)", len(model.calls))
 	}
 	prompt := model.calls[0].Messages[0].Text
-	for _, want := range []string{"docs/a.md", patch} {
+	for _, want := range []string{"docs/a.md", review.NumberedPatch(patch)} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("triage prompt missing %q:\n%s", want, prompt)
 		}

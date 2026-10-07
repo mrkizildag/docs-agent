@@ -11,7 +11,7 @@ import (
 
 // Validate reports every way p is malformed given the files changed in the
 // pull request: a bad DocPath, an Anchor on a file the PR does not change or
-// deletes, missing Reason or
+// deletes or whose line is outside its hunks, missing Reason or
 // Content, a multi-line Reason, or an IndexEntry that doesn't match whether
 // Section is empty.
 func (p Proposal) Validate(changed []ChangedFile) error {
@@ -66,16 +66,25 @@ func validateDocPath(docPath string) error {
 	return nil
 }
 
-// validateAnchor checks only the anchor's file, by the same rule Snap places
-// by, so every valid anchor yields a comment on a diff line.
+// validateAnchor requires a changed, non-removed file and a line inside one of
+// its hunks, and lists the commentable ranges so the caller can correct it.
 func validateAnchor(anchor Anchor, changed []ChangedFile) error {
-	if !slices.ContainsFunc(changed, func(f ChangedFile) bool { return f.Path == anchor.File }) {
+	i := slices.IndexFunc(changed, func(f ChangedFile) bool { return f.Path == anchor.File })
+	if i < 0 {
 		return fmt.Errorf("anchor.file %q: not a changed file", anchor.File)
 	}
-	if _, ok := anchor.Snap(changed); !ok {
+	file := changed[i]
+	if file.Removed || len(file.Hunks) == 0 {
 		return fmt.Errorf("anchor.file %q: has no head-side lines in the diff", anchor.File)
 	}
-	return nil
+	if slices.ContainsFunc(file.Hunks, func(h LineRange) bool { return anchor.Line >= h.Start && anchor.Line <= h.End }) {
+		return nil
+	}
+	ranges := make([]string, len(file.Hunks))
+	for j, h := range file.Hunks {
+		ranges[j] = fmt.Sprintf("%d-%d", h.Start, h.End)
+	}
+	return fmt.Errorf("anchor.line %d: not a numbered line in the diff of %q; commentable lines: %s", anchor.Line, anchor.File, strings.Join(ranges, ", "))
 }
 
 // ValidateTarget checks the parts of p that decide what Apply writes: the doc

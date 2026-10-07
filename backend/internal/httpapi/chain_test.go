@@ -188,7 +188,7 @@ func TestWebhookToServerRunnerChain(t *testing.T) {
 	for _, m := range model.requests[0].Messages {
 		seen.WriteString(m.Text)
 	}
-	for _, want := range []string{"docs/app.md", "Describes the app.", chainPatch} {
+	for _, want := range []string{"docs/app.md", "Describes the app.", review.NumberedPatch(chainPatch)} {
 		if !strings.Contains(seen.String(), want) {
 			t.Errorf("triage request does not contain %q:\n%s", want, seen.String())
 		}

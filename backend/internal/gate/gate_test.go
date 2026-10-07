@@ -1371,7 +1371,7 @@ func TestReconcileVariants(t *testing.T) {
 	single.Lines = review.LineRange{Start: 9, End: 9}
 	newDoc := review.Proposal{DocPath: "docs/n.md", Anchor: review.Anchor{File: "a.go", Line: 4}, Reason: "r", Content: "# N\n", IndexEntry: "- n"}
 	diffFile := func(path string, hunks ...review.LineRange) []review.ChangedFile {
-		return []review.ChangedFile{{Path: path, Hunks: hunks}}
+		return []review.ChangedFile{{Path: path, Hunks: hunks}, {Path: "a.go", Hunks: []review.LineRange{{Start: 1, End: 10}}}}
 	}
 
 	tests := []struct {

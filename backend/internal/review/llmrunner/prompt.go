@@ -85,9 +85,9 @@ const draftSystemPrompt = `You propose documentation updates for a pull request.
 	`whole section of a doc with corrected content rather than many small edits. Conventions, ` +
 	`exactly: "section" is the heading text of an existing section without the leading '#'s, exactly as it ` +
 	`appears in the doc; "content" is the full replacement for that section including its heading line; ` +
-	`"anchor" is the changed file that caused the staleness (not a deleted one) and the head-side line ` +
-	`the change is about; the comment is placed on the nearest line of the listed hunk ranges of that ` +
-	`file. Propose a new doc only when the prompt lists changed ` +
+	`"anchor" is the changed file that caused the staleness (not a deleted one) and one of its numbered ` +
+	`head-side lines (a number printed at the start of a line in the diff) that the change is about; a line ` +
+	`without a number cannot be commented on, and a submission that anchors elsewhere is returned with the valid ranges. Propose a new doc only when the prompt lists changed ` +
 	`files no doc covers and no existing doc can hold the behavior. Then "section" is "", "content" is the whole doc ` +
 	`including frontmatter with a non-empty "title" and "summary" and "covers" (globs of the source files it describes; at least ` +
 	`one must match a listed uncovered file); links to other docs in this repo are relative paths, never "/docs/..." paths or GitHub URLs to this repo's docs; "doc_path" is a new .md path under docs/, and "index_entry" is the ` +
@@ -111,7 +111,7 @@ func draftUserPrompt(f fence, impacted []docs.Doc, newDocFiles []string, changed
 	if len(paths) > 0 {
 		judged = strings.Join(paths, ", ")
 	}
-	return fmt.Sprintf("Docs judged impacted: %s\n\n%sAnchor hunks (head-side lines):\n%s\nPR diff:\n%s\n",
+	return fmt.Sprintf("Docs judged impacted: %s\n\n%sAnchor hunks (numbered head-side lines):\n%s\nPR diff:\n%s\n",
 		judged, b.String(), hunkRanges(changed), f.wrap(patch))
 }
 
@@ -137,14 +137,19 @@ func combinedPatch(changed []review.ChangedFile) string {
 		if f.PreviousPath != "" {
 			name = f.PreviousPath + " => " + f.Path
 		}
-		patch := f.Patch
+		patch := review.NumberedPatch(f.Patch)
 		switch {
 		case patch == "":
 			patch = omittedPatch
 		case left <= 0:
 			patch = fmt.Sprintf("(patch omitted: combined patch cap of %d KiB reached)", maxPatchBytes>>10)
 		case len(patch) > left:
-			patch = capText(patch, left, "patch")
+			// Cut at a line end: a half line could read as a numbered diff line.
+			cut := patch[:left]
+			if i := strings.LastIndexByte(cut, '\n'); i >= 0 {
+				cut = cut[:i]
+			}
+			patch = strings.ToValidUTF8(cut, "") + fmt.Sprintf("\n(patch truncated at %d KiB)", left>>10)
 			left = 0
 		default:
 			left -= len(patch)

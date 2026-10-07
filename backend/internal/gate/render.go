@@ -23,7 +23,8 @@ func supersededMarker(id string) string {
 
 // proposalComment is the review comment for p: a suggestion on the doc's own
 // lines when they lie within one head-side hunk of the PR diff, else the
-// checkbox variant on the diff line nearest the anchor.
+// checkbox variant on the anchor's line, or on the anchor's file when that line
+// is outside the file's hunks.
 func proposalComment(headSHA, id string, p review.Proposal, changed []review.ChangedFile, fork bool) ReviewComment {
 	if suggestable(p, changed) {
 		rc := ReviewComment{CommitSHA: headSHA, Path: p.DocPath, Line: p.Lines.End, Body: renderSuggestion(id, p, fork)}
@@ -32,8 +33,25 @@ func proposalComment(headSHA, id string, p review.Proposal, changed []review.Cha
 		}
 		return rc
 	}
-	at, _ := p.Anchor.Snap(changed)
-	return ReviewComment{CommitSHA: headSHA, Path: at.File, Line: at.Line, Body: renderCheckbox(id, p, fork)}
+	rc := ReviewComment{CommitSHA: headSHA, Path: p.Anchor.File, Line: p.Anchor.Line, Body: renderCheckbox(id, p, fork)}
+	if !inHunk(p.Anchor.File, p.Anchor.Line, changed) {
+		rc.Line, rc.File = 0, true
+	}
+	return rc
+}
+
+func inHunk(path string, line int, changed []review.ChangedFile) bool {
+	for _, f := range changed {
+		if f.Path != path || f.Removed {
+			continue
+		}
+		for _, h := range f.Hunks {
+			if line >= h.Start && line <= h.End {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func suggestable(p review.Proposal, changed []review.ChangedFile) bool {

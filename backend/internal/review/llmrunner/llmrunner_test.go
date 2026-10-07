@@ -258,7 +258,7 @@ func TestStart_CoveredFileIsTriagedWithItsPatch(t *testing.T) {
 		t.Fatalf("model saw %d calls, want 1 triage call", len(model.calls))
 	}
 	prompt := model.calls[0].Messages[0].Text
-	for _, want := range []string{"docs/x.md", "@@ -1,2 +1,3 @@\n func main() {}\n"} {
+	for _, want := range []string{"docs/x.md", "@@ -1,2 +1,3 @@\n     1  func main() {}\n"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("triage prompt = %q, want it to contain %q", prompt, want)
 		}
@@ -594,14 +594,14 @@ func TestStart_InvalidProposalIsReturnedToModel(t *testing.T) {
 	t.Parallel()
 
 	bad := proposalFor("docs/x.md", 2)
-	bad["anchor"] = map[string]any{"file": "unchanged.go", "line": 1}
+	bad["anchor"] = map[string]any{"file": "main.go", "line": 99}
 	model := &fakeModel{script: []func(llm.Request) (llm.Response, error){
 		triageResponse(true),
 		submitResponse(bad),
 		func(req llm.Request) (llm.Response, error) {
 			last := req.Messages[len(req.Messages)-1]
-			if len(last.ToolResults) != 1 || !last.ToolResults[0].IsError || !strings.Contains(last.ToolResults[0].Content, "docs/x.md") {
-				t.Errorf("last message = %+v, want a validation error tool result", last)
+			if len(last.ToolResults) != 1 || !last.ToolResults[0].IsError || !strings.Contains(last.ToolResults[0].Content, `anchor.line 99: not a numbered line in the diff of "main.go"; commentable lines: 1-3`) {
+				t.Errorf("last message = %+v, want a validation error tool result listing the commentable lines", last)
 			}
 			return submitResponse(proposalFor("docs/x.md", 2))(req)
 		},
@@ -1000,5 +1000,24 @@ func TestStart_DocsFileAtHeadIsAbsentReadme(t *testing.T) {
 	}
 	if len(model.calls) != 1 {
 		t.Fatalf("model saw %d calls, want exactly 1 new-doc decision", len(model.calls))
+	}
+}
+
+func TestCombinedPatchCapCutsAtALineEnd(t *testing.T) {
+	t.Parallel()
+
+	var b strings.Builder
+	b.WriteString("@@ -0,0 +1,9000 @@ f")
+	for i := range 9000 {
+		fmt.Fprintf(&b, "\n+line %04d END", i)
+	}
+	got := llmrunner.CombinedPatch([]review.ChangedFile{{Path: "big.go", Patch: b.String()}})
+
+	before, _, found := strings.Cut(got, "\n(patch truncated")
+	if !found {
+		t.Fatalf("combined patch was not truncated:\n%.200s", got)
+	}
+	if last := before[strings.LastIndexByte(before, '\n')+1:]; !strings.HasSuffix(last, " END") {
+		t.Errorf("last line before the truncation note = %q, want a whole numbered line", last)
 	}
 }

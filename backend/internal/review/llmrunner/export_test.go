@@ -1,6 +1,10 @@
 package llmrunner
 
-import "time"
+import (
+	"time"
+
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
+)
 
 // SetRemote overrides the clone's remote URL. Tests use it to clone a local
 // git repository instead of a real GitHub repo.
@@ -16,4 +20,9 @@ func (r *Runner) SetTimeout(d time.Duration) {
 // SetTokenBudget overrides the analysis token budget.
 func (r *Runner) SetTokenBudget(n int) {
 	r.budget = n
+}
+
+// CombinedPatch exposes combinedPatch for tests of the prompt's diff block.
+func CombinedPatch(changed []review.ChangedFile) string {
+	return combinedPatch(changed)
 }

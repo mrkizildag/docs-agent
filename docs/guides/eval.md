@@ -23,7 +23,7 @@ The eval runs the [server runner](../features/server-runner.md) or the [Actions 
 `EVAL_RUNNER` picks which runner is scored:
 
 - `server` (default): the server runner, with the same `LLM_PROVIDER`, `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, and `LLM_TRIAGE_MODEL` as the server (see [Setup](setup.md)). Costs API calls.
-- `actions`: the [Actions runner](../features/actions-runner.md), run on this machine instead of in GitHub Actions. It needs `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`, so it runs on a Claude subscription) or `ANTHROPIC_API_KEY`, plus `claude`, `jq`, and `bash` on `PATH`. Set it in `backend/.env` (see `backend/.env.example`) and export it: `CLAUDE_CODE_OAUTH_TOKEN=… EVAL_RUNNER=actions make eval`.
+- `actions`: the [Actions runner](../features/actions-runner.md), run on this machine instead of in GitHub Actions. It needs `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`, so it runs on a Claude subscription) or `ANTHROPIC_API_KEY`, plus `claude`, `jq`, `awk`, and `bash` on `PATH`. Set it in `backend/.env` (see `backend/.env.example`) and export it: `CLAUDE_CODE_OAUTH_TOKEN=… EVAL_RUNNER=actions make eval`.
 
 | Variable           | Default       | Meaning |
 |--------------------|---------------|---------|

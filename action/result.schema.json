@@ -28,10 +28,10 @@
               },
               "line": {
                 "type": "integer",
-                "description": "Head-side, 1-based line number within the changed file."
+                "description": "Head-side line number printed in the numbered diff of the file."
               }
             },
-            "description": "Changed file (not a deleted one) and head-side line that caused this proposal; the comment is placed on the nearest diff line of that file.",
+            "description": "Changed file and a head-side line number shown in the numbered diff; the review comment goes on that line.",
             "required": [
               "file",
               "line"

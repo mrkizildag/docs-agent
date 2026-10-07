@@ -115,12 +115,14 @@ type Comment struct {
 }
 
 // ReviewComment is a new review comment on the right side of a file in the
-// head commit. StartLine 0 means a single-line comment on Line.
+// head commit. StartLine 0 means a single-line comment on Line. File means a
+// file-level comment on Path, with no line.
 type ReviewComment struct {
 	CommitSHA string
 	Path      string
 	StartLine int
 	Line      int
+	File      bool
 	Body      string
 }
 
@@ -730,7 +732,8 @@ func findComment(existing []Comment, kind CommentKind, id int64) (Comment, bool)
 }
 
 // sameAnchor reports whether existing sits where rc would be created; a
-// suggestion body is only safe to write onto the lines it was computed for.
+// suggestion body is only safe to write onto the lines it was computed for. A
+// file-level comment has Line 0 on both sides.
 func sameAnchor(existing Comment, rc ReviewComment) bool {
 	return existing.Path == rc.Path && existing.StartLine == rc.StartLine && existing.Line == rc.Line
 }

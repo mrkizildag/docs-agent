@@ -166,7 +166,7 @@ func (w *localWorkflow) Dispatch(ctx context.Context, _ int64, _, _ string, in a
 	if _, err := runEvalGit(ctx, w.in.Dir, nil, "worktree", "add", "-q", "--detach", checkout, in.HeadSHA); err != nil {
 		return 0, fmt.Errorf("check out %s: %w", in.HeadSHA, err)
 	}
-	diff, err := runEvalGit(ctx, checkout, nil, "diff", "--no-color", "--no-ext-diff", w.in.Request.BaseSHA+"..."+in.HeadSHA)
+	diff, err := runEvalGit(ctx, checkout, nil, "-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", w.in.Request.BaseSHA+"..."+in.HeadSHA)
 	if err != nil {
 		return 0, err
 	}

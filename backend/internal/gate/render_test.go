@@ -13,7 +13,11 @@ import (
 func TestProposalCommentBodies(t *testing.T) {
 	t.Parallel()
 
-	gh := &fakeGitHub{changed: []review.ChangedFile{{Path: "docs/s.md", Hunks: []review.LineRange{{Start: 1, End: 10}}, Patch: "@@ -1 +1,10 @@"}}}
+	gh := &fakeGitHub{changed: []review.ChangedFile{
+		{Path: "docs/s.md", Hunks: []review.LineRange{{Start: 1, End: 10}}, Patch: "@@ -1 +1,10 @@"},
+		{Path: "a.go", Hunks: []review.LineRange{{Start: 1, End: 10}}},
+		{Path: "b.go", Hunks: []review.LineRange{{Start: 1, End: 10}}},
+	}}
 	checkbox := review.Proposal{
 		DocPath: "docs/a.md", Section: "Usage", Reason: "flag renamed", Anchor: review.Anchor{File: "a.go", Line: 4},
 		Original: "## Usage\nold\n", Lines: review.LineRange{Start: 3, End: 4}, Content: "## Usage\nnew\n",
@@ -589,7 +593,23 @@ func TestSpanDocPathIsLiteralInCheckSummary(t *testing.T) {
 	}
 }
 
-func TestProposalCommentSitsOnTheDiffLineNearestItsAnchor(t *testing.T) {
+func TestProposalCommentSitsOnItsAnchorLine(t *testing.T) {
+	t.Parallel()
+
+	changed := []review.ChangedFile{{Path: "a.go", Hunks: []review.LineRange{{Start: 3, End: 9}}}}
+	p := review.Proposal{DocPath: "docs/a.md", Section: "A", Reason: "r", Anchor: review.Anchor{File: "a.go", Line: 5}, Content: "## A\nnew\n"}
+
+	_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, changed, nil)
+
+	if len(writes) == 0 {
+		t.Fatal("Reconcile wrote nothing, want the proposal comment")
+	}
+	if got := writes[0].Review; got.Path != "a.go" || got.Line != 5 || got.File {
+		t.Errorf("comment = %+v, want a line comment at a.go:5", got)
+	}
+}
+
+func TestProposalCommentOutsideHunksIsFileLevel(t *testing.T) {
 	t.Parallel()
 
 	changed := []review.ChangedFile{{Path: "a.go", Hunks: []review.LineRange{{Start: 3, End: 9}}}}
@@ -600,7 +620,7 @@ func TestProposalCommentSitsOnTheDiffLineNearestItsAnchor(t *testing.T) {
 	if len(writes) == 0 {
 		t.Fatal("Reconcile wrote nothing, want the proposal comment")
 	}
-	if got := writes[0].Review; got.Path != "a.go" || got.Line != 9 {
-		t.Errorf("comment at %s:%d, want a.go:9 (the diff line nearest line 279)", got.Path, got.Line)
+	if got := writes[0].Review; got.Path != "a.go" || got.Line != 0 || !got.File {
+		t.Errorf("comment = %+v, want a file-level comment on a.go", got)
 	}
 }

@@ -327,14 +327,11 @@ func TestCollect(t *testing.T) {
 		{name: "missing structured output", raw: artifact(t, "abc", "n1", map[string]any{}), wantInvalid: true},
 		{name: "bad json", raw: []byte("{"), wantInvalid: true},
 		{
-			name: "anchor outside the hunks of a changed file is accepted for the gate to place",
+			name: "anchor outside the hunks of a changed file",
 			raw: artifact(t, "abc", "n1", map[string]any{
 				"structured_output": map[string]any{"proposals": []any{farAnchor}},
 			}),
-			want: review.Result{Runner: "actions", Model: "claude-code", Verdict: review.Proposals{{
-				DocPath: "docs/a.md", Section: "Usage", Anchor: review.Anchor{File: "main.go", Line: 50},
-				Reason: "x", Content: "y",
-			}}},
+			wantInvalid: true,
 		},
 		{
 			name: "anchor on a file the PR did not change",
@@ -687,5 +684,283 @@ func TestActionRejectsNonNumericPRNumber(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("stub claude ran (stat error = %v), want it never started", err)
+	}
+}
+
+const fixtureHunks = "@@ -1,3 +1,4 @@ func main\n package main\n-var a = 1\n+var a = 2\n+var b = 3\n \n@@ -20,2 +21,3 @@\n \tx()\n+\ty()\n \\ No newline at end of file\n"
+
+const fixtureDiff = "diff --git a/main.go b/main.go\nindex 1111111..2222222 100644\n--- a/main.go\n+++ b/main.go\n" + fixtureHunks
+
+func TestActionNumbersDiffAndRestrictsAnchors(t *testing.T) {
+	t.Parallel()
+
+	jq, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skip("jq is not installed")
+	}
+	action, err := filepath.Abs("../../../../action")
+	if err != nil {
+		t.Fatalf("resolve action dir: %v", err)
+	}
+	stubDir, runnerTemp := t.TempDir(), t.TempDir()
+	out := filepath.Join(runnerTemp, "pollux-agent")
+	if err := os.MkdirAll(out, 0o700); err != nil {
+		t.Fatalf("create out dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "pr.diff"), []byte(fixtureDiff), 0o600); err != nil {
+		t.Fatalf("write pr.diff: %v", err)
+	}
+	schemaOut := filepath.Join(stubDir, "schema.json")
+	stub := "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --json-schema ]; then printf %s \"$2\" > " + schemaOut + "; fi\n  shift\ndone\n"
+	if err := os.WriteFile(filepath.Join(stubDir, "claude"), []byte(stub), 0o700); err != nil { //nolint:gosec // the stub must be executable
+		t.Fatalf("write stub claude: %v", err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), "bash", filepath.Join(action, "run-claude.sh")) //nolint:gosec // fixed script path inside this repository
+	cmd.Env = []string{
+		"PATH=" + stubDir + ":" + filepath.Dir(jq) + ":/usr/bin:/bin", "RUNNER_TEMP=" + runnerTemp, "PR_NUMBER=7",
+		"CLAUDE_CODE_OAUTH_TOKEN=", "ANTHROPIC_API_KEY=", "ACTION_PATH=" + action, "CHECKOUT=.", "HEAD_SHA=abc",
+		"DEFAULT_BRANCH=main", "NONCE=n", "DOCS=[]",
+	}
+	if combined, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run-claude.sh = %v, output: %s", err, combined)
+	}
+
+	numbered, err := os.ReadFile(filepath.Join(out, "pr.numbered.diff")) //nolint:gosec // out is this test's temp dir
+	if err != nil {
+		t.Fatalf("read pr.numbered.diff: %v", err)
+	}
+	header, _, _ := strings.Cut(fixtureDiff, "@@")
+	if want := header + review.NumberedPatch(fixtureHunks); string(numbered) != want {
+		t.Errorf("pr.numbered.diff (-want +got):\n%s", cmp.Diff(want, string(numbered)))
+	}
+
+	raw, err := os.ReadFile(schemaOut) //nolint:gosec // schemaOut is a path in this test's temp dir
+	if err != nil {
+		t.Fatalf("read the --json-schema the stub received: %v", err)
+	}
+	var schema struct {
+		Properties struct {
+			Proposals struct {
+				Items struct {
+					Properties struct {
+						Anchor struct {
+							AnyOf []struct {
+								Properties struct {
+									File struct {
+										Const string `json:"const"`
+									} `json:"file"`
+									Line struct {
+										AnyOf []struct {
+											Minimum int `json:"minimum"`
+											Maximum int `json:"maximum"`
+										} `json:"anyOf"`
+									} `json:"line"`
+								} `json:"properties"`
+							} `json:"anyOf"`
+						} `json:"anchor"`
+					} `json:"properties"`
+				} `json:"items"`
+			} `json:"proposals"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("decode --json-schema %s: %v", raw, err)
+	}
+	type span struct {
+		File     string
+		Min, Max int
+	}
+	var got []span
+	for _, a := range schema.Properties.Proposals.Items.Properties.Anchor.AnyOf {
+		for _, r := range a.Properties.Line.AnyOf {
+			got = append(got, span{a.Properties.File.Const, r.Minimum, r.Maximum})
+		}
+	}
+	if diff := cmp.Diff([]span{{"main.go", 1, 4}, {"main.go", 21, 23}}, got); diff != "" {
+		t.Errorf("anchor anyOf (-want +got):\n%s", diff)
+	}
+}
+
+const blankLineDiff = "diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1,4 +1,5 @@\n package main\n\n-var a = 1\n+var a = 2\n+var b = 3\n x\n"
+
+func TestNumberedDiffAwkMatchesNumberedPatch(t *testing.T) {
+	t.Parallel()
+
+	for name, diffText := range map[string]string{"fixture": fixtureDiff, "empty line in hunk": blankLineDiff} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			diffFile := filepath.Join(t.TempDir(), "pr.diff")
+			if err := os.WriteFile(diffFile, []byte(diffText), 0o600); err != nil {
+				t.Fatalf("write diff: %v", err)
+			}
+			got, err := exec.CommandContext(t.Context(), "awk", "-f", "../../../../action/numbered-diff.awk", diffFile).Output() //nolint:gosec // fixed script path inside this repository
+			if err != nil {
+				t.Fatalf("awk numbered-diff.awk = %v", err)
+			}
+			_, hunks, _ := strings.Cut(string(got), "@@")
+			_, patch, _ := strings.Cut(diffText, "@@")
+			if diff := cmp.Diff(review.NumberedPatch("@@"+patch), "@@"+hunks); diff != "" {
+				t.Errorf("awk output differs from review.NumberedPatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestDiffHunksAwkPaths(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		diff string
+		want string
+	}{
+		{"raw UTF-8 path", "--- a/docs/über.md\n+++ b/docs/über.md\n@@ -1 +1,2 @@\n x\n+y\n", "docs/über.md\t1\t2\n"},
+		{"still-quoted path", "--- a/docs/a\"b.md\n+++ \"b/docs/a\\\"b.md\"\n@@ -1 +1,2 @@\n x\n+y\n", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			diffFile := filepath.Join(t.TempDir(), "pr.diff")
+			if err := os.WriteFile(diffFile, []byte(tc.diff), 0o600); err != nil {
+				t.Fatalf("write diff: %v", err)
+			}
+			got, err := exec.CommandContext(t.Context(), "awk", "-f", "../../../../action/diff-hunks.awk", diffFile).Output() //nolint:gosec // fixed script path inside this repository
+			if err != nil {
+				t.Fatalf("awk diff-hunks.awk = %v", err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("diff-hunks.awk = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// manyHunksDiff is a diff of one-line hunks, perFile in each of files a0.go, a1.go, ...
+func manyHunksDiff(files, perFile int) string {
+	var b strings.Builder
+	for f := range files {
+		fmt.Fprintf(&b, "diff --git a/a%d.go b/a%d.go\n--- a/a%d.go\n+++ b/a%d.go\n", f, f, f, f)
+		for h := range perFile {
+			fmt.Fprintf(&b, "@@ -%d,0 +%d,1 @@\n+x\n", 2*h+1, 2*h+2)
+		}
+	}
+	return b.String()
+}
+
+// runClaudeWithStub runs run-claude.sh for PR 7 over diffText and returns the --json-schema
+// the stub claude received and the output directory.
+func runClaudeWithStub(t *testing.T, diffText string) (schema []byte, out string) {
+	t.Helper()
+	jq, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skip("jq is not installed")
+	}
+	action, err := filepath.Abs("../../../../action")
+	if err != nil {
+		t.Fatalf("resolve action dir: %v", err)
+	}
+	stubDir, runnerTemp := t.TempDir(), t.TempDir()
+	out = filepath.Join(runnerTemp, "pollux-agent")
+	if err := os.MkdirAll(out, 0o700); err != nil {
+		t.Fatalf("create out dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "pr.diff"), []byte(diffText), 0o600); err != nil {
+		t.Fatalf("write pr.diff: %v", err)
+	}
+	schemaOut := filepath.Join(stubDir, "schema.json")
+	stub := "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --json-schema ]; then printf %s \"$2\" > " + schemaOut + "; fi\n  shift\ndone\n"
+	if err := os.WriteFile(filepath.Join(stubDir, "claude"), []byte(stub), 0o700); err != nil { //nolint:gosec // the stub must be executable
+		t.Fatalf("write stub claude: %v", err)
+	}
+	cmd := exec.CommandContext(t.Context(), "bash", filepath.Join(action, "run-claude.sh")) //nolint:gosec // fixed script path inside this repository
+	cmd.Env = []string{
+		"PATH=" + stubDir + ":" + filepath.Dir(jq) + ":/usr/bin:/bin", "RUNNER_TEMP=" + runnerTemp, "PR_NUMBER=7",
+		"CLAUDE_CODE_OAUTH_TOKEN=", "ANTHROPIC_API_KEY=", "ACTION_PATH=" + action, "CHECKOUT=.", "HEAD_SHA=abc",
+		"DEFAULT_BRANCH=main", "NONCE=n", "DOCS=[]",
+	}
+	if combined, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run-claude.sh = %v, output: %s", err, combined)
+	}
+	if _, err := os.Stat(filepath.Join(out, "result.json")); err != nil {
+		t.Fatalf("result.json: %v", err)
+	}
+	schema, err = os.ReadFile(schemaOut) //nolint:gosec // schemaOut is a path in this test's temp dir
+	if err != nil {
+		t.Fatalf("read the --json-schema the stub received: %v", err)
+	}
+	return schema, out
+}
+
+func TestActionGroupsAnchorsByFile(t *testing.T) {
+	t.Parallel()
+
+	raw, _ := runClaudeWithStub(t, manyHunksDiff(2, 150))
+	if len(raw) >= 100*1024 {
+		t.Errorf("schema is %d bytes, want under 100 KiB", len(raw))
+	}
+	var schema struct {
+		Properties struct {
+			Proposals struct {
+				Items struct {
+					Properties struct {
+						Anchor struct {
+							AnyOf []struct {
+								Properties struct {
+									File struct {
+										Const string `json:"const"`
+									} `json:"file"`
+									Line struct {
+										AnyOf []struct {
+											Minimum int `json:"minimum"`
+											Maximum int `json:"maximum"`
+										} `json:"anyOf"`
+									} `json:"line"`
+								} `json:"properties"`
+							} `json:"anyOf"`
+						} `json:"anchor"`
+					} `json:"properties"`
+				} `json:"items"`
+			} `json:"proposals"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("decode --json-schema: %v", err)
+	}
+	entries := schema.Properties.Proposals.Items.Properties.Anchor.AnyOf
+	if len(entries) != 2 {
+		t.Fatalf("anchor anyOf has %d entries, want 2 (one per file)", len(entries))
+	}
+	for i, e := range entries {
+		if want := fmt.Sprintf("a%d.go", i); e.Properties.File.Const != want {
+			t.Errorf("entry %d file = %q, want %q", i, e.Properties.File.Const, want)
+		}
+		lines := e.Properties.Line.AnyOf
+		if len(lines) != 150 {
+			t.Fatalf("entry %d has %d ranges, want 150", i, len(lines))
+		}
+		for h, r := range lines {
+			if want := 2*h + 2; r.Minimum != want || r.Maximum != want {
+				t.Fatalf("entry %d range %d = %d..%d, want %d..%d", i, h, r.Minimum, r.Maximum, want, want)
+			}
+		}
+	}
+}
+
+func TestActionFallsBackToStaticSchemaWhenAnchorsAreTooLarge(t *testing.T) {
+	t.Parallel()
+
+	raw, out := runClaudeWithStub(t, manyHunksDiff(2, 4000))
+	static, err := os.ReadFile("../../../../action/result.schema.json")
+	if err != nil {
+		t.Fatalf("read result.schema.json: %v", err)
+	}
+	if got, want := string(raw), strings.TrimRight(string(static), "\n"); got != want {
+		t.Errorf("--json-schema = %d bytes, want the static result.schema.json (%d bytes)", len(got), len(want))
+	}
+	if _, err := os.Stat(filepath.Join(out, "result.json")); err != nil {
+		t.Errorf("result.json: %v", err)
 	}
 }

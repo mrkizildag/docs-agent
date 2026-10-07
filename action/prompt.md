@@ -19,7 +19,7 @@ Each proposal replaces exactly one section of one doc:
 - `doc_path`: path of the doc, under `docs/` only, ending in `.md` or `.mdx`. Never propose a change outside `docs/`.
 - `section`: the heading text of the section to replace.
 - `content`: the full replacement for that section, including its heading line, in the doc's existing style.
-- `anchor`: the changed file that caused this proposal (one the PR changes, not one it deletes) and the head-side (post-change) line the change is about. The comment is placed on the nearest line the diff shows in that file, so the line does not have to be inside a hunk.
+- `anchor`: the changed file that caused this proposal (one the PR changes, not one it deletes) and one of the line numbers printed in the numbered diff for that file, the line the change is about. A line with no number cannot be commented on, and the output schema accepts only the numbered lines.
 - `reason`: one line saying why the doc must change.
 
 Propose a new doc only when no existing doc can hold the behavior. Then `section` is `""`, `content` is the whole doc including frontmatter with a non-empty `title` and `summary` and `covers` (globs of the source files it describes), links to other docs in this repo written as relative paths (`architecture.md`, `../guides/setup.md`), never `/docs/...` paths or GitHub URLs to this repo's docs, and `index_entry` is the line to add to `docs/README.md`. `section` and `index_entry` are each a single line. For a section replacement, omit `index_entry`. The new doc's `covers` must match at least one listed uncovered file, and new docs may only be proposed for listed uncovered files.

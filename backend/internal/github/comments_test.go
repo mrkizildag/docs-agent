@@ -69,6 +69,11 @@ func TestCreateReviewComment(t *testing.T) {
 			in:   gate.ReviewComment{CommitSHA: "abc", Path: "a.go", StartLine: 2, Line: 4, Body: "hi"},
 			want: map[string]any{"body": "hi", "commit_id": "abc", "path": "a.go", "start_line": float64(2), "line": float64(4), "side": "RIGHT", "start_side": "RIGHT"},
 		},
+		{
+			name: "file level",
+			in:   gate.ReviewComment{CommitSHA: "abc", Path: "a.go", File: true, Body: "hi"},
+			want: map[string]any{"body": "hi", "commit_id": "abc", "path": "a.go", "subject_type": "file"},
+		},
 	}
 
 	for _, tc := range tests {
