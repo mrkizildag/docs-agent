@@ -20,6 +20,7 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/basedocs"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/input"
 )
 
 type fakeAPI struct {
@@ -36,9 +37,18 @@ type fakeAPI struct {
 	dirs      map[string]bool
 	fileReads map[string]int
 	docsAt    map[string]fstest.MapFS
+	// docsFS, when set, is returned for every ref instead of docsAt.
+	docsFS fs.FS
 }
 
+type unreadableFS struct{ fstest.MapFS }
+
+func (unreadableFS) Open(string) (fs.File, error) { return nil, errors.New("unreadable") }
+
 func (f *fakeAPI) DocsAtRef(_ context.Context, _ int64, _, _, ref string) (fs.FS, error) {
+	if f.docsFS != nil {
+		return f.docsFS, f.err
+	}
 	return f.docsAt[ref], f.err
 }
 
@@ -112,6 +122,31 @@ func TestStart(t *testing.T) {
 	}
 }
 
+func TestStartDispatchesInput(t *testing.T) {
+	t.Parallel()
+
+	api := &fakeAPI{runID: 1, docsAt: map[string]fstest.MapFS{"base": {"docs/a.md": coverDoc("[main.go]")}}}
+	req := startRequest(
+		review.ChangedFile{Path: "main.go", Hunks: []review.LineRange{{Start: 1, End: 2}}},
+		review.ChangedFile{Path: "gone.txt", Removed: true},
+	)
+	if _, err := newRunner(api).Start(t.Context(), req); err != nil {
+		t.Fatalf("Start() = %v, want nil", err)
+	}
+	want := input.Input{
+		BaseSHA:    "base",
+		Candidates: []string{"docs/a.md"},
+		Uncovered:  []string{},
+		Files: []input.File{
+			{Path: "main.go", Ranges: []review.LineRange{{Start: 1, End: 2}}},
+			{Path: "gone.txt", Ranges: []review.LineRange{}},
+		},
+	}
+	if diff := cmp.Diff(want, api.dispatched.Input); diff != "" {
+		t.Errorf("dispatched Input (-want +got):\n%s", diff)
+	}
+}
+
 func newRunner(api actions.WorkflowAPI) *actions.Runner {
 	return actions.New(api, time.Minute, time.Minute)
 }
@@ -138,7 +173,7 @@ func TestStartDispatchesBaseCandidates(t *testing.T) {
 		if _, err := newRunner(api).Start(t.Context(), startRequest(main)); err != nil {
 			t.Fatalf("Start() = %v, want nil", err)
 		}
-		if diff := cmp.Diff([]string{"docs/a.md"}, api.dispatched.Docs); diff != "" {
+		if diff := cmp.Diff([]string{"docs/a.md"}, api.dispatched.Input.Candidates); diff != "" {
 			t.Errorf("dispatched Docs (-want +got):\n%s", diff)
 		}
 	})
@@ -152,7 +187,7 @@ func TestStartDispatchesBaseCandidates(t *testing.T) {
 		if _, err := newRunner(api).Start(t.Context(), startRequest(main)); err != nil {
 			t.Fatalf("Start() = %v, want nil", err)
 		}
-		if diff := cmp.Diff([]string{"docs/a.md"}, api.dispatched.Docs); diff != "" {
+		if diff := cmp.Diff([]string{"docs/a.md"}, api.dispatched.Input.Candidates); diff != "" {
 			t.Errorf("dispatched Docs (-want +got):\n%s", diff)
 		}
 	})
@@ -164,10 +199,10 @@ func TestStartDispatchesBaseCandidates(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Start() = %v, want nil", err)
 		}
-		if _, ok := started.(review.Pending); !ok || len(api.dispatched.Docs) != 0 {
-			t.Errorf("Start() = %T with Docs %v, want Pending with no docs", started, api.dispatched.Docs)
+		if _, ok := started.(review.Pending); !ok || len(api.dispatched.Input.Candidates) != 0 {
+			t.Errorf("Start() = %T with Docs %v, want Pending with no docs", started, api.dispatched.Input.Candidates)
 		}
-		if diff := cmp.Diff([]string{"main.go"}, api.dispatched.Uncovered); diff != "" {
+		if diff := cmp.Diff([]string{"main.go"}, api.dispatched.Input.Uncovered); diff != "" {
 			t.Errorf("dispatched Uncovered (-want +got):\n%s", diff)
 		}
 	})
@@ -202,7 +237,7 @@ func TestStartDispatchesBaseCandidates(t *testing.T) {
 		if _, ok := started.(review.Pending); !ok {
 			t.Fatalf("Start() = %T, want Pending", started)
 		}
-		if diff := cmp.Diff([]string{"docs/b.md"}, api.dispatched.Docs); diff != "" {
+		if diff := cmp.Diff([]string{"docs/b.md"}, api.dispatched.Input.Candidates); diff != "" {
 			t.Errorf("dispatched Docs (-want +got):\n%s", diff)
 		}
 	})
@@ -258,8 +293,27 @@ func TestStartDocsError(t *testing.T) {
 	t.Parallel()
 
 	wantErr := errors.New("boom")
-	if _, err := newRunner(&fakeAPI{err: wantErr}).Start(t.Context(), review.Request{}); !errors.Is(err, wantErr) {
+	_, err := newRunner(&fakeAPI{err: wantErr}).Start(t.Context(), review.Request{})
+	if !errors.Is(err, wantErr) {
 		t.Fatalf("Start() = %v, want wrapping %v", err, wantErr)
+	}
+	var failed *review.FailedError
+	if !errors.As(err, &failed) || failed.Cause != review.CauseClone {
+		t.Errorf("Start() = %v, want a FailedError with cause %q", err, review.CauseClone)
+	}
+}
+
+func TestStartUnparsableBaseDocsIsNotCloneFailure(t *testing.T) {
+	t.Parallel()
+
+	api := &fakeAPI{docsFS: unreadableFS{fstest.MapFS{"docs/a.md": coverDoc("[main.go]")}}}
+	_, err := newRunner(api).Start(t.Context(), review.Request{BaseSHA: "base", ChangedFiles: []review.ChangedFile{{Path: "x.go"}}})
+	if err == nil {
+		t.Fatal("Start() = nil, want an error")
+	}
+	var failed *review.FailedError
+	if errors.As(err, &failed) {
+		t.Errorf("Start() = %v, want a plain error, not FailedError %q", err, failed.Cause)
 	}
 }
 
@@ -781,7 +835,7 @@ func TestStartScaffold(t *testing.T) {
 	if pending.Deadline.Before(before.Add(10*time.Minute)) || pending.Deadline.After(time.Now().Add(10*time.Minute)) {
 		t.Errorf("StartScaffold() deadline = %v, want the 10m scaffold timeout from %v", pending.Deadline, before)
 	}
-	want := actions.DispatchInputs{HeadSHA: "base", PRNumber: 0, Nonce: pending.Nonce}
+	want := actions.DispatchInputs{HeadSHA: "base", PRNumber: 0, Nonce: pending.Nonce, Input: input.New(review.Request{}, basedocs.Selection{})}
 	if diff := cmp.Diff(want, api.dispatched); diff != "" {
 		t.Errorf("dispatch inputs (-want +got):\n%s", diff)
 	}
@@ -913,11 +967,9 @@ func TestActionRejectsNonNumericPRNumber(t *testing.T) {
 	stubDir, runnerTemp := t.TempDir(), t.TempDir()
 	marker := filepath.Join(stubDir, "ran")
 	stub := "#!/bin/sh\ntouch " + marker + "\n"
-	if err := os.WriteFile(filepath.Join(stubDir, "claude"), []byte(stub), 0o700); err != nil { //nolint:gosec // the stub must be executable
-		t.Fatalf("write stub claude: %v", err)
-	}
+	writeStubClaude(t, stubDir, stub)
 
-	cmd := exec.CommandContext(t.Context(), "bash", "../../../../action/run-claude.sh") //nolint:gosec // fixed script path inside this repository
+	cmd := exec.CommandContext(t.Context(), "bash", "../../../../action/run-claude.sh")
 	cmd.Env = []string{
 		"PATH=" + stubDir + ":/usr/bin:/bin", "RUNNER_TEMP=" + runnerTemp, "PR_NUMBER=1; x",
 		"CLAUDE_CODE_OAUTH_TOKEN=", "ANTHROPIC_API_KEY=", "ACTION_PATH=.", "CHECKOUT=.", "HEAD_SHA=abc",
@@ -935,54 +987,59 @@ const fixtureHunks = "@@ -1,3 +1,4 @@ func main\n package main\n-var a = 1\n+var
 
 const fixtureDiff = "diff --git a/main.go b/main.go\nindex 1111111..2222222 100644\n--- a/main.go\n+++ b/main.go\n" + fixtureHunks
 
-func TestActionNumbersDiffAndRestrictsAnchors(t *testing.T) {
-	t.Parallel()
+// scenarioScript builds the repository the diff-step tests run in: main has base.txt (20 lines)
+// and origin/main points at it; branch feature adds f.txt; branch pr, off feature, edits lines 2
+// and 15 of base.txt. It prints the merge base of feature and pr, then pr's head.
+const scenarioScript = `set -eu
+git init -q -b main "$REPO"
+cd "$REPO"
+git config user.email t@example.com
+git config user.name t
+seq 1 20 > base.txt
+git add base.txt
+git commit -qm base
+git update-ref refs/remotes/origin/main HEAD
+git checkout -qb feature
+echo feature > f.txt
+git add f.txt
+git commit -qm F
+git checkout -qb pr
+sed 's/^2$/two/;s/^15$/fifteen/' base.txt > base.new
+mv base.new base.txt
+git commit -qam P
+git merge-base feature pr
+git rev-parse HEAD
+`
 
-	jq, err := exec.LookPath("jq")
-	if err != nil {
-		t.Skip("jq is not installed")
-	}
-	action, err := filepath.Abs("../../../../action")
-	if err != nil {
-		t.Fatalf("resolve action dir: %v", err)
-	}
-	stubDir, runnerTemp := t.TempDir(), t.TempDir()
-	out := filepath.Join(runnerTemp, "pollux-agent")
-	if err := os.MkdirAll(out, 0o700); err != nil {
-		t.Fatalf("create out dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(out, "pr.diff"), []byte(fixtureDiff), 0o600); err != nil {
-		t.Fatalf("write pr.diff: %v", err)
-	}
-	schemaOut := filepath.Join(stubDir, "schema.json")
-	stub := "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --json-schema ]; then printf %s \"$2\" > " + schemaOut + "; fi\n  shift\ndone\n"
-	if err := os.WriteFile(filepath.Join(stubDir, "claude"), []byte(stub), 0o700); err != nil { //nolint:gosec // the stub must be executable
-		t.Fatalf("write stub claude: %v", err)
-	}
+type scenario struct{ repo, mergeBase, git string }
 
-	cmd := exec.CommandContext(t.Context(), "bash", filepath.Join(action, "run-claude.sh")) //nolint:gosec // fixed script path inside this repository
-	cmd.Env = []string{
-		"PATH=" + stubDir + ":" + filepath.Dir(jq) + ":/usr/bin:/bin", "RUNNER_TEMP=" + runnerTemp, "PR_NUMBER=7",
-		"CLAUDE_CODE_OAUTH_TOKEN=", "ANTHROPIC_API_KEY=", "ACTION_PATH=" + action, "CHECKOUT=.", "HEAD_SHA=abc",
-		"DEFAULT_BRANCH=main", "NONCE=n", "DOCS=[]",
-	}
-	if combined, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("run-claude.sh = %v, output: %s", err, combined)
-	}
-
-	numbered, err := os.ReadFile(filepath.Join(out, "pr.numbered.diff")) //nolint:gosec // out is this test's temp dir
+func newScenario(t *testing.T) scenario {
+	t.Helper()
+	git, err := exec.LookPath("git")
 	if err != nil {
-		t.Fatalf("read pr.numbered.diff: %v", err)
+		t.Skip("git is not installed")
 	}
-	header, _, _ := strings.Cut(fixtureDiff, "@@")
-	if want := header + review.NumberedPatch(fixtureHunks); string(numbered) != want {
-		t.Errorf("pr.numbered.diff (-want +got):\n%s", cmp.Diff(want, string(numbered)))
-	}
-
-	raw, err := os.ReadFile(schemaOut) //nolint:gosec // schemaOut is a path in this test's temp dir
+	repo := filepath.Join(t.TempDir(), "repo")
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", scenarioScript)
+	cmd.Env = []string{"PATH=" + filepath.Dir(git) + ":/usr/bin:/bin", "HOME=" + t.TempDir(), "REPO=" + repo}
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("read the --json-schema the stub received: %v", err)
+		t.Fatalf("build the scenario repository: %v", err)
 	}
+	shas := strings.Fields(string(out))
+	if len(shas) != 2 {
+		t.Fatalf("scenario script printed %q, want the merge base and the head", out)
+	}
+	return scenario{repo: repo, mergeBase: shas[0], git: git}
+}
+
+type anchorSpan struct {
+	File     string
+	Min, Max int
+}
+
+func anchorSpans(t *testing.T, raw []byte) []anchorSpan {
+	t.Helper()
 	var schema struct {
 		Properties struct {
 			Proposals struct {
@@ -1011,18 +1068,122 @@ func TestActionNumbersDiffAndRestrictsAnchors(t *testing.T) {
 	if err := json.Unmarshal(raw, &schema); err != nil {
 		t.Fatalf("decode --json-schema %s: %v", raw, err)
 	}
-	type span struct {
-		File     string
-		Min, Max int
-	}
-	var got []span
+	var got []anchorSpan
 	for _, a := range schema.Properties.Proposals.Items.Properties.Anchor.AnyOf {
 		for _, r := range a.Properties.Line.AnyOf {
-			got = append(got, span{a.Properties.File.Const, r.Minimum, r.Maximum})
+			got = append(got, anchorSpan{a.Properties.File.Const, r.Minimum, r.Maximum})
 		}
 	}
-	if diff := cmp.Diff([]span{{"main.go", 1, 4}, {"main.go", 21, 23}}, got); diff != "" {
+	return got
+}
+
+func readOut(t *testing.T, out, name string) string {
+	t.Helper()
+	raw, err := fs.ReadFile(os.DirFS(out), name)
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	return string(raw)
+}
+
+func TestActionDiffsFromBaseSHA(t *testing.T) {
+	t.Parallel()
+
+	sc := newScenario(t)
+	docs := `{"base_sha":"` + sc.mergeBase + `","review":[],"uncovered":[]}`
+	_, out := runClaudeWithStub(t, sc, docs)
+
+	for _, name := range []string{"pr.diff", "pr.numbered.diff"} {
+		got := readOut(t, out, name)
+		if !strings.Contains(got, "+fifteen") || strings.Contains(got, "f.txt") {
+			t.Errorf("%s = %q, want P's change and not F's", name, got)
+		}
+	}
+}
+
+// Without base_sha the action falls back to origin/<default>...HEAD.
+func TestActionWithoutBaseSHADiffsFromDefaultBranch(t *testing.T) {
+	t.Parallel()
+
+	sc := newScenario(t)
+	_, out := runClaudeWithStub(t, sc, `{"review":[],"uncovered":[]}`)
+
+	got := readOut(t, out, "pr.diff")
+	if !strings.Contains(got, "+fifteen") || !strings.Contains(got, "f.txt") {
+		t.Errorf("pr.diff = %q, want origin/main...HEAD with both P's and F's changes", got)
+	}
+}
+
+func TestActionRejectsMalformedBaseSHA(t *testing.T) {
+	t.Parallel()
+
+	sc := newScenario(t)
+	for _, docs := range []string{`{"base_sha":"--output=x"}`, `{"base_sha":"ABCDEF"}`, `{"base_sha":1}`,
+		`{"files":"x"}`, `{"files":[{"path":"a.go","ranges":[{"start":"1","end":2}]}]}`} {
+		if _, _, err := runClaude(t, sc, docs); err == nil {
+			t.Errorf("run-claude.sh with DOCS=%s succeeded, want a non-zero exit", docs)
+		}
+	}
+}
+
+func TestActionAnchorsOnTheDiffWithoutFiles(t *testing.T) {
+	t.Parallel()
+
+	sc := newScenario(t)
+	raw, _ := runClaudeWithStub(t, sc, `{"base_sha":"`+sc.mergeBase+`","review":[],"uncovered":[]}`)
+
+	want := []anchorSpan{{"base.txt", 1, 5}, {"base.txt", 12, 18}}
+	if diff := cmp.Diff(want, anchorSpans(t, raw)); diff != "" {
 		t.Errorf("anchor anyOf (-want +got):\n%s", diff)
+	}
+}
+
+func TestActionAnchorsOnTheGivenFiles(t *testing.T) {
+	t.Parallel()
+
+	sc := newScenario(t)
+	docs := `{"base_sha":"` + sc.mergeBase + `","review":[],"uncovered":[],"files":[` +
+		`{"path":"base.txt","ranges":[{"start":3,"end":4}]},` +
+		`{"path":"other.go","ranges":[{"start":10,"end":12},{"start":20,"end":20}]},` +
+		`{"path":"old.go","ranges":[]}]}`
+	raw, _ := runClaudeWithStub(t, sc, docs)
+
+	want := []anchorSpan{{"base.txt", 3, 4}, {"other.go", 10, 12}, {"other.go", 20, 20}}
+	if diff := cmp.Diff(want, anchorSpans(t, raw)); diff != "" {
+		t.Errorf("anchor anyOf (-want +got):\n%s", diff)
+	}
+}
+
+func TestActionAcceptsOldInputShapes(t *testing.T) {
+	t.Parallel()
+
+	sc := newScenario(t)
+	for name, docs := range map[string]string{
+		"bare array":                   `["docs/a.md"]`,
+		"object without base or files": `{"review":["docs/a.md"],"uncovered":["src/x.go"]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			raw, _ := runClaudeWithStub(t, sc, docs)
+			want := []anchorSpan{{"base.txt", 1, 5}, {"base.txt", 12, 18}, {"f.txt", 1, 1}}
+			if diff := cmp.Diff(want, anchorSpans(t, raw)); diff != "" {
+				t.Errorf("anchor anyOf (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestActionNumbersDiff(t *testing.T) {
+	t.Parallel()
+
+	sc := newScenario(t)
+	_, out := runClaudeWithStub(t, sc, `{"base_sha":"`+sc.mergeBase+`"}`)
+
+	diffText := readOut(t, out, "pr.diff")
+	header, hunks, _ := strings.Cut(diffText, "@@")
+	if want := header + review.NumberedPatch("@@"+hunks); readOut(t, out, "pr.numbered.diff") != want {
+		t.Errorf("pr.numbered.diff does not match review.NumberedPatch over pr.diff")
 	}
 }
 
@@ -1035,11 +1196,9 @@ func TestNumberedDiffAwkMatchesNumberedPatch(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			diffFile := filepath.Join(t.TempDir(), "pr.diff")
-			if err := os.WriteFile(diffFile, []byte(diffText), 0o600); err != nil {
-				t.Fatalf("write diff: %v", err)
-			}
-			got, err := exec.CommandContext(t.Context(), "awk", "-f", "../../../../action/numbered-diff.awk", diffFile).Output() //nolint:gosec // fixed script path inside this repository
+			cmd := exec.CommandContext(t.Context(), "awk", "-f", "../../../../action/numbered-diff.awk")
+			cmd.Stdin = strings.NewReader(diffText)
+			got, err := cmd.Output()
 			if err != nil {
 				t.Fatalf("awk numbered-diff.awk = %v", err)
 			}
@@ -1067,11 +1226,9 @@ func TestDiffHunksAwkPaths(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			diffFile := filepath.Join(t.TempDir(), "pr.diff")
-			if err := os.WriteFile(diffFile, []byte(tc.diff), 0o600); err != nil {
-				t.Fatalf("write diff: %v", err)
-			}
-			got, err := exec.CommandContext(t.Context(), "awk", "-f", "../../../../action/diff-hunks.awk", diffFile).Output() //nolint:gosec // fixed script path inside this repository
+			cmd := exec.CommandContext(t.Context(), "awk", "-f", "../../../../action/diff-hunks.awk")
+			cmd.Stdin = strings.NewReader(tc.diff)
+			got, err := cmd.Output()
 			if err != nil {
 				t.Fatalf("awk diff-hunks.awk = %v", err)
 			}
@@ -1082,66 +1239,68 @@ func TestDiffHunksAwkPaths(t *testing.T) {
 	}
 }
 
-// manyHunksDiff is a diff of one-line hunks, perFile in each of files a0.go, a1.go, ...
-func manyHunksDiff(files, perFile int) string {
-	var b strings.Builder
-	for f := range files {
-		fmt.Fprintf(&b, "diff --git a/a%d.go b/a%d.go\n--- a/a%d.go\n+++ b/a%d.go\n", f, f, f, f)
-		for h := range perFile {
-			fmt.Fprintf(&b, "@@ -%d,0 +%d,1 @@\n+x\n", 2*h+1, 2*h+2)
-		}
-	}
-	return b.String()
-}
-
-// runClaudeWithStub runs run-claude.sh for PR 7 over diffText and returns the --json-schema
-// the stub claude received and the output directory.
-func runClaudeWithStub(t *testing.T, diffText string) (schema []byte, out string) {
+// runClaude runs run-claude.sh for PR 7 in the scenario repository with the given docs input, with a stub claude
+// that records the --json-schema it receives into <runner temp>/schema.json.
+func runClaude(t *testing.T, sc scenario, docs string) (out, log string, err error) {
 	t.Helper()
-	jq, err := exec.LookPath("jq")
-	if err != nil {
+	jq, lookErr := exec.LookPath("jq")
+	if lookErr != nil {
 		t.Skip("jq is not installed")
 	}
-	action, err := filepath.Abs("../../../../action")
-	if err != nil {
-		t.Fatalf("resolve action dir: %v", err)
+	action, absErr := filepath.Abs("../../../../action")
+	if absErr != nil {
+		t.Fatalf("resolve action dir: %v", absErr)
 	}
 	stubDir, runnerTemp := t.TempDir(), t.TempDir()
 	out = filepath.Join(runnerTemp, "pollux-agent")
-	if err := os.MkdirAll(out, 0o700); err != nil {
-		t.Fatalf("create out dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(out, "pr.diff"), []byte(diffText), 0o600); err != nil {
-		t.Fatalf("write pr.diff: %v", err)
-	}
-	schemaOut := filepath.Join(stubDir, "schema.json")
+	schemaOut := filepath.Join(runnerTemp, "schema.json")
 	stub := "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --json-schema ]; then printf %s \"$2\" > " + schemaOut + "; fi\n  shift\ndone\n"
-	if err := os.WriteFile(filepath.Join(stubDir, "claude"), []byte(stub), 0o700); err != nil { //nolint:gosec // the stub must be executable
-		t.Fatalf("write stub claude: %v", err)
-	}
-	cmd := exec.CommandContext(t.Context(), "bash", filepath.Join(action, "run-claude.sh")) //nolint:gosec // fixed script path inside this repository
+	writeStubClaude(t, stubDir, stub)
+	cmd := exec.CommandContext(t.Context(), "bash", "../../../../action/run-claude.sh")
 	cmd.Env = []string{
-		"PATH=" + stubDir + ":" + filepath.Dir(jq) + ":/usr/bin:/bin", "RUNNER_TEMP=" + runnerTemp, "PR_NUMBER=7",
-		"CLAUDE_CODE_OAUTH_TOKEN=", "ANTHROPIC_API_KEY=", "ACTION_PATH=" + action, "CHECKOUT=.", "HEAD_SHA=abc",
-		"DEFAULT_BRANCH=main", "NONCE=n", "DOCS=[]",
+		"PATH=" + stubDir + ":" + filepath.Dir(jq) + ":" + filepath.Dir(sc.git) + ":/usr/bin:/bin", "RUNNER_TEMP=" + runnerTemp, "PR_NUMBER=7",
+		"CLAUDE_CODE_OAUTH_TOKEN=", "ANTHROPIC_API_KEY=", "ACTION_PATH=" + action, "CHECKOUT=" + sc.repo, "HEAD_SHA=abc",
+		"DEFAULT_BRANCH=main", "NONCE=n", "DOCS=" + docs,
 	}
-	if combined, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("run-claude.sh = %v, output: %s", err, combined)
+	combined, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		return out, string(combined), fmt.Errorf("run-claude.sh: %w, output: %s", runErr, combined)
+	}
+	return out, string(combined), nil
+}
+
+// runClaudeWithStub runs run-claude.sh for PR 7 and returns the --json-schema the stub claude
+// received and the output directory.
+func runClaudeWithStub(t *testing.T, sc scenario, docs string) (schema []byte, out string) {
+	t.Helper()
+	out, _, err := runClaude(t, sc, docs)
+	if err != nil {
+		t.Fatalf("%v", err)
 	}
 	if _, err := os.Stat(filepath.Join(out, "result.json")); err != nil {
 		t.Fatalf("result.json: %v", err)
 	}
-	schema, err = os.ReadFile(schemaOut) //nolint:gosec // schemaOut is a path in this test's temp dir
-	if err != nil {
-		t.Fatalf("read the --json-schema the stub received: %v", err)
+	return []byte(readOut(t, filepath.Dir(out), "schema.json")), out
+}
+
+// filesDocs is a docs input whose files give each of n files perFile one-line ranges.
+func filesDocs(baseSHA string, n, perFile int) string {
+	files := make([]string, n)
+	for f := range n {
+		ranges := make([]string, perFile)
+		for h := range perFile {
+			ranges[h] = fmt.Sprintf(`{"start":%d,"end":%d}`, 2*h+2, 2*h+2)
+		}
+		files[f] = fmt.Sprintf(`{"path":"a%d.go","ranges":[%s]}`, f, strings.Join(ranges, ","))
 	}
-	return schema, out
+	return `{"base_sha":"` + baseSHA + `","files":[` + strings.Join(files, ",") + `]}`
 }
 
 func TestActionGroupsAnchorsByFile(t *testing.T) {
 	t.Parallel()
 
-	raw, _ := runClaudeWithStub(t, manyHunksDiff(2, 150))
+	sc := newScenario(t)
+	raw, _ := runClaudeWithStub(t, sc, filesDocs(sc.mergeBase, 2, 150))
 	if len(raw) >= 100*1024 {
 		t.Errorf("schema is %d bytes, want under 100 KiB", len(raw))
 	}
@@ -1196,7 +1355,15 @@ func TestActionGroupsAnchorsByFile(t *testing.T) {
 func TestActionDropsAnchorRangesWhenTheSchemaIsTooLarge(t *testing.T) {
 	t.Parallel()
 
-	raw, out := runClaudeWithStub(t, manyHunksDiff(2, 4000))
+	sc := newScenario(t)
+	out, log, err := runClaude(t, sc, filesDocs(sc.mergeBase, 2, 4000))
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if !strings.Contains(log, "::warning::") {
+		t.Errorf("run-claude.sh output = %q, want a ::warning:: that the anchor ranges were dropped", log)
+	}
+	raw := []byte(readOut(t, filepath.Dir(out), "schema.json"))
 	if len(raw) > 100<<10 || strings.Contains(string(raw), `"minimum"`) {
 		t.Errorf("--json-schema = %d bytes, want the schema without per-file anchors", len(raw))
 	}
@@ -1247,6 +1414,20 @@ func requireNewDocIndexEntry(t *testing.T, raw []byte) {
 func TestActionSchemaRequiresIndexEntryForNewDocs(t *testing.T) {
 	t.Parallel()
 
-	raw, _ := runClaudeWithStub(t, manyHunksDiff(1, 2))
+	sc := newScenario(t)
+	raw, _ := runClaudeWithStub(t, sc, filesDocs(sc.mergeBase, 1, 2))
 	requireNewDocIndexEntry(t, raw)
+}
+
+// writeStubClaude writes an executable stand-in for the claude CLI into dir.
+func writeStubClaude(t *testing.T, dir, script string) {
+	t.Helper()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("open stub dir: %v", err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.WriteFile("claude", []byte(script), 0o700); err != nil {
+		t.Fatalf("write stub claude: %v", err)
+	}
 }

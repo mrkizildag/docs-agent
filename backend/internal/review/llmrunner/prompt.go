@@ -9,6 +9,7 @@ import (
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/docs"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/input"
 )
 
 const (
@@ -97,7 +98,7 @@ const draftSystemPrompt = `You propose documentation updates for a pull request.
 	`When you are done, call submit_proposals ` +
 	`exactly once with the final list; an empty list means no doc needs to change.`
 
-func draftUserPrompt(f fence, impacted []docs.Doc, newDocFiles []string, changed []review.ChangedFile, patch string) string {
+func draftUserPrompt(f fence, impacted []docs.Doc, newDocFiles []string, files []input.File, patch string) string {
 	var b strings.Builder
 	paths := make([]string, len(impacted))
 	for i, d := range impacted {
@@ -112,14 +113,14 @@ func draftUserPrompt(f fence, impacted []docs.Doc, newDocFiles []string, changed
 		judged = strings.Join(paths, ", ")
 	}
 	return fmt.Sprintf("Docs judged impacted: %s\n\n%sAnchor hunks (numbered head-side lines):\n%s\nPR diff:\n%s\n",
-		judged, b.String(), hunkRanges(changed), f.wrap(patch))
+		judged, b.String(), hunkRanges(files), f.wrap(patch))
 }
 
-func hunkRanges(changed []review.ChangedFile) string {
+func hunkRanges(files []input.File) string {
 	var b strings.Builder
-	for _, f := range changed {
-		ranges := make([]string, len(f.Hunks))
-		for i, h := range f.Hunks {
+	for _, f := range files {
+		ranges := make([]string, len(f.Ranges))
+		for i, h := range f.Ranges {
 			ranges[i] = fmt.Sprintf("%d-%d", h.Start, h.End)
 		}
 		fmt.Fprintf(&b, "%s: %s\n", strconv.Quote(f.Path), strings.Join(ranges, ", "))

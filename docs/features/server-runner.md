@@ -8,6 +8,7 @@ covers:
   - backend/internal/github/files.go
   - backend/internal/review/basedocs/**
   - backend/internal/review/finalize/**
+  - backend/internal/review/input/**
   - backend/internal/docs/candidates.go
   - backend/internal/review/diff.go
   - backend/internal/review/validate.go
@@ -22,6 +23,8 @@ The server runner is the analysis runner for repos without the pollux-agent Acti
 1. **Changed files.** The gate lists the PR's files from GitHub, each with its patch and the head-side line ranges of its hunks, and passes them in the request. No changed files means "no impact" without cloning.
 2. **Clone.** A depth-1 fetch of the PR head and its merge base, with head checked out; the base's `docs/` is read straight from git objects into memory, never checked out: a checkout would apply the PR's `.gitattributes` (encodings, line endings) to the base docs, and the agent's tools cannot reach them. Authenticated with the installation token. The token goes to git through its environment as an HTTP header, never in the remote URL, so it does not land in `.git/config` or in logs. `git` must be on the server's PATH.
 3. **Candidate docs.** The runner parses `docs/` at the merge base (the base-branch commit the PR's diff starts from, resolved once by the gate through GitHub's compare API, not the base branch's current tip, so a doc added to main after the PR forked is not a candidate the head lacks) and keeps the docs whose `covers` globs there match a changed file or its old path (see [Architecture](../architecture.md) for the docs model). Matching at base is the point: a PR could otherwise empty or narrow `covers` to opt itself out, and editing `covers` is a doc change to review, not trust. The doc text still comes from head, so an edited doc is judged as the PR leaves it; a doc the PR adds is not a candidate, a renamed doc is followed to its new path (a doc renamed out of `docs/` or to a non-`.md` path counts as deleted; a file GitHub reports as copied is not a rename), and a candidate whose frontmatter the PR broke is triaged from its headings and text and can still get section proposals. A candidate the PR replaced with a symlink or other non-regular file at head, or a doc over 1 MiB at head, ends the analysis as a failure. A doc that fails to parse at base is skipped.
+
+    The review input (merge base, docs to review, uncovered files, and every changed file with its commentable line ranges) is decided once from the PR's merge base, changed files, and base selection, independent of the runner; this runner renders it into its prompts and the Actions runner sends it in its dispatch. A failed clone ends neutral "Reading the repository failed."
 
     The same step computes the **uncovered files**: changed files that no doc covers at base, are not removed, and are not under `docs/`. Both runners share this calculation. With no candidate and no uncovered file (a removals-only or docs-only PR) the result is "no impact" without a model call.
 

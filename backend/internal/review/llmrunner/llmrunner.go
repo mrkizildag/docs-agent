@@ -24,6 +24,7 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/basedocs"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/finalize"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/input"
 )
 
 const runnerName = "llmrunner"
@@ -154,12 +155,12 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	if len(selection.Restores) > 0 {
 		return review.Result{Verdict: review.Proposals(selection.Restores)}, nil
 	}
-	candidates, uncovered := selection.Candidates, selection.Uncovered
-	if selection.Empty() {
+	in := input.New(req, selection)
+	if len(in.Candidates) == 0 && len(in.Uncovered) == 0 {
 		return noImpact(basedocs.NothingToReview, "", nil), nil
 	}
-	if len(candidates) > basedocs.MaxCandidates {
-		return review.Result{}, fmt.Errorf("%w: %d candidate docs exceed the cap of %d", errTooManyCandidates, len(candidates), basedocs.MaxCandidates)
+	if len(in.Candidates) > basedocs.MaxCandidates {
+		return review.Result{}, fmt.Errorf("%w: %d candidate docs exceed the cap of %d", errTooManyCandidates, len(in.Candidates), basedocs.MaxCandidates)
 	}
 
 	headTree, err := docs.Parse(root.FS())
@@ -170,7 +171,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	for _, d := range headTree.Docs {
 		index[d.Path] = d
 	}
-	for _, docPath := range candidates {
+	for _, docPath := range in.Candidates {
 		if _, ok := index[docPath]; ok {
 			continue
 		}
@@ -189,7 +190,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	patch := combinedPatch(req.ChangedFiles)
 
 	var impacted, reasons []string
-	for _, docPath := range candidates {
+	for _, docPath := range in.Candidates {
 		isImpacted, why, err := r.triage(ctx, log, index, budget, fence, docPath, patch)
 		if err != nil {
 			return review.Result{}, fmt.Errorf("triage %s: %w", docPath, err)
@@ -202,31 +203,31 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 	}
 
 	allowNewDoc := false
-	if len(uncovered) > 0 {
+	if len(in.Uncovered) > 0 {
 		readme, err := headReadme(root)
 		if err != nil {
 			return review.Result{}, fmt.Errorf("read docs/README.md of %s: %w", req.HeadSHA, err)
 		}
-		needed, why, err := r.decideNewDoc(ctx, log, budget, fence, string(readme), uncovered, patch)
+		needed, why, err := r.decideNewDoc(ctx, log, budget, fence, string(readme), in.Uncovered, patch)
 		if err != nil {
 			return review.Result{}, fmt.Errorf("decide new doc: %w", err)
 		}
 		if needed {
 			allowNewDoc = true
 		} else {
-			reasons = append(reasons, "no doc covers "+strings.Join(uncovered, ", ")+"; no new doc needed: "+why)
+			reasons = append(reasons, "no doc covers "+strings.Join(in.Uncovered, ", ")+"; no new doc needed: "+why)
 		}
 	}
 
 	if len(impacted) == 0 && !allowNewDoc {
 		prefix := ""
-		if len(candidates) > 0 {
+		if len(in.Candidates) > 0 {
 			prefix = "no candidate doc is affected: "
 		}
 		return noImpact(finalize.NoImpactReason(prefix+strings.Join(reasons, "; ")), r.triageModel, budget), nil
 	}
 
-	proposals, err := r.draft(ctx, log, root, c.isGitlink, index, budget, fence, req, selection, impacted, allowNewDoc, patch)
+	proposals, err := r.draft(ctx, log, root, c.isGitlink, index, budget, fence, req, in, selection, impacted, allowNewDoc, patch)
 	if err != nil {
 		return review.Result{}, err
 	}
@@ -489,8 +490,8 @@ type submitProposalsArgs struct {
 
 // draft runs the agent loop that drafts proposals for the impacted docs. It
 // may propose a new doc only when allowNewDoc, the new-doc decision for
-// sel.Uncovered, is true.
-func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, gitlink func(context.Context, string) (bool, error), index docIndex, budget *agent.Budget, f fence, req review.Request, sel basedocs.Selection, impacted []string, allowNewDoc bool, patch string) ([]review.Proposal, error) {
+// in.Uncovered, is true.
+func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, gitlink func(context.Context, string) (bool, error), index docIndex, budget *agent.Budget, f fence, req review.Request, in input.Input, sel basedocs.Selection, impacted []string, allowNewDoc bool, patch string) ([]review.Proposal, error) {
 	finish, err := submitProposalsTool()
 	if err != nil {
 		return nil, err
@@ -503,7 +504,7 @@ func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, git
 
 	var newDocFiles []string
 	if allowNewDoc {
-		newDocFiles = sel.Uncovered
+		newDocFiles = in.Uncovered
 	}
 
 	rules := finalize.Rules{Changed: req.ChangedFiles, Selection: &sel, Repo: req.Owner + "/" + req.Repo, AllowNewDoc: allowNewDoc}
@@ -515,7 +516,7 @@ func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, git
 	task := agent.Task{
 		Model:  r.model,
 		System: draftSystemPrompt,
-		Prompt: draftUserPrompt(f, impactedDocs, newDocFiles, req.ChangedFiles, patch),
+		Prompt: draftUserPrompt(f, impactedDocs, newDocFiles, in.Files, patch),
 		Root:   root,
 		Finish: finish,
 		Accept: func(args json.RawMessage) error {

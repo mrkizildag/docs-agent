@@ -11,7 +11,7 @@ inputs:
     description: Dispatch nonce, echoed back in the result.
     required: true
   docs:
-    description: 'JSON object {"review": doc paths to review, "uncovered": changed files no doc covers}, chosen by the pollux-agent server. A bare array of doc paths to review is also accepted.'
+    description: 'JSON object {"base_sha": merge base to diff from, "review": doc paths to review, "uncovered": changed files no doc covers, "files": [{"path", "ranges": [{"start", "end"}]}] commentable head-side lines}, chosen by the pollux-agent server. Without base_sha and files the action diffs against the default branch; a bare array of doc paths to review is also accepted.'
     required: true
   claude_code_oauth_token:
     description: Claude subscription token. One of this or anthropic_api_key is required.
@@ -46,12 +46,10 @@ runs:
         fetch-depth: 0
         persist-credentials: false
 
-    - name: Verify the head commit and write the diff
+    - name: Verify the head commit
       shell: bash
       env:
-        PR_NUMBER: ${{ inputs.pr_number }}
         HEAD_SHA: ${{ inputs.head_sha }}
-        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         CHECKOUT: ${{ github.workspace }}/pr
       run: |
         set -euo pipefail
@@ -61,9 +59,6 @@ runs:
           echo "::error::Checked-out HEAD is $actual, expected $HEAD_SHA"
           exit 1
         fi
-        mkdir -p "$RUNNER_TEMP/pollux-agent"
-        [ "$PR_NUMBER" != "0" ] || exit 0
-        git -c core.quotePath=false diff "origin/$DEFAULT_BRANCH...HEAD" > "$RUNNER_TEMP/pollux-agent/pr.diff"
 
     - name: Run Claude
       shell: bash

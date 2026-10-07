@@ -20,6 +20,7 @@ import (
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/input"
 )
 
 // Client creates GitHub check runs, authenticating per installation as the
@@ -179,6 +180,45 @@ const (
 	maxArtifactBytes   = 10 << 20
 )
 
+// maxDocsInputBytes bounds the docs workflow input; GitHub caps all dispatch
+// inputs together at about 65,535 characters, and the others need room.
+const maxDocsInputBytes = 60000
+
+// encodeDocs returns in as JSON, without its per-file ranges when they would
+// not fit; the action then derives them from its own diff.
+func encodeDocs(in input.Input) ([]byte, error) {
+	docsJSON, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("encode docs: %w", err)
+	}
+	if size, err := wireSize(docsJSON); err != nil || size <= maxDocsInputBytes {
+		return docsJSON, err
+	}
+	in.Files = nil
+	docsJSON, err = json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("encode docs: %w", err)
+	}
+	size, err := wireSize(docsJSON)
+	if err != nil {
+		return nil, err
+	}
+	if size > maxDocsInputBytes {
+		return nil, fmt.Errorf("docs input is %d bytes encoded without file ranges, over the limit of %d", size, maxDocsInputBytes)
+	}
+	return docsJSON, nil
+}
+
+// wireSize is the size of docsJSON once it is escaped as a JSON string value
+// in the dispatch request, which is what GitHub's input cap sees.
+func wireSize(docsJSON []byte) (int, error) {
+	quoted, err := json.Marshal(string(docsJSON))
+	if err != nil {
+		return 0, fmt.Errorf("encode docs: %w", err)
+	}
+	return len(quoted), nil
+}
+
 // Dispatch runs the pollux-agent workflow on owner/repo's default branch and
 // returns the ID of the run it started.
 func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo string, in actions.DispatchInputs) (int64, error) {
@@ -187,12 +227,9 @@ func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo
 		return 0, fmt.Errorf("dispatch workflow %s/%s: %w", owner, repo, err)
 	}
 
-	docsJSON, err := json.Marshal(struct {
-		Review    []string `json:"review"`
-		Uncovered []string `json:"uncovered"`
-	}{Review: nonNil(in.Docs), Uncovered: nonNil(in.Uncovered)})
+	docsJSON, err := encodeDocs(in.Input)
 	if err != nil {
-		return 0, fmt.Errorf("dispatch workflow %s/%s: encode docs: %w", owner, repo, err)
+		return 0, fmt.Errorf("dispatch workflow %s/%s: %w", owner, repo, err)
 	}
 
 	r, _, err := client.Repositories.Get(ctx, owner, repo)
@@ -219,14 +256,6 @@ func (c *Client) Dispatch(ctx context.Context, installationID int64, owner, repo
 	}
 
 	return details.GetWorkflowRunID(), nil
-}
-
-// nonNil makes a nil slice encode as [] rather than null.
-func nonNil(s []string) []string {
-	if s == nil {
-		return []string{}
-	}
-	return s
 }
 
 // ResultArtifact returns the result.json inside run runID's result artifact.
