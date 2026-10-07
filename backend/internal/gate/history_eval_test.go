@@ -2,6 +2,7 @@ package gate_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,15 +18,14 @@ func savedAnalyses(store *fakeStore) []gate.Analysis {
 	var out []gate.Analysis
 	idx := map[string]int{}
 	for _, h := range store.histories {
-		if h.Analysis == nil {
-			continue
+		for _, a := range h.Analyses {
+			if i, ok := idx[a.Nonce]; ok {
+				out[i] = a
+				continue
+			}
+			idx[a.Nonce] = len(out)
+			out = append(out, a)
 		}
-		if i, ok := idx[h.Analysis.Nonce]; ok {
-			out[i] = *h.Analysis
-			continue
-		}
-		idx[h.Analysis.Nonce] = len(out)
-		out = append(out, *h.Analysis)
 	}
 	return out
 }
@@ -34,7 +34,7 @@ func TestHistoryActionsCompletionRecordedOnceWithUsage(t *testing.T) {
 	t.Parallel()
 
 	cost := 0.42
-	usage := &review.Usage{InputTokens: 10, OutputTokens: 20, CacheReadTokens: 3, CacheWriteTokens: 4, CostUSD: &cost, CostBasis: "list"}
+	usage := &review.Usage{Tokens: &review.Tokens{Input: 10, Output: 20, CacheRead: 3, CacheWrite: 4}, CostUSD: &cost, CostBasis: "list"}
 	started := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	state := awaitingState()
 	state.Run.StartedAt, state.Run.Runner = started, gate.RunnerKindActions
@@ -122,5 +122,79 @@ func TestHistoryDeliberateRerunOfSameHeadWritesNewRow(t *testing.T) {
 	want := map[string]gate.AnalysisVerdict{"check-801": gate.VerdictNoImpact, "check-802": gate.VerdictNoImpact}
 	if diff := cmp.Diff(want, nonces); diff != "" {
 		t.Errorf("analysis rows by nonce (-want +got):\n%s", diff)
+	}
+}
+
+func TestHistoryOutdatedEventsSavedWithTheOutdatedProposals(t *testing.T) {
+	t.Parallel()
+
+	idA := gate.ProposalID("docs/a.md", "A")
+	tests := []struct {
+		name    string
+		verdict review.Verdict
+	}{
+		{name: "no create, final save", verdict: review.NoImpact{Reason: "none"}},
+		{name: "create, save before it", verdict: review.Proposals{proposal("docs/b.md", "B")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			state := awaitingState()
+			state.Proposals = []gate.ProposalState{{ID: idA, DocPath: "docs/a.md", Section: "A", State: gate.ProposalOpen}}
+			store := &fakeStore{stored: state, live: true}
+			runner := &fakeRunner{result: review.Result{Verdict: tt.verdict}}
+			svc := gate.NewService(&fakeGitHub{}, nil, store, gate.Runners{Actions: runner}, nil, nil)
+
+			if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
+				t.Fatalf("HandleRunCompleted() = %v", err)
+			}
+
+			var withEvent []int
+			for i, h := range store.histories {
+				for _, e := range h.Events {
+					if e.Kind == gate.EventOutdated && e.ProposalID == idA {
+						withEvent = append(withEvent, i)
+					}
+				}
+			}
+			if len(withEvent) != 1 {
+				t.Fatalf("outdated event saved by saves %v, want exactly one", withEvent)
+			}
+			if got := store.saveCalls[withEvent[0]].Proposals[0].State; got != gate.ProposalOutdated {
+				t.Errorf("proposal state in the save carrying the event = %s, want outdated", got)
+			}
+		})
+	}
+}
+
+func TestHistoryNoImpactReasonIsCapped(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeRunner{result: review.Result{Verdict: review.NoImpact{Reason: strings.Repeat("x", 5000)}}}
+	store := &fakeStore{stored: awaitingState(), live: true}
+	svc := gate.NewService(&fakeGitHub{}, nil, store, gate.Runners{Actions: runner}, nil, nil)
+
+	if err := svc.HandleRunCompleted(t.Context(), completedRun("success")); err != nil {
+		t.Fatalf("HandleRunCompleted() = %v", err)
+	}
+	got := savedAnalyses(store)
+	if len(got) != 1 || len(got[0].Reason) > 1000 {
+		t.Errorf("analyses = %d rows, reason length %d, want one row with a reason of at most 1000 bytes", len(got), len(got[0].Reason))
+	}
+}
+
+func TestOnStartedKeepsTheArmedRunFields(t *testing.T) {
+	t.Parallel()
+
+	started := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	armed := gate.PRState{Run: &gate.AwaitingRun{Nonce: "check-1", StartedAt: started, Runner: gate.RunnerKindActions}}
+	deadline := started.Add(time.Minute)
+
+	got := gate.OnStarted(armed, review.Pending{RunID: 9, Nonce: "n9", Deadline: deadline}, 5, "mb")
+
+	want := &gate.AwaitingRun{RunID: 9, Nonce: "n9", Deadline: deadline, BaseSHA: "mb", StartedAt: started, Runner: gate.RunnerKindActions}
+	if diff := cmp.Diff(want, got.Run); diff != "" {
+		t.Errorf("OnStarted().Run (-want +got):\n%s", diff)
 	}
 }

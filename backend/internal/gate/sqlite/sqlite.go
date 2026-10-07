@@ -160,7 +160,7 @@ func migrations() []string {
 			verdict TEXT NOT NULL,
 			reason TEXT NOT NULL,
 			proposals INTEGER NOT NULL,
-			started_at TEXT NOT NULL,
+			started_at TEXT,
 			finished_at TEXT NOT NULL,
 			input_tokens INTEGER,
 			output_tokens INTEGER,
@@ -184,9 +184,10 @@ func migrations() []string {
 			reason TEXT NOT NULL,
 			commit_sha TEXT NOT NULL,
 			head_sha TEXT NOT NULL,
-			created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+			created_at TEXT NOT NULL,
 			UNIQUE (owner, repo, number, key)
-		)`,
+		);
+		UPDATE pull_requests SET run_runner = 'actions' WHERE run_nonce != '' AND run_id != 0`,
 	}
 }
 

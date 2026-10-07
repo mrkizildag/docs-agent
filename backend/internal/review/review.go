@@ -90,16 +90,22 @@ type Result struct {
 	Usage *Usage
 }
 
-// Usage is what one analysis consumed. CostUSD is nil when the runner has no
-// cost figure; CostBasis says how a reported cost was derived ("list" for a
-// list-price estimate) and is empty when unknown.
+// Usage is what one analysis consumed. Tokens is nil when the runner reported
+// no token count; CostUSD is nil when it has no cost figure; CostBasis says how
+// a reported cost was derived ("list" for a list-price estimate) and is empty
+// when unknown.
 type Usage struct {
-	InputTokens      int64
-	OutputTokens     int64
-	CacheReadTokens  int64
-	CacheWriteTokens int64
-	CostUSD          *float64
-	CostBasis        string
+	Tokens    *Tokens
+	CostUSD   *float64
+	CostBasis string
+}
+
+// Tokens is a token count by kind.
+type Tokens struct {
+	Input      int64
+	Output     int64
+	CacheRead  int64
+	CacheWrite int64
 }
 
 func (Pending) isStarted() {}

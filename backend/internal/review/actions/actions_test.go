@@ -327,7 +327,7 @@ func TestCollect(t *testing.T) {
 			}),
 			want: review.Result{
 				Model: "claude-haiku", Verdict: review.NoImpact{Reason: "internal refactor"},
-				Usage: &review.Usage{InputTokens: 4, OutputTokens: 966, CacheReadTokens: 6475, CacheWriteTokens: 11501, CostUSD: ptr(0.056967), CostBasis: "list"},
+				Usage: &review.Usage{Tokens: &review.Tokens{Input: 4, Output: 966, CacheRead: 6475, CacheWrite: 11501}, CostUSD: ptr(0.056967), CostBasis: "list"},
 			},
 		},
 		{
@@ -337,7 +337,109 @@ func TestCollect(t *testing.T) {
 				"modelUsage":        map[string]any{"a": map[string]any{"costBasis": "list"}, "b": map[string]any{}},
 				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
 			}),
-			want: review.Result{Model: "a", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{InputTokens: 1, OutputTokens: 2}},
+			want: review.Result{Model: "a", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{Tokens: &review.Tokens{Input: 1, Output: 2}}},
+		},
+		{
+			name: "modelUsage entry not an object",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"modelUsage":        map[string]any{"m": "n/a"},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "m", Verdict: review.NoImpact{Reason: "x"}},
+		},
+		{
+			name: "modelUsage not an object",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"modelUsage":        "n/a",
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
+		},
+		{
+			name: "costBasis not a string",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"usage":             map[string]any{"input_tokens": 1},
+				"modelUsage":        map[string]any{"m": map[string]any{"costBasis": map[string]any{}}},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "m", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{Tokens: &review.Tokens{Input: 1}}},
+		},
+		{
+			name: "token count not a number",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"usage":             map[string]any{"input_tokens": "12"},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
+		},
+		{
+			name: "one malformed token count keeps the rest",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"usage":             map[string]any{"input_tokens": "12", "output_tokens": 5},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{Tokens: &review.Tokens{Output: 5}}},
+		},
+		{
+			name: "cost not a number",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"total_cost_usd":    "free",
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
+		},
+		{
+			name: "cost without a usage block",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"total_cost_usd":    0.5,
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{CostUSD: ptr(0.5)}},
+		},
+		{
+			name: "null cost and tokens are not reported",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"total_cost_usd":    nil,
+				"usage":             map[string]any{"input_tokens": nil, "output_tokens": 3},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{Tokens: &review.Tokens{Output: 3}}},
+		},
+		{
+			name: "all null usage is nil",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"total_cost_usd":    nil,
+				"usage":             map[string]any{"input_tokens": nil},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}},
+		},
+		{
+			name: "negative tokens and cost",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"total_cost_usd":    -1,
+				"usage":             map[string]any{"input_tokens": -5, "output_tokens": 7},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{Tokens: &review.Tokens{Output: 7}}},
+		},
+		{
+			name: "absurd tokens and cost",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"total_cost_usd":    2e6,
+				"usage":             map[string]any{"input_tokens": 2e12, "output_tokens": 7},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "claude-code", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{Tokens: &review.Tokens{Output: 7}}},
+		},
+		{
+			name: "model name and cost basis over their caps",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"usage":             map[string]any{"input_tokens": 1},
+				"modelUsage":        map[string]any{strings.Repeat("m", 300): map[string]any{"costBasis": strings.Repeat("b", 33)}},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: strings.Repeat("m", 200), Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{Tokens: &review.Tokens{Input: 1}}},
 		},
 		{name: "head mismatch", raw: artifact(t, "other", "n1", map[string]any{"structured_output": map[string]any{}}), wantInvalid: true},
 		{name: "nonce mismatch", raw: artifact(t, "abc", "stale", map[string]any{"structured_output": map[string]any{}}), wantInvalid: true},

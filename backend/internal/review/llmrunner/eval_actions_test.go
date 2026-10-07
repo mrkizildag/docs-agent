@@ -291,8 +291,12 @@ func (w *localWorkflow) models() []string {
 	if err := json.Unmarshal(data, &art); err != nil {
 		return nil
 	}
+	var usage map[string]json.RawMessage
+	if err := json.Unmarshal(art.Claude.ModelUsage, &usage); err != nil {
+		return nil
+	}
 	var models []string
-	for m := range art.Claude.ModelUsage {
+	for m := range usage {
 		models = append(models, m)
 	}
 	slices.Sort(models)

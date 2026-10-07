@@ -211,10 +211,11 @@ type fakeStore struct {
 	saveCalls   []gate.PRState
 	loadErr     error
 	saveErr     error
+	failSaves   int // the first failSaves saves fail with saveErr and store nothing
 	stored      gate.PRState
 	saved       *gate.PRState
 	saveCtxErrs []error
-	histories   []gate.History // History of each saved state, which saveCalls and saved omit
+	histories   []gate.History // History passed with each save, parallel to saveCalls
 	live        bool           // SavePR also replaces stored, as a real store would
 	onSave      func()
 }
@@ -265,10 +266,13 @@ func (f *fakeStore) MarkScaffoldWaiterLinked(context.Context, string, string, in
 	return nil
 }
 
-func (f *fakeStore) SavePR(ctx context.Context, state gate.PRState) error {
+func (f *fakeStore) SavePR(ctx context.Context, state gate.PRState, history gate.History) error {
 	f.saveCtxErrs = append(f.saveCtxErrs, ctx.Err())
-	f.histories = append(f.histories, state.History)
-	state.History = gate.History{}
+	if f.failSaves > 0 {
+		f.failSaves--
+		return f.saveErr
+	}
+	f.histories = append(f.histories, history)
 	f.saveCalls = append(f.saveCalls, state)
 	f.saved = &state
 	if f.onSave != nil {
@@ -612,7 +616,8 @@ func TestOnPush(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			if diff := cmp.Diff(want, gate.OnPush(tt.state, testPR(), time.Now())); diff != "" {
+			got, _ := gate.OnPush(tt.state, testPR(), time.Now())
+			if diff := cmp.Diff(want, got); diff != "" {
 				t.Errorf("OnPush() (-want +got):\n%s", diff)
 			}
 		})
@@ -1126,7 +1131,7 @@ func TestHandleRunCompletedCapsText(t *testing.T) {
 func TestOnPushDropsAwaitedRun(t *testing.T) {
 	t.Parallel()
 
-	got := gate.OnPush(awaitingState(), testPR(), time.Now())
+	got, _ := gate.OnPush(awaitingState(), testPR(), time.Now())
 	if got.Run != nil || got.CheckRunID != 0 {
 		t.Errorf("OnPush() = %+v, want no awaited run and no check run", got)
 	}
@@ -1273,7 +1278,7 @@ func TestReconcile(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			state, writes := gate.Reconcile(tc.prev, pr, tc.verdict, nil, tc.existing)
+			state, writes, _ := gate.Reconcile(tc.prev, pr, tc.verdict, nil, tc.existing)
 			creates, edits := countWrites(writes)
 			if creates != tc.wantCreates || edits != tc.wantEdits {
 				t.Errorf("writes = %d creates, %d edits, want %d, %d", creates, edits, tc.wantCreates, tc.wantEdits)
@@ -1311,7 +1316,7 @@ func TestReconcileReopenedAppliedGetsNewComment(t *testing.T) {
 	oldBody := "<!-- pollux-agent:proposal:" + id + " -->\n\nreason\n\n- [x] Apply this change\n"
 	existing := []gate.Comment{{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: oldBody}}
 
-	state, writes := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, existing)
+	state, writes, _ := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, existing)
 
 	var proposalWrites []gate.CommentWrite
 	for _, w := range writes {
@@ -1342,7 +1347,7 @@ func TestReconcileNeverAdoptsSupersededComment(t *testing.T) {
 	prev := gate.PRState{Proposals: []gate.ProposalState{{ID: id, DocPath: "docs/a.md", Section: "A", State: gate.ProposalOpen}}}
 	existing := []gate.Comment{{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: "<!-- pollux-agent:superseded:" + id + " -->\n\nold"}}
 
-	state, writes := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, existing)
+	state, writes, _ := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, existing)
 
 	if got := state.Proposals[0].CommentID; got != 0 {
 		t.Errorf("CommentID = %d, want 0: a superseded comment is not adopted", got)
@@ -1360,7 +1365,7 @@ func TestReconcileKeepsRowOrder(t *testing.T) {
 	prev := gate.PRState{Proposals: []gate.ProposalState{
 		{ID: gate.ProposalID("docs/a.md", "A"), DocPath: "docs/a.md", Section: "A", CommentID: 1, State: gate.ProposalOpen},
 	}}
-	state, _ := gate.Reconcile(prev, testPR(), review.Proposals{proposal("docs/z.md", "Z"), proposal("docs/a.md", "A")}, nil, nil)
+	state, _, _ := gate.Reconcile(prev, testPR(), review.Proposals{proposal("docs/z.md", "Z"), proposal("docs/a.md", "A")}, nil, nil)
 	if len(state.Proposals) != 2 || state.Proposals[0].DocPath != "docs/a.md" || state.Proposals[1].DocPath != "docs/z.md" {
 		t.Errorf("rows = %+v, want existing first, new appended", state.Proposals)
 	}
@@ -1399,7 +1404,7 @@ func TestReconcileVariants(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{tc.p}, tc.changed, nil)
+			_, writes, _ := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{tc.p}, tc.changed, nil)
 			rc := writes[0].Review
 			if rc.Path != tc.wantPath || rc.StartLine != tc.wantStart || rc.Line != tc.wantLine || rc.CommitSHA != "abc123" {
 				t.Errorf("comment = %+v, want %s %d-%d on abc123", rc, tc.wantPath, tc.wantStart, tc.wantLine)
@@ -1413,7 +1418,7 @@ func TestReconcileVariants(t *testing.T) {
 		})
 	}
 
-	_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{suggest}, diffFile("docs/a.md", review.LineRange{Start: 1, End: 20}), nil)
+	_, writes, _ := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{suggest}, diffFile("docs/a.md", review.LineRange{Start: 1, End: 20}), nil)
 	body := writes[0].Review.Body
 	want := "````suggestion\n## Mid\nnew ```go\nx\n```\n\n````\n"
 	if !strings.HasSuffix(body, want) {
@@ -1450,7 +1455,7 @@ func TestReconcileEditKeepsVariantSafe(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, writes := gate.Reconcile(prev, testPR(), review.Proposals{p}, tc.changed, []gate.Comment{tc.existing})
+			_, writes, _ := gate.Reconcile(prev, testPR(), review.Proposals{p}, tc.changed, []gate.Comment{tc.existing})
 			if writes[0].ID != 1 {
 				t.Fatalf("write = %+v, want an edit of comment 1", writes[0])
 			}
@@ -1688,7 +1693,7 @@ func TestReconcileIgnoresForeignMarkers(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			state, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{a}, nil, []gate.Comment{tc.existing})
+			state, writes, _ := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{a}, nil, []gate.Comment{tc.existing})
 			creates, edits := countWrites(writes)
 			if creates != 2 || edits != 0 || state.SummaryCommentID != 0 || state.Proposals[0].CommentID != 0 {
 				t.Errorf("writes = %d creates, %d edits, state = %+v, want 2 creates, nothing adopted", creates, edits, state)
@@ -1708,7 +1713,7 @@ func TestReconcileRecreatesStateCommentNotMine(t *testing.T) {
 		{ID: 90, Kind: gate.CommentKindIssue, Body: "y"},
 	}
 
-	state, writes := gate.Reconcile(prev, testPR(), review.Proposals{a}, nil, existing)
+	state, writes, _ := gate.Reconcile(prev, testPR(), review.Proposals{a}, nil, existing)
 	creates, edits := countWrites(writes)
 	if creates != 2 || edits != 0 || state.SummaryCommentID != 0 || state.Proposals[0].CommentID != 0 {
 		t.Errorf("writes = %d creates, %d edits, state = %+v, want 2 creates, no edits of foreign comments", creates, edits, state)
@@ -1766,7 +1771,7 @@ func TestReconcileRestoresOmittedHeading(t *testing.T) {
 	p.Original = "## Behavior\n\nold text\n"
 	p.Content = "new text\n"
 
-	_, writes := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
+	_, writes, _ := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
 	if len(writes) == 0 {
 		t.Fatal("Reconcile() returned no writes, want a review comment create")
 	}
@@ -1776,13 +1781,13 @@ func TestReconcileRestoresOmittedHeading(t *testing.T) {
 	}
 
 	p.Content = "### Install\n\nnew text\n"
-	_, writes = gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
+	_, writes, _ = gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
 	want = "+## Behavior\n+\n+### Install\n+\n+new text\n"
 	if body := writes[0].Review.Body; !strings.Contains(body, want) {
 		t.Errorf("subsection content: review comment body = %q, want diff %q", body, want)
 	}
 	p.Content = "## Behaviour\n\nnew text\n"
-	_, writes = gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
+	_, writes, _ = gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
 	if body := writes[0].Review.Body; strings.Contains(body, "+## Behavior\n") || !strings.Contains(body, "+## Behaviour\n") {
 		t.Errorf("renamed heading: review comment body = %q, want the model's heading kept and no second heading", body)
 	}
@@ -1809,7 +1814,7 @@ func TestOnPushSkips(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := gate.OnPush(tt.prev, testPR(), time.Now())
+			got, _ := gate.OnPush(tt.prev, testPR(), time.Now())
 			if diff := cmp.Diff(tt.wantSkip, got.Skip); diff != "" {
 				t.Errorf("Skip (-want +got):\n%s", diff)
 			}
@@ -1824,7 +1829,7 @@ func TestOnPushDropsPendingApply(t *testing.T) {
 	t.Parallel()
 
 	prev := gate.PRState{HeadSHA: "old111", PendingApply: &gate.PendingApply{IDs: []string{"p1"}, Message: "m", Parent: "old111"}}
-	if got := gate.OnPush(prev, testPR(), time.Now()); got.PendingApply != nil {
+	if got, _ := gate.OnPush(prev, testPR(), time.Now()); got.PendingApply != nil {
 		t.Errorf("OnPush().PendingApply = %+v, want nil", got.PendingApply)
 	}
 }
@@ -1834,7 +1839,7 @@ func TestOnPushCopiesFork(t *testing.T) {
 
 	pr := testPR()
 	pr.Fork = true
-	if got := gate.OnPush(gate.PRState{}, pr, time.Now()); !got.Fork {
+	if got, _ := gate.OnPush(gate.PRState{}, pr, time.Now()); !got.Fork {
 		t.Error("OnPush().Fork = false, want true")
 	}
 }
@@ -1871,7 +1876,7 @@ func TestHandlePullRequestPRSkipSkipsAnalysis(t *testing.T) {
 func TestHandleRunCompletedAfterSkip(t *testing.T) {
 	t.Parallel()
 
-	skipped, _ := gate.OnSkip(awaitingState(), gate.Skip{User: "dev", Scope: gate.SkipCommit, Reason: "typo"}, time.Now())
+	skipped, _, _ := gate.OnSkip(awaitingState(), gate.Skip{User: "dev", Scope: gate.SkipCommit, Reason: "typo"}, time.Now())
 
 	t.Run("late run is ignored", func(t *testing.T) {
 		t.Parallel()
@@ -2497,7 +2502,7 @@ func TestHandlePullRequestConcludesAfterALongAnalysis(t *testing.T) {
 	}
 }
 
-func TestOnPushAtSupersededAnalysis(t *testing.T) {
+func TestOnPushSupersededAnalysis(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
@@ -2506,24 +2511,24 @@ func TestOnPushAtSupersededAnalysis(t *testing.T) {
 	tests := []struct {
 		name string
 		prev gate.PRState
-		want *gate.Analysis
+		want []gate.Analysis
 	}{
-		{name: "armed run", prev: armed, want: &gate.Analysis{
+		{name: "armed run", prev: armed, want: []gate.Analysis{{
 			Nonce: "n1", HeadSHA: "old111", Runner: gate.RunnerKindActions, Verdict: gate.VerdictSuperseded,
 			StartedAt: started, FinishedAt: now, RunID: 9,
-		}},
+		}}},
 		{name: "nothing armed", prev: gate.PRState{HeadSHA: "old111"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := gate.OnPush(tt.prev, testPR(), now)
-			if diff := cmp.Diff(tt.want, got.History.Analysis); diff != "" {
-				t.Errorf("OnPush().History.Analysis (-want +got):\n%s", diff)
+			got, history := gate.OnPush(tt.prev, testPR(), now)
+			if diff := cmp.Diff(tt.want, history.Analyses); diff != "" {
+				t.Errorf("OnPush() history.Analyses (-want +got):\n%s", diff)
 			}
-			if got.Run != nil || len(got.History.Events) != 0 {
-				t.Errorf("OnPush() Run = %+v, Events = %+v, want no run and no events", got.Run, got.History.Events)
+			if got.Run != nil || len(history.Events) != 0 {
+				t.Errorf("OnPush() Run = %+v, Events = %+v, want no run and no events", got.Run, history.Events)
 			}
 		})
 	}
@@ -2538,7 +2543,7 @@ func TestReconcileRetiresOutdatedCommentThatStillHasTheLiveMarker(t *testing.T) 
 	body := "<!-- pollux-agent:proposal:" + id + " -->\n\nold"
 	existing := []gate.Comment{{ID: 1, Mine: true, Kind: gate.CommentKindReview, Body: body}}
 
-	state, writes := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, existing)
+	state, writes, _ := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, existing)
 
 	if len(writes) < 2 || writes[0].ID != 1 || !writes[0].Resolve || writes[0].Body != strings.Replace(body, "proposal", "superseded", 1) || writes[1].ID != 0 {
 		t.Errorf("writes = %+v, want a retire of comment 1 then a create", writes)
@@ -2565,7 +2570,7 @@ func TestReconcileEmitsRetiresFirst(t *testing.T) {
 		{ID: 90, Mine: true, Kind: gate.CommentKindIssue, Body: "<!-- pollux-agent:summary -->"},
 	}
 
-	_, writes := gate.Reconcile(prev, testPR(), review.Proposals{a, bNew}, nil, existing)
+	_, writes, _ := gate.Reconcile(prev, testPR(), review.Proposals{a, bNew}, nil, existing)
 
 	if len(writes) != 4 || !writes[0].Resolve || writes[0].ID != 2 || writes[1].ID != 1 || writes[2].ID != 0 || !writes[3].Summary {
 		t.Errorf("writes = %+v, want retire of 2, edit of 1, create, summary", writes)
@@ -2607,7 +2612,7 @@ func TestReconcileSameContent(t *testing.T) {
 				{ID: 2, Mine: true, Kind: gate.CommentKindIssue, Body: "<!-- pollux-agent:summary -->\nold"},
 			}
 
-			_, writes := gate.Reconcile(prev, testPR(), review.Proposals{tc.got}, nil, existing)
+			_, writes, _ := gate.Reconcile(prev, testPR(), review.Proposals{tc.got}, nil, existing)
 
 			if creates, _ := countWrites(writes); creates != tc.wantCreates {
 				t.Errorf("creates = %d, want %d", creates, tc.wantCreates)
@@ -2635,12 +2640,37 @@ func TestStartRunSavesSupersededBeforeNewAnalysis(t *testing.T) {
 
 	var got []string
 	for _, h := range store.histories {
-		if a := h.Analysis; a != nil {
+		for _, a := range h.Analyses {
 			got = append(got, a.Nonce+":"+string(a.Verdict))
 		}
 	}
-	got = slices.Compact(got) // the concluded run is saved again by the final save; the store upserts it
 	want := []string{"check-400:superseded", "check-555:no_impact"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("analyses saved (-want +got):\n%s", diff)
+	}
+}
+
+func TestStartRunKeepsSupersededWhenTheArmSaveFails(t *testing.T) {
+	t.Parallel()
+
+	prev := gate.PRState{
+		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "old111", CheckRunID: 400,
+		Run: &gate.AwaitingRun{RunID: 9, Nonce: "check-400", Runner: gate.RunnerKindServer},
+	}
+	gh := &fakeGitHub{checkRunID: 555}
+	runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
+	store := &fakeStore{stored: prev, live: true, failSaves: 1, saveErr: errors.New("database is locked")}
+	svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner}, nil, nil)
+
+	_ = svc.HandlePullRequest(t.Context(), testPR()) // the run fails; only what it saved matters
+
+	var got []string
+	for _, h := range store.histories {
+		for _, a := range h.Analyses {
+			got = append(got, a.Nonce+":"+string(a.Verdict))
+		}
+	}
+	want := []string{"check-400:superseded", "check-555:failed"}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("analyses saved (-want +got):\n%s", diff)
 	}
@@ -2674,9 +2704,9 @@ func TestReconcileOutdatedEvents(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			next, _ := gate.Reconcile(prev, pr, tt.verdict, nil, nil)
-			if diff := cmp.Diff(tt.want, next.History.Events); diff != "" {
-				t.Errorf("Reconcile().History.Events (-want +got):\n%s", diff)
+			_, _, history := gate.Reconcile(prev, pr, tt.verdict, nil, nil)
+			if diff := cmp.Diff(tt.want, history.Events); diff != "" {
+				t.Errorf("Reconcile() history.Events (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -2690,7 +2720,7 @@ func TestReconcileAppliedIgnoresTrailingWhitespace(t *testing.T) {
 	id := gate.ProposalID("docs/a.md", "A")
 	prev := gate.PRState{Proposals: []gate.ProposalState{{ID: id, DocPath: "docs/a.md", Section: "A", CommentID: 1, State: gate.ProposalApplied, Content: "## A\nnew\n\n", AppliedSHA: "abc", ReplyID: 7}}}
 
-	state, writes := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, nil)
+	state, writes, _ := gate.Reconcile(prev, testPR(), review.Proposals{p}, nil, nil)
 
 	if got := state.Proposals[0]; got.State != gate.ProposalApplied || got.ReplyID != 7 {
 		t.Errorf("proposal = %+v, want it to stay applied", got)

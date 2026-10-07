@@ -87,8 +87,8 @@ func (s *Store) LoadPR(ctx context.Context, owner, repo string, number int) (gat
 }
 
 // SavePR upserts state, keyed by owner/repo/number, replacing the PR's
-// proposal rows in the same transaction.
-func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
+// proposal rows, and records history, all in one transaction.
+func (s *Store) SavePR(ctx context.Context, state gate.PRState, history gate.History) error {
 	var run gate.AwaitingRun
 	var deadline, startedAt string
 	if state.Run != nil {
@@ -172,17 +172,17 @@ func (s *Store) SavePR(ctx context.Context, state gate.PRState) error {
 		}
 	}
 
-	if a := state.History.Analysis; a != nil {
-		if err := upsertAnalysis(ctx, tx, state, *a); err != nil {
+	for _, a := range history.Analyses {
+		if err := upsertAnalysis(ctx, tx, state, a); err != nil {
 			return err
 		}
 	}
-	for _, e := range state.History.Events {
+	for _, e := range history.Events {
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO pr_events (owner, repo, number, key, kind, actor, proposal_id, scope, reason, commit_sha, head_sha)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT (owner, repo, number, key) DO NOTHING`,
-			state.Owner, state.Repo, state.Number, e.Key, e.Kind, e.Actor, e.ProposalID, e.Scope, e.Reason, e.CommitSHA, e.HeadSHA)
+			INSERT INTO pr_events (owner, repo, number, key, kind, actor, proposal_id, scope, reason, commit_sha, head_sha, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (owner, repo, number, key) DO UPDATE SET reason = excluded.reason`,
+			state.Owner, state.Repo, state.Number, e.Key, e.Kind, e.Actor, e.ProposalID, e.Scope, e.Reason, e.CommitSHA, e.HeadSHA, now())
 		if err != nil {
 			return fmt.Errorf("save pr %s/%s#%d: event %s: %w", state.Owner, state.Repo, state.Number, e.Key, err)
 		}
@@ -201,12 +201,18 @@ func upsertAnalysis(ctx context.Context, tx *sql.Tx, state gate.PRState, a gate.
 	var cost sql.NullFloat64
 	var basis string
 	if u := a.Usage; u != nil {
-		input, output = sql.NullInt64{Int64: u.InputTokens, Valid: true}, sql.NullInt64{Int64: u.OutputTokens, Valid: true}
-		cacheRead, cacheWrite = sql.NullInt64{Int64: u.CacheReadTokens, Valid: true}, sql.NullInt64{Int64: u.CacheWriteTokens, Valid: true}
+		if t := u.Tokens; t != nil {
+			input, output = sql.NullInt64{Int64: t.Input, Valid: true}, sql.NullInt64{Int64: t.Output, Valid: true}
+			cacheRead, cacheWrite = sql.NullInt64{Int64: t.CacheRead, Valid: true}, sql.NullInt64{Int64: t.CacheWrite, Valid: true}
+		}
 		if u.CostUSD != nil {
 			cost = sql.NullFloat64{Float64: *u.CostUSD, Valid: true}
 		}
 		basis = u.CostBasis
+	}
+	var startedAt sql.NullString
+	if !a.StartedAt.IsZero() {
+		startedAt = sql.NullString{String: a.StartedAt.UTC().Format(time.RFC3339Nano), Valid: true}
 	}
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO analyses (owner, repo, number, run_nonce, head_sha, runner, model, verdict, reason, proposals, started_at, finished_at, run_id,
@@ -229,7 +235,7 @@ func upsertAnalysis(ctx context.Context, tx *sql.Tx, state gate.PRState, a gate.
 			cost_usd = excluded.cost_usd,
 			cost_basis = excluded.cost_basis`,
 		state.Owner, state.Repo, state.Number, a.Nonce, a.HeadSHA, a.Runner, a.Model, a.Verdict, a.Reason, a.Proposals,
-		a.StartedAt.UTC().Format(time.RFC3339Nano), a.FinishedAt.UTC().Format(time.RFC3339Nano), a.RunID,
+		startedAt, a.FinishedAt.UTC().Format(time.RFC3339Nano), a.RunID,
 		input, output, cacheRead, cacheWrite, cost, basis)
 	if err != nil {
 		return fmt.Errorf("save pr %s/%s#%d: analysis %s: %w", state.Owner, state.Repo, state.Number, a.Nonce, err)

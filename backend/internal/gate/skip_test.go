@@ -50,12 +50,12 @@ func TestOnSkipEmitsHistory(t *testing.T) {
 			{ID: "p1", State: gate.ProposalOpen}, {ID: "p2", State: gate.ProposalApplied},
 			{ID: "p3", State: gate.ProposalOutdated}, {ID: "p4", State: gate.ProposalOpen},
 		}
-		got, _ := gate.OnSkip(prev, sk, skipNow())
-		if diff := cmp.Diff([]gate.PREvent{skipped("p1"), skipped("p4")}, got.History.Events); diff != "" {
-			t.Errorf("History.Events (-want +got):\n%s", diff)
+		_, _, history := gate.OnSkip(prev, sk, skipNow())
+		if diff := cmp.Diff([]gate.PREvent{skipped("p1"), skipped("p4")}, history.Events); diff != "" {
+			t.Errorf("history.Events (-want +got):\n%s", diff)
 		}
-		if got.History.Analysis != nil {
-			t.Errorf("History.Analysis = %+v, want nil without an armed run", got.History.Analysis)
+		if len(history.Analyses) != 0 {
+			t.Errorf("history.Analyses = %+v, want none without an armed run", history.Analyses)
 		}
 	})
 
@@ -63,9 +63,9 @@ func TestOnSkipEmitsHistory(t *testing.T) {
 		t.Parallel()
 		prev := skipBase()
 		prev.Run = nil
-		got, _ := gate.OnSkip(prev, sk, skipNow())
-		if diff := cmp.Diff([]gate.PREvent{skipped("")}, got.History.Events); diff != "" {
-			t.Errorf("History.Events (-want +got):\n%s", diff)
+		_, _, history := gate.OnSkip(prev, sk, skipNow())
+		if diff := cmp.Diff([]gate.PREvent{skipped("")}, history.Events); diff != "" {
+			t.Errorf("history.Events (-want +got):\n%s", diff)
 		}
 	})
 
@@ -73,13 +73,13 @@ func TestOnSkipEmitsHistory(t *testing.T) {
 		t.Parallel()
 		prev := skipBase()
 		prev.Run.StartedAt, prev.Run.Runner = skipNow().Add(-time.Minute), gate.RunnerKindActions
-		got, _ := gate.OnSkip(prev, sk, skipNow())
-		want := &gate.Analysis{
+		_, _, history := gate.OnSkip(prev, sk, skipNow())
+		want := []gate.Analysis{{
 			Nonce: "n1", HeadSHA: "head1", Runner: gate.RunnerKindActions, Verdict: gate.VerdictSuperseded,
 			StartedAt: skipNow().Add(-time.Minute), FinishedAt: skipNow(), RunID: 99,
-		}
-		if diff := cmp.Diff(want, got.History.Analysis); diff != "" {
-			t.Errorf("History.Analysis (-want +got):\n%s", diff)
+		}}
+		if diff := cmp.Diff(want, history.Analyses); diff != "" {
+			t.Errorf("history.Analyses (-want +got):\n%s", diff)
 		}
 	})
 }
@@ -102,7 +102,7 @@ func TestHandleCommentSkipReplayEmitsNothing(t *testing.T) {
 		t.Fatalf("replayed HandleComment() = %v, want nil", err)
 	}
 	for _, h := range store.histories[before:] {
-		if len(h.Events) != 0 || h.Analysis != nil {
+		if len(h.Events) != 0 || len(h.Analyses) != 0 {
 			t.Errorf("replay saved history %+v, want none", h)
 		}
 	}
@@ -114,7 +114,7 @@ func TestOnSkip(t *testing.T) {
 	prev := skipBase()
 	prev.PendingSkip = &gate.SkipAsk{User: "dev", Scope: gate.SkipPR}
 
-	got, run := gate.OnSkip(prev, gate.Skip{User: "dev", Scope: gate.SkipPR, Reason: "generated code"}, skipNow())
+	got, run, _ := gate.OnSkip(prev, gate.Skip{User: "dev", Scope: gate.SkipPR, Reason: "generated code"}, skipNow())
 
 	wantSkip := &gate.Skip{User: "dev", Scope: gate.SkipPR, Reason: "generated code", HeadSHA: "head1"}
 	if diff := cmp.Diff(wantSkip, got.Skip); diff != "" {

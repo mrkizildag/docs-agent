@@ -281,8 +281,8 @@ type savedStore struct {
 	saved chan gate.PRState
 }
 
-func (s *savedStore) SavePR(ctx context.Context, state gate.PRState) error {
-	if err := s.Store.SavePR(ctx, state); err != nil {
+func (s *savedStore) SavePR(ctx context.Context, state gate.PRState, history gate.History) error {
+	if err := s.Store.SavePR(ctx, state, history); err != nil {
 		return fmt.Errorf("save pr: %w", err)
 	}
 	s.saved <- state
@@ -910,7 +910,7 @@ func (f *statefulGitHub) snapshot() (comments []gate.Comment, creates, edits int
 }
 
 // scriptedRunner plays one queued outcome per run: a review.Verdict is a
-// finished analysis, a review.Pending is an external run, an error is a failed
+// finished analysis, a review.Result one that also names its model, a review.Pending is an external run, an error is a failed
 // one. Collect never finds a result, which is what a failed workflow run leaves.
 type scriptedRunner struct{ outcomes chan any }
 
@@ -944,6 +944,8 @@ func (r scriptedRunner) Start(ctx context.Context, rq review.Request) (review.St
 		case <-ctx.Done():
 			return nil, &review.FailedError{Cause: review.CauseTimeout, Err: ctx.Err()}
 		}
+	case review.Result:
+		return o, nil
 	case review.Verdict:
 		return review.Result{Verdict: o}, nil
 	case review.Pending:
@@ -976,12 +978,14 @@ type pushHarness struct {
 	secret  []byte
 	deliver int
 	queued  chan any
+	dbPath  string
 }
 
 func newPushHarness(t *testing.T, outcomes ...any) *pushHarness {
 	t.Helper()
 
-	store, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "pollux.db"))
+	dbPath := filepath.Join(t.TempDir(), "pollux.db")
+	store, err := sqlite.Open(t.Context(), dbPath)
 	if err != nil {
 		t.Fatalf("sqlite.Open() error = %v", err)
 	}
@@ -1011,7 +1015,7 @@ func newPushHarness(t *testing.T, outcomes ...any) *pushHarness {
 	})
 
 	secret := []byte("test-secret")
-	return &pushHarness{t: t, gh: gh, store: store, handler: httpapi.NewHandler(logger, secret, worker, store), secret: secret, queued: queued}
+	return &pushHarness{t: t, gh: gh, store: store, handler: httpapi.NewHandler(logger, secret, worker, store), secret: secret, queued: queued, dbPath: dbPath}
 }
 
 // push delivers a synchronize webhook for sha and returns the check run and the
@@ -1039,21 +1043,26 @@ func (h *pushHarness) send(sha string) {
 func (h *pushHarness) sendWith(sha string, o pushOpts) {
 	h.t.Helper()
 
+	h.deliver++
+	h.sendAs(fmt.Sprintf("d%d", h.deliver), sha, o)
+}
+
+// resend redelivers the synchronize webhook for sha under an earlier deliveryID.
+func (h *pushHarness) resend(deliveryID, sha string) {
+	h.t.Helper()
+
+	h.sendAs(deliveryID, sha, pushOpts{})
+}
+
+func (h *pushHarness) sendAs(deliveryID, sha string, o pushOpts) {
+	h.t.Helper()
+
 	h.gh.mu.Lock()
 	h.gh.head = sha
 	h.gh.mu.Unlock()
 
-	h.deliver++
 	body := bytes.Replace(e2ePullRequestFrom(h.t, 1, sha, o), []byte(`"opened"`), []byte(`"synchronize"`), 1)
-	req := httptest.NewRequestWithContext(h.t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
-	req.Header.Set("X-GitHub-Event", "pull_request")
-	req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("d%d", h.deliver))
-	req.Header.Set("X-Hub-Signature-256", sign(h.secret, body))
-	rec := httptest.NewRecorder()
-	h.handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusAccepted {
-		h.t.Fatalf("POST /webhook for %s = %d, want %d", sha, rec.Code, http.StatusAccepted)
-	}
+	h.deliverAs("pull_request", deliveryID, body)
 }
 
 // waitConcluded waits for the next concluded check run and the saved state of sha.
@@ -1307,7 +1316,7 @@ func TestWebhookReconcilesProposalCommentsAcrossPushes(t *testing.T) {
 			state.Proposals[i].CommentID = 0
 			state.Proposals[i].CommentURL = ""
 		}
-		if err := h.store.SavePR(t.Context(), state); err != nil {
+		if err := h.store.SavePR(t.Context(), state, gate.History{}); err != nil {
 			t.Fatalf("SavePR() error = %v", err)
 		}
 
@@ -1350,9 +1359,15 @@ func (h *pushHarness) deliverEvent(event string, body []byte) {
 	h.t.Helper()
 
 	h.deliver++
+	h.deliverAs(event, fmt.Sprintf("d%d", h.deliver), body)
+}
+
+func (h *pushHarness) deliverAs(event, deliveryID string, body []byte) {
+	h.t.Helper()
+
 	req := httptest.NewRequestWithContext(h.t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-GitHub-Event", event)
-	req.Header.Set("X-GitHub-Delivery", fmt.Sprintf("d%d", h.deliver))
+	req.Header.Set("X-GitHub-Delivery", deliveryID)
 	req.Header.Set("X-Hub-Signature-256", sign(h.secret, body))
 	rec := httptest.NewRecorder()
 	h.handler.ServeHTTP(rec, req)
@@ -2042,82 +2057,28 @@ func (f *statefulGitHub) CommitAt(context.Context, int64, string, string, string
 	return gate.Commit{}, nil
 }
 
-type noImpactRunner struct{ proposalRunner }
-
-func (noImpactRunner) Start(context.Context, review.Request) (review.Started, error) {
-	return review.Result{Model: "fake-model", Verdict: review.NoImpact{Reason: "typo fix"}}, nil
-}
-
 func TestWebhookToAnalysisHistoryEndToEnd(t *testing.T) {
 	t.Parallel()
 
-	secret := []byte("test-secret")
-	dbPath := filepath.Join(t.TempDir(), "pollux.db")
-	store, err := sqlite.Open(t.Context(), dbPath)
+	result := func() review.Result {
+		return review.Result{Model: "fake-model", Verdict: review.NoImpact{Reason: "typo fix"}}
+	}
+	h := newPushHarness(t, result(), result())
+
+	h.sendWith("sha1", pushOpts{})
+	if run, _ := h.waitConcluded("sha1"); run.Conclusion != gate.ConclusionSuccess {
+		t.Errorf("check run conclusion = %q, want %q", run.Conclusion, gate.ConclusionSuccess)
+	}
+	h.resend("d1", "sha1")
+	// A later push is a barrier: once it concludes, a duplicate job for sha1 would have run too.
+	h.push("sha2")
+
+	db, err := sql.Open("sqlite", h.dbPath)
 	if err != nil {
-		t.Fatalf("sqlite.Open() error = %v", err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Errorf("Close() error = %v", err)
-		}
-	})
-
-	gh := &commentGitHub{checkRuns: make(chan gate.CheckRun, 4), review: make(chan gate.ReviewComment, 1), issue: make(chan string, 1), edited: make(chan string, 1)}
-	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{Server: noImpactRunner{}}, nil, nil)
-
-	logger := slog.New(slog.DiscardHandler)
-	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
-	workerCtx, cancelWorker := context.WithCancel(t.Context())
-	workerDone := make(chan error, 1)
-	go func() { workerDone <- worker.Run(workerCtx) }()
-	t.Cleanup(func() {
-		cancelWorker()
-		if err := <-workerDone; err != nil {
-			t.Errorf("worker.Run() error = %v", err)
-		}
-	})
-
-	handler := httpapi.NewHandler(logger, secret, worker, store)
-	post := func(deliveryID string, body []byte) {
-		t.Helper()
-		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
-		req.Header.Set("X-GitHub-Event", "pull_request")
-		req.Header.Set("X-GitHub-Delivery", deliveryID)
-		req.Header.Set("X-Hub-Signature-256", sign(secret, body))
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
-		if rec.Code != http.StatusAccepted {
-			t.Fatalf("POST /webhook %s = %d, want %d", deliveryID, rec.Code, http.StatusAccepted)
-		}
-	}
-	waitConcluded := func() {
-		t.Helper()
-		select {
-		case run := <-gh.checkRuns:
-			if run.Conclusion != gate.ConclusionSuccess {
-				t.Errorf("check run conclusion = %q, want %q", run.Conclusion, gate.ConclusionSuccess)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("timed out waiting for check run")
-		}
-	}
-
-	body := e2ePullRequestBody(t, 1, "sha1")
-	post("d1", body)
-	waitConcluded()
-	post("d1", body)
-	// A distinct PR is a barrier: once it concludes, a duplicate job for PR 1 would have run too.
-	post("d2", e2ePullRequestBody(t, 2, "sha2"))
-	waitConcluded()
-
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("sql.Open(%q) error = %v", dbPath, err)
+		t.Fatalf("sql.Open(%q) error = %v", h.dbPath, err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-
-	rows, err := db.QueryContext(t.Context(), `SELECT runner, verdict, reason, head_sha, model, proposals, started_at, finished_at FROM analyses WHERE number = 1`)
+	rows, err := db.QueryContext(t.Context(), `SELECT runner, verdict, reason, head_sha, model, proposals, started_at, finished_at FROM analyses WHERE number = 1 ORDER BY id`)
 	if err != nil {
 		t.Fatalf("query analyses: %v", err)
 	}
@@ -2139,7 +2100,10 @@ func TestWebhookToAnalysisHistoryEndToEnd(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("read analyses: %v", err)
 	}
-	want := [][]any{{"server", "no_impact", "typo fix", "sha1", "fake-model", 0}}
+	want := [][]any{
+		{"server", "no_impact", "typo fix", "sha1", "fake-model", 0},
+		{"server", "no_impact", "typo fix", "sha2", "fake-model", 0},
+	}
 	if diff := gocmp.Diff(want, got); diff != "" {
 		t.Errorf("analyses of PR 1 mismatch (-want +got):\n%s", diff)
 	}

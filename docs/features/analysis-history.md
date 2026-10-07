@@ -17,16 +17,16 @@ The store keeps each PR's current state, and every analysis overwrites the last.
 
 Two tables, both keyed by PR.
 
-- **Analyses**: one row per analysis run: head SHA, runner (`actions` or `server`), model, verdict, a one-line reason or failure cause, proposal count, start and finish times, token and cost totals when the runner reports them, and the Actions run ID.
+- **Analyses**: one row per analysis run: head SHA, runner (`actions` or `server`; empty, with no start time, only for a run already in flight when history was introduced), model, verdict, a one-line reason or failure cause, proposal count, start and finish times, token and cost totals when the runner reports them, and the Actions run ID.
 - **PR events**: one row per proposal outcome: who, what, scope, reason, and commit SHA. Kinds are `applied` (one per proposal, crediting the sender even when a crash left the commit to be adopted later), `skipped` (one per open proposal, or one row with no proposal when none was open), and `outdated` (one per proposal that a push made stale), so per-proposal outcomes can be counted.
 
 ## Verdicts
 
 `no_impact`, `proposals`, `failed`, and `superseded`. The verdict is the analysis's real result, even when a Skip is active and the check passes regardless. `failed` carries the failure cause as the reason. `superseded` marks a run that never concluded because it was replaced: a push to a new head dropped it, or a Skip dropped the run still being awaited. Failures and supersessions have no runner result, so the start time and runner kind are kept on the awaited run itself and are the only source for them.
 
-## The outbox invariant
+## The transaction invariant
 
-The pure state transitions that change the state also emit the rows that record the change, on the state they return. The store writes those rows in the same transaction as the state. A crash cannot leave history disagreeing with state: either both exist or neither does. The store never returns history when it loads a state, so a replay that changes no state emits and writes nothing. The gate's store interface is the same as before; history rides on the state it already saves.
+The pure state transitions that change the state also return the rows that record the change, as a `History` next to the state. The caller passes both to the store's `SavePR`, which writes them in one transaction. A crash cannot leave history disagreeing with state: either both exist or neither does. The store never returns history when it loads a state, so a replay that changes no state returns and writes nothing. A transition's rows go to the save that persists its state change: a push that replaces an armed run saves the superseded row with the armed state, or with the failure if that save fails, and the outdated rows from reconciling comments are saved with the outdated proposals. Saves that record nothing pass an empty `History`.
 
 ## Idempotency
 
@@ -41,7 +41,7 @@ Model output, diffs, and doc text. Transcripts stay in Actions artifacts and ser
 
 ## Cost
 
-Usage is reported by the runner, not computed by the gate; a runner that reports none leaves the columns empty, which is different from zero.
+Usage is reported by the runner, not computed by the gate; a runner that reports none leaves the columns empty, which is different from zero. Tokens and cost are reported independently, so a run can have one without the other; a JSON `null` counts as not reported.
 
 - **Actions**: tokens (input, output, cache read, cache write) and `total_cost_usd` come from the result artifact. Under an OAuth token the cost is a list-price estimate, not spend, and `cost_basis` (`list`, or empty when unknown or mixed) is the only marker, so readers must label it as an estimate. See [Actions runner](actions-runner.md).
 - **Server**: tokens only, summed over every model call. There is no pricing table, so cost stays empty. See [Server runner](server-runner.md).

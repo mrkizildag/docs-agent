@@ -57,7 +57,6 @@ type Stats struct {
 // Budget bounds the total tokens a Run may spend.
 type Budget struct {
 	max   int
-	used  int
 	total llm.Usage
 }
 
@@ -70,13 +69,12 @@ func NewBudget(maxTokens int) *Budget {
 // Charge adds u to the budget's running total, returning ErrTokenBudget once
 // the total exceeds the budget's cap.
 func (b *Budget) Charge(u llm.Usage) error {
-	b.used += u.InputTokens + u.OutputTokens
 	b.total.InputTokens += u.InputTokens
 	b.total.OutputTokens += u.OutputTokens
 	b.total.CacheReadTokens += u.CacheReadTokens
 	b.total.CacheWriteTokens += u.CacheWriteTokens
-	if b.used > b.max {
-		return fmt.Errorf("used %d tokens, budget %d: %w", b.used, b.max, ErrTokenBudget)
+	if used := b.total.InputTokens + b.total.OutputTokens; used > b.max {
+		return fmt.Errorf("used %d tokens, budget %d: %w", used, b.max, ErrTokenBudget)
 	}
 	return nil
 }

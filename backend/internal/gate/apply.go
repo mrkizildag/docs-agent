@@ -73,16 +73,16 @@ type CommentGitHub interface {
 // OnApply is the state transition for a commit by user that applied the open
 // proposals ids at sha: pure, no I/O. It emits one applied event per proposal it
 // moves, so a replay emits none.
-func OnApply(s PRState, ids []string, sha, by string) PRState {
+func OnApply(s PRState, ids []string, sha, by string) (PRState, History) {
 	s.Proposals = slices.Clone(s.Proposals)
-	s.History.Events = slices.Clone(s.History.Events)
+	var history History
 	for i := range s.Proposals {
 		if p := &s.Proposals[i]; p.State == ProposalOpen && slices.Contains(ids, p.ID) {
 			p.State, p.AppliedSHA = ProposalApplied, sha
-			s.History.Events = append(s.History.Events, appliedEvent(p.ID, sha, by, s.HeadSHA))
+			history.Events = append(history.Events, appliedEvent(p.ID, sha, by, s.HeadSHA))
 		}
 	}
-	return s
+	return s, history
 }
 
 // splice replaces original, which must occur exactly once in file, with
@@ -208,7 +208,7 @@ func (s *Service) handleApply(ctx context.Context, state PRState, ev CommentEven
 	// Saved before the commit so a push of that commit, which can be handled
 	// before this one is retried, still finds the proposals it applied.
 	state.PendingApply = &PendingApply{IDs: ids, Message: message, Parent: state.HeadSHA, By: ev.Sender}
-	if err := s.store.SavePR(ctx, state); err != nil {
+	if err := s.store.SavePR(ctx, state, History{}); err != nil {
 		return "", fmt.Errorf("%s: save pending apply: %w", op, err)
 	}
 	sha, err := s.comments.CommitFiles(ctx, state.InstallationID, state.Owner, state.Repo, state.HeadRef, state.HeadSHA, files, message)
@@ -219,14 +219,14 @@ func (s *Service) handleApply(ctx context.Context, state PRState, ev CommentEven
 		}
 		if !adopted {
 			state.PendingApply = nil
-			if err := s.saveWrite(ctx, state, "clear pending apply", op); err != nil {
+			if err := s.saveWrite(ctx, state, History{}, "clear pending apply", op); err != nil {
 				return "", err
 			}
 			return s.say(ctx, state, ev, "the branch moved while applying; nothing was committed. A re-analysis follows.", op)
 		}
 	} else if errors.Is(err, ErrCommitRejected) {
 		state.PendingApply = nil
-		if err := s.saveWrite(ctx, state, "clear pending apply", op); err != nil {
+		if err := s.saveWrite(ctx, state, History{}, "clear pending apply", op); err != nil {
 			return "", err
 		}
 		text := "GitHub rejected the commit (a protected branch, or a symlink or submodule at a doc path); nothing was committed."
@@ -238,9 +238,9 @@ func (s *Service) handleApply(ctx context.Context, state PRState, ev CommentEven
 		return "", fmt.Errorf("%s: %w", op, err)
 	}
 
-	state = OnApply(state, ids, sha, ev.Sender)
+	state, history := OnApply(state, ids, sha, ev.Sender)
 	state.PendingApply = nil
-	if err := s.saveWrite(ctx, state, "save after commit "+shortSHA(sha), op); err != nil {
+	if err := s.saveWrite(ctx, state, history, "save after commit "+shortSHA(sha), op); err != nil {
 		return "", err
 	}
 	var tick []string
@@ -266,11 +266,11 @@ func openTargets(state PRState, in Intent) []int {
 	return targets
 }
 
-// saveWrite saves state under its own write budget.
-func (s *Service) saveWrite(ctx context.Context, state PRState, what, op string) error {
+// saveWrite saves state and history under its own write budget.
+func (s *Service) saveWrite(ctx context.Context, state PRState, history History, what, op string) error {
 	ctx, cancel := writeContext(ctx)
 	defer cancel()
-	if err := s.store.SavePR(ctx, state); err != nil {
+	if err := s.store.SavePR(ctx, state, history); err != nil {
 		return fmt.Errorf("%s: %s: %w", op, what, err)
 	}
 	return nil
@@ -520,9 +520,9 @@ func (s *Service) adoptPendingApply(ctx context.Context, state PRState, pr PullR
 
 // saveAdopted records that the pending apply's commit sha landed.
 func (s *Service) saveAdopted(ctx context.Context, state PRState, sha, op string) (PRState, error) {
-	state = OnApply(state, state.PendingApply.IDs, sha, state.PendingApply.By)
+	state, history := OnApply(state, state.PendingApply.IDs, sha, state.PendingApply.By)
 	state.PendingApply = nil
-	if err := s.saveWrite(ctx, state, "save adopted commit "+shortSHA(sha), op); err != nil {
+	if err := s.saveWrite(ctx, state, history, "save adopted commit "+shortSHA(sha), op); err != nil {
 		return PRState{}, err
 	}
 	return state, nil
@@ -591,7 +591,7 @@ func (s *Service) replyApplied(ctx context.Context, state PRState, scope []strin
 				replyID = c.ID
 			}
 			state.Proposals[i].ReplyID = replyID
-			if err := s.store.SavePR(ctx, state); err != nil {
+			if err := s.store.SavePR(ctx, state, History{}); err != nil {
 				return posted, fmt.Errorf("%s: save reply %d: %w", op, replyID, err)
 			}
 			posted++

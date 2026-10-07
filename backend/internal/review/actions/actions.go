@@ -26,6 +26,12 @@ const (
 	runnerName   = "actions"
 	defaultModel = "claude-code"
 
+	// Bounds on untrusted usage values; anything beyond them is not recorded.
+	maxCostUSD      = 1e6
+	maxTokens       = 1e12
+	maxModelLen     = 200
+	maxCostBasisLen = 32
+
 	// maxCauseText bounds model-controlled text in an InvalidResultError, which
 	// becomes a public check-run summary.
 	maxCauseText = 200
@@ -69,26 +75,17 @@ type Artifact[T any] struct {
 // ClaudeOutput is the subset of `claude -p --output-format json` stdout the
 // runner reads.
 type ClaudeOutput[T any] struct {
-	IsError          bool                  `json:"is_error"`
-	Subtype          string                `json:"subtype"`
-	TerminalReason   string                `json:"terminal_reason"`
-	APIErrorStatus   *int                  `json:"api_error_status"`
-	ModelUsage       map[string]modelUsage `json:"modelUsage"`
-	StructuredOutput *T                    `json:"structured_output"`
-	TotalCostUSD     *float64              `json:"total_cost_usd"`
-	Usage            *claudeUsage          `json:"usage"`
-}
+	IsError          bool   `json:"is_error"`
+	Subtype          string `json:"subtype"`
+	TerminalReason   string `json:"terminal_reason"`
+	APIErrorStatus   *int   `json:"api_error_status"`
+	StructuredOutput *T     `json:"structured_output"`
 
-// claudeUsage holds the top-level token totals; `iterations` is ignored.
-type claudeUsage struct {
-	InputTokens      int64 `json:"input_tokens"`
-	OutputTokens     int64 `json:"output_tokens"`
-	CacheReadTokens  int64 `json:"cache_read_input_tokens"`
-	CacheWriteTokens int64 `json:"cache_creation_input_tokens"`
-}
-
-type modelUsage struct {
-	CostBasis string `json:"costBasis"`
+	// The usage fields are raw because the artifact is untrusted and usage is
+	// only recorded: a malformed one must not invalidate the result.
+	ModelUsage   json.RawMessage `json:"modelUsage"`
+	TotalCostUSD json.RawMessage `json:"total_cost_usd"`
+	Usage        json.RawMessage `json:"usage"`
 }
 
 // Runner dispatches the repo's pollux-agent workflow and collects its result.
@@ -351,38 +348,80 @@ func capText(s string) string {
 	return strings.ToValidUTF8(s[:maxCauseText], "") + "..."
 }
 
-// reviewUsage is nil when the run reported no usage block.
+// reviewUsage is nil when the run reported no valid token count or cost.
+// Negative or implausible values count as not reported.
 func (o ClaudeOutput[T]) reviewUsage() *review.Usage {
-	if o.Usage == nil {
+	fields := decodeObject(o.Usage)
+	tokensReported := false
+	count := func(key string) int64 {
+		n, ok := boundedNumber(fields[key], maxTokens)
+		tokensReported = tokensReported || ok
+		return int64(n)
+	}
+	tokens := review.Tokens{
+		Input:      count("input_tokens"),
+		Output:     count("output_tokens"),
+		CacheRead:  count("cache_read_input_tokens"),
+		CacheWrite: count("cache_creation_input_tokens"),
+	}
+	u := review.Usage{CostBasis: o.costBasis()}
+	if tokensReported {
+		u.Tokens = &tokens
+	}
+	if cost, ok := boundedNumber(o.TotalCostUSD, maxCostUSD); ok {
+		u.CostUSD = &cost
+	}
+	if u.Tokens == nil && u.CostUSD == nil {
 		return nil
 	}
-	return &review.Usage{
-		InputTokens:      o.Usage.InputTokens,
-		OutputTokens:     o.Usage.OutputTokens,
-		CacheReadTokens:  o.Usage.CacheReadTokens,
-		CacheWriteTokens: o.Usage.CacheWriteTokens,
-		CostUSD:          o.TotalCostUSD,
-		CostBasis:        o.costBasis(),
-	}
+	return &u
 }
 
-// costBasis is the basis every model reports, or empty when they differ or
-// none is reported.
+// boundedNumber reports raw as a number in [0, limit]; JSON null is not one.
+func boundedNumber(raw json.RawMessage, limit float64) (float64, bool) {
+	var n *float64
+	if json.Unmarshal(raw, &n) != nil || n == nil || *n < 0 || *n > limit {
+		return 0, false
+	}
+	return *n, true
+}
+
+// decodeObject is nil unless raw is a JSON object.
+func decodeObject(raw json.RawMessage) map[string]json.RawMessage {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil {
+		return nil
+	}
+	return m
+}
+
+// costBasis is the basis every model reports, or empty when they differ,
+// none is given, or one is malformed or over maxCostBasisLen.
 func (o ClaudeOutput[T]) costBasis() string {
+	models := decodeObject(o.ModelUsage)
 	basis := ""
-	for i, name := range slices.Sorted(maps.Keys(o.ModelUsage)) {
-		b := o.ModelUsage[name].CostBasis
-		if i > 0 && b != basis {
+	for i, name := range slices.Sorted(maps.Keys(models)) {
+		var entry struct {
+			CostBasis string `json:"costBasis"`
+		}
+		if json.Unmarshal(models[name], &entry) != nil || len(entry.CostBasis) > maxCostBasisLen {
+			entry.CostBasis = ""
+		}
+		if i > 0 && entry.CostBasis != basis {
 			return ""
 		}
-		basis = b
+		basis = entry.CostBasis
 	}
 	return basis
 }
 
 func (o ClaudeOutput[T]) model() string {
-	if models := slices.Sorted(maps.Keys(o.ModelUsage)); len(models) > 0 {
-		return models[0]
+	if models := slices.Sorted(maps.Keys(decodeObject(o.ModelUsage))); len(models) > 0 {
+		name := models[0]
+		if len(name) > maxModelLen {
+			name = strings.ToValidUTF8(name[:maxModelLen], "")
+		}
+		return name
 	}
 	return defaultModel
 }

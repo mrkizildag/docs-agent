@@ -203,7 +203,7 @@ func TestOnApply(t *testing.T) {
 		gate.ProposalState{ID: "p2", State: gate.ProposalOpen},
 		gate.ProposalState{ID: "p3", State: gate.ProposalOutdated})
 
-	got := gate.OnApply(prev, []string{"p1", "p3"}, "sha9", "alice")
+	got, history := gate.OnApply(prev, []string{"p1", "p3"}, "sha9", "alice")
 
 	want := map[string]gate.ProposalStatus{"p1": gate.ProposalApplied, "p2": gate.ProposalOpen, "p3": gate.ProposalOutdated}
 	for _, p := range got.Proposals {
@@ -219,14 +219,14 @@ func TestOnApply(t *testing.T) {
 	}
 
 	wantEvents := []gate.PREvent{{Key: "applied/p1/sha9", Kind: gate.EventApplied, Actor: "alice", ProposalID: "p1", CommitSHA: "sha9", HeadSHA: "head1"}}
-	if diff := cmp.Diff(wantEvents, got.History.Events); diff != "" {
-		t.Errorf("History.Events (-want +got):\n%s", diff)
+	if diff := cmp.Diff(wantEvents, history.Events); diff != "" {
+		t.Errorf("history.Events (-want +got):\n%s", diff)
 	}
-	if replay := gate.OnApply(got, []string{"p1", "p2"}, "sha10", "bob"); len(replay.History.Events) != 2 || replay.History.Events[1].ProposalID != "p2" {
-		t.Errorf("replay History.Events = %+v, want the p1 event kept and one new for p2 only", replay.History.Events)
+	if _, replay := gate.OnApply(got, []string{"p1", "p2"}, "sha10", "bob"); len(replay.Events) != 1 || replay.Events[0].ProposalID != "p2" {
+		t.Errorf("replay history.Events = %+v, want one new for p2 only", replay.Events)
 	}
-	if again := gate.OnApply(got, []string{"p1"}, "sha10", "bob"); len(again.History.Events) != 1 {
-		t.Errorf("OnApply of an applied proposal emitted %d events, want none new", len(again.History.Events)-1)
+	if _, again := gate.OnApply(got, []string{"p1"}, "sha10", "bob"); len(again.Events) != 0 {
+		t.Errorf("OnApply of an applied proposal emitted %d events, want none", len(again.Events))
 	}
 }
 
@@ -301,7 +301,7 @@ func TestReconcileKeepsApplied(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			state, writes := gate.Reconcile(gate.PRState{Proposals: []gate.ProposalState{applied}}, testPR(), tc.verdict, nil, existing)
+			state, writes, _ := gate.Reconcile(gate.PRState{Proposals: []gate.ProposalState{applied}}, testPR(), tc.verdict, nil, existing)
 
 			got := state.Proposals[0]
 			if got.State != tc.wantState || got.AppliedSHA != tc.wantSHA || got.ReplyID != tc.wantReply {
@@ -328,7 +328,7 @@ func TestReconcileStoresEdit(t *testing.T) {
 
 	p := proposal("docs/a.md", "A")
 	p.IndexEntry = "- [A](a.md)"
-	state, _ := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
+	state, _, _ := gate.Reconcile(gate.PRState{}, testPR(), review.Proposals{p}, nil, nil)
 
 	want := gate.ProposalState{
 		ID: gate.ProposalID("docs/a.md", "A"), DocPath: "docs/a.md", Section: "A", State: gate.ProposalOpen,

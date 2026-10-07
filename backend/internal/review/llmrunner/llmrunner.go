@@ -122,12 +122,12 @@ func usageOf(budget *agent.Budget) *review.Usage {
 	if u == (llm.Usage{}) {
 		return nil
 	}
-	return &review.Usage{
-		InputTokens:      int64(u.InputTokens),
-		OutputTokens:     int64(u.OutputTokens),
-		CacheReadTokens:  int64(u.CacheReadTokens),
-		CacheWriteTokens: int64(u.CacheWriteTokens),
-	}
+	return &review.Usage{Tokens: &review.Tokens{
+		Input:      int64(u.InputTokens),
+		Output:     int64(u.OutputTokens),
+		CacheRead:  int64(u.CacheReadTokens),
+		CacheWrite: int64(u.CacheWriteTokens),
+	}}
 }
 
 func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result, error) {
