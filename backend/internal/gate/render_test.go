@@ -238,7 +238,7 @@ func TestSummaryRendering(t *testing.T) {
 		{
 			name:  "pending commit skip",
 			state: gate.PRState{PendingSkip: &gate.SkipAsk{User: "ann", Scope: gate.SkipCommit}},
-			want:  []string{"- [x] Skip this commit", "- [ ] Skip this PR", "Waiting for @ann to reply with a reason."},
+			want:  []string{"- [x] Skip this commit", "- [ ] Skip this PR", "Waiting for @ann to post the reason as a new comment on this PR."},
 		},
 		{
 			name:  "pending pr skip",

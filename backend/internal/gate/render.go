@@ -417,7 +417,7 @@ func renderSummary(state PRState) string {
 		fmt.Fprintf(&b, "\nSkipped by @%s for this %s: %s\n", active.User, active.Scope.noun(), inertProse(active.Reason))
 	}
 	if state.PendingSkip != nil {
-		fmt.Fprintf(&b, "\nWaiting for @%s to reply with a reason.\n", state.PendingSkip.User)
+		fmt.Fprintf(&b, "\nWaiting for @%s to post the reason as a new comment on this PR.\n", state.PendingSkip.User)
 	}
 	fmt.Fprintf(&b, "\nCommands: `%[1]s %[2]s`, `%[1]s %[3]s <reason>`, `%[1]s %[4]s <reason>`.\n", commandPrefix, applyCommand, skipCommand, skipPRCommand)
 	return b.String()
