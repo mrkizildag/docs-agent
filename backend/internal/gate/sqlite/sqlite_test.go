@@ -2,6 +2,7 @@ package sqlite_test
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
 	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 )
 
 func open(t *testing.T) (*sqlite.Store, string) {
@@ -785,5 +787,196 @@ func TestPRsForHead(t *testing.T) {
 	}
 	if got, err := store.PRsForHead(ctx, "acme", "widgets", "zzz"); err != nil || len(got) != 0 {
 		t.Errorf("PRsForHead(unknown head) = %v, %v, want none", got, err)
+	}
+}
+
+func countAnalyses(t *testing.T, path string) (n int, verdict gate.AnalysisVerdict) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open(%q) = %v, want nil error", path, err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.QueryRowContext(t.Context(), `SELECT COUNT(*), COALESCE(MAX(verdict), '') FROM analyses`).Scan(&n, &verdict); err != nil {
+		t.Fatalf("query analyses = %v, want nil error", err)
+	}
+	return n, verdict
+}
+
+func TestSavePR_AnalysisUpsertsPerNonceLastWins(t *testing.T) {
+	t.Parallel()
+
+	store, path := open(t)
+	ctx := t.Context()
+
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	state := gate.PRState{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1"}
+	state.History.Analysis = &gate.Analysis{Nonce: "check-1", HeadSHA: "sha1", Runner: gate.RunnerKindServer, Verdict: gate.VerdictProposals, Proposals: 2, StartedAt: at, FinishedAt: at}
+	if err := store.SavePR(ctx, state); err != nil {
+		t.Fatalf("SavePR() = %v, want nil error", err)
+	}
+	state.History.Analysis.Verdict, state.History.Analysis.Proposals = gate.VerdictFailed, 0
+	if err := store.SavePR(ctx, state); err != nil {
+		t.Fatalf("SavePR() again = %v, want nil error", err)
+	}
+	if n, verdict := countAnalyses(t, path); n != 1 || verdict != gate.VerdictFailed {
+		t.Errorf("analyses = %d rows with verdict %q, want 1 row with %q", n, verdict, gate.VerdictFailed)
+	}
+
+	state.History.Analysis.Nonce = "check-2"
+	if err := store.SavePR(ctx, state); err != nil {
+		t.Fatalf("SavePR() new nonce = %v, want nil error", err)
+	}
+	if n, _ := countAnalyses(t, path); n != 2 {
+		t.Errorf("analyses after a new nonce = %d rows, want 2", n)
+	}
+
+	got, err := store.LoadPR(ctx, "acme", "widgets", 7)
+	if err != nil {
+		t.Fatalf("LoadPR() = %v, want nil error", err)
+	}
+	if got.History.Analysis != nil {
+		t.Errorf("LoadPR().History.Analysis = %+v, want nil", got.History.Analysis)
+	}
+}
+
+func TestSavePR_RoundTripsRunStartAndRunner(t *testing.T) {
+	t.Parallel()
+
+	store, _ := open(t)
+	ctx := t.Context()
+
+	started := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
+	state := gate.PRState{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1",
+		Run: &gate.AwaitingRun{Nonce: "n", Deadline: started.Add(time.Minute), StartedAt: started, Runner: gate.RunnerKindActions}}
+	if err := store.SavePR(ctx, state); err != nil {
+		t.Fatalf("SavePR() = %v, want nil error", err)
+	}
+	got, err := store.LoadPR(ctx, "acme", "widgets", 7)
+	if err != nil {
+		t.Fatalf("LoadPR() = %v, want nil error", err)
+	}
+	if diff := cmp.Diff(state, got); diff != "" {
+		t.Errorf("LoadPR() mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestOpen_MigratesAV9Database(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "state.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open(%q) = %v, want nil error", path, err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.ExecContext(t.Context(), `CREATE TABLE pull_requests (owner TEXT NOT NULL, repo TEXT NOT NULL, number INTEGER NOT NULL, PRIMARY KEY (owner, repo, number));
+		INSERT INTO pull_requests VALUES ('acme', 'widgets', 7);
+		PRAGMA user_version = 9`); err != nil {
+		t.Fatalf("seed v9 database = %v, want nil error", err)
+	}
+
+	store, err := sqlite.Open(t.Context(), path)
+	if err != nil {
+		t.Fatalf("Open() v9 database = %v, want nil error", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil error", err)
+	}
+
+	var runner string
+	if err := db.QueryRowContext(t.Context(), `SELECT run_runner FROM pull_requests WHERE number = 7`).Scan(&runner); err != nil {
+		t.Fatalf("select migrated run_runner = %v, want nil error", err)
+	}
+	if n, _ := countAnalyses(t, path); n != 0 {
+		t.Errorf("analyses after migration = %d rows, want 0", n)
+	}
+}
+
+func TestSavePR_AnalysisUsageNullVersusValue(t *testing.T) {
+	t.Parallel()
+
+	store, path := open(t)
+	ctx := t.Context()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open(%q) = %v, want nil error", path, err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	cost := 0.0
+	tests := []struct {
+		name      string
+		usage     *review.Usage
+		wantIn    sql.NullInt64
+		wantCache sql.NullInt64
+		wantCost  sql.NullFloat64
+		wantBasis string
+	}{
+		{name: "nil usage is NULL", usage: nil},
+		{
+			name:   "tokens without cost",
+			usage:  &review.Usage{InputTokens: 10, OutputTokens: 20, CacheReadTokens: 30, CacheWriteTokens: 40},
+			wantIn: sql.NullInt64{Int64: 10, Valid: true}, wantCache: sql.NullInt64{Int64: 40, Valid: true},
+		},
+		{
+			name:   "reported zero cost stays zero",
+			usage:  &review.Usage{InputTokens: 1, CostUSD: &cost, CostBasis: "list"},
+			wantIn: sql.NullInt64{Int64: 1, Valid: true}, wantCache: sql.NullInt64{Valid: true},
+			wantCost: sql.NullFloat64{Valid: true}, wantBasis: "list",
+		},
+	}
+	for i, tt := range tests {
+		nonce := fmt.Sprintf("check-%d", i)
+		state := gate.PRState{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1"}
+		state.History.Analysis = &gate.Analysis{Nonce: nonce, HeadSHA: "sha1", Runner: gate.RunnerKindServer, Verdict: gate.VerdictNoImpact, StartedAt: at, FinishedAt: at, Usage: tt.usage}
+		if err := store.SavePR(ctx, state); err != nil {
+			t.Fatalf("%s: SavePR() = %v, want nil error", tt.name, err)
+		}
+
+		var in, cacheWrite sql.NullInt64
+		var gotCost sql.NullFloat64
+		var basis string
+		err := db.QueryRowContext(ctx, `SELECT input_tokens, cache_write_tokens, cost_usd, cost_basis FROM analyses WHERE run_nonce = ?`, nonce).
+			Scan(&in, &cacheWrite, &gotCost, &basis)
+		if err != nil {
+			t.Fatalf("%s: query analyses = %v, want nil error", tt.name, err)
+		}
+		if in != tt.wantIn || cacheWrite != tt.wantCache || gotCost != tt.wantCost || basis != tt.wantBasis {
+			t.Errorf("%s: input, cache_write, cost, basis = %v, %v, %v, %q, want %v, %v, %v, %q",
+				tt.name, in, cacheWrite, gotCost, basis, tt.wantIn, tt.wantCache, tt.wantCost, tt.wantBasis)
+		}
+	}
+}
+
+func TestSavePR_EventsSavedTwiceWriteOnce(t *testing.T) {
+	t.Parallel()
+
+	store, path := open(t)
+	ctx := t.Context()
+
+	state := gate.PRState{InstallationID: 1, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "sha1"}
+	state.History.Events = []gate.PREvent{
+		{Key: "outdated/p1/sha1", Kind: gate.EventOutdated, ProposalID: "p1", HeadSHA: "sha1"},
+		{Key: "outdated/p2/sha1", Kind: gate.EventOutdated, ProposalID: "p2", HeadSHA: "sha1"},
+	}
+	for range 2 {
+		if err := store.SavePR(ctx, state); err != nil {
+			t.Fatalf("SavePR() = %v, want nil error", err)
+		}
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open(%q) = %v, want nil error", path, err)
+	}
+	defer func() { _ = db.Close() }()
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pr_events`).Scan(&n); err != nil {
+		t.Fatalf("query pr_events = %v, want nil error", err)
+	}
+	if n != 2 {
+		t.Errorf("pr_events = %d rows after saving two events twice, want 2", n)
 	}
 }

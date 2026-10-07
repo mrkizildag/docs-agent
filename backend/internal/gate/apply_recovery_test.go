@@ -384,3 +384,28 @@ func TestHandleCommentStaleApplyUnderAPRSkip(t *testing.T) {
 		t.Errorf("replies = %v, want %q", comments.replies, want)
 	}
 }
+
+func TestHandleCommentAdoptionCreditsTheOriginalSender(t *testing.T) {
+	t.Parallel()
+
+	state := pendingState()
+	state.PendingApply.By = "alice"
+	store := &fakeStore{stored: state, live: true}
+	api := apiWithComments()
+	api.pullRequest = gate.PullRequest{HeadSHA: "botbot1234", Open: true}
+	comments := &fakeCommentGitHub{canWrite: true, files: baseFiles(), byAdd: map[string]gate.Commit{"botbot1234": botCommit()}}
+	svc := gate.NewService(api, comments, store, gate.Runners{}, nil, nil)
+
+	if err := svc.HandleComment(t.Context(), reviewTick(1)); err != nil {
+		t.Fatalf("HandleComment() = %v, want nil", err)
+	}
+
+	want := gate.PREvent{Key: "applied/p1/botbot1234", Kind: gate.EventApplied, Actor: "alice", ProposalID: "p1", CommitSHA: "botbot1234", HeadSHA: "head1"}
+	var got []gate.PREvent
+	for _, h := range store.histories {
+		got = append(got, h.Events...)
+	}
+	if len(got) == 0 || cmp.Diff(want, got[0]) != "" {
+		t.Errorf("events = %+v, want first %+v", got, want)
+	}
+}

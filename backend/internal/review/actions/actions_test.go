@@ -157,7 +157,7 @@ func TestStartDispatchesBaseCandidates(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Start() = %v, want nil", err)
 		}
-		want := review.Result{Runner: "actions", Verdict: review.NoImpact{Reason: basedocs.NothingToReview}}
+		want := review.Result{Verdict: review.NoImpact{Reason: basedocs.NothingToReview}}
 		if diff := cmp.Diff(review.Started(want), started); diff != "" {
 			t.Errorf("Start() (-want +got):\n%s", diff)
 		}
@@ -259,6 +259,8 @@ func artifact(t *testing.T, head, nonce string, claude map[string]any) []byte {
 	return b
 }
 
+func ptr[T any](v T) *T { return &v }
+
 func validProposal() map[string]any {
 	return map[string]any{
 		"doc_path": "docs/a.md", "section": "Usage", "anchor": map[string]any{"file": "main.go", "line": 3},
@@ -298,17 +300,42 @@ func TestCollect(t *testing.T) {
 				"modelUsage":        map[string]any{"claude-sonnet-4-5": map[string]any{}},
 				"structured_output": map[string]any{"no_impact_reason": "internal refactor", "proposals": []any{}},
 			}),
-			want: review.Result{Runner: "actions", Model: "claude-sonnet-4-5", Verdict: review.NoImpact{Reason: "internal refactor"}},
+			want: review.Result{Model: "claude-sonnet-4-5", Verdict: review.NoImpact{Reason: "internal refactor"}},
 		},
 		{
 			name: "proposals",
 			raw: artifact(t, "abc", "n1", map[string]any{
 				"structured_output": map[string]any{"proposals": []any{proposal}},
 			}),
-			want: review.Result{Runner: "actions", Model: "claude-code", Verdict: review.Proposals{{
+			want: review.Result{Model: "claude-code", Verdict: review.Proposals{{
 				DocPath: "docs/a.md", Section: "Usage", Anchor: review.Anchor{File: "main.go", Line: 3},
 				Reason: "flag renamed", Content: "new text",
 			}}},
+		},
+		{
+			name: "usage and cost",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"total_cost_usd": 0.056967,
+				"usage": map[string]any{
+					"input_tokens": 4, "output_tokens": 966, "cache_read_input_tokens": 6475, "cache_creation_input_tokens": 11501,
+					"iterations": []any{map[string]any{"input_tokens": 2, "output_tokens": 637}},
+				},
+				"modelUsage":        map[string]any{"claude-sonnet-5-5": map[string]any{"costBasis": "list"}, "claude-haiku": map[string]any{"costBasis": "list"}},
+				"structured_output": map[string]any{"no_impact_reason": "internal refactor", "proposals": []any{}},
+			}),
+			want: review.Result{
+				Model: "claude-haiku", Verdict: review.NoImpact{Reason: "internal refactor"},
+				Usage: &review.Usage{InputTokens: 4, OutputTokens: 966, CacheReadTokens: 6475, CacheWriteTokens: 11501, CostUSD: ptr(0.056967), CostBasis: "list"},
+			},
+		},
+		{
+			name: "usage without cost and with differing bases",
+			raw: artifact(t, "abc", "n1", map[string]any{
+				"usage":             map[string]any{"input_tokens": 1, "output_tokens": 2},
+				"modelUsage":        map[string]any{"a": map[string]any{"costBasis": "list"}, "b": map[string]any{}},
+				"structured_output": map[string]any{"no_impact_reason": "x", "proposals": []any{}},
+			}),
+			want: review.Result{Model: "a", Verdict: review.NoImpact{Reason: "x"}, Usage: &review.Usage{InputTokens: 1, OutputTokens: 2}},
 		},
 		{name: "head mismatch", raw: artifact(t, "other", "n1", map[string]any{"structured_output": map[string]any{}}), wantInvalid: true},
 		{name: "nonce mismatch", raw: artifact(t, "abc", "stale", map[string]any{"structured_output": map[string]any{}}), wantInvalid: true},

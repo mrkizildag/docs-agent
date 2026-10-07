@@ -146,6 +146,99 @@ type PRState struct {
 	SummaryCommentID int64  // 0 until the summary comment is created
 	FailureCause     string // why the last analysis failed, shown in the summary; "" when it did not
 	Proposals        []ProposalState
+
+	// History is the rows to write with this save, in the same transaction; the
+	// Store never returns it from LoadPR.
+	History History
+}
+
+// History is the outbox of records a state transition emits for the Store to
+// write together with the state.
+type History struct {
+	Analysis *Analysis
+	Events   []PREvent
+}
+
+// RunnerKind is which analysis runner ran.
+type RunnerKind string
+
+const (
+	RunnerKindActions RunnerKind = "actions"
+	RunnerKindServer  RunnerKind = "server"
+)
+
+// AnalysisVerdict is how a recorded analysis ended.
+type AnalysisVerdict string
+
+const (
+	VerdictNoImpact   AnalysisVerdict = "no_impact"
+	VerdictProposals  AnalysisVerdict = "proposals"
+	VerdictFailed     AnalysisVerdict = "failed"
+	VerdictSuperseded AnalysisVerdict = "superseded"
+)
+
+// Analysis is the record of one analysis run, unique per Nonce of a pull
+// request; a later save of the same Nonce replaces it. Reason is the one-line
+// no-impact reason or the failure cause.
+type Analysis struct {
+	Nonce      string
+	HeadSHA    string
+	Runner     RunnerKind
+	Model      string
+	Verdict    AnalysisVerdict
+	Reason     string
+	Proposals  int
+	StartedAt  time.Time
+	FinishedAt time.Time
+	RunID      int64
+	Usage      *review.Usage // nil when the runner reported none
+}
+
+// EventKind is what happened to a proposal.
+type EventKind string
+
+const (
+	EventApplied  EventKind = "applied"
+	EventSkipped  EventKind = "skipped"
+	EventOutdated EventKind = "outdated"
+)
+
+// PREvent is the record of one user action or outdating on a proposal. Key is
+// unique per pull request, so saving the same event twice writes it once.
+// ProposalID is empty for a skip made while no proposal was open.
+type PREvent struct {
+	Key        string
+	Kind       EventKind
+	Actor      string
+	ProposalID string
+	Scope      SkipScope
+	Reason     string
+	CommitSHA  string
+	HeadSHA    string
+}
+
+// supersededAnalysis is the record of run, awaited at head, dropped at now
+// before it concluded.
+func supersededAnalysis(run *AwaitingRun, head string, now time.Time) *Analysis {
+	return &Analysis{
+		Nonce: run.Nonce, HeadSHA: head, Runner: run.Runner, Verdict: VerdictSuperseded,
+		StartedAt: run.StartedAt, FinishedAt: now, RunID: run.RunID,
+	}
+}
+
+func appliedEvent(id, sha, by, head string) PREvent {
+	return PREvent{Key: fmt.Sprintf("applied/%s/%s", id, sha), Kind: EventApplied, Actor: by, ProposalID: id, CommitSHA: sha, HeadSHA: head}
+}
+
+func outdatedEvent(id, head string) PREvent {
+	return PREvent{Key: fmt.Sprintf("outdated/%s/%s", id, head), Kind: EventOutdated, ProposalID: id, HeadSHA: head}
+}
+
+func skippedEvent(skip Skip, id string) PREvent {
+	return PREvent{
+		Key:  fmt.Sprintf("skipped/%s/%s/%s/%s", skip.Scope, skip.HeadSHA, skip.User, id),
+		Kind: EventSkipped, Actor: skip.User, ProposalID: id, Scope: skip.Scope, Reason: skip.Reason, CommitSHA: skip.HeadSHA, HeadSHA: skip.HeadSHA,
+	}
 }
 
 // PendingApply is an Apply commit that may exist on GitHub before its proposals
@@ -154,6 +247,7 @@ type PendingApply struct {
 	IDs     []string
 	Message string
 	Parent  string
+	By      string // who asked for the apply, credited when a crash leaves it to adoption
 }
 
 // SkipScope is how long a skip passes the check.
@@ -186,6 +280,9 @@ type AwaitingRun struct {
 	Nonce    string
 	Deadline time.Time
 	BaseSHA  string // merge base the run was started at
+	// StartedAt and Runner are the only record of a run that ends in failure.
+	StartedAt time.Time
+	Runner    RunnerKind
 }
 
 // RunCompleted reports that an external analysis run finished.
@@ -287,7 +384,8 @@ type Store interface {
 // summary comment and PR-scope skips carry over. A commit-scope skip carries
 // over only for the head it was made at, and a pending skip ask, of either
 // scope, only while the head stays the same. The pending apply is dropped.
-func OnPush(prev PRState, pr PullRequest) PRState {
+// A run still awaited is dropped and recorded as superseded at now.
+func OnPush(prev PRState, pr PullRequest, now time.Time) PRState {
 	next := PRState{
 		InstallationID:   pr.InstallationID,
 		Owner:            pr.Owner,
@@ -310,6 +408,9 @@ func OnPush(prev PRState, pr PullRequest) PRState {
 	if ask := prev.PendingSkip; ask != nil && pendingSkipCancelled(prev, pr) == nil {
 		kept := *ask
 		next.PendingSkip = &kept
+	}
+	if prev.Run != nil {
+		next.History.Analysis = supersededAnalysis(prev.Run, prev.HeadSHA, now)
 	}
 	return next
 }
@@ -346,7 +447,11 @@ func Overdue(state PRState, now time.Time) bool {
 // OnStarted is the state transition for an analysis that runs elsewhere: pure, no I/O.
 func OnStarted(state PRState, pending review.Pending, checkRunID int64, baseSHA string) PRState {
 	state.CheckRunID = checkRunID
-	state.Run = &AwaitingRun{RunID: pending.RunID, Nonce: pending.Nonce, Deadline: pending.Deadline, BaseSHA: baseSHA}
+	run := AwaitingRun{RunID: pending.RunID, Nonce: pending.Nonce, Deadline: pending.Deadline, BaseSHA: baseSHA}
+	if state.Run != nil {
+		run.StartedAt, run.Runner = state.Run.StartedAt, state.Run.Runner
+	}
+	state.Run = &run
 	return state
 }
 
@@ -441,10 +546,13 @@ func shortSHA(sha string) string { return sha[:min(7, len(sha))] }
 // It clears the awaited run and returns the completed check run to report;
 // runner-supplied text is capped to what GitHub accepts. An active skip
 // replaces the outcome with its success.
-func conclude(state PRState, outcome Outcome) (PRState, CheckRun) {
+func conclude(state PRState, outcome Outcome, now time.Time) (PRState, CheckRun) {
 	state.FailureCause = ""
 	if outcome.Failed != nil {
 		state.FailureCause = truncate(outcome.Failed.Cause, maxCauseBytes)
+	}
+	if state.Run != nil {
+		state.History.Analysis = analysisOf(state, outcome, now)
 	}
 	if skipActive(state) {
 		state.Run = nil
@@ -455,36 +563,74 @@ func conclude(state PRState, outcome Outcome) (PRState, CheckRun) {
 	return state, run
 }
 
-func concludeUncapped(state PRState, outcome Outcome) (PRState, CheckRun) {
-	state.Run = nil
-	run := CheckRun{Name: CheckName, HeadSHA: state.HeadSHA, Status: StatusCompleted}
+// analysisOf is the record of the run state awaits, ended as outcome says at now.
+func analysisOf(state PRState, outcome Outcome, now time.Time) *Analysis {
+	verdict, reason, proposals := classify(outcome)
+	a := &Analysis{
+		Nonce:      state.Run.Nonce,
+		HeadSHA:    state.HeadSHA,
+		Runner:     state.Run.Runner,
+		Verdict:    verdict,
+		Reason:     reason,
+		Proposals:  proposals,
+		StartedAt:  state.Run.StartedAt,
+		FinishedAt: now,
+		RunID:      state.Run.RunID,
+	}
+	if outcome.Result != nil {
+		a.Model, a.Usage = outcome.Result.Model, outcome.Result.Usage
+	}
+	return a
+}
 
+// classify is how outcome ends an analysis: the verdict recorded for it and
+// that the check run reports, its one-line reason, and its proposal count.
+func classify(outcome Outcome) (verdict AnalysisVerdict, reason string, proposals int) {
 	switch {
 	case outcome.Result != nil:
 		switch v := outcome.Result.Verdict.(type) {
 		case review.NoImpact:
-			run.Conclusion, run.Title, run.Summary = ConclusionSuccess, "No doc impact", inertProse(v.Reason)
-			return state, run
+			return VerdictNoImpact, v.Reason, 0
 		case review.Proposals:
-			pending := unapplied(state, v)
-			if len(v) > 0 && len(pending) == 0 {
-				run.Conclusion, run.Title, run.Summary = ConclusionSuccess, "Docs up to date", "Every proposed doc change is already applied."
-				return state, run
+			if len(v) == 0 {
+				return VerdictFailed, "runner returned an empty proposal list; no impact must be NoImpact", 0
 			}
-			if len(v) > 0 {
-				run.Conclusion, run.Title, run.Summary = ConclusionActionRequired, "Docs need updating", proposalsSummary(pending)
-				return state, run
-			}
-			return state, neutral(run, "Analysis failed", "runner returned an empty proposal list; no impact must be NoImpact")
+			return VerdictProposals, "", len(v)
 		default:
-			return state, neutral(run, "Analysis failed", fmt.Sprintf("unknown review.Verdict %T", outcome.Result.Verdict))
+			return VerdictFailed, fmt.Sprintf("unknown review.Verdict %T", v), 0
 		}
 	case outcome.Failed != nil:
-		title := cmp.Or(outcome.Failed.Title, "Analysis failed")
-		return state, neutral(run, title, truncate(outcome.Failed.Cause, maxCauseBytes))
+		return VerdictFailed, truncate(outcome.Failed.Cause, maxCauseBytes), 0
 	default:
-		return state, neutral(run, "Analysis failed", "analysis ended without an outcome")
+		return VerdictFailed, "analysis ended without an outcome", 0
 	}
+}
+
+func concludeUncapped(state PRState, outcome Outcome) (PRState, CheckRun) {
+	state.Run = nil
+	run := CheckRun{Name: CheckName, HeadSHA: state.HeadSHA, Status: StatusCompleted}
+
+	verdict, reason, _ := classify(outcome)
+	switch verdict {
+	case VerdictNoImpact:
+		run.Conclusion, run.Title, run.Summary = ConclusionSuccess, "No doc impact", inertProse(reason)
+		return state, run
+	case VerdictProposals:
+		proposals, _ := outcome.Result.Verdict.(review.Proposals)
+		pending := unapplied(state, proposals)
+		if len(pending) == 0 {
+			run.Conclusion, run.Title, run.Summary = ConclusionSuccess, "Docs up to date", "Every proposed doc change is already applied."
+			return state, run
+		}
+		run.Conclusion, run.Title, run.Summary = ConclusionActionRequired, "Docs need updating", proposalsSummary(pending)
+		return state, run
+	case VerdictFailed, VerdictSuperseded:
+	}
+	title := "Analysis failed"
+	if outcome.Failed != nil {
+		title = cmp.Or(outcome.Failed.Title, title)
+	}
+	return state, neutral(run, title, reason)
 }
 
 // unapplied is v without the proposals state already holds as applied with the
@@ -523,8 +669,8 @@ type CommentWrite struct {
 }
 
 // Reconcile is the state transition for a finished run: pure, no I/O. It
-// returns prev with only Proposals, ProposalsSHA and SummaryCommentID changed, and the
-// comment writes that realize it. existing is the PR's current comments: our
+// returns prev with only Proposals, ProposalsSHA, SummaryCommentID and the
+// outdated events in History changed, and the comment writes that realize it. existing is the PR's current comments: our
 // own comments carrying our markers are reused when state lacks their IDs, and
 // an outdated proposal keeps its current body. Created comments' IDs and URLs
 // belong in the returned state at the writes' Index. An applied proposal
@@ -532,6 +678,7 @@ type CommentWrite struct {
 func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []review.ChangedFile, existing []Comment) (PRState, []CommentWrite) {
 	next := prev
 	next.Proposals = slices.Clone(prev.Proposals)
+	next.History.Events = slices.Clone(prev.History.Events)
 	next.ProposalsSHA = pr.HeadSHA
 	proposals, _ := verdict.(review.Proposals)
 
@@ -583,6 +730,7 @@ func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []r
 		}
 		adoptMarked(ps, existing)
 		ps.State = ProposalOutdated
+		next.History.Events = append(next.History.Events, outdatedEvent(ps.ID, pr.HeadSHA))
 		if c, ok := findComment(existing, CommentKindReview, ps.CommentID); ok {
 			writes = append(writes, CommentWrite{Index: i, ID: ps.CommentID, Body: renderOutdated(ps.ID, pr.HeadSHA, c.Body)})
 		}
@@ -836,7 +984,7 @@ func (s *Service) analyze(ctx context.Context, state PRState, pr PullRequest) er
 		}
 	}
 
-	if next := OnPush(state, pr); next.Skip != nil && next.Skip.Scope == SkipPR {
+	if next := OnPush(state, pr, time.Now()); next.Skip != nil && next.Skip.Scope == SkipPR {
 		return s.concludeSkipped(ctx, next, pr)
 	}
 
@@ -863,9 +1011,9 @@ func (s *Service) analyze(ctx context.Context, state PRState, pr PullRequest) er
 
 	switch selected {
 	case runnerActions:
-		return s.startRun(ctx, state, pr, s.runners.Actions)
+		return s.startRun(ctx, state, pr, s.runners.Actions, RunnerKindActions)
 	case runnerServer:
-		return s.startRun(ctx, state, pr, s.runners.Server)
+		return s.startRun(ctx, state, pr, s.runners.Server, RunnerKindServer)
 	case runnerNone:
 	}
 
@@ -880,7 +1028,7 @@ func (s *Service) analyze(ctx context.Context, state PRState, pr PullRequest) er
 	if _, err := s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, run); err != nil {
 		return fmt.Errorf("create check run: %w", err)
 	}
-	if err := s.store.SavePR(ctx, OnPush(state, pr)); err != nil {
+	if err := s.store.SavePR(ctx, OnPush(state, pr, time.Now())); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}
 	return nil
@@ -906,7 +1054,7 @@ func (s *Service) concludeSkipped(ctx context.Context, next PRState, pr PullRequ
 // failed or cancelled start can still close the check run, and the deadline
 // sweep can if nothing else does; once started, the state writes outlive a
 // cancelled ctx so the next job can find and close the check run.
-func (s *Service) startRun(ctx context.Context, state PRState, pr PullRequest, runner review.Runner) error {
+func (s *Service) startRun(ctx context.Context, state PRState, pr PullRequest, runner review.Runner, kind RunnerKind) error {
 	id, err := s.gh.CreateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, CheckRun{
 		Name:    CheckName,
 		HeadSHA: pr.HeadSHA,
@@ -918,9 +1066,10 @@ func (s *Service) startRun(ctx context.Context, state PRState, pr PullRequest, r
 		return fmt.Errorf("create check run: %w", err)
 	}
 
-	next := OnPush(state, pr)
+	now := time.Now()
+	next := OnPush(state, pr, now)
 	next.CheckRunID = id
-	next.Run = &AwaitingRun{Nonce: fmt.Sprintf("check-%d", id), Deadline: time.Now().Add(AnalysisDeadline)}
+	next.Run = &AwaitingRun{Nonce: fmt.Sprintf("check-%d", id), Deadline: now.Add(AnalysisDeadline), StartedAt: now, Runner: kind}
 
 	var out startOutcome
 	armCtx, cancelArm := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
@@ -929,6 +1078,8 @@ func (s *Service) startRun(ctx context.Context, state PRState, pr PullRequest, r
 	if err != nil {
 		err = fmt.Errorf("save state: %w", err)
 	} else {
+		// The superseded record is saved; conclude must not find it in the single slot.
+		next.History = History{}
 		out, err = s.start(ctx, runner, pr)
 		if err != nil && ctx.Err() != nil {
 			// Superseded or shutting down: the armed state stays so the next job
@@ -988,7 +1139,7 @@ func (r *reportedFailure) Unwrap() error { return r.error }
 // the summary comment with its cause, and saves the concluded state. If the
 // check run cannot be concluded the armed state stays so the deadline sweep retries.
 func (s *Service) concludeFailed(ctx context.Context, state PRState, pr PullRequest, outcome Outcome) error {
-	next, run := conclude(state, outcome)
+	next, run := conclude(state, outcome, time.Now())
 	if err := s.gh.UpdateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, state.CheckRunID, run); err != nil {
 		return fmt.Errorf("conclude check run %d: %w", state.CheckRunID, err)
 	}
@@ -1009,7 +1160,7 @@ func (s *Service) concludeFailed(ctx context.Context, state PRState, pr PullRequ
 // with backoff. If every post fails the run is re-armed so the deadline sweep
 // ends the check neutral. Callers save the returned state.
 func (s *Service) concludeResult(ctx context.Context, state PRState, pr PullRequest, res review.Result, changed []review.ChangedFile) (PRState, error) {
-	next, run := conclude(state, resultOutcome(res))
+	next, run := conclude(state, resultOutcome(res), time.Now())
 	if err := s.gh.UpdateCheckRun(ctx, pr.InstallationID, pr.Owner, pr.Repo, state.CheckRunID, run); err != nil {
 		return PRState{}, fmt.Errorf("conclude check run %d: %w", state.CheckRunID, err)
 	}

@@ -202,7 +202,7 @@ func TestOnApply(t *testing.T) {
 		gate.ProposalState{ID: "p2", State: gate.ProposalOpen},
 		gate.ProposalState{ID: "p3", State: gate.ProposalOutdated})
 
-	got := gate.OnApply(prev, []string{"p1", "p3"}, "sha9")
+	got := gate.OnApply(prev, []string{"p1", "p3"}, "sha9", "alice")
 
 	want := map[string]gate.ProposalStatus{"p1": gate.ProposalApplied, "p2": gate.ProposalOpen, "p3": gate.ProposalOutdated}
 	for _, p := range got.Proposals {
@@ -215,6 +215,59 @@ func TestOnApply(t *testing.T) {
 	}
 	if prev.Proposals[0].State != gate.ProposalOpen {
 		t.Error("OnApply mutated its input")
+	}
+
+	wantEvents := []gate.PREvent{{Key: "applied/p1/sha9", Kind: gate.EventApplied, Actor: "alice", ProposalID: "p1", CommitSHA: "sha9", HeadSHA: "head1"}}
+	if diff := cmp.Diff(wantEvents, got.History.Events); diff != "" {
+		t.Errorf("History.Events (-want +got):\n%s", diff)
+	}
+	if replay := gate.OnApply(got, []string{"p1", "p2"}, "sha10", "bob"); len(replay.History.Events) != 2 || replay.History.Events[1].ProposalID != "p2" {
+		t.Errorf("replay History.Events = %+v, want the p1 event kept and one new for p2 only", replay.History.Events)
+	}
+	if again := gate.OnApply(got, []string{"p1"}, "sha10", "bob"); len(again.History.Events) != 1 {
+		t.Errorf("OnApply of an applied proposal emitted %d events, want none new", len(again.History.Events)-1)
+	}
+}
+
+func TestHandleCommentApplyRecordsEventsOncePerProposal(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{stored: threeState(), live: true}
+	comments := &fakeCommentGitHub{canWrite: true, files: baseFiles()}
+	svc := gate.NewService(apiWithComments(), comments, store, gate.Runners{}, nil, nil)
+
+	if err := svc.HandleComment(t.Context(), summaryTick("Apply all")); err != nil {
+		t.Fatalf("HandleComment() = %v, want nil", err)
+	}
+	applied := func() (keys []string) {
+		for _, h := range store.histories {
+			for _, e := range h.Events {
+				if e.Kind == gate.EventApplied && e.Actor == "dev" {
+					keys = append(keys, e.Key)
+				}
+			}
+		}
+		return keys
+	}
+	if got := len(applied()); got == 0 {
+		t.Fatal("no applied events saved, want one per proposal")
+	}
+	seen := map[string]bool{}
+	for _, k := range applied() {
+		seen[k] = true
+	}
+	if len(seen) != 3 {
+		t.Errorf("distinct applied events = %d, want 3", len(seen))
+	}
+
+	before := len(store.histories)
+	if err := svc.HandleComment(t.Context(), summaryTick("Apply all")); err != nil {
+		t.Fatalf("replayed HandleComment() = %v, want nil", err)
+	}
+	for _, h := range store.histories[before:] {
+		if len(h.Events) != 0 {
+			t.Errorf("replay saved events %+v, want none", h.Events)
+		}
 	}
 }
 

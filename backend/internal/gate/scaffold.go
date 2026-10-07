@@ -230,7 +230,7 @@ func (s *Service) concludeNoDocs(ctx context.Context, state PRState, pr PullRequ
 	if err != nil {
 		return fmt.Errorf("create check run: %w", err)
 	}
-	next := OnPush(state, pr)
+	next := OnPush(state, pr, time.Now())
 	next.CheckRunID = id
 	if err := s.store.SavePR(ctx, next); err != nil {
 		return fmt.Errorf("save state: %w", err)
@@ -256,7 +256,7 @@ func (s *Service) requestScaffold(ctx context.Context, state PRState, pr PullReq
 		return fmt.Errorf("request scaffold: %w", err)
 	}
 
-	next := OnPush(state, pr)
+	next := OnPush(state, pr, time.Now())
 	next.CheckRunID = id
 	if err := s.store.SavePR(ctx, next); err != nil {
 		return fmt.Errorf("save state: %w", err)

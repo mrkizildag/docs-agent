@@ -170,7 +170,7 @@ func TestHandleCommentSavesPendingApplyBeforeCommitting(t *testing.T) {
 		if err := svc.HandleComment(t.Context(), reviewTick(1)); err == nil {
 			t.Fatal("HandleComment() = nil, want the commit error")
 		}
-		want := &gate.PendingApply{IDs: []string{"p1"}, Message: singleMsg, Parent: "head1"}
+		want := &gate.PendingApply{IDs: []string{"p1"}, Message: singleMsg, Parent: "head1", By: "dev"}
 		if diff := cmp.Diff(want, store.stored.PendingApply); diff != "" {
 			t.Errorf("PendingApply (-want +got):\n%s", diff)
 		}

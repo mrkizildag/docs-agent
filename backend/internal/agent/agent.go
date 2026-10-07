@@ -56,8 +56,9 @@ type Stats struct {
 
 // Budget bounds the total tokens a Run may spend.
 type Budget struct {
-	max  int
-	used int
+	max   int
+	used  int
+	total llm.Usage
 }
 
 // NewBudget returns a Budget that allows up to maxTokens total input and
@@ -70,11 +71,18 @@ func NewBudget(maxTokens int) *Budget {
 // the total exceeds the budget's cap.
 func (b *Budget) Charge(u llm.Usage) error {
 	b.used += u.InputTokens + u.OutputTokens
+	b.total.InputTokens += u.InputTokens
+	b.total.OutputTokens += u.OutputTokens
+	b.total.CacheReadTokens += u.CacheReadTokens
+	b.total.CacheWriteTokens += u.CacheWriteTokens
 	if b.used > b.max {
 		return fmt.Errorf("used %d tokens, budget %d: %w", b.used, b.max, ErrTokenBudget)
 	}
 	return nil
 }
+
+// Usage is everything charged to the budget so far, cache tokens included.
+func (b *Budget) Usage() llm.Usage { return b.total }
 
 // Run drives m through t's conversation: on each step it offers read_file, grep,
 // list_dir and t.Finish, executes any other tool call against t.Root, and ends when the

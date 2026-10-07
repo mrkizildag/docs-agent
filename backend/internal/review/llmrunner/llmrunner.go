@@ -69,7 +69,7 @@ var (
 // *review.FailedError whose Err keeps the original chain.
 func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started, error) {
 	if len(req.ChangedFiles) == 0 {
-		return r.noImpact("no changed files"), nil
+		return noImpact("no changed files", "", nil), nil
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
@@ -107,8 +107,27 @@ func classify(err error) review.FailureCause {
 	}
 }
 
-func (r *Runner) noImpact(reason string) review.Result {
-	return review.Result{Runner: runnerName, Model: r.model, Verdict: review.NoImpact{Reason: reason}}
+// noImpact is the Result for a PR that needs no doc change, decided by model;
+// pass "" when no model was called.
+func noImpact(reason, model string, budget *agent.Budget) review.Result {
+	return review.Result{Model: model, Verdict: review.NoImpact{Reason: reason}, Usage: usageOf(budget)}
+}
+
+// usageOf reports what budget was charged; nil when no model call was made.
+func usageOf(budget *agent.Budget) *review.Usage {
+	if budget == nil {
+		return nil
+	}
+	u := budget.Usage()
+	if u == (llm.Usage{}) {
+		return nil
+	}
+	return &review.Usage{
+		InputTokens:      int64(u.InputTokens),
+		OutputTokens:     int64(u.OutputTokens),
+		CacheReadTokens:  int64(u.CacheReadTokens),
+		CacheWriteTokens: int64(u.CacheWriteTokens),
+	}
 }
 
 func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result, error) {
@@ -130,11 +149,11 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		return review.Result{}, fmt.Errorf("base docs of %s: %w", req.BaseSHA, err)
 	}
 	if len(selection.Restores) > 0 {
-		return review.Result{Runner: runnerName, Model: "", Verdict: review.Proposals(selection.Restores)}, nil
+		return review.Result{Verdict: review.Proposals(selection.Restores)}, nil
 	}
 	candidates, uncovered := selection.Candidates, selection.Uncovered
 	if selection.Empty() {
-		return r.noImpact(basedocs.NothingToReview), nil
+		return noImpact(basedocs.NothingToReview, "", nil), nil
 	}
 	if len(candidates) > basedocs.MaxCandidates {
 		return review.Result{}, fmt.Errorf("%w: %d candidate docs exceed the cap of %d", errTooManyCandidates, len(candidates), basedocs.MaxCandidates)
@@ -201,7 +220,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		if len(candidates) > 0 {
 			prefix = "no candidate doc is affected: "
 		}
-		return r.noImpact(oneLine(prefix+strings.Join(reasons, "; "), maxReasonLen)), nil
+		return noImpact(oneLine(prefix+strings.Join(reasons, "; "), maxReasonLen), r.triageModel, budget), nil
 	}
 
 	proposals, err := r.draft(ctx, log, root, index, budget, fence, req, selection, impacted, allowNewDoc, patch)
@@ -209,7 +228,7 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		return review.Result{}, err
 	}
 	if len(proposals) == 0 {
-		return r.noImpact("model proposed no doc changes"), nil
+		return noImpact("model proposed no doc changes", r.model, budget), nil
 	}
 
 	var kept []review.Proposal
@@ -226,10 +245,10 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		}
 	}
 	if len(kept) == 0 {
-		return r.noImpact(oneLine("verification rejected every proposal: "+strings.Join(rejected, "; "), maxReasonLen)), nil
+		return noImpact(oneLine("verification rejected every proposal: "+strings.Join(rejected, "; "), maxReasonLen), r.triageModel, budget), nil
 	}
 
-	return review.Result{Runner: runnerName, Model: r.model, Verdict: review.Proposals(kept)}, nil
+	return review.Result{Model: r.model, Verdict: review.Proposals(kept), Usage: usageOf(budget)}, nil
 }
 
 // headDoc reads docPath from the head clone for a candidate that docs.Parse

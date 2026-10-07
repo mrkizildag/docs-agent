@@ -78,6 +78,10 @@ type Response struct {
 type Usage struct {
 	InputTokens  int
 	OutputTokens int
+	// CacheReadTokens and CacheWriteTokens are prompt-cache tokens, which the
+	// provider reports apart from InputTokens; zero when it reports none.
+	CacheReadTokens  int
+	CacheWriteTokens int
 }
 
 const maxResponseBytes = 8 << 20

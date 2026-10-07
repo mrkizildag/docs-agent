@@ -16,6 +16,7 @@ Start here. Each entry is one file with a one-line summary; open only what the t
 - [Server runner](features/server-runner.md): how the server decides whether a PR makes docs stale, why its tools are read-only, and its limits.
 - [Proposal output](features/proposal-output.md): what a PR gets for proposed doc edits (review comments, summary) and how re-runs keep them stable.
 - [Apply and Skip](features/apply-skip.md): how proposals are applied or the gate waived, who may, what is refused, and why a repeated delivery commits at most once.
+- [Analysis history](features/analysis-history.md): what is recorded for every analysis and Apply or Skip, why it is written with the state, and how replays stay idempotent.
 - [Docs scaffold](features/scaffold.md): how a repo with no `docs/` gets one starting docs PR, exactly once, and what waiting checks say.
 - [Setup](guides/setup.md): run, test, and lint the backend locally.
 - [Registering the GitHub App](guides/github-app.md): create the GitHub App, set its webhook and permissions, and install it.

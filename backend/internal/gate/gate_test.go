@@ -206,7 +206,8 @@ type fakeStore struct {
 	stored      gate.PRState
 	saved       *gate.PRState
 	saveCtxErrs []error
-	live        bool // SavePR also replaces stored, as a real store would
+	histories   []gate.History // History of each saved state, which saveCalls and saved omit
+	live        bool           // SavePR also replaces stored, as a real store would
 }
 
 type loadPRCall struct {
@@ -257,6 +258,8 @@ func (f *fakeStore) MarkScaffoldWaiterLinked(context.Context, string, string, in
 
 func (f *fakeStore) SavePR(ctx context.Context, state gate.PRState) error {
 	f.saveCtxErrs = append(f.saveCtxErrs, ctx.Err())
+	f.histories = append(f.histories, state.History)
+	state.History = gate.History{}
 	f.saveCalls = append(f.saveCalls, state)
 	f.saved = &state
 	if f.live {
@@ -597,7 +600,7 @@ func TestOnPush(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			if diff := cmp.Diff(want, gate.OnPush(tt.state, testPR())); diff != "" {
+			if diff := cmp.Diff(want, gate.OnPush(tt.state, testPR(), time.Now())); diff != "" {
 				t.Errorf("OnPush() (-want +got):\n%s", diff)
 			}
 		})
@@ -680,7 +683,10 @@ func TestHandlePullRequestActionsStartsRun(t *testing.T) {
 	}
 	want := gate.PRState{
 		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "abc123", CheckRunID: 555,
-		Run: &gate.AwaitingRun{RunID: 99, Nonce: "n1", Deadline: deadline, BaseSHA: "mb1"},
+		Run: &gate.AwaitingRun{RunID: 99, Nonce: "n1", Deadline: deadline, BaseSHA: "mb1", StartedAt: store.saveCalls[0].Run.StartedAt, Runner: gate.RunnerKindActions},
+	}
+	if store.saveCalls[0].Run.StartedAt.IsZero() {
+		t.Error("armed run StartedAt is zero, want the start time")
 	}
 	if diff := cmp.Diff(want, store.saveCalls[1]); diff != "" {
 		t.Errorf("started state (-want +got):\n%s", diff)
@@ -1108,7 +1114,7 @@ func TestHandleRunCompletedCapsText(t *testing.T) {
 func TestOnPushDropsAwaitedRun(t *testing.T) {
 	t.Parallel()
 
-	got := gate.OnPush(awaitingState(), testPR())
+	got := gate.OnPush(awaitingState(), testPR(), time.Now())
 	if got.Run != nil || got.CheckRunID != 0 {
 		t.Errorf("OnPush() = %+v, want no awaited run and no check run", got)
 	}
@@ -1709,7 +1715,7 @@ func TestOnPushSkips(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := gate.OnPush(tt.prev, testPR())
+			got := gate.OnPush(tt.prev, testPR(), time.Now())
 			if diff := cmp.Diff(tt.wantSkip, got.Skip); diff != "" {
 				t.Errorf("Skip (-want +got):\n%s", diff)
 			}
@@ -1724,7 +1730,7 @@ func TestOnPushDropsPendingApply(t *testing.T) {
 	t.Parallel()
 
 	prev := gate.PRState{HeadSHA: "old111", PendingApply: &gate.PendingApply{IDs: []string{"p1"}, Message: "m", Parent: "old111"}}
-	if got := gate.OnPush(prev, testPR()); got.PendingApply != nil {
+	if got := gate.OnPush(prev, testPR(), time.Now()); got.PendingApply != nil {
 		t.Errorf("OnPush().PendingApply = %+v, want nil", got.PendingApply)
 	}
 }
@@ -1734,7 +1740,7 @@ func TestOnPushCopiesFork(t *testing.T) {
 
 	pr := testPR()
 	pr.Fork = true
-	if got := gate.OnPush(gate.PRState{}, pr); !got.Fork {
+	if got := gate.OnPush(gate.PRState{}, pr, time.Now()); !got.Fork {
 		t.Error("OnPush().Fork = false, want true")
 	}
 }
@@ -1771,7 +1777,7 @@ func TestHandlePullRequestPRSkipSkipsAnalysis(t *testing.T) {
 func TestHandleRunCompletedAfterSkip(t *testing.T) {
 	t.Parallel()
 
-	skipped, _ := gate.OnSkip(awaitingState(), gate.Skip{User: "dev", Scope: gate.SkipCommit, Reason: "typo"})
+	skipped, _ := gate.OnSkip(awaitingState(), gate.Skip{User: "dev", Scope: gate.SkipCommit, Reason: "typo"}, time.Now())
 
 	t.Run("late run is ignored", func(t *testing.T) {
 		t.Parallel()
@@ -2393,6 +2399,104 @@ func TestHandlePullRequestConcludesAfterALongAnalysis(t *testing.T) {
 					t.Errorf("updates = %+v, want the check concluded %s after a 2-minute analysis", gh.updates, tc.want)
 				}
 			})
+		})
+	}
+}
+
+func TestOnPushAtSupersededAnalysis(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	started := now.Add(-time.Minute)
+	armed := gate.PRState{HeadSHA: "old111", Run: &gate.AwaitingRun{RunID: 9, Nonce: "n1", StartedAt: started, Runner: gate.RunnerKindActions}}
+	tests := []struct {
+		name string
+		prev gate.PRState
+		want *gate.Analysis
+	}{
+		{name: "armed run", prev: armed, want: &gate.Analysis{
+			Nonce: "n1", HeadSHA: "old111", Runner: gate.RunnerKindActions, Verdict: gate.VerdictSuperseded,
+			StartedAt: started, FinishedAt: now, RunID: 9,
+		}},
+		{name: "nothing armed", prev: gate.PRState{HeadSHA: "old111"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := gate.OnPush(tt.prev, testPR(), now)
+			if diff := cmp.Diff(tt.want, got.History.Analysis); diff != "" {
+				t.Errorf("OnPush().History.Analysis (-want +got):\n%s", diff)
+			}
+			if got.Run != nil || len(got.History.Events) != 0 {
+				t.Errorf("OnPush() Run = %+v, Events = %+v, want no run and no events", got.Run, got.History.Events)
+			}
+		})
+	}
+}
+
+func TestStartRunSavesSupersededBeforeNewAnalysis(t *testing.T) {
+	t.Parallel()
+
+	started := time.Date(2026, 3, 4, 5, 0, 0, 0, time.UTC)
+	prev := gate.PRState{
+		InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "old111", CheckRunID: 400,
+		Run: &gate.AwaitingRun{RunID: 9, Nonce: "check-400", StartedAt: started, Runner: gate.RunnerKindServer},
+	}
+	gh := &fakeGitHub{checkRunID: 555}
+	runner := &fakeRunner{started: review.Result{Verdict: review.NoImpact{Reason: "ok"}}}
+	store := &fakeStore{stored: prev, live: true}
+	svc := gate.NewService(gh, nil, store, gate.Runners{Server: runner}, nil, nil)
+
+	if err := svc.HandlePullRequest(t.Context(), testPR()); err != nil {
+		t.Fatalf("HandlePullRequest() = %v, want nil", err)
+	}
+
+	var got []string
+	for _, h := range store.histories {
+		if a := h.Analysis; a != nil {
+			got = append(got, a.Nonce+":"+string(a.Verdict))
+		}
+	}
+	got = slices.Compact(got) // the concluded run is saved again by the final save; the store upserts it
+	want := []string{"check-400:superseded", "check-555:no_impact"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("analyses saved (-want +got):\n%s", diff)
+	}
+}
+
+func TestReconcileOutdatedEvents(t *testing.T) {
+	t.Parallel()
+
+	pr := gate.PullRequest{InstallationID: 1, Owner: "o", Repo: "r", Number: 3, HeadSHA: "head2"}
+	idA, idB, idC := gate.ProposalID("docs/a.md", "A"), gate.ProposalID("docs/b.md", "B"), gate.ProposalID("docs/c.md", "C")
+	prev := gate.PRState{Proposals: []gate.ProposalState{
+		{ID: idA, DocPath: "docs/a.md", Section: "A", State: gate.ProposalOpen},
+		{ID: idB, DocPath: "docs/b.md", Section: "B", State: gate.ProposalOpen},
+		{ID: idC, DocPath: "docs/c.md", Section: "C", State: gate.ProposalOutdated},
+	}}
+	tests := []struct {
+		name    string
+		verdict review.Verdict
+		want    []gate.PREvent
+	}{
+		{name: "each dropped open proposal", verdict: review.NoImpact{Reason: "none"}, want: []gate.PREvent{
+			{Key: "outdated/" + idA + "/head2", Kind: gate.EventOutdated, ProposalID: idA, HeadSHA: "head2"},
+			{Key: "outdated/" + idB + "/head2", Kind: gate.EventOutdated, ProposalID: idB, HeadSHA: "head2"},
+		}},
+		{name: "only the one not repeated", verdict: review.Proposals{proposal("docs/a.md", "A")}, want: []gate.PREvent{
+			{Key: "outdated/" + idB + "/head2", Kind: gate.EventOutdated, ProposalID: idB, HeadSHA: "head2"},
+		}},
+		{name: "none when all repeated", verdict: review.Proposals{proposal("docs/a.md", "A"), proposal("docs/b.md", "B")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			next, _ := gate.Reconcile(prev, pr, tt.verdict, nil, nil)
+			if diff := cmp.Diff(tt.want, next.History.Events); diff != "" {
+				t.Errorf("Reconcile().History.Events (-want +got):\n%s", diff)
+			}
 		})
 	}
 }

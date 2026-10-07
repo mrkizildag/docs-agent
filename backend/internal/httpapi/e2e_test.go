@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"database/sql"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -604,7 +605,7 @@ func (f *commentGitHub) EditIssueComment(_ context.Context, _ int64, _, _ string
 type proposalRunner struct{ proposals review.Proposals }
 
 func (r proposalRunner) Start(context.Context, review.Request) (review.Started, error) {
-	return review.Result{Runner: "fake", Verdict: r.proposals}, nil
+	return review.Result{Verdict: r.proposals}, nil
 }
 
 func (proposalRunner) StartScaffold(context.Context, review.ScaffoldRequest) (review.ScaffoldStarted, error) {
@@ -931,12 +932,12 @@ func (r scriptedRunner) Start(ctx context.Context, rq review.Request) (review.St
 		close(o.started)
 		select {
 		case <-o.release:
-			return review.Result{Runner: "fake", Verdict: review.NoImpact{Reason: "held run done"}}, nil
+			return review.Result{Verdict: review.NoImpact{Reason: "held run done"}}, nil
 		case <-ctx.Done():
 			return nil, &review.FailedError{Cause: review.CauseTimeout, Err: ctx.Err()}
 		}
 	case review.Verdict:
-		return review.Result{Runner: "fake", Verdict: o}, nil
+		return review.Result{Verdict: o}, nil
 	case review.Pending:
 		return o, nil
 	case error:
@@ -2035,4 +2036,107 @@ func (unusedCommentGitHub) CommitAt(context.Context, int64, string, string, stri
 
 func (f *statefulGitHub) CommitAt(context.Context, int64, string, string, string) (gate.Commit, error) {
 	return gate.Commit{}, nil
+}
+
+type noImpactRunner struct{ proposalRunner }
+
+func (noImpactRunner) Start(context.Context, review.Request) (review.Started, error) {
+	return review.Result{Model: "fake-model", Verdict: review.NoImpact{Reason: "typo fix"}}, nil
+}
+
+func TestWebhookToAnalysisHistoryEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	secret := []byte("test-secret")
+	dbPath := filepath.Join(t.TempDir(), "pollux.db")
+	store, err := sqlite.Open(t.Context(), dbPath)
+	if err != nil {
+		t.Fatalf("sqlite.Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	gh := &commentGitHub{checkRuns: make(chan gate.CheckRun, 4), review: make(chan gate.ReviewComment, 1), issue: make(chan string, 1), edited: make(chan string, 1)}
+	gateSvc := gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{Server: noImpactRunner{}}, nil, nil)
+
+	logger := slog.New(slog.DiscardHandler)
+	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, 8)
+	workerCtx, cancelWorker := context.WithCancel(t.Context())
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- worker.Run(workerCtx) }()
+	t.Cleanup(func() {
+		cancelWorker()
+		if err := <-workerDone; err != nil {
+			t.Errorf("worker.Run() error = %v", err)
+		}
+	})
+
+	handler := httpapi.NewHandler(logger, secret, worker, store)
+	post := func(deliveryID string, body []byte) {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
+		req.Header.Set("X-GitHub-Event", "pull_request")
+		req.Header.Set("X-GitHub-Delivery", deliveryID)
+		req.Header.Set("X-Hub-Signature-256", sign(secret, body))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("POST /webhook %s = %d, want %d", deliveryID, rec.Code, http.StatusAccepted)
+		}
+	}
+	waitConcluded := func() {
+		t.Helper()
+		select {
+		case run := <-gh.checkRuns:
+			if run.Conclusion != gate.ConclusionSuccess {
+				t.Errorf("check run conclusion = %q, want %q", run.Conclusion, gate.ConclusionSuccess)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for check run")
+		}
+	}
+
+	body := e2ePullRequestBody(t, 1, "sha1")
+	post("d1", body)
+	waitConcluded()
+	post("d1", body)
+	// A distinct PR is a barrier: once it concludes, a duplicate job for PR 1 would have run too.
+	post("d2", e2ePullRequestBody(t, 2, "sha2"))
+	waitConcluded()
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open(%q) error = %v", dbPath, err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	rows, err := db.QueryContext(t.Context(), `SELECT runner, verdict, reason, head_sha, model, proposals, started_at, finished_at FROM analyses WHERE number = 1`)
+	if err != nil {
+		t.Fatalf("query analyses: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var got [][]any
+	for rows.Next() {
+		var runner, verdict, reason, head, model, started, finished string
+		var proposals int
+		if err := rows.Scan(&runner, &verdict, &reason, &head, &model, &proposals, &started, &finished); err != nil {
+			t.Fatalf("scan analyses: %v", err)
+		}
+		got = append(got, []any{runner, verdict, reason, head, model, proposals})
+		for _, ts := range []string{started, finished} {
+			if _, err := time.Parse(time.RFC3339Nano, ts); err != nil {
+				t.Errorf("analysis time %q does not parse: %v", ts, err)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read analyses: %v", err)
+	}
+	want := [][]any{{"server", "no_impact", "typo fix", "sha1", "fake-model", 0}}
+	if diff := gocmp.Diff(want, got); diff != "" {
+		t.Errorf("analyses of PR 1 mismatch (-want +got):\n%s", diff)
+	}
 }

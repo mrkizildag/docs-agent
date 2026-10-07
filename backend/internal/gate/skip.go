@@ -3,7 +3,9 @@ package gate
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
+	"time"
 )
 
 // skipActive reports whether a skip covers the head state reports on.
@@ -31,12 +33,28 @@ func skipRun(s PRState) CheckRun {
 	}
 }
 
-// OnSkip is the state transition for a skip made at the current head: pure, no
-// I/O. The skip wins over any awaited run, so that run's result is ignored.
-func OnSkip(s PRState, sk Skip) (PRState, CheckRun) {
+// OnSkip is the state transition for a skip made at the current head at now:
+// pure, no I/O. The skip wins over any awaited run, so that run's result is
+// ignored and recorded as superseded. It emits a skipped event per open
+// proposal, or one without a proposal when none is open.
+func OnSkip(s PRState, sk Skip, now time.Time) (PRState, CheckRun) {
 	s.Skip = &Skip{User: sk.User, Scope: sk.Scope, Reason: sk.Reason, HeadSHA: s.HeadSHA}
 	s.PendingSkip = nil
-	s.Run = nil
+	if s.Run != nil {
+		s.History.Analysis = supersededAnalysis(s.Run, s.HeadSHA, now)
+		s.Run = nil
+	}
+	s.History.Events = slices.Clone(s.History.Events)
+	open := false
+	for _, p := range s.Proposals {
+		if p.State == ProposalOpen {
+			open = true
+			s.History.Events = append(s.History.Events, skippedEvent(*s.Skip, p.ID))
+		}
+	}
+	if !open {
+		s.History.Events = append(s.History.Events, skippedEvent(*s.Skip, ""))
+	}
 	return s, skipRun(s)
 }
 
@@ -100,7 +118,7 @@ func (s *Service) skip(ctx context.Context, state PRState, sk Skip, op string) e
 			return s.redrawSummary(ctx, state, op)
 		}
 	}
-	state, run := OnSkip(state, sk)
+	state, run := OnSkip(state, sk, time.Now())
 	if state.CheckRunID == 0 {
 		id, err := s.gh.CreateCheckRun(ctx, state.InstallationID, state.Owner, state.Repo, run)
 		if err != nil {

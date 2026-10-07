@@ -69,12 +69,26 @@ type Artifact[T any] struct {
 // ClaudeOutput is the subset of `claude -p --output-format json` stdout the
 // runner reads.
 type ClaudeOutput[T any] struct {
-	IsError          bool                       `json:"is_error"`
-	Subtype          string                     `json:"subtype"`
-	TerminalReason   string                     `json:"terminal_reason"`
-	APIErrorStatus   *int                       `json:"api_error_status"`
-	ModelUsage       map[string]json.RawMessage `json:"modelUsage"`
-	StructuredOutput *T                         `json:"structured_output"`
+	IsError          bool                  `json:"is_error"`
+	Subtype          string                `json:"subtype"`
+	TerminalReason   string                `json:"terminal_reason"`
+	APIErrorStatus   *int                  `json:"api_error_status"`
+	ModelUsage       map[string]modelUsage `json:"modelUsage"`
+	StructuredOutput *T                    `json:"structured_output"`
+	TotalCostUSD     *float64              `json:"total_cost_usd"`
+	Usage            *claudeUsage          `json:"usage"`
+}
+
+// claudeUsage holds the top-level token totals; `iterations` is ignored.
+type claudeUsage struct {
+	InputTokens      int64 `json:"input_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+	CacheReadTokens  int64 `json:"cache_read_input_tokens"`
+	CacheWriteTokens int64 `json:"cache_creation_input_tokens"`
+}
+
+type modelUsage struct {
+	CostBasis string `json:"costBasis"`
 }
 
 // Runner dispatches the repo's pollux-agent workflow and collects its result.
@@ -107,7 +121,7 @@ func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started,
 		return nil, fmt.Errorf("start actions run %s: %w", where, err)
 	}
 	if len(selection.Restores) > 0 {
-		return review.Result{Runner: runnerName, Verdict: review.Proposals(selection.Restores)}, nil
+		return review.Result{Verdict: review.Proposals(selection.Restores)}, nil
 	}
 	if len(selection.Candidates) > basedocs.MaxCandidates {
 		return nil, &review.FailedError{
@@ -117,7 +131,7 @@ func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started,
 	}
 
 	if selection.Empty() {
-		return review.Result{Runner: runnerName, Verdict: review.NoImpact{Reason: basedocs.NothingToReview}}, nil
+		return review.Result{Verdict: review.NoImpact{Reason: basedocs.NothingToReview}}, nil
 	}
 	pending, err := r.dispatch(ctx, r.timeout, req.InstallationID, req.Owner, req.Repo, req.HeadSHA, req.Number, selection.Candidates, selection.Uncovered)
 	if err != nil {
@@ -216,7 +230,7 @@ func (r *Runner) Collect(ctx context.Context, c review.Completion) (review.Resul
 		return review.Result{}, &review.InvalidResultError{Cause: err}
 	}
 
-	result := review.Result{Runner: runnerName, Model: art.Claude.model()}
+	result := review.Result{Model: art.Claude.model(), Usage: art.Claude.reviewUsage()}
 	if len(out.Proposals) == 0 {
 		if strings.TrimSpace(out.NoImpactReason) == "" {
 			return review.Result{}, &review.InvalidResultError{Cause: errors.New("no proposals and an empty no_impact_reason")}
@@ -335,6 +349,35 @@ func capText(s string) string {
 		return s
 	}
 	return strings.ToValidUTF8(s[:maxCauseText], "") + "..."
+}
+
+// reviewUsage is nil when the run reported no usage block.
+func (o ClaudeOutput[T]) reviewUsage() *review.Usage {
+	if o.Usage == nil {
+		return nil
+	}
+	return &review.Usage{
+		InputTokens:      o.Usage.InputTokens,
+		OutputTokens:     o.Usage.OutputTokens,
+		CacheReadTokens:  o.Usage.CacheReadTokens,
+		CacheWriteTokens: o.Usage.CacheWriteTokens,
+		CostUSD:          o.TotalCostUSD,
+		CostBasis:        o.costBasis(),
+	}
+}
+
+// costBasis is the basis every model reports, or empty when they differ or
+// none is reported.
+func (o ClaudeOutput[T]) costBasis() string {
+	basis := ""
+	for i, name := range slices.Sorted(maps.Keys(o.ModelUsage)) {
+		b := o.ModelUsage[name].CostBasis
+		if i > 0 && b != basis {
+			return ""
+		}
+		basis = b
+	}
+	return basis
 }
 
 func (o ClaudeOutput[T]) model() string {
