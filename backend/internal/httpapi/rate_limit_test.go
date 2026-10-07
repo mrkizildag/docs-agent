@@ -11,8 +11,8 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/httpapi"
 )
 
-func tightWebhookRateLimit() httpapi.WebhookRateLimitConfig {
-	return httpapi.WebhookRateLimitConfig{
+func tightWebhookRateLimit() httpapi.RateLimitConfig {
+	return httpapi.RateLimitConfig{
 		GlobalPerSecond: 1000,
 		GlobalBurst:     1000,
 		PerIPPerSecond:  1,
@@ -25,7 +25,7 @@ func TestWebhookRateLimitRejectsBeforeBodyRead(t *testing.T) {
 
 	logger := slog.New(slog.DiscardHandler)
 	secret := []byte("test-secret")
-	handler := httpapi.NewHandlerWithWebhookRateLimit(logger, secret, newFakeEnqueuer(), fakeRunLookup{}, tightWebhookRateLimit())
+	handler := httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: newFakeEnqueuer(), Runs: fakeRunLookup{}, WebhookRateLimit: tightWebhookRateLimit()})
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader([]byte(`{"zen":"x"}`)))
 	req.Header.Set("X-GitHub-Event", "ping")
@@ -55,7 +55,7 @@ func TestWebhookRateLimitPerIPIndependent(t *testing.T) {
 
 	logger := slog.New(slog.DiscardHandler)
 	secret := []byte("test-secret")
-	handler := httpapi.NewHandlerWithWebhookRateLimit(logger, secret, newFakeEnqueuer(), fakeRunLookup{}, tightWebhookRateLimit())
+	handler := httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: newFakeEnqueuer(), Runs: fakeRunLookup{}, WebhookRateLimit: tightWebhookRateLimit()})
 
 	payload := []byte(`{"zen":"x"}`)
 	sig := sign(secret, payload)
@@ -101,7 +101,7 @@ func TestWebhookRateLimitIgnoresForwardedForFromNonLoopbackPeer(t *testing.T) {
 
 	logger := slog.New(slog.DiscardHandler)
 	secret := []byte("test-secret")
-	handler := httpapi.NewHandlerWithWebhookRateLimit(logger, secret, newFakeEnqueuer(), fakeRunLookup{}, tightWebhookRateLimit())
+	handler := httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: newFakeEnqueuer(), Runs: fakeRunLookup{}, WebhookRateLimit: tightWebhookRateLimit()})
 
 	payload := []byte(`{"zen":"x"}`)
 	sig := sign(secret, payload)
@@ -137,7 +137,7 @@ func TestWebhookRateLimitEvictsIdlePerIPBucket(t *testing.T) {
 	cfg := tightWebhookRateLimit()
 	cfg.PerIPMaxEntries = 1
 	cfg.PerIPIdle = 20 * time.Millisecond
-	handler := httpapi.NewHandlerWithWebhookRateLimit(logger, secret, newFakeEnqueuer(), fakeRunLookup{}, cfg)
+	handler := httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: newFakeEnqueuer(), Runs: fakeRunLookup{}, WebhookRateLimit: cfg})
 
 	payload := []byte(`{"zen":"x"}`)
 	sig := sign(secret, payload)
@@ -172,13 +172,13 @@ func TestWebhookRateLimitGlobalBucket(t *testing.T) {
 
 	logger := slog.New(slog.DiscardHandler)
 	secret := []byte("test-secret")
-	cfg := httpapi.WebhookRateLimitConfig{
+	cfg := httpapi.RateLimitConfig{
 		GlobalPerSecond: 1,
 		GlobalBurst:     1,
 		PerIPPerSecond:  100,
 		PerIPBurst:      100,
 	}
-	handler := httpapi.NewHandlerWithWebhookRateLimit(logger, secret, newFakeEnqueuer(), fakeRunLookup{}, cfg)
+	handler := httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: newFakeEnqueuer(), Runs: fakeRunLookup{}, WebhookRateLimit: cfg})
 
 	payload := []byte(`{"zen":"x"}`)
 	sig := sign(secret, payload)
@@ -203,5 +203,38 @@ func TestWebhookRateLimitGlobalBucket(t *testing.T) {
 	handler.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusTooManyRequests {
 		t.Fatalf("second IP under global cap = %d, want 429", rec2.Code)
+	}
+}
+
+func TestAuthRateLimitIsSeparateFromWebhook(t *testing.T) {
+	t.Parallel()
+
+	env := newAuthEnvWithLimit(t, httpapi.RateLimitConfig{PerIPPerSecond: 0.001, PerIPBurst: 2})
+	const peer = "203.0.113.10:1234"
+	login := func() int {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/auth/login", nil)
+		req.RemoteAddr = peer
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	for i := range 2 {
+		if got := login(); got != http.StatusFound {
+			t.Fatalf("GET /auth/login #%d = %d, want 302", i+1, got)
+		}
+	}
+	if got := login(); got != http.StatusTooManyRequests {
+		t.Fatalf("GET /auth/login past burst = %d, want 429", got)
+	}
+
+	payload := []byte(`{"zen":"x"}`)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(payload))
+	req.Header.Set("X-GitHub-Event", "ping")
+	req.Header.Set("X-Hub-Signature-256", sign([]byte("secret"), payload))
+	req.RemoteAddr = peer
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST /webhook from the same IP after /auth/login was limited = %d, want 202", rec.Code)
 	}
 }

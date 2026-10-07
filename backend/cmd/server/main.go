@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mrkizildag/pollux-agent/backend/internal/auth"
 	"github.com/mrkizildag/pollux-agent/backend/internal/config"
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate/sqlite"
@@ -86,8 +87,14 @@ func run(ctx context.Context) error {
 	}()
 
 	srv := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           httpapi.NewHandler(logger, []byte(cfg.WebhookSecret.Reveal()), worker, store),
+		Addr: cfg.Addr,
+		Handler: httpapi.NewHandler(httpapi.Deps{
+			Logger:        logger,
+			WebhookSecret: []byte(cfg.WebhookSecret.Reveal()),
+			Jobs:          worker,
+			Runs:          store,
+			Auth:          buildAuth(cfg.Dashboard, store, ghHTTPClient),
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -143,6 +150,22 @@ func sweepDeadlines(ctx context.Context, src httpapi.OverdueSource, jobs httpapi
 			}
 		}
 	}
+}
+
+// buildAuth wires Sign in with GitHub from the dashboard config. A nil dashboard
+// returns nil, which leaves the dashboard routes unregistered.
+func buildAuth(dashboard *config.Dashboard, store auth.Store, httpClient *http.Client) *auth.Service {
+	if dashboard == nil {
+		return nil
+	}
+	opts := auth.Options{
+		ClientID:     dashboard.ClientID,
+		AuthorizeURL: "https://github.com/login/oauth/authorize",
+		RedirectURL:  dashboard.PublicURL.JoinPath("auth", "callback").String(),
+	}
+	copy(opts.Key[:], dashboard.SessionKey.Reveal())
+	user := github.NewUserClient(httpClient, dashboard.ClientID, dashboard.ClientSecret.Reveal(), "", "")
+	return auth.NewService(store, user, opts)
 }
 
 // llmHTTPTimeout is longer than the GitHub client's 20s: chat completions

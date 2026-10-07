@@ -3,6 +3,7 @@ package config
 
 import (
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -39,6 +40,21 @@ type Config struct {
 	GitHubPrivateKey Secret
 	WebhookSecret    Secret
 	LLM              *LLM
+	Dashboard        *Dashboard
+}
+
+// sessionKeyBytes is the AES-256 key length the dashboard seals tokens with.
+const sessionKeyBytes = 32
+
+// Dashboard configures Sign in with GitHub. A nil *Dashboard on Config means
+// the dashboard routes are off: none of its variables were set.
+type Dashboard struct {
+	ClientID     string
+	ClientSecret Secret
+	// PublicURL is the https URL the browser reaches pollux at.
+	PublicURL *url.URL
+	// SessionKey holds the 32 raw key bytes, not their base64 text.
+	SessionKey Secret
 }
 
 // LLMProvider selects which wire format to speak to the LLM. OpenAI covers any
@@ -116,7 +132,54 @@ func Load() (Config, error) {
 		cfg.LLM = llm
 	}
 
+	dashboard, dashErrs := loadDashboard()
+	errs = append(errs, dashErrs...)
+	cfg.Dashboard = dashboard
+
 	return cfg, errors.Join(errs...)
+}
+
+// loadDashboard reads the dashboard variables: all or none.
+func loadDashboard() (*Dashboard, []error) {
+	vars := []struct{ key, value string }{
+		{"GITHUB_CLIENT_ID", os.Getenv("GITHUB_CLIENT_ID")},
+		{"GITHUB_CLIENT_SECRET", os.Getenv("GITHUB_CLIENT_SECRET")},
+		{"PUBLIC_URL", os.Getenv("PUBLIC_URL")},
+		{"SESSION_KEY", os.Getenv("SESSION_KEY")},
+	}
+	var set, unset []string
+	for _, v := range vars {
+		if v.value == "" {
+			unset = append(unset, v.key)
+		} else {
+			set = append(set, v.key)
+		}
+	}
+	if len(set) == 0 {
+		return nil, nil
+	}
+	if len(unset) > 0 {
+		return nil, []error{fmt.Errorf("%s: required when %s is set", strings.Join(unset, ", "), strings.Join(set, ", "))}
+	}
+
+	var errs []error
+	publicURL, err := url.Parse(vars[2].value)
+	if err != nil || publicURL.Scheme != "https" || publicURL.Host == "" || publicURL.RawQuery != "" || publicURL.Fragment != "" {
+		errs = append(errs, errors.New("PUBLIC_URL: must be an absolute https URL without query or fragment"))
+	}
+	key, err := base64.StdEncoding.DecodeString(vars[3].value)
+	if err != nil || len(key) != sessionKeyBytes {
+		errs = append(errs, fmt.Errorf("SESSION_KEY: must be %d bytes, base64-encoded", sessionKeyBytes))
+	}
+	if len(errs) > 0 {
+		return nil, errs
+	}
+	return &Dashboard{
+		ClientID:     vars[0].value,
+		ClientSecret: Secret{value: vars[1].value},
+		PublicURL:    publicURL,
+		SessionKey:   Secret{value: string(key)},
+	}, nil
 }
 
 // llmEnv holds the raw LLM_* variables before validation.

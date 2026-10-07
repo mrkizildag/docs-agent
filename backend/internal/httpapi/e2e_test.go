@@ -229,7 +229,7 @@ func TestWebhookToCheckRunEndToEnd(t *testing.T) {
 		}
 	})
 
-	handler := httpapi.NewHandler(logger, secret, worker, store)
+	handler := httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: worker, Runs: store})
 
 	post := func(deliveryID string, body []byte) *httptest.ResponseRecorder {
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
@@ -486,7 +486,7 @@ func TestActionsRunnerEndToEnd(t *testing.T) {
 		}
 	})
 
-	handler := httpapi.NewHandler(logger, secret, worker, baseStore)
+	handler := httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: worker, Runs: baseStore})
 	post := func(event, deliveryID string, body []byte) {
 		t.Helper()
 
@@ -655,7 +655,7 @@ func TestWebhookToProposalCommentsEndToEnd(t *testing.T) {
 	req.Header.Set("X-GitHub-Delivery", "d1")
 	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
 	rec := httptest.NewRecorder()
-	httpapi.NewHandler(logger, secret, worker, store).ServeHTTP(rec, req)
+	httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: worker, Runs: store}).ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("POST /webhook = %d, want %d", rec.Code, http.StatusAccepted)
 	}
@@ -1015,7 +1015,7 @@ func newPushHarness(t *testing.T, outcomes ...any) *pushHarness {
 	})
 
 	secret := []byte("test-secret")
-	return &pushHarness{t: t, gh: gh, store: store, handler: httpapi.NewHandler(logger, secret, worker, store), secret: secret, queued: queued, dbPath: dbPath}
+	return &pushHarness{t: t, gh: gh, store: store, handler: httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: worker, Runs: store}), secret: secret, queued: queued, dbPath: dbPath}
 }
 
 // push delivers a synchronize webhook for sha and returns the check run and the

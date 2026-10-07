@@ -75,7 +75,7 @@ func TestHealthz(t *testing.T) {
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, []byte("secret"), newFakeEnqueuer(), fakeRunLookup{}).ServeHTTP(rec, req)
+	httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: []byte("secret"), Jobs: newFakeEnqueuer(), Runs: fakeRunLookup{}}).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
 		t.Errorf("GET /healthz = %d %q, want 200 \"ok\"", rec.Code, rec.Body.String())
@@ -152,7 +152,7 @@ func TestWebhook(t *testing.T) {
 			}
 			rec := httptest.NewRecorder()
 
-			httpapi.NewHandler(logger, secret, enqueuer, fakeRunLookup{}).ServeHTTP(rec, req)
+			httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: enqueuer, Runs: fakeRunLookup{}}).ServeHTTP(rec, req)
 
 			if rec.Code != tc.wantStatus {
 				t.Errorf("POST /webhook = %d, want %d", rec.Code, tc.wantStatus)
@@ -175,7 +175,7 @@ func TestWebhookBodyTooLarge(t *testing.T) {
 	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, secret, newFakeEnqueuer(), fakeRunLookup{}).ServeHTTP(rec, req)
+	httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: newFakeEnqueuer(), Runs: fakeRunLookup{}}).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("POST /webhook with oversized body = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
@@ -225,7 +225,7 @@ func postWebhookWithLookup(t *testing.T, secret []byte, jobs httpapi.Enqueuer, r
 	}
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(logger, secret, jobs, runs).ServeHTTP(rec, req)
+	httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: jobs, Runs: runs}).ServeHTTP(rec, req)
 	return rec
 }
 
@@ -572,7 +572,7 @@ func postWorkflowRun(t *testing.T, runs httpapi.RunLookup, jobs httpapi.Enqueuer
 	req.Header.Set("X-Hub-Signature-256", sign(secret, body))
 	rec := httptest.NewRecorder()
 
-	httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, jobs, runs).ServeHTTP(rec, req)
+	httpapi.NewHandler(httpapi.Deps{Logger: slog.New(slog.DiscardHandler), WebhookSecret: secret, Jobs: jobs, Runs: runs}).ServeHTTP(rec, req)
 	return rec
 }
 

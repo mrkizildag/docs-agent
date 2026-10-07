@@ -19,6 +19,16 @@ GitHub needs a reachable HTTPS URL to deliver events to `POST /webhook`. For loc
 
 Generate the webhook secret with `openssl rand -hex 32`. Set the same value in the App's webhook secret field and in `GITHUB_WEBHOOK_SECRET` (see [Setup](setup.md)). `POST /webhook` applies a global and per-client-IP rate limit before reading the body; over-limit requests get `429` and the body is not read. After that, the backend rejects any delivery whose `X-Hub-Signature-256` doesn't match this secret with `401`. GitHub does not automatically retry failed webhook deliveries.
 
+## Sign in with GitHub
+
+The dashboard signs users in through this same App (see [Sign in](../features/sign-in.md)):
+
+1. Under "Callback URL", register `${PUBLIC_URL}/auth/callback` (the Funnel https URL from [Deploy](deploy.md)). One App can hold up to 10 callbacks, so a dev Funnel URL can sit beside the production one.
+2. Keep "Expire user authorization tokens" on. Sessions rely on refresh tokens, and the code assumes GitHub rotates them.
+3. Copy the Client ID from the App's settings page into `GITHUB_CLIENT_ID`. Under "Client secrets", generate one and copy it into `GITHUB_CLIENT_SECRET` (it is shown once). Set `PUBLIC_URL` and `SESSION_KEY` too; all four or none (see [Setup](setup.md)).
+
+No extra permission is needed: GitHub limits a user's token to what both the App and the user can access.
+
 ## Permissions
 
 Grant only what the bot uses:

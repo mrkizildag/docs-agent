@@ -9,9 +9,9 @@ import (
 	"time"
 )
 
-// WebhookRateLimitConfig tunes token buckets for POST /webhook. Zero values select
-// defaults sized for GitHub delivery bursts at a single installation.
-type WebhookRateLimitConfig struct {
+// RateLimitConfig tunes the token buckets guarding one route group: one global
+// bucket plus one bucket per client IP. Zero fields select that group's defaults.
+type RateLimitConfig struct {
 	GlobalPerSecond float64
 	GlobalBurst     int
 	PerIPPerSecond  float64
@@ -24,8 +24,8 @@ type WebhookRateLimitConfig struct {
 
 // DefaultWebhookRateLimitConfig returns limits that should not throttle normal
 // GitHub webhook volume for one App installation.
-func DefaultWebhookRateLimitConfig() WebhookRateLimitConfig {
-	return WebhookRateLimitConfig{
+func DefaultWebhookRateLimitConfig() RateLimitConfig {
+	return RateLimitConfig{
 		GlobalPerSecond: 80,
 		GlobalBurst:     160,
 		PerIPPerSecond:  30,
@@ -33,8 +33,21 @@ func DefaultWebhookRateLimitConfig() WebhookRateLimitConfig {
 	}
 }
 
-func (c WebhookRateLimitConfig) withDefaults() WebhookRateLimitConfig {
-	d := DefaultWebhookRateLimitConfig()
+// DefaultAuthRateLimitConfig returns limits for the public /auth/* routes. A
+// person signs in a few times a day, so one IP gets 10 requests a minute after
+// a burst of 5 (a login plus its callback and a retry or two). The global
+// bucket bounds total work, each callback costing a GitHub round trip and a
+// database write, however many IPs the traffic claims to come from.
+func DefaultAuthRateLimitConfig() RateLimitConfig {
+	return RateLimitConfig{
+		GlobalPerSecond: 5,
+		GlobalBurst:     20,
+		PerIPPerSecond:  10.0 / 60,
+		PerIPBurst:      5,
+	}
+}
+
+func (c RateLimitConfig) withDefaults(d RateLimitConfig) RateLimitConfig {
 	if c.GlobalPerSecond <= 0 {
 		c.GlobalPerSecond = d.GlobalPerSecond
 	}
@@ -94,7 +107,7 @@ type perIPLimiterEntry struct {
 	lastSeen time.Time
 }
 
-type webhookRateLimiter struct {
+type ipRateLimiter struct {
 	global     *tokenBucket
 	perIPRate  float64
 	perIPBurst int
@@ -104,9 +117,9 @@ type webhookRateLimiter struct {
 	perIP      map[string]*perIPLimiterEntry
 }
 
-func newWebhookRateLimiter(cfg WebhookRateLimitConfig) *webhookRateLimiter {
-	cfg = cfg.withDefaults()
-	return &webhookRateLimiter{
+func newIPRateLimiter(cfg, defaults RateLimitConfig) *ipRateLimiter {
+	cfg = cfg.withDefaults(defaults)
+	return &ipRateLimiter{
 		global:     newTokenBucket(cfg.GlobalPerSecond, cfg.GlobalBurst),
 		perIPRate:  cfg.PerIPPerSecond,
 		perIPBurst: cfg.PerIPBurst,
@@ -116,14 +129,14 @@ func newWebhookRateLimiter(cfg WebhookRateLimitConfig) *webhookRateLimiter {
 	}
 }
 
-func (l *webhookRateLimiter) allow(ip string, now time.Time) bool {
+func (l *ipRateLimiter) allow(ip string, now time.Time) bool {
 	if !l.perIPBucket(ip, now).allow(now) {
 		return false
 	}
 	return l.global.allow(now)
 }
 
-func (l *webhookRateLimiter) perIPBucket(ip string, now time.Time) *tokenBucket {
+func (l *ipRateLimiter) perIPBucket(ip string, now time.Time) *tokenBucket {
 	l.perIPMu.Lock()
 	defer l.perIPMu.Unlock()
 	if e, ok := l.perIP[ip]; ok {
@@ -136,7 +149,7 @@ func (l *webhookRateLimiter) perIPBucket(ip string, now time.Time) *tokenBucket 
 	return lim
 }
 
-func (l *webhookRateLimiter) evictPerIP(now time.Time) {
+func (l *ipRateLimiter) evictPerIP(now time.Time) {
 	cutoff := now.Add(-l.perIPIdle)
 	for ip, e := range l.perIP {
 		if e.lastSeen.Before(cutoff) {
@@ -170,10 +183,10 @@ func peerIsLoopback(r *http.Request) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// webhookClientIP is the rate-limit key. Behind Tailscale Funnel the TCP peer is
+// clientIP is the rate-limit key. Behind Tailscale Funnel the TCP peer is
 // localhost; Funnel sets X-Forwarded-For to the real client. The header is used
 // only when the peer is loopback so direct clients cannot forge it.
-func webhookClientIP(r *http.Request) string {
+func clientIP(r *http.Request) string {
 	if peerIsLoopback(r) {
 		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
 			part, _, _ := strings.Cut(fwd, ",")
@@ -189,11 +202,11 @@ func webhookClientIP(r *http.Request) string {
 	return host
 }
 
-func withWebhookRateLimit(logger *slog.Logger, limiter *webhookRateLimiter, next http.HandlerFunc) http.HandlerFunc {
+func withRateLimit(logger *slog.Logger, name string, limiter *ipRateLimiter, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ip := webhookClientIP(r)
+		ip := clientIP(r)
 		if !limiter.allow(ip, time.Now()) {
-			logger.Warn("webhook rate limited", "client_ip", ip, "delivery_id", r.Header.Get("X-GitHub-Delivery"))
+			logger.Warn("rate limited", "route_group", name, "client_ip", ip, "delivery_id", r.Header.Get("X-GitHub-Delivery"))
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusTooManyRequests)
 			_ = r.Body.Close()

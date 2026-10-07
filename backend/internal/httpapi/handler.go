@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/mrkizildag/pollux-agent/backend/internal/auth"
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 )
@@ -34,22 +35,33 @@ type RunLookup interface {
 	ScaffoldForRun(ctx context.Context, owner, repo string, runID int64) (bool, error)
 }
 
-func NewHandler(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer, runs RunLookup) *http.ServeMux {
-	return NewHandlerWithWebhookRateLimit(logger, webhookSecret, jobs, runs, DefaultWebhookRateLimitConfig())
+// Deps are the collaborators NewHandler wires into routes.
+type Deps struct {
+	Logger        *slog.Logger
+	WebhookSecret []byte
+	Jobs          Enqueuer
+	Runs          RunLookup
+	// WebhookRateLimit's zero fields select DefaultWebhookRateLimitConfig.
+	WebhookRateLimit RateLimitConfig
+	// AuthRateLimit's zero fields select DefaultAuthRateLimitConfig.
+	AuthRateLimit RateLimitConfig
+	// Auth turns the dashboard's sign-in routes on; nil leaves them unregistered.
+	Auth *auth.Service
 }
 
-// NewHandlerWithWebhookRateLimit is like NewHandler but accepts custom webhook rate
-// limits (used in tests).
-func NewHandlerWithWebhookRateLimit(logger *slog.Logger, webhookSecret []byte, jobs Enqueuer, runs RunLookup, rateLimit WebhookRateLimitConfig) *http.ServeMux {
+func NewHandler(deps Deps) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		if _, err := w.Write([]byte("ok")); err != nil {
-			logger.Warn("write healthz response", "err", err)
+			deps.Logger.Warn("write healthz response", "err", err)
 		}
 	})
-	lim := newWebhookRateLimiter(rateLimit)
-	mux.HandleFunc("POST /webhook", withWebhookRateLimit(logger, lim, webhookHandler(logger, webhookSecret, jobs, runs)))
+	webhookLimit := newIPRateLimiter(deps.WebhookRateLimit, DefaultWebhookRateLimitConfig())
+	mux.HandleFunc("POST /webhook", withRateLimit(deps.Logger, "webhook", webhookLimit, webhookHandler(deps.Logger, deps.WebhookSecret, deps.Jobs, deps.Runs)))
+	if deps.Auth != nil {
+		mountAuth(mux, deps.Logger, deps.Auth, newIPRateLimiter(deps.AuthRateLimit, DefaultAuthRateLimitConfig()))
+	}
 	return mux
 }
 

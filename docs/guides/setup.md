@@ -40,6 +40,10 @@ Only `backend/internal/config` reads the environment (forbidigo enforces it). Th
 | `LLM_API_KEY`                  | optional | Key for the LLM provider. Required for `anthropic`; optional for `openai` (e.g. Ollama has none). |
 | `LLM_MODEL`                    | required when `LLM_PROVIDER` is set | Model used to review docs impact. |
 | `LLM_TRIAGE_MODEL`             | defaults to `LLM_MODEL` | Cheaper model used for triage, if different. |
+| `GITHUB_CLIENT_ID`             | optional | The GitHub App's client ID, for Sign in with GitHub. Set this and the next three, or none; see [Sign in](../features/sign-in.md). |
+| `GITHUB_CLIENT_SECRET`         | with `GITHUB_CLIENT_ID` | A client secret generated on the App's settings page. |
+| `PUBLIC_URL`                   | with `GITHUB_CLIENT_ID` | The public https URL (the Funnel URL); `PUBLIC_URL/auth/callback` must be registered on the App. |
+| `SESSION_KEY`                  | with `GITHUB_CLIENT_ID` | 32 random bytes, base64-encoded (`openssl rand -base64 32`); seals the stored GitHub tokens. Changing it signs everyone out. |
 
 Without `LLM_PROVIDER` set, the analysis runner is off, and repos without the pollux-agent workflow get a neutral "No analysis runner configured" check. With it set, `git` must be on the PATH: the server runner clones the PR head. See [Server runner](../features/server-runner.md).
 

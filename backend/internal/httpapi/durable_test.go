@@ -182,7 +182,7 @@ func TestWebhookRedeliveryAfterFailedJobEnqueuesNewJob(t *testing.T) {
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)), slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	t.Cleanup(func() { _ = stop() })
-	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store)
+	h := httpapi.NewHandler(httpapi.Deps{Logger: slog.New(slog.DiscardHandler), WebhookSecret: secret, Jobs: worker, Runs: store})
 
 	body := prBody(t, "opened", 1, "sha1")
 	if code := postSigned(t, h, secret, "d1", body); code != http.StatusAccepted {
@@ -228,7 +228,7 @@ func TestWebhookSecondSynchronizeCancelsFirst(t *testing.T) {
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gate.NewService(gh, unusedCommentGitHub{}, store, gate.Runners{}, nil, nil)), slog.New(slog.DiscardHandler), 8)
 	stop := runWorker(worker)
 	t.Cleanup(func() { _ = stop() })
-	h := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store)
+	h := httpapi.NewHandler(httpapi.Deps{Logger: slog.New(slog.DiscardHandler), WebhookSecret: secret, Jobs: worker, Runs: store})
 
 	if code := postSigned(t, h, secret, "d1", prBody(t, "synchronize", 1, "sha1")); code != http.StatusAccepted {
 		t.Fatalf("first synchronize = %d, want 202", code)
@@ -259,7 +259,7 @@ func TestWebhookPendingJobRunsAfterRestartAndDuplicateStaysNoOp(t *testing.T) {
 	store1 := openStore(t, path)
 	gh1 := newBlockingGitHub("")
 	worker1 := jobqueue.NewWorker(store1, httpapi.HandleJob(gate.NewService(gh1, unusedCommentGitHub{}, store1, gate.Runners{}, nil, nil)), logger, 8)
-	h1 := httpapi.NewHandler(logger, secret, worker1, store1)
+	h1 := httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: worker1, Runs: store1})
 	if code := postSigned(t, h1, secret, "d1", prBody(t, "opened", 1, "sha1")); code != http.StatusAccepted {
 		t.Fatalf("POST = %d, want 202", code)
 	}
@@ -279,7 +279,7 @@ func TestWebhookPendingJobRunsAfterRestartAndDuplicateStaysNoOp(t *testing.T) {
 	}
 
 	// The same delivery redelivered after restart is still a no-op.
-	h2 := httpapi.NewHandler(logger, secret, worker2, store2)
+	h2 := httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: worker2, Runs: store2})
 	if code := postSigned(t, h2, secret, "d1", prBody(t, "opened", 1, "sha1")); code != http.StatusAccepted {
 		t.Fatalf("duplicate POST = %d, want 202", code)
 	}

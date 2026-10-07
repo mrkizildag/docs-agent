@@ -233,7 +233,7 @@ func TestWebhookToScaffoldPullRequest(t *testing.T) {
 		return stopErr
 	}
 	t.Cleanup(func() { _ = stop() })
-	handler := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store)
+	handler := httpapi.NewHandler(httpapi.Deps{Logger: slog.New(slog.DiscardHandler), WebhookSecret: secret, Jobs: worker, Runs: store})
 
 	if code := postSigned(t, handler, secret, "d1", e2ePullRequestBody(t, 1, tip)); code != http.StatusAccepted {
 		t.Fatalf("first POST /webhook = %d, want %d", code, http.StatusAccepted)
@@ -345,7 +345,7 @@ func adoptBotScaffoldPullRequest(t *testing.T, branchTip string) {
 		return stopErr
 	}
 	t.Cleanup(func() { _ = stop() })
-	handler := httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store)
+	handler := httpapi.NewHandler(httpapi.Deps{Logger: slog.New(slog.DiscardHandler), WebhookSecret: secret, Jobs: worker, Runs: store})
 
 	if code := postSigned(t, handler, secret, "d1", e2ePullRequestBody(t, 1, tip)); code != http.StatusAccepted {
 		t.Fatalf("POST /webhook = %d, want %d", code, http.StatusAccepted)

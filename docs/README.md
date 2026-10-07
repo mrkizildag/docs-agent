@@ -18,6 +18,7 @@ Start here. Each entry is one file with a one-line summary; open only what the t
 - [Apply and Skip](features/apply-skip.md): how proposals are applied or the gate waived, who may, what is refused, and why a repeated delivery commits at most once.
 - [Analysis history](features/analysis-history.md): what is recorded for every analysis and Apply or Skip, why it is written with the state, and how replays stay idempotent.
 - [Docs scaffold](features/scaffold.md): how a repo with no `docs/` gets one starting docs PR, exactly once, and what waiting checks say.
+- [Sign in with GitHub](features/sign-in.md): how the dashboard knows who is asking and which repos they may see, and the session and access invariants.
 - [Setup](guides/setup.md): run, test, and lint the backend locally.
 - [Eval](guides/eval.md): measure either runner's docs-impact quality against labeled cases from this repo's history.
 - [Sandbox repo](guides/sandbox.md): the private repo pollux is tested on end to end, what is set up there, and how to run a test PR.

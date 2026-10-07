@@ -303,7 +303,7 @@ func newActionsScaffoldHarness(t *testing.T, server gate.ServerRunner) *actionsS
 		}
 	})
 
-	handler := httpapi.NewHandler(logger, secret, worker, baseStore)
+	handler := httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: worker, Runs: baseStore})
 	return &actionsScaffoldHarness{api: api, saved: store.saved, post: func(event, deliveryID string, body []byte) {
 		t.Helper()
 

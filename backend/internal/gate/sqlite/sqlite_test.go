@@ -863,7 +863,7 @@ func TestOpen_BackfillsArmedRunsWhenMigratingToAnalysisHistory(t *testing.T) {
 		t.Fatalf("Close() = %v, want nil error", err)
 	}
 	db := rawDB(t, path)
-	if _, err := db.ExecContext(t.Context(), `DROP TABLE analyses; DROP TABLE pr_events;
+	if _, err := db.ExecContext(t.Context(), `DROP TABLE analyses; DROP TABLE pr_events; DROP TABLE login_attempts; DROP TABLE sessions;
 		ALTER TABLE pull_requests DROP COLUMN run_started_at;
 		ALTER TABLE pull_requests DROP COLUMN run_runner;
 		INSERT INTO pull_requests (owner, repo, number, installation_id, head_sha) VALUES ('acme', 'widgets', 7, 1, 'sha0');
