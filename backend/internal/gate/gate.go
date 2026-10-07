@@ -8,9 +8,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
@@ -81,6 +83,9 @@ type GitHub interface {
 	ListComments(ctx context.Context, installationID int64, owner, repo string, number int) ([]Comment, error)
 	CreateReviewComment(ctx context.Context, installationID int64, owner, repo string, number int, c ReviewComment) (Comment, error)
 	EditReviewComment(ctx context.Context, installationID int64, owner, repo string, id int64, body string) error
+	// ResolveReviewThread resolves the review thread that starts with comment
+	// commentID. A thread that is already resolved or gone is not an error.
+	ResolveReviewThread(ctx context.Context, installationID int64, owner, repo string, number int, commentID int64) error
 	CreateIssueComment(ctx context.Context, installationID int64, owner, repo string, number int, body string) (Comment, error)
 	EditIssueComment(ctx context.Context, installationID int64, owner, repo string, id int64, body string) error
 }
@@ -352,9 +357,14 @@ type ProposalState struct {
 // ProposalID is the stable identity of a proposal across re-runs: a short hash
 // of its doc path and normalized section heading (path alone for a new doc).
 func ProposalID(docPath, section string) string {
-	section = strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(section), "#"))
-	sum := sha256.Sum256([]byte(docPath + "\x00" + section))
+	sum := sha256.Sum256([]byte(docPath + "\x00" + headingText(section)))
 	return hex.EncodeToString(sum[:6])
+}
+
+// headingText is a heading line without its leading '#' marks and surrounding
+// whitespace, so differently marked spellings of one heading compare equal.
+func headingText(s string) string {
+	return strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(s), "#"))
 }
 
 // Store persists PRState.
@@ -647,7 +657,20 @@ func unapplied(state PRState, v review.Proposals) review.Proposals {
 }
 
 func appliedAs(ps ProposalState, p review.Proposal) bool {
-	return ps.State == ProposalApplied && ps.Content == withHeading(p).Content
+	return ps.State == ProposalApplied && sameContent(p.Section, ps.Content, withHeading(p).Content)
+}
+
+// sameContent reports whether two contents of a proposal differ at most in
+// insignificant whitespace at the end and, for a section, in how its heading
+// line is spelled.
+func sameContent(section, a, b string) bool {
+	a, b = strings.TrimRightFunc(a, unicode.IsSpace), strings.TrimRightFunc(b, unicode.IsSpace)
+	if section == "" {
+		return a == b
+	}
+	headA, restA, _ := strings.Cut(a, "\n")
+	headB, restB, _ := strings.Cut(b, "\n")
+	return restA == restB && headingText(headA) == headingText(headB)
 }
 
 func neutral(run CheckRun, title, summary string) CheckRun {
@@ -659,22 +682,23 @@ func neutral(run CheckRun, title, summary string) CheckRun {
 // Summary writes target the summary comment; the Service renders its body from
 // the final state because it links comments created by earlier writes.
 // Otherwise Index is the proposal in State.Proposals. ID 0 means create (Review
-// holds the new review comment); else edit comment ID to Body.
+// holds the new review comment); else edit comment ID to Body, and when Resolve
+// is set also resolve its review thread.
 type CommentWrite struct {
 	Summary bool
 	Index   int
 	ID      int64
 	Review  ReviewComment
 	Body    string
+	Resolve bool
 }
 
 // Reconcile is the state transition for a finished run: pure, no I/O. It
 // returns prev with only Proposals, ProposalsSHA, SummaryCommentID and the
-// outdated events in History changed, and the comment writes that realize it. existing is the PR's current comments: our
-// own comments carrying our markers are reused when state lacks their IDs, and
-// an outdated proposal keeps its current body. Created comments' IDs and URLs
-// belong in the returned state at the writes' Index. An applied proposal
-// stays applied, and gets no write, while the verdict repeats its Content.
+// outdated events in History changed, and the comment writes that realize it,
+// ordered retire, then edits and creates, then the summary. Created comments' IDs and URLs belong in the
+// returned state at the writes' Index. The rules are in
+// docs/features/proposal-output.md.
 func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []review.ChangedFile, existing []Comment) (PRState, []CommentWrite) {
 	next := prev
 	next.Proposals = slices.Clone(prev.Proposals)
@@ -687,7 +711,7 @@ func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []r
 		index[ps.ID] = i
 	}
 	current := make(map[string]bool, len(proposals))
-	var writes []CommentWrite
+	var retires, writes []CommentWrite
 
 	for _, p := range proposals {
 		id := ProposalID(p.DocPath, p.Section)
@@ -706,21 +730,32 @@ func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []r
 			continue
 		}
 		p = withHeading(p)
+		prior := ps.State
+		contentChanged := !sameContent(p.Section, ps.Content, p.Content)
 		ps.DocPath, ps.Section, ps.State = p.DocPath, p.Section, ProposalOpen
 		ps.Content, ps.Original, ps.IndexEntry = p.Content, p.Original, p.IndexEntry
 		ps.AppliedSHA, ps.ReplyID = "", 0
-		adoptMarked(ps, existing)
-
-		rc := proposalComment(pr.HeadSHA, id, p, changed, pr.Fork)
-		if c, ok := findComment(existing, CommentKindReview, ps.CommentID); ok {
-			if !sameAnchor(c, rc) {
-				rc.Body = renderCheckbox(id, p, pr.Fork)
-			}
-			writes = append(writes, CommentWrite{Index: i, ID: ps.CommentID, Body: rc.Body})
-		} else {
-			ps.CommentID, ps.CommentURL = 0, ""
-			writes = append(writes, CommentWrite{Index: i, Review: rc})
+		if prior == "" || prior == ProposalOpen {
+			adoptMarked(ps, existing)
 		}
+		rc := proposalComment(pr.HeadSHA, id, p, changed, pr.Fork)
+		retire := prior == ProposalApplied || prior == ProposalOutdated || (prior == ProposalOpen && contentChanged)
+		old, found := findComment(existing, CommentKindReview, ps.CommentID)
+		switch {
+		case retire:
+			if found {
+				retires = append(retires, retireWrite(i, id, old))
+			}
+		case found:
+			body := rc.Body
+			if !sameAnchor(old, rc) {
+				body = renderCheckbox(id, p, pr.Fork)
+			}
+			writes = append(writes, CommentWrite{Index: i, ID: old.ID, Body: body})
+			continue
+		}
+		ps.CommentID, ps.CommentURL = 0, ""
+		writes = append(writes, CommentWrite{Index: i, Review: rc})
 	}
 
 	for i := range next.Proposals {
@@ -732,15 +767,22 @@ func Reconcile(prev PRState, pr PullRequest, verdict review.Verdict, changed []r
 		ps.State = ProposalOutdated
 		next.History.Events = append(next.History.Events, outdatedEvent(ps.ID, pr.HeadSHA))
 		if c, ok := findComment(existing, CommentKindReview, ps.CommentID); ok {
-			writes = append(writes, CommentWrite{Index: i, ID: ps.CommentID, Body: renderOutdated(ps.ID, pr.HeadSHA, c.Body)})
+			retires = append(retires, retireWrite(i, ps.ID, c))
 		}
 	}
+	writes = slices.Concat(retires, writes)
 
 	summaryLost := resolveSummary(&next, existing)
 	if next.SummaryCommentID != 0 || len(proposals) > 0 || summaryLost {
 		writes = append(writes, CommentWrite{Summary: true, ID: next.SummaryCommentID})
 	}
 	return next, writes
+}
+
+// retireWrite swaps comment c's live marker for the superseded one and
+// resolves its thread; repeating it is harmless.
+func retireWrite(i int, id string, c Comment) CommentWrite {
+	return CommentWrite{Index: i, ID: c.ID, Body: renderSuperseded(id, c.Body), Resolve: true}
 }
 
 // ReconcileFailure is the state transition for a failed run: pure, no I/O. It
@@ -870,6 +912,7 @@ type Service struct {
 	comments      CommentGitHub
 	scaffoldGH    ScaffoldGitHub
 	scaffoldQueue ScaffoldQueue
+	log           *slog.Logger
 	// collectBackoff is the wait before the first Collect retry; it doubles.
 	collectBackoff time.Duration
 }
@@ -879,7 +922,14 @@ type Service struct {
 // runners for analysis, and writes scaffolds through scaffoldGH, scheduling
 // their jobs on scaffoldQueue.
 func NewService(gh GitHub, comments CommentGitHub, store Store, runners Runners, scaffoldGH ScaffoldGitHub, scaffoldQueue ScaffoldQueue) *Service {
-	return &Service{gh: gh, comments: comments, store: store, runners: runners, scaffoldGH: scaffoldGH, scaffoldQueue: scaffoldQueue, collectBackoff: time.Second}
+	return &Service{gh: gh, comments: comments, store: store, runners: runners, scaffoldGH: scaffoldGH, scaffoldQueue: scaffoldQueue, log: slog.New(slog.DiscardHandler), collectBackoff: time.Second}
+}
+
+// WithLogger sets where the Service logs failures it continues past, such as
+// a review thread it could not resolve, and returns s.
+func (s *Service) WithLogger(l *slog.Logger) *Service {
+	s.log = l
+	return s
 }
 
 // WithCollectBackoff sets the wait before the first Collect retry (doubling
@@ -919,7 +969,7 @@ func (s *Service) analyzeHead(ctx context.Context, loaded PRState, pr PullReques
 	var commentErr error
 	if adopted {
 		writeCtx, cancel := writeContext(ctx)
-		_, commentErr = s.finishApply(writeCtx, state, loaded.PendingApply.IDs, "", op)
+		_, commentErr = s.finishApply(writeCtx, state, loaded.PendingApply.IDs, loaded.PendingApply.IDs, "", op)
 		cancel()
 	}
 	analyzeErr := errors.Join(commentErr, s.analyze(ctx, state, pr))
@@ -1179,7 +1229,14 @@ func (s *Service) concludeResult(ctx context.Context, state PRState, pr PullRequ
 		case <-time.After(backoff):
 		}
 		backoff *= 2
-		posted, err = s.postComments(ctx, next, pr, res.Verdict, changed)
+		// A failed attempt may have retired comments and saved state before
+		// creating; reconciling from the pre-post state again would orphan them.
+		latest, lerr := s.store.LoadPR(ctx, pr.Owner, pr.Repo, pr.Number)
+		if lerr != nil {
+			err = errors.Join(err, fmt.Errorf("load state to retry posting comments: %w", lerr))
+			break
+		}
+		posted, err = s.postComments(ctx, latest, pr, res.Verdict, changed)
 	}
 	if err != nil {
 		// A check claiming proposals that were never posted is worse than a neutral
@@ -1388,33 +1445,36 @@ func (s *Service) postComments(ctx context.Context, prev PRState, pr PullRequest
 	}
 
 	next, writes := Reconcile(prev, pr, verdict, changed, existing)
-	// Saving before the first create means a run that stops after posting
-	// leaves state behind, so the next run lists comments and adopts them by marker.
-	if slices.ContainsFunc(writes, func(w CommentWrite) bool { return w.ID == 0 }) {
-		if err := s.store.SavePR(ctx, next); err != nil {
-			return PRState{}, fmt.Errorf("save state before creating comments: %w", err)
-		}
-	}
 	// GitHub orders comments by creation time, so a new summary is created
-	// before the review comments to sit above them, then edited with their links.
+	// before the review comments to sit above them, then edited with their
+	// links. The retires stay first: once state is saved without their IDs, a
+	// crash must not leave a live marker a later run could adopt.
 	if i := slices.IndexFunc(writes, func(w CommentWrite) bool { return w.Summary && w.ID == 0 }); i >= 0 && len(writes) > 1 {
 		first := writes[i]
-		writes = append(slices.Delete(slices.Clone(writes), i, i+1), CommentWrite{Summary: true})
-		if err := s.writeSummary(ctx, pr, &next, first); err != nil {
-			return PRState{}, err
+		rest := slices.Delete(slices.Clone(writes), i, i+1)
+		at := slices.IndexFunc(rest, func(w CommentWrite) bool { return !w.Resolve })
+		if at < 0 {
+			at = len(rest)
 		}
-		writes[len(writes)-1].ID = next.SummaryCommentID
+		writes = append(slices.Insert(rest, at, first), CommentWrite{Summary: true})
 	}
+	// Saving before the first create means a run that stops after posting
+	// leaves state behind, so the next run lists comments and adopts them by marker.
+	saved := false
 	for _, w := range writes {
+		if w.ID == 0 && !saved {
+			if err := s.store.SavePR(ctx, next); err != nil {
+				return PRState{}, fmt.Errorf("save state before creating comments: %w", err)
+			}
+			saved = true
+		}
 		switch {
 		case w.Summary:
 			err = s.writeSummary(ctx, pr, &next, w)
 		case w.ID == 0:
 			err = s.createProposalComment(ctx, pr, &next, w)
 		default:
-			if err = s.gh.EditReviewComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, w.ID, w.Body); err != nil {
-				err = fmt.Errorf("edit review comment for %s: %w", next.Proposals[w.Index].DocPath, err)
-			}
+			err = s.editProposalComment(ctx, pr, next.Proposals[w.Index], w)
 		}
 		if err != nil {
 			return PRState{}, err
@@ -1436,6 +1496,18 @@ func (s *Service) postFailureSummary(ctx context.Context, prev PRState, pr PullR
 	return next, nil
 }
 
+func (s *Service) editProposalComment(ctx context.Context, pr PullRequest, ps ProposalState, w CommentWrite) error {
+	if err := s.gh.EditReviewComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, w.ID, w.Body); err != nil {
+		return fmt.Errorf("edit review comment for %s: %w", ps.DocPath, err)
+	}
+	if w.Resolve {
+		if err := s.gh.ResolveReviewThread(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number, w.ID); err != nil {
+			s.log.WarnContext(ctx, "resolve review thread failed", "owner", pr.Owner, "repo", pr.Repo, "number", pr.Number, "comment_id", w.ID, "error", err)
+		}
+	}
+	return nil
+}
+
 func (s *Service) createProposalComment(ctx context.Context, pr PullRequest, next *PRState, w CommentWrite) error {
 	ps := &next.Proposals[w.Index]
 	c, err := s.gh.CreateReviewComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, pr.Number, w.Review)
@@ -1448,8 +1520,8 @@ func (s *Service) createProposalComment(ctx context.Context, pr PullRequest, nex
 
 func (s *Service) writeSummary(ctx context.Context, pr PullRequest, next *PRState, w CommentWrite) error {
 	body := renderSummary(*next)
-	if w.ID != 0 {
-		if err := s.gh.EditIssueComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, w.ID, body); err != nil {
+	if id := cmp.Or(w.ID, next.SummaryCommentID); id != 0 {
+		if err := s.gh.EditIssueComment(ctx, pr.InstallationID, pr.Owner, pr.Repo, id, body); err != nil {
 			return fmt.Errorf("edit summary comment: %w", err)
 		}
 		return nil

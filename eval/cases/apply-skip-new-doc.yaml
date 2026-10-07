@@ -1,0 +1,27 @@
+id: apply-skip-new-doc
+source: "PR #29"
+base: b12f59628cdf8964a86b23476c9497a7f9897f8e
+head: aa187810ddd28813731355689d16ede5a8617e06
+expect:
+  verdict: proposals
+  docs:
+    - path: docs/features/proposal-output.md
+      new: false
+      sections: ["Proposal output", "Failures and Re-run", "Identity and re-runs"]
+      must_say:
+        - "Ticking a proposal's Apply checkbox, or Apply all in the summary, commits the proposed edit to the PR branch; the checkboxes are no longer inert."
+        - "The summary carries PR-wide Apply all, Skip this commit, and Skip this PR checkboxes."
+  allow:
+    - docs/features/apply*.md
+    - docs/architecture.md
+    - docs/features/job-queue.md
+    - docs/features/server-runner.md
+    - docs/guides/github-app.md
+    - docs/guides/setup.md
+notes: >
+  CHANGED: the brief expected the new doc features/apply-skip.md as required, but it is unreachable. At base
+  architecture.md covers backend/** and action/**, so the only uncovered changed files are .gitignore, AGENTS.md,
+  and README.md, and a new doc's covers must match an uncovered file; apply-skip.md's real covers (gate, httpapi,
+  github files) match none. The required doc is instead proposal-output.md, whose intro says "Acting on a proposal
+  is not built yet ... until #14", which this PR makes wrong. Human also edited architecture, job-queue (comment job
+  kind), server-runner, github-app, and setup; those are allowed, as is an apply-skip new doc. 44 non-docs files.

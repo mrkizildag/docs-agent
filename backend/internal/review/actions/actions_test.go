@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -655,23 +657,47 @@ func TestCollectNewDocAlreadyAtHead(t *testing.T) {
 func TestActionKeepsClaudeToolsReadOnly(t *testing.T) {
 	t.Parallel()
 
-	raw, err := os.ReadFile("../../../../action/action.yml")
+	raw, err := os.ReadFile("../../../../action/run-claude.sh")
 	if err != nil {
-		t.Fatalf("read action.yml: %v", err)
+		t.Fatalf("read run-claude.sh: %v", err)
 	}
 	action := string(raw)
 
 	if !strings.Contains(action, "--tools Read,Grep,Glob ") {
-		t.Error("action.yml must allow exactly --tools Read,Grep,Glob")
+		t.Error("run-claude.sh must allow exactly --tools Read,Grep,Glob")
 	}
 	_, after, found := strings.Cut(action, "--disallowedTools ")
 	if !found {
-		t.Fatal("action.yml has no --disallowedTools list")
+		t.Fatal("run-claude.sh has no --disallowedTools list")
 	}
 	list := strings.Fields(after)[0]
 	for _, tool := range []string{"Bash", "Edit", "Write", "WebFetch", "WebSearch"} {
 		if !strings.Contains(","+list+",", ","+tool+",") {
 			t.Errorf("--disallowedTools %s is missing %s", list, tool)
 		}
+	}
+}
+
+func TestActionRejectsNonNumericPRNumber(t *testing.T) {
+	t.Parallel()
+
+	stubDir, runnerTemp := t.TempDir(), t.TempDir()
+	marker := filepath.Join(stubDir, "ran")
+	stub := "#!/bin/sh\ntouch " + marker + "\n"
+	if err := os.WriteFile(filepath.Join(stubDir, "claude"), []byte(stub), 0o700); err != nil { //nolint:gosec // the stub must be executable
+		t.Fatalf("write stub claude: %v", err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), "bash", "../../../../action/run-claude.sh") //nolint:gosec // fixed script path inside this repository
+	cmd.Env = []string{
+		"PATH=" + stubDir + ":/usr/bin:/bin", "RUNNER_TEMP=" + runnerTemp, "PR_NUMBER=1; x",
+		"CLAUDE_CODE_OAUTH_TOKEN=", "ANTHROPIC_API_KEY=", "ACTION_PATH=.", "CHECKOUT=.", "HEAD_SHA=abc",
+		"DEFAULT_BRANCH=main", "NONCE=n", "DOCS=[]",
+	}
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Errorf("run-claude.sh with PR_NUMBER=\"1; x\" succeeded, want a non-zero exit; output: %s", out)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("stub claude ran (stat error = %v), want it never started", err)
 	}
 }

@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test vuln run generate
+.PHONY: check fmt lint test vuln run generate eval eval-check
 
 # golangci-lint's default cache is per user, so worktrees of this repo share it and report each other's files.
 export GOLANGCI_LINT_CACHE ?= $(CURDIR)/.cache/golangci-lint
@@ -22,3 +22,9 @@ vuln:
 
 run:
 	cd backend && go run ./cmd/server
+
+eval:
+	cd backend && go test -tags eval -run '^TestEval$$' -count=1 -timeout 3h -v ./internal/review/llmrunner/
+
+eval-check:
+	cd backend && go test -tags eval -run '^(TestEvalCases|TestEvalActions|TestEvalPreviousReport|TestScore)' -count=1 -v ./internal/review/llmrunner/

@@ -33,6 +33,17 @@ func TestIsRerunTick(t *testing.T) {
 	}
 }
 
+func TestParseIntentIgnoresTickOnCommentWithoutProposal(t *testing.T) {
+	t.Parallel()
+
+	state := gate.PRState{Proposals: []gate.ProposalState{{ID: "p1", CommentID: 2, State: gate.ProposalOpen}}}
+	ev := gate.CommentEvent{Kind: gate.CommentKindReview, CommentID: 1, Ticked: "- [x] Apply this change"}
+
+	if got := gate.ParseIntent(ev, state); got.Kind != gate.IntentNone {
+		t.Errorf("ParseIntent() = %+v, want no intent for a superseded comment no proposal points at", got)
+	}
+}
+
 func failedSummaryState() gate.PRState {
 	state := skipBase()
 	state.Run = nil

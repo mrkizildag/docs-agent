@@ -63,7 +63,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("build analysis runners: %w", err)
 	}
-	gateSvc := gate.NewService(ghClient, ghClient, store, runners, ghClient, httpapi.NewScaffoldQueue(store))
+	gateSvc := gate.NewService(ghClient, ghClient, store, runners, ghClient, httpapi.NewScaffoldQueue(store)).WithLogger(logger)
 
 	worker := jobqueue.NewWorker(store, httpapi.HandleJob(gateSvc), logger, maxParallelJobs)
 	workerCtx, cancelWorker := context.WithCancel(context.WithoutCancel(ctx))
@@ -157,14 +157,9 @@ func buildRunners(cfg config.Config, ghClient *github.Client, logger *slog.Logge
 		return gate.Runners{Actions: actionsRunner}, nil
 	}
 
-	var model llm.Model
-	switch cfg.LLM.Provider {
-	case config.LLMProviderOpenAI:
-		model = llm.NewOpenAI(&http.Client{Timeout: llmHTTPTimeout}, cfg.LLM.BaseURL, cfg.LLM.APIKey.Reveal())
-	case config.LLMProviderAnthropic:
-		model = llm.NewAnthropic(&http.Client{Timeout: llmHTTPTimeout}, cfg.LLM.BaseURL, cfg.LLM.APIKey.Reveal())
-	default:
-		return gate.Runners{}, fmt.Errorf("LLM_PROVIDER: unknown provider %q", cfg.LLM.Provider)
+	model, err := llm.New(string(cfg.LLM.Provider), &http.Client{Timeout: llmHTTPTimeout}, cfg.LLM.BaseURL, cfg.LLM.APIKey.Reveal())
+	if err != nil {
+		return gate.Runners{}, fmt.Errorf("build LLM model: %w", err)
 	}
 
 	runner := llmrunner.New(model, ghClient.InstallationToken, cfg.LLM.TriageModel, cfg.LLM.Model, logger)

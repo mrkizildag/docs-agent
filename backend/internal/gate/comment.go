@@ -169,10 +169,18 @@ func (s *Service) HandleComment(ctx context.Context, ev CommentEvent) error {
 		return fmt.Errorf("%s: load state: %w", op, err)
 	}
 	intent := ParseIntent(ev, state)
-	if intent.Kind == IntentNone {
+	retiredTick := intent.Kind == IntentNone && isRetiredTick(ev)
+	if intent.Kind == IntentNone && !retiredTick {
 		return nil
 	}
 	state.InstallationID = cmp.Or(state.InstallationID, ev.InstallationID)
+
+	if retiredTick {
+		ours, err := s.isOurRetiredComment(ctx, state, ev, op)
+		if err != nil || !ours {
+			return err
+		}
+	}
 
 	canWrite, err := s.comments.Permission(ctx, state.InstallationID, state.Owner, state.Repo, ev.Sender)
 	if err != nil {
@@ -190,11 +198,34 @@ func (s *Service) HandleComment(ctx context.Context, ev CommentEvent) error {
 	if err != nil {
 		return fmt.Errorf("%s: react %s: %w", op, ReactionSeen, err)
 	}
-	final, err := s.act(ctx, state, ev, intent, op)
+	var final Reaction
+	if retiredTick {
+		final, err = s.say(ctx, state, ev, "a newer comment replaced this proposal; nothing was committed.", op)
+	} else {
+		final, err = s.act(ctx, state, ev, intent, op)
+	}
 	if err != nil {
 		return err
 	}
 	return s.settle(ctx, state, ev, seen, final, op)
+}
+
+// isRetiredTick reports whether ev ticks the Apply box of a review comment
+// that claims to be retired; isOurRetiredComment checks the claim against GitHub.
+func isRetiredTick(ev CommentEvent) bool {
+	return ev.Kind == CommentKindReview && strings.TrimSpace(ev.Ticked) == checkbox(true, applyLabel) && isSuperseded(ev.Body)
+}
+
+// isOurRetiredComment reports whether the ticked comment is one of our retired
+// proposal comments: the proposal lives on in a newer comment. Anyone else's
+// comment is left alone, before any permission check or reply.
+func (s *Service) isOurRetiredComment(ctx context.Context, state PRState, ev CommentEvent, op string) (bool, error) {
+	existing, err := s.gh.ListComments(ctx, state.InstallationID, state.Owner, state.Repo, state.Number)
+	if err != nil {
+		return false, fmt.Errorf("%s: list comments: %w", op, err)
+	}
+	c, ok := findComment(existing, CommentKindReview, ev.CommentID)
+	return ok && isSuperseded(c.Body), nil
 }
 
 // act runs intent for ev, whose sender may write, and reports how it ended:

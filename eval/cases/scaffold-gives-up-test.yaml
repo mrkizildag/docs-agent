@@ -1,0 +1,9 @@
+id: scaffold-gives-up-test
+source: "commit 5e77bd5 (PR #36)"
+base: 42fbf8389ee43ee5263f087832294a834c040aeb
+head: 5e77bd567fbea75b176e84bd27b7a86d8e9ab680
+expect:
+  verdict: no_impact
+notes: >
+  Test-only: adds httpapi/scaffold_eval_test.go, an end-to-end test that the scaffold stops after three failed
+  attempts, which scaffold.md already states. No production code changes.

@@ -434,3 +434,28 @@ func (c *Client) appBotLogin(ctx context.Context) (string, error) {
 	c.mu.Unlock()
 	return login, nil
 }
+
+type graphQLResponse[T any] struct {
+	Data   T `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
+// graphQL posts a query to the GraphQL endpoint and decodes its data into out.
+// GraphQL reports failures in the body of a 200 response, so they are checked here.
+func graphQL[T any](ctx context.Context, client *github.Client, query string, vars map[string]any, out *T) error {
+	req, err := client.NewRequest(ctx, http.MethodPost, "graphql", map[string]any{"query": query, "variables": vars})
+	if err != nil {
+		return fmt.Errorf("build graphql request: %w", err)
+	}
+	var resp graphQLResponse[T]
+	if _, err := client.Do(req, &resp); err != nil {
+		return fmt.Errorf("graphql request: %w", err)
+	}
+	if len(resp.Errors) > 0 {
+		return fmt.Errorf("graphql: %s", resp.Errors[0].Message)
+	}
+	*out = resp.Data
+	return nil
+}

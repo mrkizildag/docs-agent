@@ -1,0 +1,22 @@
+id: prune-jobs
+source: "PR #42"
+base: 1f74842db6298b193770ea1a7a144d09be99938c
+head: da84c5b3a589c9d5bb1f77c89296d60f754669df
+expect:
+  verdict: proposals
+  docs:
+    - path: docs/features/job-queue.md
+      new: false
+      sections: ["Guarantees", "Not yet"]
+      must_say:
+        - "Finished jobs (done, failed, superseded) and their deliveries are deleted after 7 days."
+        - "Pending and running jobs, and their deliveries, are never deleted."
+        - "The worker prunes a minute after it starts and hourly after that."
+        - "Delivery deduplication only holds while the delivery is kept, so a redelivery after the 7-day window runs again."
+  allow: [docs/architecture.md]
+notes: >
+  The code adds a 7-day retention prune for finished jobs and deliveries, which makes job-queue.md's
+  "Not yet: rows are never pruned" section wrong and its dedup guarantee incomplete. The human added a
+  "Pruned after 7 days" guarantee, qualified the dedup bullet, and replaced "Not yet" with storage notes
+  (timestamp ordering), which is an implementation detail and not required. architecture.md got a one-clause
+  mention of the prune; it is allowed but not required.

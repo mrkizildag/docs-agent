@@ -1,0 +1,11 @@
+id: evict-idle-buckets
+source: "commit f38e459 (PR #45)"
+base: 6d1a40b20ef5fa72a7cb46e212ffdf9c0a7f0a6e
+head: f38e459e41c1bcdbc31444e4c71452604f942eeb
+expect:
+  verdict: no_impact
+notes: >
+  Adds eviction of per-IP rate-limit buckets after 15 minutes idle or above 2048 entries, inside
+  httpapi/webhook_limit.go. At base, architecture.md, github-app.md, and deploy.md describe the global and
+  per-client-IP limits and the 429 response, but none mentions how buckets are stored or how long they live, so
+  no doc text becomes wrong.

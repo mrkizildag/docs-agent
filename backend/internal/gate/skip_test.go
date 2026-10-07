@@ -149,7 +149,7 @@ func TestHandleCommentSkipAsk(t *testing.T) {
 	if store.saved == nil || store.saved.PendingSkip == nil || *store.saved.PendingSkip != (gate.SkipAsk{User: "dev", Scope: gate.SkipCommit}) {
 		t.Fatalf("saved state = %+v, want PendingSkip for dev at commit scope", store.saved)
 	}
-	if len(gh.comments) != 1 || gh.comments[0].Body != "@dev, reply with the reason for skipping this commit; your next comment on this PR becomes the reason." {
+	if len(gh.comments) != 1 || gh.comments[0].Body != "@dev, post your reason for skipping this commit as a new comment; your next comment on this PR becomes the reason. Or skip in one step: `/pollux-agent skip <reason>`." {
 		t.Errorf("comments = %+v, want one ask for dev", gh.comments)
 	}
 	if gh.editIssue != 1 {
@@ -176,7 +176,7 @@ func TestHandleCommentSkipAskForPR(t *testing.T) {
 	if err := svc.HandleComment(t.Context(), skipEvent(gate.CommentKindIssue, "- [x] Skip this PR", "")); err != nil {
 		t.Fatalf("HandleComment() = %v, want nil", err)
 	}
-	if len(gh.comments) != 1 || !strings.Contains(gh.comments[0].Body, "skipping this PR;") {
+	if len(gh.comments) != 1 || !strings.Contains(gh.comments[0].Body, "skipping this PR as a new comment") || !strings.Contains(gh.comments[0].Body, "`/pollux-agent skip-pr <reason>`") {
 		t.Errorf("comments = %+v, want an ask naming this PR", gh.comments)
 	}
 }

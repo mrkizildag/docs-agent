@@ -95,6 +95,10 @@ func (noComments) CreateReviewComment(context.Context, int64, string, string, in
 	return gate.Comment{}, nil
 }
 
+func (noComments) ResolveReviewThread(context.Context, int64, string, string, int, int64) error {
+	return nil
+}
+
 func (noComments) EditReviewComment(context.Context, int64, string, string, int64, string) error {
 	return nil
 }
@@ -863,6 +867,10 @@ func (f *statefulGitHub) CreateIssueComment(_ context.Context, _ int64, _, _ str
 	return f.create(gate.CommentKindIssue, body), nil
 }
 
+func (f *statefulGitHub) ResolveReviewThread(context.Context, int64, string, string, int, int64) error {
+	return nil
+}
+
 func (f *statefulGitHub) EditReviewComment(_ context.Context, _ int64, _, _ string, id int64, body string) error {
 	return f.edit(gate.CommentKindReview, id, body)
 }
@@ -1251,9 +1259,7 @@ func TestWebhookReconcilesProposalCommentsAcrossPushes(t *testing.T) {
 		if run.Conclusion != gate.ConclusionActionRequired {
 			t.Errorf("conclusion = %q, want %q", run.Conclusion, gate.ConclusionActionRequired)
 		}
-		if body := h.commentWith(markerB).Body; !strings.Contains(body, "Outdated") {
-			t.Errorf("dropped proposal comment not outdated:\n%s", body)
-		}
+		h.commentWith(retired(markerB))
 		if body := h.commentWith(markerA).Body; strings.Contains(body, "Outdated") {
 			t.Errorf("kept proposal comment marked outdated:\n%s", body)
 		}
@@ -1280,9 +1286,7 @@ func TestWebhookReconcilesProposalCommentsAcrossPushes(t *testing.T) {
 			t.Errorf("conclusion = %q, want %q", run.Conclusion, gate.ConclusionSuccess)
 		}
 		for _, marker := range []string{markerA, markerB} {
-			if body := h.commentWith(marker).Body; !strings.Contains(body, "Outdated") {
-				t.Errorf("comment %s not outdated:\n%s", marker, body)
-			}
+			h.commentWith(retired(marker))
 		}
 		summary := h.commentWith(summaryMarker).Body
 		if strings.Contains(summary, "| open |") || strings.Count(summary, "| outdated |") != 2 {
@@ -2139,4 +2143,9 @@ func TestWebhookToAnalysisHistoryEndToEnd(t *testing.T) {
 	if diff := gocmp.Diff(want, got); diff != "" {
 		t.Errorf("analyses of PR 1 mismatch (-want +got):\n%s", diff)
 	}
+}
+
+// retired is the marker a proposal comment carries once its thread is resolved.
+func retired(marker string) string {
+	return strings.Replace(marker, "pollux-agent:proposal:", "pollux-agent:superseded:", 1)
 }

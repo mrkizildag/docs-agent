@@ -13,6 +13,14 @@ func skipActive(s PRState) bool {
 	return s.Skip != nil && (s.Skip.Scope == SkipPR || s.Skip.HeadSHA == s.HeadSHA)
 }
 
+// command is the one-step slash command for this scope.
+func (sc SkipScope) command() string {
+	if sc == SkipPR {
+		return "/pollux-agent skip-pr"
+	}
+	return "/pollux-agent skip"
+}
+
 func (sc SkipScope) noun() string {
 	if sc == SkipPR {
 		return "PR"
@@ -99,7 +107,7 @@ func (s *Service) handleSkip(ctx context.Context, state PRState, in Intent, send
 }
 
 func (s *Service) askSkipReason(ctx context.Context, state PRState, ask SkipAsk, op string) error {
-	body := fmt.Sprintf("@%s, reply with the reason for skipping this %s; your next comment on this PR becomes the reason.", ask.User, ask.Scope.noun())
+	body := fmt.Sprintf("@%s, post your reason for skipping this %s as a new comment; your next comment on this PR becomes the reason. Or skip in one step: `%s <reason>`.", ask.User, ask.Scope.noun(), ask.Scope.command())
 	if _, err := s.gh.CreateIssueComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, body); err != nil {
 		return fmt.Errorf("%s: ask for skip reason: %w", op, err)
 	}

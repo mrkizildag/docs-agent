@@ -85,7 +85,10 @@ func OnApply(s PRState, ids []string, sha, by string) PRState {
 	return s
 }
 
-// splice replaces original, which must occur exactly once in file, with content.
+// splice replaces original, which must occur exactly once in file, with
+// content. content takes original's trailing newlines: a model rarely ends a
+// section with the blank line before the next heading, and without it the
+// next heading joins the last paragraph.
 func splice(file, original, content string) (string, error) {
 	if original == "" {
 		return "", errors.New("the proposal has no original section text")
@@ -93,7 +96,8 @@ func splice(file, original, content string) (string, error) {
 	if n := strings.Count(file, original); n != 1 {
 		return "", fmt.Errorf("section text occurs %d times in the doc, want exactly 1", n)
 	}
-	return strings.Replace(file, original, content, 1), nil
+	trailing := original[len(strings.TrimRight(original, "\n")):]
+	return strings.Replace(file, original, strings.TrimRight(content, "\n")+trailing, 1), nil
 }
 
 // addIndexEntry inserts entry after the last list item of the "## Index"
@@ -166,7 +170,7 @@ func (s *Service) handleApply(ctx context.Context, state PRState, ev CommentEven
 			}
 			writeCtx, cancel := writeContext(ctx)
 			defer cancel()
-			if _, err := s.finishApply(writeCtx, state, tick, "", op); err != nil {
+			if _, err := s.finishApply(writeCtx, state, tick, pa.IDs, "", op); err != nil {
 				return "", err
 			}
 			if targets = openTargets(state, in); len(targets) == 0 {
@@ -245,7 +249,7 @@ func (s *Service) handleApply(ctx context.Context, state PRState, ev CommentEven
 	}
 	writeCtx, cancel := writeContext(ctx)
 	defer cancel()
-	if _, err := s.finishApply(writeCtx, state, tick, "", op); err != nil {
+	if _, err := s.finishApply(writeCtx, state, tick, ids, "", op); err != nil {
 		return "", err
 	}
 	return ReactionDone, nil
@@ -302,11 +306,13 @@ func (s *Service) replayApplied(ctx context.Context, state PRState, ev CommentEv
 	writeCtx, cancel := writeContext(ctx)
 	defer cancel()
 	var tick []string
+	scope := applied
 	if in.Kind == IntentApplyAll {
 		tick = applied
+		scope = latestApplied(state)
 	}
 	if len(applied) > 0 {
-		if _, err := s.finishApply(writeCtx, state, tick, in.ProposalID, op); err != nil {
+		if _, err := s.finishApply(writeCtx, state, tick, scope, in.ProposalID, op); err != nil {
 			return "", err
 		}
 	}
@@ -318,11 +324,32 @@ func (s *Service) replayApplied(ctx context.Context, state PRState, ev CommentEv
 	return ReactionDone, nil
 }
 
+// latestApplied returns the ids of the proposals the most recent apply commit
+// applied, so a replay does not resolve threads a reviewer reopened after an
+// older apply. State records no apply order: the commit at head wins, else the
+// last applied proposal's commit.
+func latestApplied(state PRState) []string {
+	newest := ""
+	for _, p := range state.Proposals {
+		if p.State == ProposalApplied && p.AppliedSHA != "" && (newest == "" || newest != state.HeadSHA) {
+			newest = p.AppliedSHA
+		}
+	}
+	var ids []string
+	for _, p := range state.Proposals {
+		if p.State == ProposalApplied && p.AppliedSHA == newest {
+			ids = append(ids, p.ID)
+		}
+	}
+	return ids
+}
+
 // finishApply brings the comments up to date with state's applied proposals:
-// it ticks the Apply boxes of tick, redraws the summary, and posts the replies
-// still missing (just proposal only, when it is not ""). It returns how many
-// replies it posted or adopted.
-func (s *Service) finishApply(ctx context.Context, state PRState, tick []string, only, op string) (int, error) {
+// it ticks the Apply boxes of tick, redraws the summary, posts the replies
+// still missing (just proposal only, when it is not ""), and resolves the
+// threads of the proposals scope, the ones being applied now. It returns how
+// many replies it posted or adopted.
+func (s *Service) finishApply(ctx context.Context, state PRState, tick, scope []string, only, op string) (int, error) {
 	if len(tick) > 0 {
 		if err := s.tickApplied(ctx, state, tick, op); err != nil {
 			return 0, err
@@ -331,7 +358,7 @@ func (s *Service) finishApply(ctx context.Context, state PRState, tick []string,
 	if err := s.redrawSummary(ctx, state, op); err != nil {
 		return 0, err
 	}
-	return s.replyApplied(ctx, state, only, op)
+	return s.replyApplied(ctx, state, scope, only, op)
 }
 
 // errDocMismatch marks a proposal that cannot be applied to the doc at head.
@@ -535,36 +562,45 @@ func appliedMarker(id, sha string) string {
 // replyApplied posts the "Applied" reply still missing under each applied
 // proposal's comment (just proposal only, when it is not ""), saving after each.
 // A reply a crashed run posted before saving its ID is adopted by its marker.
-// It returns how many replies it posted or adopted.
-func (s *Service) replyApplied(ctx context.Context, state PRState, only, op string) (posted int, err error) {
+// Each proposal in scope then has its thread resolved once its reply is in it;
+// resolving an already resolved thread does nothing, so a redelivery repeats it
+// safely. It returns how many replies it posted or adopted.
+func (s *Service) replyApplied(ctx context.Context, state PRState, scope []string, only, op string) (posted int, err error) {
 	var existing []Comment
 	listed := false
 	for i, p := range state.Proposals {
-		if p.State != ProposalApplied || p.ReplyID != 0 || p.AppliedSHA == "" || p.CommentID == 0 || (only != "" && p.ID != only) {
+		if p.State != ProposalApplied || p.AppliedSHA == "" || p.CommentID == 0 {
 			continue
 		}
-		if !listed {
-			if existing, err = s.gh.ListComments(ctx, state.InstallationID, state.Owner, state.Repo, state.Number); err != nil {
-				return posted, fmt.Errorf("%s: list comments: %w", op, err)
+		if p.ReplyID == 0 && (only == "" || p.ID == only) {
+			if !listed {
+				if existing, err = s.gh.ListComments(ctx, state.InstallationID, state.Owner, state.Repo, state.Number); err != nil {
+					return posted, fmt.Errorf("%s: list comments: %w", op, err)
+				}
+				listed = true
 			}
-			listed = true
-		}
-		replyID := int64(0)
-		if c, ok := findReply(existing, appliedMarker(p.ID, p.AppliedSHA)); ok {
-			replyID = c.ID
-		} else {
-			body := "✅ Applied in " + shortSHA(p.AppliedSHA) + "\n\n" + appliedMarker(p.ID, p.AppliedSHA)
-			c, err := s.comments.ReplyToReviewComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, p.CommentID, body)
-			if err != nil {
-				return posted, fmt.Errorf("%s: %w", op, err)
+			replyID := int64(0)
+			if c, ok := findReply(existing, appliedMarker(p.ID, p.AppliedSHA)); ok {
+				replyID = c.ID
+			} else {
+				body := "✅ Applied in " + shortSHA(p.AppliedSHA) + "\n\n" + appliedMarker(p.ID, p.AppliedSHA)
+				c, err := s.comments.ReplyToReviewComment(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, p.CommentID, body)
+				if err != nil {
+					return posted, fmt.Errorf("%s: %w", op, err)
+				}
+				replyID = c.ID
 			}
-			replyID = c.ID
+			state.Proposals[i].ReplyID = replyID
+			if err := s.store.SavePR(ctx, state); err != nil {
+				return posted, fmt.Errorf("%s: save reply %d: %w", op, replyID, err)
+			}
+			posted++
 		}
-		state.Proposals[i].ReplyID = replyID
-		if err := s.store.SavePR(ctx, state); err != nil {
-			return posted, fmt.Errorf("%s: save reply %d: %w", op, replyID, err)
+		if state.Proposals[i].ReplyID != 0 && slices.Contains(scope, p.ID) {
+			if err := s.gh.ResolveReviewThread(ctx, state.InstallationID, state.Owner, state.Repo, state.Number, p.CommentID); err != nil {
+				s.log.WarnContext(ctx, "resolve review thread failed", "op", op, "owner", state.Owner, "repo", state.Repo, "number", state.Number, "comment_id", p.CommentID, "error", err)
+			}
 		}
-		posted++
 	}
 	return posted, nil
 }

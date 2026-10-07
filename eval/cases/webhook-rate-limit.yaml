@@ -1,0 +1,26 @@
+id: webhook-rate-limit
+source: "PR #45"
+base: 8bbb36edc5b88bedfe237497cf07b0537ef9523a
+head: f38e459e41c1bcdbc31444e4c71452604f942eeb
+expect:
+  verdict: proposals
+  docs:
+    - path: docs/guides/github-app.md
+      new: false
+      sections: ["Webhook URL and secret"]
+      must_say:
+        - "POST /webhook applies a global and a per-client-IP rate limit before reading the request body."
+        - "Over-limit requests get 429 and their body is not read; the signature check happens only after the rate limit."
+    - path: docs/architecture.md
+      new: false
+      sections: ["Parts"]
+      must_say:
+        - "POST /webhook rate-limits by client IP and globally before reading the body, then verifies GitHub's signature."
+        - "The client IP is taken from X-Forwarded-For only when the TCP peer is loopback (the Funnel proxy)."
+  allow: [docs/guides/deploy.md]
+notes: >
+  Both commits of the PR: a token-bucket rate limit (global plus per client IP) in front of POST /webhook, and
+  eviction of idle per-IP buckets. github-app.md (covers httpapi/**) and architecture.md (covers backend/**)
+  both describe what POST /webhook does and now omit the 429-before-body step. The human also added a
+  rate-limit paragraph and a 429 troubleshooting entry to deploy.md, but deploy.md does not cover any changed
+  file at base (its covers are Dockerfile, compose, deploy/**), so it is only in allow.
