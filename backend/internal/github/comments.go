@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 
 	"github.com/google/go-github/v92/github"
@@ -99,12 +100,14 @@ func (c *Client) EditReviewComment(ctx context.Context, installationID int64, ow
 	return nil
 }
 
-const reviewThreadsQuery = `query($owner:String!,$repo:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{id isResolved comments(first:1){nodes{fullDatabaseId}}}}}}}`
+const reviewThreadsQuery = `query($owner:String!,$repo:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{id isResolved comments(first:100){nodes{fullDatabaseId}}}}}}}`
 
 const resolveThreadMutation = `mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id}}}`
 
-// ResolveReviewThread resolves the review thread that starts with review
-// comment commentID. A thread that is already resolved, or gone with its
+// ResolveReviewThread resolves the review thread that contains review
+// comment commentID, wherever GitHub lists it among the thread's comments.
+// Threads are matched on their first 100 comments; a proposal thread never
+// grows near that. A thread that is already resolved, or gone with its
 // comment, is not an error.
 func (c *Client) ResolveReviewThread(ctx context.Context, installationID int64, owner, repo string, number int, commentID int64) error {
 	client, err := c.installationClient(installationID)
@@ -112,7 +115,11 @@ func (c *Client) ResolveReviewThread(ctx context.Context, installationID int64, 
 		return fmt.Errorf("resolve review thread %s/%s#%d comment %d: %w", owner, repo, number, commentID, err)
 	}
 
+	type threadComment struct {
+		FullDatabaseID json.Number `json:"fullDatabaseId"`
+	}
 	wantID := strconv.FormatInt(commentID, 10)
+	isWanted := func(c threadComment) bool { return c.FullDatabaseID.String() == wantID }
 	var cursor *string
 	for {
 		var data struct {
@@ -127,9 +134,7 @@ func (c *Client) ResolveReviewThread(ctx context.Context, installationID int64, 
 							ID         string `json:"id"`
 							IsResolved bool   `json:"isResolved"`
 							Comments   struct {
-								Nodes []struct {
-									FullDatabaseID json.Number `json:"fullDatabaseId"`
-								} `json:"nodes"`
+								Nodes []threadComment `json:"nodes"`
 							} `json:"comments"`
 						} `json:"nodes"`
 					} `json:"reviewThreads"`
@@ -143,7 +148,7 @@ func (c *Client) ResolveReviewThread(ctx context.Context, installationID int64, 
 
 		threads := data.Repository.PullRequest.ReviewThreads
 		for _, th := range threads.Nodes {
-			if len(th.Comments.Nodes) == 0 || th.Comments.Nodes[0].FullDatabaseID.String() != wantID {
+			if !slices.ContainsFunc(th.Comments.Nodes, isWanted) {
 				continue
 			}
 			if th.IsResolved {

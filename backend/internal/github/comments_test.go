@@ -335,8 +335,12 @@ func TestResolveReviewThread(t *testing.T) {
 	page := func(hasNext bool, end string, nodes string) string {
 		return fmt.Sprintf(`{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":%t,"endCursor":%q},"nodes":[%s]}}}}}`, hasNext, end, nodes)
 	}
-	thread := func(id string, resolved bool, commentID int64) string {
-		return fmt.Sprintf(`{"id":%q,"isResolved":%t,"comments":{"nodes":[{"fullDatabaseId":"%d"}]}}`, id, resolved, commentID)
+	thread := func(id string, resolved bool, commentIDs ...int64) string {
+		nodes := make([]string, len(commentIDs))
+		for i, c := range commentIDs {
+			nodes[i] = fmt.Sprintf(`{"fullDatabaseId":"%d"}`, c)
+		}
+		return fmt.Sprintf(`{"id":%q,"isResolved":%t,"comments":{"nodes":[%s]}}`, id, resolved, strings.Join(nodes, ","))
 	}
 
 	tests := []struct {
@@ -345,6 +349,7 @@ func TestResolveReviewThread(t *testing.T) {
 		wantResolved []string
 	}{
 		{name: "resolves the thread on a later page", pages: []string{page(true, "c1", thread("T1", false, 1)), page(false, "", thread("T2", false, 4205541822))}, wantResolved: []string{"T2"}},
+		{name: "matches the comment wherever the thread lists it", pages: []string{page(false, "", thread("T1", false, 4205549999, 4205541822))}, wantResolved: []string{"T1"}},
 		{name: "already resolved is skipped", pages: []string{page(false, "", thread("T1", true, 4205541822))}},
 		{name: "missing thread is not an error", pages: []string{page(false, "", thread("T1", false, 1))}},
 	}
