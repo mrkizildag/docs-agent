@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/google/go-cmp/cmp"
@@ -31,13 +32,89 @@ func skipEvent(kind gate.CommentKind, ticked, body string) gate.CommentEvent {
 	return gate.CommentEvent{InstallationID: 42, Owner: "acme", Repo: "widgets", Number: 7, Sender: "dev", CommentID: 9, Kind: kind, Ticked: ticked, Body: body}
 }
 
+func skipNow() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC) }
+
+func TestOnSkipEmitsHistory(t *testing.T) {
+	t.Parallel()
+
+	sk := gate.Skip{User: "dev", Scope: gate.SkipCommit, Reason: "typo"}
+	skipped := func(id string) gate.PREvent {
+		return gate.PREvent{Key: "skipped/commit/head1/dev/" + id, Kind: gate.EventSkipped, Actor: "dev", ProposalID: id, Scope: gate.SkipCommit, Reason: "typo", CommitSHA: "head1", HeadSHA: "head1"}
+	}
+
+	t.Run("one event per open proposal", func(t *testing.T) {
+		t.Parallel()
+		prev := skipBase()
+		prev.Run = nil
+		prev.Proposals = []gate.ProposalState{
+			{ID: "p1", State: gate.ProposalOpen}, {ID: "p2", State: gate.ProposalApplied},
+			{ID: "p3", State: gate.ProposalOutdated}, {ID: "p4", State: gate.ProposalOpen},
+		}
+		_, _, history := gate.OnSkip(prev, sk, skipNow())
+		if diff := cmp.Diff([]gate.PREvent{skipped("p1"), skipped("p4")}, history.Events); diff != "" {
+			t.Errorf("history.Events (-want +got):\n%s", diff)
+		}
+		if len(history.Analyses) != 0 {
+			t.Errorf("history.Analyses = %+v, want none without an armed run", history.Analyses)
+		}
+	})
+
+	t.Run("no open proposal", func(t *testing.T) {
+		t.Parallel()
+		prev := skipBase()
+		prev.Run = nil
+		_, _, history := gate.OnSkip(prev, sk, skipNow())
+		if diff := cmp.Diff([]gate.PREvent{skipped("")}, history.Events); diff != "" {
+			t.Errorf("history.Events (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("armed run is superseded", func(t *testing.T) {
+		t.Parallel()
+		prev := skipBase()
+		prev.Run.StartedAt, prev.Run.Runner = skipNow().Add(-time.Minute), gate.RunnerKindActions
+		_, _, history := gate.OnSkip(prev, sk, skipNow())
+		want := []gate.Analysis{{
+			Nonce: "n1", HeadSHA: "head1", Runner: gate.RunnerKindActions, Verdict: gate.VerdictSuperseded,
+			StartedAt: skipNow().Add(-time.Minute), FinishedAt: skipNow(), RunID: 99,
+		}}
+		if diff := cmp.Diff(want, history.Analyses); diff != "" {
+			t.Errorf("history.Analyses (-want +got):\n%s", diff)
+		}
+	})
+}
+
+func TestHandleCommentSkipReplayEmitsNothing(t *testing.T) {
+	t.Parallel()
+
+	svc, _, store := skipService(skipBase())
+	store.live = true
+	ev := skipEvent(gate.CommentKindIssue, "", "/pollux-agent skip typo")
+
+	if err := svc.HandleComment(t.Context(), ev); err != nil {
+		t.Fatalf("HandleComment() = %v, want nil", err)
+	}
+	if len(store.histories) == 0 || len(store.histories[0].Events) != 1 {
+		t.Fatalf("histories = %+v, want one skipped event on the first save", store.histories)
+	}
+	before := len(store.histories)
+	if err := svc.HandleComment(t.Context(), ev); err != nil {
+		t.Fatalf("replayed HandleComment() = %v, want nil", err)
+	}
+	for _, h := range store.histories[before:] {
+		if len(h.Events) != 0 || len(h.Analyses) != 0 {
+			t.Errorf("replay saved history %+v, want none", h)
+		}
+	}
+}
+
 func TestOnSkip(t *testing.T) {
 	t.Parallel()
 
 	prev := skipBase()
 	prev.PendingSkip = &gate.SkipAsk{User: "dev", Scope: gate.SkipPR}
 
-	got, run := gate.OnSkip(prev, gate.Skip{User: "dev", Scope: gate.SkipPR, Reason: "generated code"})
+	got, run, _ := gate.OnSkip(prev, gate.Skip{User: "dev", Scope: gate.SkipPR, Reason: "generated code"}, skipNow())
 
 	wantSkip := &gate.Skip{User: "dev", Scope: gate.SkipPR, Reason: "generated code", HeadSHA: "head1"}
 	if diff := cmp.Diff(wantSkip, got.Skip); diff != "" {

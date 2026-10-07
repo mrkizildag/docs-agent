@@ -291,8 +291,12 @@ func (w *localWorkflow) models() []string {
 	if err := json.Unmarshal(data, &art); err != nil {
 		return nil
 	}
+	var usage map[string]json.RawMessage
+	if err := json.Unmarshal(art.Claude.ModelUsage, &usage); err != nil {
+		return nil
+	}
 	var models []string
-	for m := range art.Claude.ModelUsage {
+	for m := range usage {
 		models = append(models, m)
 	}
 	slices.Sort(models)
@@ -450,13 +454,13 @@ func TestEvalActionsLocalRun(t *testing.T) {
 		{
 			name:       "no impact",
 			result:     success(map[string]any{"no_impact_reason": "constant only", "proposals": []any{}}),
-			want:       review.Result{Runner: "actions", Model: "stub-model", Verdict: review.NoImpact{Reason: "constant only"}},
+			want:       review.Result{Model: "stub-model", Verdict: review.NoImpact{Reason: "constant only"}},
 			wantModels: []string{"stub-model"},
 		},
 		{
 			name:   "proposal anchored in the diff",
 			result: success(map[string]any{"no_impact_reason": "", "proposals": []any{proposal}}),
-			want: review.Result{Runner: "actions", Model: "stub-model", Verdict: review.Proposals{{
+			want: review.Result{Model: "stub-model", Verdict: review.Proposals{{
 				DocPath: "docs/features/thing.md", Section: "Retention",
 				Anchor: review.Anchor{File: "src/thing.go", Line: 3}, Reason: "retention changed", Content: "## Retention\n\nKeeps 30 days.\n",
 			}}},
