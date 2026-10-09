@@ -303,3 +303,34 @@ func TestStart_HeadGitattributesDoNotRewriteBaseDocs(t *testing.T) {
 		t.Fatalf("model saw %d calls, want 1 triage call for docs/x.md", len(calls))
 	}
 }
+
+func TestStart_CandidateUnderASymlinkedDirectoryAtHeadFailsWithoutModelCalls(t *testing.T) {
+	t.Parallel()
+
+	repoDir, _ := newGitRepo(t)
+	if err := os.Remove(filepath.Join(repoDir, "docs", "x.md")); err != nil {
+		t.Fatalf("remove docs/x.md: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoDir, "docs", "sub"), 0o700); err != nil {
+		t.Fatalf("mkdir docs/sub: %v", err)
+	}
+	baseSHA := commitDoc(t, repoDir, "docs/sub/x.md", docWithCovers("\n  - main.go", "## Mid\nmid text\n"))
+
+	// At head docs/sub is a symlink to a directory holding the same doc.
+	if err := os.Rename(filepath.Join(repoDir, "docs", "sub"), filepath.Join(repoDir, "docs", "real")); err != nil {
+		t.Fatalf("rename docs/sub: %v", err)
+	}
+	if err := os.Symlink("real", filepath.Join(repoDir, "docs", "sub")); err != nil {
+		t.Fatalf("symlink docs/sub: %v", err)
+	}
+	headSHA := commitDoc(t, repoDir, "main.go", mainGoChanged)
+
+	_, calls, err := startBaseToHead(t, repoDir, baseSHA, headSHA, []review.ChangedFile{mainGoChange()})
+	var failed *review.FailedError
+	if !errors.As(err, &failed) || failed.Cause != review.CauseInternal {
+		t.Fatalf("Start() error = %v, want *review.FailedError with CauseInternal", err)
+	}
+	if len(calls) != 0 {
+		t.Errorf("model saw %d calls, want 0", len(calls))
+	}
+}

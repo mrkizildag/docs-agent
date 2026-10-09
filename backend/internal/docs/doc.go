@@ -261,12 +261,17 @@ func CheckScaffold(index, architecture, setup, repo string) error {
 	return nil
 }
 
+// NormalizeHeading trims s and its leading "#"s, so "## Usage" and "Usage" name the same heading.
+func NormalizeHeading(s string) string {
+	return strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(s), "#"))
+}
+
 // SectionSpan returns the text of the section titled heading (leading "#"s and
 // surrounding space ignored) and its 1-based inclusive line range, from the
 // heading line through the section's last line. ok is false when no heading
 // matches or when several do, since a span for the wrong one would be edited.
 func (d Doc) SectionSpan(heading string) (text string, start, end int, ok bool) {
-	want := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(heading), "#"))
+	want := NormalizeHeading(heading)
 
 	var found *Section
 

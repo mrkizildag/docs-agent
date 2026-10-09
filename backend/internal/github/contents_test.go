@@ -40,6 +40,13 @@ func TestFileAtRef(t *testing.T) {
 	mux.HandleFunc("GET /repos/o/r/contents/docs/boom.md", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	})
+	mux.HandleFunc("GET /repos/o/r/contents/docs/huge.md", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		if _, err := fmt.Fprint(w, `{"message":"too large","errors":[{"resource":"Blob","field":"data","code":"too_large"}]}`); err != nil {
+			t.Errorf("write contents response: %v", err)
+		}
+	})
 	mux.HandleFunc("/", http.NotFound)
 
 	srv := httptest.NewServer(mux)
@@ -59,12 +66,91 @@ func TestFileAtRef(t *testing.T) {
 		{path: "docs/a.md", want: "# A\n", wantOK: true},
 		{path: "docs/missing.md"},
 		{path: "docs/big.md"},
+		{path: "docs/huge.md"},
 		{path: "docs/boom.md", wantErr: true},
 	}
 	for _, tc := range tests {
 		got, ok, err := client.FileAtRef(t.Context(), 1, "o", "r", tc.path, "abc")
 		if (err != nil) != tc.wantErr || ok != tc.wantOK || string(got) != tc.want {
 			t.Errorf("FileAtRef(%q) = %q, %v, %v; want %q, %v, error=%v", tc.path, got, ok, err, tc.want, tc.wantOK, tc.wantErr)
+		}
+	}
+}
+
+func TestPathAtRef(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /app/installations/{id}/access_tokens", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprintf(w, `{"token":"ghs_test","expires_at":%q}`, time.Now().Add(time.Hour).Format(time.RFC3339)); err != nil {
+			t.Errorf("write access_tokens response: %v", err)
+		}
+	})
+	mux.HandleFunc("GET /repos/o/r/contents/docs/a.md", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprint(w, `{"type":"file","encoding":"none","size":2000000,"content":""}`); err != nil {
+			t.Errorf("write contents response: %v", err)
+		}
+	})
+	mux.HandleFunc("GET /repos/o/r/contents/docs/boom.md", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	mux.HandleFunc("GET /repos/o/r/contents/docs/link", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprint(w, `{"type":"symlink","target":"real","path":"docs/link"}`); err != nil {
+			t.Errorf("write contents response: %v", err)
+		}
+	})
+	mux.HandleFunc("GET /repos/o/r/contents/docs", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprint(w, `[{"type":"file","name":"a.md","path":"docs/a.md"}]`); err != nil {
+			t.Errorf("write contents response: %v", err)
+		}
+	})
+	mux.HandleFunc("GET /repos/o/r/contents/docs/huge.bin", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		if _, err := fmt.Fprint(w, `{"message":"too large","errors":[{"resource":"Blob","field":"data","code":"too_large"}]}`); err != nil {
+			t.Errorf("write contents response: %v", err)
+		}
+	})
+	mux.HandleFunc("GET /repos/o/r/contents/docs/forbidden.md", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		if _, err := fmt.Fprint(w, `{"message":"forbidden"}`); err != nil {
+			t.Errorf("write contents response: %v", err)
+		}
+	})
+	mux.HandleFunc("/", http.NotFound)
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	client, err := ghclient.NewClient(&http.Client{Timeout: 5 * time.Second}, 1, testPrivateKeyPEM(t), srv.URL)
+	if err != nil {
+		t.Fatalf("NewClient() = %v, want nil error", err)
+	}
+
+	tests := []struct {
+		path       string
+		wantExists bool
+		wantDir    bool
+		wantErr    bool
+	}{
+		{path: "docs/huge.bin", wantExists: true},
+		{path: "docs/forbidden.md", wantErr: true},
+		{path: "docs/a.md", wantExists: true},
+		{path: "docs/link", wantExists: true},
+		{path: "docs", wantExists: true, wantDir: true},
+		{path: "docs/missing.md"},
+		{path: "docs/a.md/new.md"},
+		{path: "docs/boom.md", wantErr: true},
+	}
+	for _, tc := range tests {
+		exists, dir, err := client.PathAtRef(t.Context(), 1, "o", "r", tc.path, "abc")
+		if (err != nil) != tc.wantErr || exists != tc.wantExists || dir != tc.wantDir {
+			t.Errorf("PathAtRef(%q) = %v, %v, %v; want %v, %v, error=%v", tc.path, exists, dir, err, tc.wantExists, tc.wantDir, tc.wantErr)
 		}
 	}
 }
