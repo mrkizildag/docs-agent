@@ -117,6 +117,8 @@ func newGitRepo(t *testing.T, files map[string]string) (string, string) {
 	}
 
 	git("init", "-q", "-b", "main")
+	// A detached auto-maintenance can outlive the test and break TempDir cleanup.
+	git("config", "maintenance.auto", "false")
 	git("config", "user.email", "test@example.com")
 	git("config", "user.name", "test")
 	git("add", "-A")
@@ -163,7 +165,7 @@ func TestWebhookToServerRunnerChain(t *testing.T) {
 		}
 	})
 
-	handler := httpapi.NewHandler(logger, secret, worker, store)
+	handler := httpapi.NewHandler(httpapi.Deps{Logger: logger, WebhookSecret: secret, Jobs: worker, Runs: store})
 	body := e2ePullRequestFrom(t, 1, headSHA, pushOpts{baseSHA: baseSHA})
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", bytes.NewReader(body))
 	req.Header.Set("X-GitHub-Event", "pull_request")

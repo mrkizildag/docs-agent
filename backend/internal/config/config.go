@@ -3,6 +3,7 @@ package config
 
 import (
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -39,6 +40,35 @@ type Config struct {
 	GitHubPrivateKey Secret
 	WebhookSecret    Secret
 	LLM              *LLM
+	Dashboard        *Dashboard
+}
+
+// sessionKeyBytes is the AES-256 key length the dashboard seals tokens with.
+const sessionKeyBytes = 32
+
+// Dashboard configures Sign in with GitHub. A nil *Dashboard on Config means
+// the dashboard routes are off: none of its variables were set.
+type Dashboard struct {
+	ClientID     string
+	ClientSecret Secret
+	// PublicURL is the https URL the browser reaches pollux at.
+	PublicURL *url.URL
+	// SessionKey holds the 32 raw key bytes, not their base64 text.
+	SessionKey Secret
+}
+
+// Origin is PublicURL's scheme and lowercased host without the scheme's default
+// port, the value browsers send as Origin.
+func (d Dashboard) Origin() string {
+	host := strings.ToLower(d.PublicURL.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	defaultPort := map[string]string{"https": "443", "http": "80"}[d.PublicURL.Scheme]
+	if port := d.PublicURL.Port(); port != "" && port != defaultPort {
+		host += ":" + port
+	}
+	return d.PublicURL.Scheme + "://" + host
 }
 
 // LLMProvider selects which wire format to speak to the LLM. OpenAI covers any
@@ -116,7 +146,65 @@ func Load() (Config, error) {
 		cfg.LLM = llm
 	}
 
+	dashboard, dashErrs := loadDashboard()
+	errs = append(errs, dashErrs...)
+	cfg.Dashboard = dashboard
+
 	return cfg, errors.Join(errs...)
+}
+
+// dashboardEnv holds the raw dashboard variables before validation.
+type dashboardEnv struct {
+	clientID, clientSecret, publicURL, sessionKey string
+}
+
+// loadDashboard reads the dashboard variables: all or none.
+func loadDashboard() (*Dashboard, []error) {
+	env := dashboardEnv{
+		clientID:     os.Getenv("GITHUB_CLIENT_ID"),
+		clientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
+		publicURL:    os.Getenv("PUBLIC_URL"),
+		sessionKey:   os.Getenv("SESSION_KEY"),
+	}
+	var set, unset []string
+	for _, v := range []struct{ key, value string }{
+		{"GITHUB_CLIENT_ID", env.clientID},
+		{"GITHUB_CLIENT_SECRET", env.clientSecret},
+		{"PUBLIC_URL", env.publicURL},
+		{"SESSION_KEY", env.sessionKey},
+	} {
+		if v.value == "" {
+			unset = append(unset, v.key)
+		} else {
+			set = append(set, v.key)
+		}
+	}
+	if len(set) == 0 {
+		return nil, nil
+	}
+	if len(unset) > 0 {
+		return nil, []error{fmt.Errorf("%s: required when %s is set", strings.Join(unset, ", "), strings.Join(set, ", "))}
+	}
+
+	var errs []error
+	publicURL, err := url.Parse(env.publicURL)
+	if err != nil || publicURL.Scheme != "https" || publicURL.Host == "" || publicURL.RawQuery != "" || publicURL.Fragment != "" ||
+		(publicURL.Path != "" && publicURL.Path != "/") {
+		errs = append(errs, errors.New("PUBLIC_URL: must be an absolute https URL without path, query, or fragment"))
+	}
+	key, err := base64.StdEncoding.DecodeString(env.sessionKey)
+	if err != nil || len(key) != sessionKeyBytes {
+		errs = append(errs, fmt.Errorf("SESSION_KEY: must be %d bytes, base64-encoded", sessionKeyBytes))
+	}
+	if len(errs) > 0 {
+		return nil, errs
+	}
+	return &Dashboard{
+		ClientID:     env.clientID,
+		ClientSecret: Secret{value: env.clientSecret},
+		PublicURL:    publicURL,
+		SessionKey:   Secret{value: string(key)},
+	}, nil
 }
 
 // llmEnv holds the raw LLM_* variables before validation.

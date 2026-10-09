@@ -41,6 +41,13 @@ linters:
           allow:
             - $gostd
             - github.com/mrkizildag/pollux-agent/backend/internal/review$
+        auth-domain:
+          list-mode: strict
+          files:
+            - "**/internal/auth/*.go"
+            - "!$test"
+          allow:
+            - $gostd
         review-contracts:
           files:
             - "**/internal/review/*.go"

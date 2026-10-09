@@ -1,5 +1,5 @@
-// Package sqlite is the SQLite-backed storage for pull request state and the
-// durable job queue, using the pure-Go modernc.org/sqlite driver.
+// Package sqlite is the SQLite-backed storage for pull request state, the
+// durable job queue, and dashboard sign-in state, using the pure-Go modernc.org/sqlite driver.
 package sqlite
 
 import (
@@ -11,6 +11,7 @@ import (
 	msqlite "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 
+	"github.com/mrkizildag/pollux-agent/backend/internal/auth"
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	"github.com/mrkizildag/pollux-agent/backend/internal/jobqueue"
 )
@@ -18,9 +19,10 @@ import (
 var (
 	_ gate.Store     = (*Store)(nil)
 	_ jobqueue.Store = (*Store)(nil)
+	_ auth.Store     = (*Store)(nil)
 )
 
-// Store is a SQLite-backed implementation of gate.Store and jobqueue.Store.
+// Store is a SQLite-backed implementation of gate.Store, jobqueue.Store, and auth.Store.
 type Store struct {
 	db *sql.DB
 }
@@ -188,6 +190,22 @@ func migrations() []string {
 			UNIQUE (owner, repo, number, key)
 		);
 		UPDATE pull_requests SET run_runner = 'actions' WHERE run_nonce != '' AND run_id != 0`,
+		`CREATE TABLE login_attempts (
+			state_hash BLOB PRIMARY KEY,
+			verifier TEXT NOT NULL,
+			binding_hash BLOB NOT NULL,
+			expires_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE sessions (
+			id_hash BLOB PRIMARY KEY,
+			login TEXT NOT NULL,
+			avatar_url TEXT NOT NULL,
+			sealed_tokens BLOB NOT NULL,
+			access_expires_at INTEGER NOT NULL,
+			refresh_expires_at INTEGER NOT NULL,
+			last_used_at INTEGER NOT NULL,
+			version INTEGER NOT NULL DEFAULT 0
+		)`,
 	}
 }
 

@@ -186,6 +186,8 @@ func buildEvalInput(ctx context.Context, root, dir string, c evalCase) (evalInpu
 
 	for _, args := range [][]string{
 		{"init", "-q"},
+		// A detached auto-maintenance can outlive the test and break TempDir cleanup.
+		{"config", "maintenance.auto", "false"},
 		{"config", "uploadpack.allowAnySHA1InWant", "true"},
 		{"-c", "uploadpack.allowAnySHA1InWant=true", "fetch", "-q", "--no-tags", root, c.Base, c.Head},
 	} {

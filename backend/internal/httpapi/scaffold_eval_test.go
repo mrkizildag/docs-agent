@@ -84,7 +84,7 @@ func startEvalEnv(t *testing.T, store *sqlite.Store, gh gateScaffoldGitHub, mode
 	stopFn := func() error { once.Do(func() { stopErr = stop() }); return stopErr }
 	t.Cleanup(func() { _ = stopFn() })
 	secret := []byte("test-secret")
-	return evalEnv{handler: httpapi.NewHandler(slog.New(slog.DiscardHandler), secret, worker, store), secret: secret, stop: stopFn}
+	return evalEnv{handler: httpapi.NewHandler(httpapi.Deps{Logger: slog.New(slog.DiscardHandler), WebhookSecret: secret, Jobs: worker, Runs: store}), secret: secret, stop: stopFn}
 }
 
 type gateScaffoldGitHub interface {

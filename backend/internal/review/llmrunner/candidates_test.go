@@ -41,6 +41,8 @@ func TestStart_GlobCoveredNestedFileTriagesOnlyItsDoc(t *testing.T) {
 	}
 
 	run("init", "-q", "-b", "main")
+	// A detached auto-maintenance can outlive the test and break TempDir cleanup.
+	run("config", "maintenance.auto", "false")
 	run("config", "user.email", "test@example.com")
 	run("config", "user.name", "test")
 	write("src/pkg/deep/x.go", "package deep\n\nfunc X() {}\n")
