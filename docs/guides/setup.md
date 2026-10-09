@@ -19,7 +19,7 @@ Requires Go (version in `backend/go.mod`) and golangci-lint v2. To run it in pro
 | `make test`  | `go test -race ./...`                                  |
 | `make lint`  | golangci-lint, including formatting and import rules. Its cache is per worktree, in `.cache/`. |
 | `make fmt`   | Apply gofmt and goimports.                             |
-| `make generate` | Regenerate the three schemas in `action/` (proposal, result, scaffold) from the `internal/review` types; a test fails when any is stale. |
+| `make generate` | Regenerate the three schemas in `action/` (proposal, result, scaffold) from the `internal/review` types, and `action/prompt.md` and `action/scaffold.md` from `internal/review/instructions`; a test fails when any is stale. |
 | `make check` | lint, test, and govulncheck; what CI runs, plus `make eval-check`. |
 | `make eval`, `make eval-check` | Score a runner on labeled cases, or validate them offline; see [Eval](eval.md). |
 

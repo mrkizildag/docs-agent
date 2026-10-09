@@ -1,12 +1,12 @@
-.PHONY: check fmt lint test vuln run generate eval eval-check
+.PHONY: check fmt lint test generated vuln run generate eval eval-check
 
 # golangci-lint's default cache is per user, so worktrees of this repo share it and report each other's files.
 export GOLANGCI_LINT_CACHE ?= $(CURDIR)/.cache/golangci-lint
 
-check: lint test vuln
+check: lint test generated vuln
 
 generate:
-	cd backend && go run ./cmd/genschema ../action/proposal.schema.json ../action/result.schema.json ../action/scaffold.schema.json
+	cd backend && go run ./cmd/genaction ../action
 
 fmt:
 	cd backend && golangci-lint fmt ./...
@@ -16,6 +16,10 @@ lint:
 
 test:
 	cd backend && go test -race ./...
+
+# -count=1: the generated files live outside the Go module, so the test cache would not notice an edit.
+generated:
+	cd backend && go test -count=1 ./cmd/genaction
 
 vuln:
 	cd backend && go run golang.org/x/vuln/cmd/govulncheck@latest ./...

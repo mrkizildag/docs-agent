@@ -5,6 +5,7 @@ covers:
   - backend/internal/llm/**
   - backend/internal/agent/**
   - backend/internal/review/llmrunner/**
+  - backend/internal/review/instructions/**
   - backend/internal/github/files.go
   - backend/internal/review/basedocs/**
   - backend/internal/review/finalize/**
@@ -40,7 +41,7 @@ The diff comes from GitHub's per-file patches, not from git in the clone, so anc
 
 PR content (code, comments, docs, commit messages) is attacker-controlled text that the model reads. Safety comes from what the model can do, not from asking it nicely. The only tools are `read_file`, `grep`, `list_dir`, and the finishing `submit_proposals` (`submit_docs` for a scaffold run): there is nothing to write, execute, or fetch, so an injected instruction has nothing to call. File access goes through `os.Root` on the clone, so `../`, absolute paths, and symlinks pointing out are refused by the OS-level check, not by string filtering. A refused call returns a tool error to the model and the run continues.
 
-Everything taken from the PR (patch, doc text, the proposal under verification) reaches the model inside markers carrying a per-run random nonce, and every system prompt says text inside them is data. That lowers the odds of injection; it does not remove them, which is why the tools stay read-only and a human still applies every edit. Git itself runs on attacker-controlled content, so it gets a minimal environment: no server secrets, no system or global git config (so no host-configured filters or hooks), no terminal prompts, HTTPS only, and a token narrowed to the one repo with `contents: read`. Prompt inputs are capped (64 KiB per doc, 128 KiB of patch, with a visible truncation note) and more than 10 candidate docs is an analysis failure, so a PR cannot buy unbounded model spend. A file whose patch GitHub omits (large or binary) is shown to the model as omitted, not as an empty diff, and a renamed file matches docs covering its old path too.
+Everything taken from the PR (patch, doc text, the proposal under verification) reaches the model inside markers carrying a per-run random nonce, and every system prompt says text inside them is data. The draft and scaffold prompts wrap the rules in `internal/review/instructions` with server-only tool sentences; the Actions runner's prompts are generated from the same rules, so a rule change reaches both (see [Actions runner](actions-runner.md)). That lowers the odds of injection; it does not remove them, which is why the tools stay read-only and a human still applies every edit. Git itself runs on attacker-controlled content, so it gets a minimal environment: no server secrets, no system or global git config (so no host-configured filters or hooks), no terminal prompts, HTTPS only, and a token narrowed to the one repo with `contents: read`. Prompt inputs are capped (64 KiB per doc, 128 KiB of patch, with a visible truncation note) and more than 10 candidate docs is an analysis failure, so a PR cannot buy unbounded model spend. A file whose patch GitHub omits (large or binary) is shown to the model as omitted, not as an empty diff, and a renamed file matches docs covering its old path too.
 
 The agent and LLM packages know nothing about GitHub or the review domain; the import boundary is enforced by depguard in `backend/.golangci.yml`.
 
