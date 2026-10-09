@@ -98,22 +98,32 @@ const draftSystemPrompt = `You propose documentation updates for a pull request.
 	`When you are done, call submit_proposals ` +
 	`exactly once with the final list; an empty list means no doc needs to change.`
 
-func draftUserPrompt(f fence, impacted []docs.Doc, newDocFiles []string, files []input.File, patch string) string {
+// draftPrompt is what the draft agent is shown: the impacted docs, the
+// uncovered files it may write a new doc for, and the PR's hunks and diff.
+type draftPrompt struct {
+	fence       fence
+	impacted    []docs.Doc
+	newDocFiles []string
+	files       []input.File
+	patch       string
+}
+
+func (p draftPrompt) user() string {
 	var b strings.Builder
-	paths := make([]string, len(impacted))
-	for i, d := range impacted {
+	paths := make([]string, len(p.impacted))
+	for i, d := range p.impacted {
 		paths[i] = d.Path
-		fmt.Fprintf(&b, "## %s\n\n%s\n\n", d.Path, f.wrap(docText(d)))
+		fmt.Fprintf(&b, "## %s\n\n%s\n\n", d.Path, p.fence.wrap(docText(d)))
 	}
-	if len(newDocFiles) > 0 {
-		fmt.Fprintf(&b, "Changed files no doc covers (a new doc is needed for them):\n%s\n\n", f.wrap(strings.Join(newDocFiles, "\n")))
+	if len(p.newDocFiles) > 0 {
+		fmt.Fprintf(&b, "Changed files no doc covers (a new doc is needed for them):\n%s\n\n", p.fence.wrap(strings.Join(p.newDocFiles, "\n")))
 	}
 	judged := "(none)"
 	if len(paths) > 0 {
 		judged = strings.Join(paths, ", ")
 	}
 	return fmt.Sprintf("Docs judged impacted: %s\n\n%sAnchor hunks (numbered head-side lines):\n%s\nPR diff:\n%s\n",
-		judged, b.String(), hunkRanges(files), f.wrap(patch))
+		judged, b.String(), hunkRanges(p.files), p.fence.wrap(p.patch))
 }
 
 func hunkRanges(files []input.File) string {

@@ -1,6 +1,6 @@
 module github.com/mrkizildag/pollux-agent/backend
 
-go 1.26.6
+go 1.26.9
 
 require (
 	github.com/bmatcuk/doublestar/v4 v4.10.2

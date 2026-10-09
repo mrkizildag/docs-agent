@@ -227,7 +227,15 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		return noImpact(finalize.NoImpactReason(prefix+strings.Join(reasons, "; ")), r.triageModel, budget), nil
 	}
 
-	proposals, err := r.draft(ctx, log, root, c.isGitlink, index, budget, fence, req, in, selection, impacted, allowNewDoc, patch)
+	prompt := draftPrompt{fence: fence, impacted: make([]docs.Doc, len(impacted)), files: in.Files, patch: patch}
+	for i, p := range impacted {
+		prompt.impacted[i] = index[p]
+	}
+	if allowNewDoc {
+		prompt.newDocFiles = in.Uncovered
+	}
+	rules := finalize.Rules{Changed: req.ChangedFiles, Selection: &selection, Repo: req.Owner + "/" + req.Repo, AllowNewDoc: allowNewDoc}
+	proposals, err := r.draft(ctx, log, budget, cloneHead{root: root, gitlink: c.isGitlink}, rules, prompt)
 	if err != nil {
 		return review.Result{}, err
 	}
@@ -488,26 +496,14 @@ type submitProposalsArgs struct {
 	Proposals []review.Proposal `json:"proposals"`
 }
 
-// draft runs the agent loop that drafts proposals for the impacted docs. It
-// may propose a new doc only when allowNewDoc, the new-doc decision for
-// in.Uncovered, is true.
-func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, gitlink func(context.Context, string) (bool, error), index docIndex, budget *agent.Budget, f fence, req review.Request, in input.Input, sel basedocs.Selection, impacted []string, allowNewDoc bool, patch string) ([]review.Proposal, error) {
+// draft runs the agent loop that drafts proposals and finalizes each
+// submission against the clone's head under rules.
+func (r *Runner) draft(ctx context.Context, log *slog.Logger, budget *agent.Budget, head cloneHead, rules finalize.Rules, prompt draftPrompt) ([]review.Proposal, error) {
 	finish, err := submitProposalsTool()
 	if err != nil {
 		return nil, err
 	}
 
-	impactedDocs := make([]docs.Doc, len(impacted))
-	for i, p := range impacted {
-		impactedDocs[i] = index[p]
-	}
-
-	var newDocFiles []string
-	if allowNewDoc {
-		newDocFiles = in.Uncovered
-	}
-
-	rules := finalize.Rules{Changed: req.ChangedFiles, Selection: &sel, Repo: req.Owner + "/" + req.Repo, AllowNewDoc: allowNewDoc}
 	var finalized []review.Proposal
 	var headErr error
 	runCtx, cancel := context.WithCancel(ctx)
@@ -516,15 +512,15 @@ func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, git
 	task := agent.Task{
 		Model:  r.model,
 		System: draftSystemPrompt,
-		Prompt: draftUserPrompt(f, impactedDocs, newDocFiles, in.Files, patch),
-		Root:   root,
+		Prompt: prompt.user(),
+		Root:   head.root,
 		Finish: finish,
 		Accept: func(args json.RawMessage) error {
 			var parsed submitProposalsArgs
 			if err := json.Unmarshal(args, &parsed); err != nil {
 				return fmt.Errorf("decode submit_proposals arguments: %w", err)
 			}
-			out, problems, err := finalize.Proposals(runCtx, cloneHead{root: root, gitlink: gitlink}, rules, parsed.Proposals)
+			out, problems, err := finalize.Proposals(runCtx, head, rules, parsed.Proposals)
 			if err != nil {
 				// The model cannot fix a failed read of the clone: end the loop.
 				headErr = fmt.Errorf("finalize proposals: %w", err)
