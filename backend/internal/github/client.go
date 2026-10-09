@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -187,36 +188,35 @@ const maxDocsInputBytes = 60000
 // encodeDocs returns in as JSON, without its per-file ranges when they would
 // not fit; the action then derives them from its own diff.
 func encodeDocs(in input.Input) ([]byte, error) {
-	docsJSON, err := json.Marshal(in)
-	if err != nil {
-		return nil, fmt.Errorf("encode docs: %w", err)
-	}
-	if size, err := wireSize(docsJSON); err != nil || size <= maxDocsInputBytes {
+	docsJSON, err := encodeDocsWithinLimit(in)
+	if !errors.Is(err, errDocsTooLarge) {
 		return docsJSON, err
 	}
 	in.Files = nil
-	docsJSON, err = json.Marshal(in)
+	docsJSON, err = encodeDocsWithinLimit(in)
 	if err != nil {
-		return nil, fmt.Errorf("encode docs: %w", err)
-	}
-	size, err := wireSize(docsJSON)
-	if err != nil {
-		return nil, err
-	}
-	if size > maxDocsInputBytes {
-		return nil, fmt.Errorf("docs input is %d bytes encoded without file ranges, over the limit of %d", size, maxDocsInputBytes)
+		return nil, fmt.Errorf("without file ranges: %w", err)
 	}
 	return docsJSON, nil
 }
 
-// wireSize is the size of docsJSON once it is escaped as a JSON string value
-// in the dispatch request, which is what GitHub's input cap sees.
-func wireSize(docsJSON []byte) (int, error) {
-	quoted, err := json.Marshal(string(docsJSON))
+var errDocsTooLarge = errors.New("docs input too large")
+
+// encodeDocsWithinLimit returns in as JSON, or errDocsTooLarge when it is over
+// the limit once escaped as the JSON string value GitHub receives.
+func encodeDocsWithinLimit(in input.Input) ([]byte, error) {
+	docsJSON, err := json.Marshal(in)
 	if err != nil {
-		return 0, fmt.Errorf("encode docs: %w", err)
+		return nil, fmt.Errorf("encode docs: %w", err)
 	}
-	return len(quoted), nil
+	escaped, err := json.Marshal(string(docsJSON))
+	if err != nil {
+		return nil, fmt.Errorf("encode docs: %w", err)
+	}
+	if len(escaped) > maxDocsInputBytes {
+		return nil, fmt.Errorf("%w: %d bytes encoded, over the limit of %d", errDocsTooLarge, len(escaped), maxDocsInputBytes)
+	}
+	return docsJSON, nil
 }
 
 // Dispatch runs the pollux-agent workflow on owner/repo's default branch and

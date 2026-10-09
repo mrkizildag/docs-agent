@@ -136,7 +136,8 @@ func (r *Runner) Start(ctx context.Context, req review.Request) (review.Started,
 	if selection.Empty() {
 		return review.Result{Verdict: review.NoImpact{Reason: basedocs.NothingToReview}}, nil
 	}
-	pending, err := r.dispatch(ctx, r.timeout, req.InstallationID, req.Owner, req.Repo, req.HeadSHA, req.Number, input.New(req, selection))
+	pending, err := r.dispatch(ctx, r.timeout, req.InstallationID, req.Owner, req.Repo,
+		DispatchInputs{HeadSHA: req.HeadSHA, PRNumber: req.Number, Input: input.New(req, selection)})
 	if err != nil {
 		return nil, fmt.Errorf("start actions run %s: %w", where, err)
 	}
@@ -160,20 +161,22 @@ func (r *Runner) selectAtBase(ctx context.Context, installationID int64, owner, 
 // StartScaffold dispatches the workflow with pr_number 0 and no docs at
 // req.BaseSHA and returns review.Pending.
 func (r *Runner) StartScaffold(ctx context.Context, req review.ScaffoldRequest) (review.ScaffoldStarted, error) {
-	pending, err := r.dispatch(ctx, r.scaffoldTimeout, req.InstallationID, req.Owner, req.Repo, req.BaseSHA, 0, input.New(review.Request{}, basedocs.Selection{}))
+	pending, err := r.dispatch(ctx, r.scaffoldTimeout, req.InstallationID, req.Owner, req.Repo,
+		DispatchInputs{HeadSHA: req.BaseSHA, Input: input.New(review.Request{}, basedocs.Selection{})})
 	if err != nil {
 		return nil, fmt.Errorf("start actions scaffold %s/%s: %w", req.Owner, req.Repo, err)
 	}
 	return pending, nil
 }
 
-func (r *Runner) dispatch(ctx context.Context, timeout time.Duration, installationID int64, owner, repo, sha string, number int, in input.Input) (review.Pending, error) {
+func (r *Runner) dispatch(ctx context.Context, timeout time.Duration, installationID int64, owner, repo string, in DispatchInputs) (review.Pending, error) {
 	nonce, err := newNonce()
 	if err != nil {
 		return review.Pending{}, err
 	}
 
-	runID, err := r.api.Dispatch(ctx, installationID, owner, repo, DispatchInputs{HeadSHA: sha, PRNumber: number, Nonce: nonce, Input: in})
+	in.Nonce = nonce
+	runID, err := r.api.Dispatch(ctx, installationID, owner, repo, in)
 	if err != nil {
 		return review.Pending{}, fmt.Errorf("dispatch: %w", err)
 	}
