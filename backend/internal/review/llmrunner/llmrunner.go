@@ -24,6 +24,7 @@ import (
 	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/basedocs"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/finalize"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/input"
 )
 
 const runnerName = "llmrunner"
@@ -139,119 +140,119 @@ func (r *Runner) analyze(ctx context.Context, req review.Request) (review.Result
 		return review.Result{}, err
 	}
 	defer cleanup()
-	root := c.root
-	log := r.log.With("repo", req.Owner+"/"+req.Repo, "pr", req.Number, "head_sha", req.HeadSHA)
 
-	baseFS, err := c.docsAt(ctx, req.BaseSHA)
+	selection, err := selectAtBase(ctx, c, req)
 	if err != nil {
-		return review.Result{}, fmt.Errorf("%w: %w", errClone, err)
-	}
-
-	selection, err := basedocs.Select(baseFS, req.ChangedFiles)
-	if err != nil {
-		return review.Result{}, fmt.Errorf("base docs of %s: %w", req.BaseSHA, err)
+		return review.Result{}, err
 	}
 	if len(selection.Restores) > 0 {
 		return review.Result{Verdict: review.Proposals(selection.Restores)}, nil
 	}
-	candidates, uncovered := selection.Candidates, selection.Uncovered
-	if selection.Empty() {
+	in := input.New(req, selection)
+	if len(in.Candidates) == 0 && len(in.Uncovered) == 0 {
 		return noImpact(basedocs.NothingToReview, "", nil), nil
 	}
-	if len(candidates) > basedocs.MaxCandidates {
-		return review.Result{}, fmt.Errorf("%w: %d candidate docs exceed the cap of %d", errTooManyCandidates, len(candidates), basedocs.MaxCandidates)
+	if len(in.Candidates) > basedocs.MaxCandidates {
+		return review.Result{}, fmt.Errorf("%w: %d candidate docs exceed the cap of %d", errTooManyCandidates, len(in.Candidates), basedocs.MaxCandidates)
 	}
-
-	headTree, err := docs.Parse(root.FS())
+	candidates, err := candidateDocs(ctx, c.root, in.Candidates)
 	if err != nil {
-		return review.Result{}, fmt.Errorf("parse docs of %s: %w", req.HeadSHA, err)
-	}
-	index := make(docIndex, len(headTree.Docs))
-	for _, d := range headTree.Docs {
-		index[d.Path] = d
-	}
-	for _, docPath := range candidates {
-		if _, ok := index[docPath]; ok {
-			continue
-		}
-		d, err := headDoc(ctx, root, docPath)
-		if err != nil {
-			return review.Result{}, err
-		}
-		index[docPath] = d
+		return review.Result{}, fmt.Errorf("docs of %s: %w", req.HeadSHA, err)
 	}
 
 	fence, err := newFence()
 	if err != nil {
 		return review.Result{}, err
 	}
-	budget := agent.NewBudget(r.budget)
-	patch := combinedPatch(req.ChangedFiles)
-
-	var impacted, reasons []string
-	for _, docPath := range candidates {
-		isImpacted, why, err := r.triage(ctx, log, index, budget, fence, docPath, patch)
-		if err != nil {
-			return review.Result{}, fmt.Errorf("triage %s: %w", docPath, err)
-		}
-		if isImpacted {
-			impacted = append(impacted, docPath)
-		} else {
-			reasons = append(reasons, docPath+": "+why)
-		}
+	s := session{
+		r:      r,
+		log:    r.log.With("repo", req.Owner+"/"+req.Repo, "pr", req.Number, "head_sha", req.HeadSHA),
+		budget: agent.NewBudget(r.budget),
+		fence:  fence,
+		patch:  combinedPatch(req.ChangedFiles),
 	}
 
+	impacted, reasons, err := s.triageAll(ctx, candidates)
+	if err != nil {
+		return review.Result{}, err
+	}
 	allowNewDoc := false
-	if len(uncovered) > 0 {
-		readme, err := headReadme(root)
+	if len(in.Uncovered) > 0 {
+		var why string
+		allowNewDoc, why, err = s.newDocAllowed(ctx, c.root, in.Uncovered)
 		if err != nil {
-			return review.Result{}, fmt.Errorf("read docs/README.md of %s: %w", req.HeadSHA, err)
+			return review.Result{}, err
 		}
-		needed, why, err := r.decideNewDoc(ctx, log, budget, fence, string(readme), uncovered, patch)
-		if err != nil {
-			return review.Result{}, fmt.Errorf("decide new doc: %w", err)
-		}
-		if needed {
-			allowNewDoc = true
-		} else {
-			reasons = append(reasons, "no doc covers "+strings.Join(uncovered, ", ")+"; no new doc needed: "+why)
+		if !allowNewDoc {
+			reasons = append(reasons, "no doc covers "+strings.Join(in.Uncovered, ", ")+"; no new doc needed: "+why)
 		}
 	}
-
 	if len(impacted) == 0 && !allowNewDoc {
 		prefix := ""
-		if len(candidates) > 0 {
+		if len(in.Candidates) > 0 {
 			prefix = "no candidate doc is affected: "
 		}
-		return noImpact(finalize.NoImpactReason(prefix+strings.Join(reasons, "; ")), r.triageModel, budget), nil
+		return noImpact(finalize.NoImpactReason(prefix+strings.Join(reasons, "; ")), r.triageModel, s.budget), nil
 	}
 
-	proposals, err := r.draft(ctx, log, root, c.isGitlink, index, budget, fence, req, selection, impacted, allowNewDoc, patch)
+	prompt := draftPrompt{impacted: impacted, files: in.Files}
+	if allowNewDoc {
+		prompt.newDocFiles = in.Uncovered
+	}
+	rules := finalize.Rules{Changed: req.ChangedFiles, Selection: &selection, Repo: req.Owner + "/" + req.Repo, AllowNewDoc: allowNewDoc}
+	proposals, err := s.draft(ctx, cloneHead{root: c.root, gitlink: c.isGitlink}, rules, prompt)
 	if err != nil {
 		return review.Result{}, err
 	}
 	if len(proposals) == 0 {
-		return noImpact("model proposed no doc changes", r.model, budget), nil
+		return noImpact("model proposed no doc changes", r.model, s.budget), nil
 	}
 
-	var kept []review.Proposal
-	var rejected []string
-	for _, p := range proposals {
-		supported, why, err := r.verify(ctx, log, budget, fence, p, patch)
-		if err != nil {
-			return review.Result{}, fmt.Errorf("verify proposal %s: %w", p.DocPath, err)
-		}
-		if supported {
-			kept = append(kept, p)
-		} else {
-			rejected = append(rejected, p.DocPath+": "+why)
-		}
+	kept, rejected, err := s.verifyAll(ctx, proposals)
+	if err != nil {
+		return review.Result{}, err
 	}
 	if len(kept) == 0 {
-		return noImpact(finalize.NoImpactReason("verification rejected every proposal: "+strings.Join(rejected, "; ")), r.triageModel, budget), nil
+		return noImpact(finalize.NoImpactReason("verification rejected every proposal: "+strings.Join(rejected, "; ")), r.triageModel, s.budget), nil
 	}
+	return review.Result{Model: r.model, Verdict: review.Proposals(kept), Usage: usageOf(s.budget)}, nil
+}
 
-	return review.Result{Model: r.model, Verdict: review.Proposals(kept), Usage: usageOf(budget)}, nil
+// selectAtBase picks the candidate docs and uncovered files from the docs at
+// the PR's merge base.
+func selectAtBase(ctx context.Context, c *clone, req review.Request) (basedocs.Selection, error) {
+	baseFS, err := c.docsAt(ctx, req.BaseSHA)
+	if err != nil {
+		return basedocs.Selection{}, fmt.Errorf("%w: %w", errClone, err)
+	}
+	selection, err := basedocs.Select(baseFS, req.ChangedFiles)
+	if err != nil {
+		return basedocs.Selection{}, fmt.Errorf("base docs of %s: %w", req.BaseSHA, err)
+	}
+	return selection, nil
+}
+
+// candidateDocs reads each candidate doc at the head clone, in order.
+func candidateDocs(ctx context.Context, root *os.Root, paths []string) ([]docs.Doc, error) {
+	tree, err := docs.Parse(root.FS())
+	if err != nil {
+		return nil, fmt.Errorf("parse docs: %w", err)
+	}
+	parsed := make(map[string]docs.Doc, len(tree.Docs))
+	for _, d := range tree.Docs {
+		parsed[d.Path] = d
+	}
+	out := make([]docs.Doc, len(paths))
+	for i, p := range paths {
+		d, ok := parsed[p]
+		if !ok {
+			if d, err = headDoc(ctx, root, p); err != nil {
+				return nil, err
+			}
+		}
+		out[i] = d
+	}
+	return out, nil
 }
 
 // headDoc reads docPath from the head clone for a candidate that docs.Parse
@@ -376,9 +377,15 @@ func oneLine(s string, max int) string {
 	return s
 }
 
-// docIndex maps a repo-relative doc path to its parsed doc at the head commit;
-// candidates are chosen from the base commit's covers, but docs are read here.
-type docIndex map[string]docs.Doc
+// session is one analysis's shared model state: the logger, the token
+// budget, the prompt fence, and the PR's combined diff every prompt carries.
+type session struct {
+	r      *Runner
+	log    *slog.Logger
+	budget *agent.Budget
+	fence  fence
+	patch  string
+}
 
 // The verdict flags are pointers so a reply that omits them is an error, not
 // a silent "no".
@@ -410,21 +417,21 @@ func decodeVerdict(reply string, v any) error {
 	return nil
 }
 
-// ask sends one tool-less prompt to model, charges its usage to budget, and
-// decodes the JSON verdict in the reply into v. It returns the reply text for
-// error messages.
-func (r *Runner) ask(ctx context.Context, log *slog.Logger, kind string, budget *agent.Budget, model, system, prompt string, v any) (string, error) {
-	resp, err := r.m.Complete(ctx, llm.Request{
-		Model:    model,
+// ask sends one tool-less prompt to the triage model, charges its usage to
+// the budget, and decodes the JSON verdict in the reply into v. It returns the
+// reply text for error messages.
+func (s session) ask(ctx context.Context, kind, system, prompt string, v any) (string, error) {
+	resp, err := s.r.m.Complete(ctx, llm.Request{
+		Model:    s.r.triageModel,
 		System:   system,
 		Messages: []llm.Message{{Role: llm.RoleUser, Text: prompt}},
 	})
 	if err != nil {
 		return "", fmt.Errorf("complete: %w: %w", errProvider, err)
 	}
-	log.Info("agent call", "kind", kind, "model", model,
+	s.log.Info("agent call", "kind", kind, "model", s.r.triageModel,
 		"input_tokens", resp.Usage.InputTokens, "output_tokens", resp.Usage.OutputTokens)
-	if err := budget.Charge(resp.Usage); err != nil {
+	if err := s.budget.Charge(resp.Usage); err != nil {
 		return "", fmt.Errorf("charge token budget: %w", err)
 	}
 	if err := decodeVerdict(resp.Text, v); err != nil {
@@ -433,11 +440,28 @@ func (r *Runner) ask(ctx context.Context, log *slog.Logger, kind string, budget 
 	return resp.Text, nil
 }
 
-// triage runs one small-model call for docPath, returning whether the PR's
-// diff makes it stale and why.
-func (r *Runner) triage(ctx context.Context, log *slog.Logger, index docIndex, budget *agent.Budget, f fence, docPath, patch string) (impacted bool, reason string, err error) {
+// triageAll triages every candidate, returning the impacted docs and a
+// "path: reason" line for each doc left out.
+func (s session) triageAll(ctx context.Context, candidates []docs.Doc) (impacted []docs.Doc, reasons []string, err error) {
+	for _, d := range candidates {
+		isImpacted, why, err := s.triage(ctx, d)
+		if err != nil {
+			return nil, nil, fmt.Errorf("triage %s: %w", d.Path, err)
+		}
+		if isImpacted {
+			impacted = append(impacted, d)
+		} else {
+			reasons = append(reasons, d.Path+": "+why)
+		}
+	}
+	return impacted, reasons, nil
+}
+
+// triage runs one small-model call for doc, returning whether the PR's diff
+// makes it stale and why.
+func (s session) triage(ctx context.Context, doc docs.Doc) (impacted bool, reason string, err error) {
 	var v triageVerdict
-	reply, err := r.ask(ctx, log, "triage", budget, r.triageModel, triageSystemPrompt, triageUserPrompt(f, index[docPath], patch), &v)
+	reply, err := s.ask(ctx, "triage", triageSystemPrompt, triageUserPrompt(s.fence, doc, s.patch), &v)
 	if err != nil {
 		return false, "", err
 	}
@@ -447,30 +471,51 @@ func (r *Runner) triage(ctx context.Context, log *slog.Logger, index docIndex, b
 	return *v.Impacted, v.Reason, nil
 }
 
-// decideNewDoc runs one small-model call on whether the PR's diff adds
-// behavior that needs a new doc because no existing doc can hold it.
-func (r *Runner) decideNewDoc(ctx context.Context, log *slog.Logger, budget *agent.Budget, f fence, readme string, uncovered []string, patch string) (needed bool, reason string, err error) {
-	var v newDocVerdict
-	reply, err := r.ask(ctx, log, "new_doc", budget, r.triageModel, newDocSystemPrompt, newDocUserPrompt(f, readme, uncovered, patch), &v)
+// newDocAllowed decides, against the head's docs index, whether the uncovered
+// files need a new doc, and why not when they don't.
+func (s session) newDocAllowed(ctx context.Context, root *os.Root, uncovered []string) (needed bool, reason string, err error) {
+	readme, err := headReadme(root)
 	if err != nil {
-		return false, "", err
+		return false, "", fmt.Errorf("read docs/README.md: %w", err)
+	}
+	var v newDocVerdict
+	reply, err := s.ask(ctx, "new_doc", newDocSystemPrompt, newDocUserPrompt(s.fence, readme, uncovered, s.patch), &v)
+	if err != nil {
+		return false, "", fmt.Errorf("decide new doc: %w", err)
 	}
 	if v.Needed == nil {
-		return false, "", fmt.Errorf("%w: new-doc verdict has no \"needed\" field in reply %q", errProvider, oneLine(reply, 200))
+		return false, "", fmt.Errorf("decide new doc: %w: new-doc verdict has no \"needed\" field in reply %q", errProvider, oneLine(reply, 200))
 	}
 	return *v.Needed, v.Reason, nil
 }
 
+// verifyAll verifies every proposal, returning the supported ones and a
+// "path: reason" line for each rejected one.
+func (s session) verifyAll(ctx context.Context, proposals []review.Proposal) (kept []review.Proposal, rejected []string, err error) {
+	for _, p := range proposals {
+		supported, why, err := s.verify(ctx, p)
+		if err != nil {
+			return nil, nil, fmt.Errorf("verify proposal %s: %w", p.DocPath, err)
+		}
+		if supported {
+			kept = append(kept, p)
+		} else {
+			rejected = append(rejected, p.DocPath+": "+why)
+		}
+	}
+	return kept, rejected, nil
+}
+
 // verify asks the triage model whether p is supported by the patch, given the
 // doc section p replaces.
-func (r *Runner) verify(ctx context.Context, log *slog.Logger, budget *agent.Budget, f fence, p review.Proposal, patch string) (supported bool, reason string, err error) {
+func (s session) verify(ctx context.Context, p review.Proposal) (supported bool, reason string, err error) {
 	section := p.Original
 	if p.Section == "" {
 		section = "(new doc)"
 	}
 
 	var v verifyVerdict
-	reply, err := r.ask(ctx, log, "verify", budget, r.triageModel, verifySystemPrompt, verifyUserPrompt(f, p, section, patch), &v)
+	reply, err := s.ask(ctx, "verify", verifySystemPrompt, verifyUserPrompt(s.fence, p, section, s.patch), &v)
 	if err != nil {
 		return false, "", err
 	}
@@ -487,43 +532,31 @@ type submitProposalsArgs struct {
 	Proposals []review.Proposal `json:"proposals"`
 }
 
-// draft runs the agent loop that drafts proposals for the impacted docs. It
-// may propose a new doc only when allowNewDoc, the new-doc decision for
-// sel.Uncovered, is true.
-func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, gitlink func(context.Context, string) (bool, error), index docIndex, budget *agent.Budget, f fence, req review.Request, sel basedocs.Selection, impacted []string, allowNewDoc bool, patch string) ([]review.Proposal, error) {
+// draft runs the agent loop that drafts proposals and finalizes each
+// submission against the clone's head under rules.
+func (s session) draft(ctx context.Context, head cloneHead, rules finalize.Rules, prompt draftPrompt) ([]review.Proposal, error) {
 	finish, err := submitProposalsTool()
 	if err != nil {
 		return nil, err
 	}
 
-	impactedDocs := make([]docs.Doc, len(impacted))
-	for i, p := range impacted {
-		impactedDocs[i] = index[p]
-	}
-
-	var newDocFiles []string
-	if allowNewDoc {
-		newDocFiles = sel.Uncovered
-	}
-
-	rules := finalize.Rules{Changed: req.ChangedFiles, Selection: &sel, Repo: req.Owner + "/" + req.Repo, AllowNewDoc: allowNewDoc}
 	var finalized []review.Proposal
 	var headErr error
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	task := agent.Task{
-		Model:  r.model,
+		Model:  s.r.model,
 		System: draftSystemPrompt,
-		Prompt: draftUserPrompt(f, impactedDocs, newDocFiles, req.ChangedFiles, patch),
-		Root:   root,
+		Prompt: prompt.user(s.fence, s.patch),
+		Root:   head.root,
 		Finish: finish,
 		Accept: func(args json.RawMessage) error {
 			var parsed submitProposalsArgs
 			if err := json.Unmarshal(args, &parsed); err != nil {
 				return fmt.Errorf("decode submit_proposals arguments: %w", err)
 			}
-			out, problems, err := finalize.Proposals(runCtx, cloneHead{root: root, gitlink: gitlink}, rules, parsed.Proposals)
+			out, problems, err := finalize.Proposals(runCtx, head, rules, parsed.Proposals)
 			if err != nil {
 				// The model cannot fix a failed read of the clone: end the loop.
 				headErr = fmt.Errorf("finalize proposals: %w", err)
@@ -537,10 +570,10 @@ func (r *Runner) draft(ctx context.Context, log *slog.Logger, root *os.Root, git
 			return nil
 		},
 		MaxSteps: stepCap,
-		Log:      log,
+		Log:      s.log,
 	}
 
-	_, _, err = agent.Run(runCtx, r.m, task, budget)
+	_, _, err = agent.Run(runCtx, s.r.m, task, s.budget)
 	if headErr != nil {
 		return nil, fmt.Errorf("draft proposals: %w", headErr)
 	}

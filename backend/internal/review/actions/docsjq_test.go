@@ -34,12 +34,32 @@ func TestDocsJQ(t *testing.T) {
 		{name: "review not a list", key: "review", input: `{"review":"x"}`, wantErr: true},
 		{name: "string input", key: "review", input: `"s"`, wantErr: true},
 		{name: "non-string element", key: "uncovered", input: `{"uncovered":[1]}`, wantErr: true},
+		{name: "base_sha of an object", key: "base_sha", input: `{"base_sha":"abc"}`, want: "abc\n"},
+		{name: "base_sha absent", key: "base_sha", input: `{}`, want: "\n"},
+		{name: "base_sha of a bare array", key: "base_sha", input: `["a.md"]`, want: "\n"},
+		{name: "base_sha not a string", key: "base_sha", input: `{"base_sha":1}`, wantErr: true},
+		{name: "base_sha not a string fails any key", key: "review", input: `{"base_sha":false}`, wantErr: true},
+		{name: "files absent", key: "has_files", input: `{}`, want: "false\n"},
+		{name: "files null", key: "has_files", input: `{"files":null}`, want: "false\n"},
+		{name: "empty files", key: "has_files", input: `{"files":[]}`, want: "true\n"},
+		{name: "hunks flatten files and ranges", key: "hunks", input: `{"files":[{"path":"a.go","ranges":[{"start":1,"end":2},{"start":5,"end":5}]},{"path":"old.go","ranges":[]}]}`,
+			want: `{"file":"a.go","start":1,"end":2}` + "\n" + `{"file":"a.go","start":5,"end":5}` + "\n"},
+		{name: "hunks of no files", key: "hunks", input: `{}`, want: ""},
+		{name: "files not an array", key: "has_files", input: `{"files":{}}`, wantErr: true},
+		{name: "file without path", key: "has_files", input: `{"files":[{"ranges":[]}]}`, wantErr: true},
+		{name: "file path not a string", key: "has_files", input: `{"files":[{"path":1,"ranges":[]}]}`, wantErr: true},
+		{name: "file without ranges", key: "has_files", input: `{"files":[{"path":"a.go"}]}`, wantErr: true},
+		{name: "range start not a number", key: "has_files", input: `{"files":[{"path":"a.go","ranges":[{"start":"1","end":2}]}]}`, wantErr: true},
+		{name: "range without end", key: "has_files", input: `{"files":[{"path":"a.go","ranges":[{"start":1}]}]}`, wantErr: true},
+		{name: "bad review list fails the first key read", key: "has_files", input: `{"review":"x"}`, wantErr: true},
+		{name: "bad uncovered list fails the first key read", key: "has_files", input: `{"uncovered":[1]}`, wantErr: true},
 		{name: "quote and newline in a path stay on one line", key: "review", input: `["a\"b\nc.md"]`, want: `- "a\"b\nc.md"` + "\n"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			cmd := exec.CommandContext(t.Context(), jq, "-r", "--arg", "key", tc.key, "-f", filter) //nolint:gosec // jq from PATH and table-literal args
+			cmd := exec.CommandContext(t.Context(), "bash", "-c", `jq -c -r --arg key "$KEY" -f "$FILTER"`)
+			cmd.Env = []string{"PATH=" + filepath.Dir(jq) + ":/usr/bin:/bin", "KEY=" + tc.key, "FILTER=" + filter}
 			cmd.Stdin = strings.NewReader(tc.input)
 			out, err := cmd.Output()
 			if tc.wantErr {
@@ -79,7 +99,8 @@ func TestTraceJQ(t *testing.T) {
 	}, "\n") + "\n"
 	want := "» Read a/b.md\n» Grep p q src\n» Glob **/*.go\n» done: turns=4 duration=12s cost=$0.12 tokens in=10 cache_read=0 cache_write=0 out=20\n"
 
-	cmd := exec.CommandContext(t.Context(), jq, "-rR", "-f", filter) //nolint:gosec // jq from PATH and fixed args
+	cmd := exec.CommandContext(t.Context(), "bash", "-c", `jq -rR -f "$FILTER"`)
+	cmd.Env = []string{"PATH=" + filepath.Dir(jq) + ":/usr/bin:/bin", "FILTER=" + filter}
 	cmd.Stdin = strings.NewReader(stream)
 	out, err := cmd.Output()
 	if err != nil {

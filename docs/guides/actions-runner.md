@@ -41,6 +41,8 @@ With the Actions runner, your repo runs the analysis in its own GitHub Actions u
 
 If you set up the workflow before the `docs` input existed, copy it again: GitHub rejects a dispatch with an input the workflow doesn't declare, so the old copy fails every review.
 
+The server sends the merge base and the changed files' commentable lines inside the existing `docs` input, so the workflow's inputs do not change and no repo re-copies it for that.
+
 No other config. Once the workflow exists on the default branch, the repo uses this runner and never the server runner. A workflow that exists only on a PR branch does nothing: the gate always dispatches the default branch's copy.
 
 ## Docs scaffold

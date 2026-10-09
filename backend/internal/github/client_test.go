@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,7 +20,10 @@ import (
 
 	"github.com/mrkizildag/pollux-agent/backend/internal/gate"
 	ghclient "github.com/mrkizildag/pollux-agent/backend/internal/github"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review"
 	"github.com/mrkizildag/pollux-agent/backend/internal/review/actions"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/basedocs"
+	"github.com/mrkizildag/pollux-agent/backend/internal/review/input"
 )
 
 func testPrivateKeyPEM(t *testing.T) []byte {
@@ -350,53 +354,140 @@ func TestDispatch(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name     string
-		in       actions.DispatchInputs
-		wantDocs string
+		name string
+		in   actions.DispatchInputs
 	}{
 		{
-			name:     "both lists",
-			in:       actions.DispatchInputs{HeadSHA: "abc", PRNumber: 7, Nonce: "n1", Docs: []string{"docs/a.md"}, Uncovered: []string{"src/x.go"}},
-			wantDocs: `{"review":["docs/a.md"],"uncovered":["src/x.go"]}`,
+			name: "full input",
+			in: actions.DispatchInputs{HeadSHA: "abc", PRNumber: 7, Nonce: "n1", Input: input.New(
+				review.Request{BaseSHA: "base", ChangedFiles: []review.ChangedFile{
+					{Path: "src/x.go", Hunks: []review.LineRange{{Start: 1, End: 3}}},
+					{Path: "old.go", Removed: true},
+				}},
+				basedocs.Selection{Candidates: []string{"docs/a.md"}, Uncovered: []string{"src/x.go"}},
+			)},
 		},
 		{
-			name:     "nil uncovered",
-			in:       actions.DispatchInputs{HeadSHA: "abc", PRNumber: 7, Nonce: "n1", Docs: []string{"docs/a.md"}},
-			wantDocs: `{"review":["docs/a.md"],"uncovered":[]}`,
+			name: "empty input",
+			in: actions.DispatchInputs{HeadSHA: "abc", PRNumber: 7, Nonce: "n1",
+				Input: input.New(review.Request{}, basedocs.Selection{})},
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			var got map[string]any
-			mux := http.NewServeMux()
-			handleAccessToken(t, mux)
-			mux.HandleFunc("GET /repos/o/r", func(w http.ResponseWriter, _ *http.Request) {
-				writeJSON(t, w, http.StatusOK, `{"default_branch":"trunk"}`)
-			})
-			mux.HandleFunc("POST /repos/o/r/actions/workflows/pollux-agent.yml/dispatches", func(w http.ResponseWriter, r *http.Request) {
-				if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
-					t.Errorf("decode dispatch body: %v", err)
-				}
-				writeJSON(t, w, http.StatusOK, `{"workflow_run_id":4242,"run_url":"u","html_url":"h"}`)
-			})
-			client := newTestClient(t, mux)
-
-			runID, err := client.Dispatch(t.Context(), 99, "o", "r", tc.in)
+			wantDocs, err := json.Marshal(tc.in.Input)
+			if err != nil {
+				t.Fatalf("marshal input: %v", err)
+			}
+			got, runID, err := dispatch(t, tc.in)
 			if err != nil || runID != 4242 {
 				t.Fatalf("Dispatch() = %d, %v, want 4242, nil", runID, err)
 			}
 
 			want := map[string]any{
 				"ref":                "trunk",
-				"inputs":             map[string]any{"head_sha": "abc", "pr_number": "7", "nonce": "n1", "docs": tc.wantDocs},
+				"inputs":             map[string]any{"head_sha": "abc", "pr_number": "7", "nonce": "n1", "docs": string(wantDocs)},
 				"return_run_details": true,
 			}
 			if diff := cmp.Diff(want, got); diff != "" {
 				t.Errorf("dispatch body (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func dispatch(t *testing.T, in actions.DispatchInputs) (body map[string]any, runID int64, err error) {
+	t.Helper()
+
+	mux := http.NewServeMux()
+	handleAccessToken(t, mux)
+	mux.HandleFunc("GET /repos/o/r", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, http.StatusOK, `{"default_branch":"trunk"}`)
+	})
+	mux.HandleFunc("POST /repos/o/r/actions/workflows/pollux-agent.yml/dispatches", func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode dispatch body: %v", err)
+		}
+		writeJSON(t, w, http.StatusOK, `{"workflow_run_id":4242,"run_url":"u","html_url":"h"}`)
+	})
+	runID, err = newTestClient(t, mux).Dispatch(t.Context(), 99, "o", "r", in)
+	if err != nil {
+		return nil, 0, fmt.Errorf("dispatch: %w", err)
+	}
+	return body, runID, nil
+}
+
+func TestDispatchDropsFileRangesOverTheLimit(t *testing.T) {
+	t.Parallel()
+
+	files := make([]review.ChangedFile, 3000)
+	for i := range files {
+		files[i] = review.ChangedFile{Path: fmt.Sprintf("src/pkg%04d/file.go", i), Hunks: []review.LineRange{{Start: 1, End: 2}}}
+	}
+	in := actions.DispatchInputs{HeadSHA: "abc", PRNumber: 7, Nonce: "n1",
+		Input: input.New(review.Request{BaseSHA: "base", ChangedFiles: files}, basedocs.Selection{Candidates: []string{"docs/a.md"}})}
+
+	got, _, err := dispatch(t, in)
+	if err != nil {
+		t.Fatalf("Dispatch() = %v, want nil", err)
+	}
+	docs, _ := got["inputs"].(map[string]any)["docs"].(string)
+	var sent struct {
+		BaseSHA string   `json:"base_sha"`
+		Review  []string `json:"review"`
+		Files   any      `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(docs), &sent); err != nil {
+		t.Fatalf("decode docs input: %v", err)
+	}
+	if sent.Files != nil || sent.BaseSHA != "base" || len(sent.Review) != 1 {
+		t.Errorf("docs input = %+v, want base_sha and review kept and files null", sent)
+	}
+}
+
+func TestDispatchCountsEscapedSizeAgainstTheLimit(t *testing.T) {
+	t.Parallel()
+
+	// About 54 KB of JSON that grows past the limit once its quotes are
+	// escaped inside the dispatch request.
+	files := make([]review.ChangedFile, 850)
+	for i := range files {
+		files[i] = review.ChangedFile{Path: fmt.Sprintf("src/pkg%04d/file.go", i), Hunks: []review.LineRange{{Start: 1, End: 2}}}
+	}
+	in := actions.DispatchInputs{HeadSHA: "abc", PRNumber: 7, Nonce: "n1",
+		Input: input.New(review.Request{BaseSHA: "base", ChangedFiles: files}, basedocs.Selection{})}
+	raw, err := json.Marshal(in.Input)
+	if err != nil || len(raw) >= 60000 {
+		t.Fatalf("fixture is %d raw bytes (err %v), want under the limit", len(raw), err)
+	}
+
+	got, _, err := dispatch(t, in)
+	if err != nil {
+		t.Fatalf("Dispatch() = %v, want nil", err)
+	}
+	docs, _ := got["inputs"].(map[string]any)["docs"].(string)
+	var sent struct {
+		Files any `json:"files"`
+	}
+	if err := json.Unmarshal([]byte(docs), &sent); err != nil {
+		t.Fatalf("decode docs input: %v", err)
+	}
+	if sent.Files != nil {
+		t.Errorf("files sent although the escaped input is over the limit")
+	}
+}
+
+func TestDispatchRejectsDocsOverTheLimit(t *testing.T) {
+	t.Parallel()
+
+	in := actions.DispatchInputs{HeadSHA: "abc", PRNumber: 7, Nonce: "n1",
+		Input: input.New(review.Request{}, basedocs.Selection{Uncovered: []string{strings.Repeat("x", 70000)}})}
+
+	_, _, err := dispatch(t, in)
+	if err == nil || !strings.Contains(err.Error(), "over the limit of 60000") {
+		t.Errorf("Dispatch() = %v, want an error naming the size and the limit", err)
 	}
 }
 

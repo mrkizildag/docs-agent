@@ -167,6 +167,12 @@ func TestFailureCauseIsFixedTextWhateverTheErrorSays(t *testing.T) {
 			wantCause: "The model provider returned an error.",
 		},
 		{
+			name:      "server repository read failure",
+			runner:    &fakeRunner{err: &review.FailedError{Cause: review.CauseClone, Err: payloadErr}},
+			runsOnPR:  true,
+			wantCause: "Reading the repository failed.",
+		},
+		{
 			name:      "server internal failure",
 			runner:    &fakeRunner{err: &review.FailedError{Cause: review.CauseInternal, Err: payloadErr}},
 			runsOnPR:  true,

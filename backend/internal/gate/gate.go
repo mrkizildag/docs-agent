@@ -1281,7 +1281,7 @@ func failureCause(err error) string {
 		case review.CauseTooManyCandidates:
 			return "Too many docs cover the changed files."
 		case review.CauseClone:
-			return "Cloning the repository failed."
+			return "Reading the repository failed."
 		case review.CauseInternal:
 			return "The analysis failed unexpectedly."
 		}
