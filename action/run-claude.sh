@@ -43,7 +43,7 @@ else
   if [ "$has_files" = true ]; then
     docs_input hunks > "$out/hunks.jsonl"
   else
-    awk -f "$ACTION_PATH/diff-hunks.awk" "$out/pr.diff" | jq -cR 'select(. != "") | split("\t") | {file: .[0], start: (.[1] | tonumber), end: (.[2] | tonumber)}' > "$out/hunks.jsonl"
+    awk -f "$ACTION_PATH/diff-hunks.awk" "$out/pr.diff" > "$out/hunks.jsonl"
   fi
   if [ -s "$out/hunks.jsonl" ]; then
     jq -c --slurpfile hunks "$out/hunks.jsonl" -f "$ACTION_PATH/anchor-schema.jq" "$schema_file" > "$out/review.schema.json"

@@ -1219,8 +1219,14 @@ func TestDiffHunksAwkPaths(t *testing.T) {
 		diff string
 		want string
 	}{
-		{"raw UTF-8 path", "--- a/docs/über.md\n+++ b/docs/über.md\n@@ -1 +1,2 @@\n x\n+y\n", "docs/über.md\t1\t2\n"},
-		{"still-quoted path", "--- a/docs/a\"b.md\n+++ \"b/docs/a\\\"b.md\"\n@@ -1 +1,2 @@\n x\n+y\n", ""},
+		{"raw UTF-8 path", "--- a/docs/über.md\n+++ b/docs/über.md\n@@ -1 +1,2 @@\n x\n+y\n", `{"file":"docs/über.md","start":1,"end":2}` + "\n"},
+		{"path with a space", "--- a/docs/a b.md\n+++ b/docs/a b.md\t\n@@ -1 +1,2 @@\n x\n+y\n", `{"file":"docs/a b.md","start":1,"end":2}` + "\n"},
+		{
+			"quoted path",
+			"--- a/x\n+++ \"b/docs/a\\\"b\\\\c\\td\\001.md\"\n@@ -1 +1,2 @@\n x\n+y\n",
+			`{"file":"docs/a\"b\\c\u0009d\u0001.md","start":1,"end":2}` + "\n",
+		},
+		{"deleted file", "--- a/x.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n", ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1356,7 +1362,12 @@ func TestActionDropsAnchorRangesWhenTheSchemaIsTooLarge(t *testing.T) {
 	t.Parallel()
 
 	sc := newScenario(t)
-	out, log, err := runClaude(t, sc, filesDocs(sc.mergeBase, 2, 4000))
+	docs := filesDocs(sc.mergeBase, 2, 1500)
+	// Linux refuses to exec with one environment string over 128 KiB (MAX_ARG_STRLEN).
+	if len(docs) >= 128<<10 {
+		t.Fatalf("docs input is %d bytes, want under 128 KiB", len(docs))
+	}
+	out, log, err := runClaude(t, sc, docs)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
