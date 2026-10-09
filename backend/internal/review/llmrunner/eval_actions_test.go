@@ -103,13 +103,15 @@ func claudeJudge(sandbox claudeSandbox, model string) judgeFunc {
 			return "", err
 		}
 
-		args := []string{"-p", prompt, "--system-prompt", judgeSystem, "--output-format", "json", "--tools", "", "--strict-mcp-config"}
-		if model != "" {
-			args = append(args, "--model", model)
-		}
-		cmd := exec.CommandContext(ctx, "claude", args...) //nolint:gosec // fixed binary; the prompt is one argv entry and no shell runs
+		// The prompt goes on stdin and the model in ANTHROPIC_MODEL, so the
+		// argv is fixed.
+		cmd := exec.CommandContext(ctx, "claude", "-p", "--system-prompt", judgeSystem, "--output-format", "json", "--tools", "", "--strict-mcp-config")
 		cmd.Dir = dir
+		cmd.Stdin = strings.NewReader(prompt)
 		cmd.Env = sandbox.judgeEnv(home, tmp)
+		if model != "" {
+			cmd.Env = append(cmd.Env, "ANTHROPIC_MODEL="+model)
+		}
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		out, err := cmd.Output()
@@ -152,7 +154,7 @@ func (w *localWorkflow) artifactPath() string {
 	return filepath.Join(w.work, "runner", "pollux-agent", "result.json")
 }
 
-// Dispatch checks out the synthetic head, writes the diff, and runs
+// Dispatch checks out the synthetic head and runs
 // action/run-claude.sh with the environment action.yml gives it. A failing
 // script is not an error: the artifact it left decides, as in CI.
 func (w *localWorkflow) Dispatch(ctx context.Context, _ int64, _, _ string, in actions.DispatchInputs) (int64, error) {
@@ -166,21 +168,13 @@ func (w *localWorkflow) Dispatch(ctx context.Context, _ int64, _, _ string, in a
 	if _, err := runEvalGit(ctx, w.in.Dir, nil, "worktree", "add", "-q", "--detach", checkout, in.HeadSHA); err != nil {
 		return 0, fmt.Errorf("check out %s: %w", in.HeadSHA, err)
 	}
-	diff, err := runEvalGit(ctx, checkout, nil, "-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", w.in.Request.BaseSHA+"..."+in.HeadSHA)
-	if err != nil {
-		return 0, err
-	}
-	if err := os.WriteFile(filepath.Join(out, "pr.diff"), []byte(diff), 0o600); err != nil {
-		return 0, fmt.Errorf("write pr.diff: %w", err)
-	}
-
-	docsJSON, err := json.Marshal(map[string][]string{"review": in.Docs, "uncovered": in.Uncovered})
+	docsJSON, err := json.Marshal(in.Input)
 	if err != nil {
 		return 0, fmt.Errorf("encode docs input: %w", err)
 	}
 	actionDir := filepath.Join(w.root, "action")
-	cmd := exec.CommandContext(ctx, "bash", filepath.Join(actionDir, "run-claude.sh")) //nolint:gosec // the script path is inside this repository
-	cmd.Dir = w.work
+	cmd := exec.CommandContext(ctx, "bash", "run-claude.sh")
+	cmd.Dir = actionDir
 	cmd.Env = w.sandbox.scriptEnv(home, tmp,
 		"HEAD_SHA="+in.HeadSHA,
 		"PR_NUMBER="+strconv.Itoa(in.PRNumber),
@@ -201,13 +195,13 @@ func (w *localWorkflow) Dispatch(ctx context.Context, _ int64, _, _ string, in a
 		return 0, fmt.Errorf("write action log: %w", err)
 	}
 
-	transcript, err := os.ReadFile(filepath.Join(out, "transcript.jsonl")) //nolint:gosec // the path is inside the per-run scratch directory
+	transcript, err := fs.ReadFile(os.DirFS(out), "transcript.jsonl")
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 	case err != nil:
 		return 0, fmt.Errorf("read transcript: %w", err)
 	default:
-		if err := os.WriteFile(w.logPrefix+".transcript.jsonl", transcript, 0o600); err != nil { //nolint:gosec // logPrefix is built from a validated case id inside the results directory
+		if err := os.WriteFile(w.logPrefix+".transcript.jsonl", transcript, 0o600); err != nil {
 			return 0, fmt.Errorf("write transcript: %w", err)
 		}
 	}
@@ -369,7 +363,12 @@ func stubClaude(t *testing.T, result map[string]any, status int) string {
 	}
 	dir := t.TempDir()
 	script := fmt.Sprintf("#!/bin/sh\ncat <<'EOF'\n{\"type\":\"system\",\"subtype\":\"init\"}\n%s\nEOF\nexit %d\n", event, status)
-	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o700); err != nil { //nolint:gosec // the stub must be executable
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("open stub dir: %v", err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.WriteFile("claude", []byte(script), 0o700); err != nil {
 		t.Fatalf("write stub claude: %v", err)
 	}
 	return dir

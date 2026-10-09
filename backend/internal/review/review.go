@@ -175,6 +175,6 @@ type ChangedFile struct {
 
 // LineRange is an inclusive range of 1-based line numbers.
 type LineRange struct {
-	Start int
-	End   int
+	Start int `json:"start"`
+	End   int `json:"end"`
 }

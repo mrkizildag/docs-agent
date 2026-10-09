@@ -38,7 +38,7 @@ The run needs this repo's full history: cases name commits by SHA. Each run writ
 
 A case names a `base` and a `head` commit. The harness builds the input head from `head` with the whole `docs/` tree reset to `base`, so the runner sees the code change without the doc update the human made, and the changed files come from git in the shape GitHub's PR files API returns. The server runner clones that local repo instead of GitHub; nothing else about the pipeline changes.
 
-The Actions runner runs unchanged too: a local stand-in for the GitHub Actions API answers its dispatch by running `action/run-claude.sh`, the same script the action's "Run Claude" step runs, over a checkout of the input head, then hands back the `result.json` it wrote. Each run gets an empty `HOME` and a minimal environment, so your own Claude Code settings, hooks, and memory never load, as on a fresh CI runner. `make eval-check` covers this path with a stub `claude`.
+The Actions runner runs unchanged too: a local stand-in for the GitHub Actions API answers its dispatch with the same input the server sends and runs `action/run-claude.sh`, the same script the action's "Run Claude" step runs, over a checkout of the input head (the stand-in computes no diff; the script diffs against the dispatched merge base), then hands back the `result.json` it wrote. Each run gets an empty `HOME` and a minimal environment, so your own Claude Code settings, hooks, and memory never load, as on a fresh CI runner. `make eval-check` covers this path with a stub `claude`.
 
 ## Scoring
 
