@@ -401,6 +401,8 @@ func stubCase(t *testing.T) (evalCase, evalInput) {
 	}
 
 	git("init", "-q")
+	// A detached auto-maintenance can outlive the test and break TempDir cleanup.
+	git("config", "maintenance.auto", "false")
 	git("config", "uploadpack.allowAnySHA1InWant", "true")
 	write("docs/features/thing.md", "---\ncovers:\n  - src/*.go\n---\n# Thing\n\nIntro.\n\n## Retention\n\nKeeps 7 days.\n")
 	write("src/thing.go", "package src\n\nconst Retention = 7\n")

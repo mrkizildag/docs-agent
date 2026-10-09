@@ -117,6 +117,8 @@ func newGitRepo(t *testing.T, files map[string]string) (string, string) {
 	}
 
 	git("init", "-q", "-b", "main")
+	// A detached auto-maintenance can outlive the test and break TempDir cleanup.
+	git("config", "maintenance.auto", "false")
 	git("config", "user.email", "test@example.com")
 	git("config", "user.name", "test")
 	git("add", "-A")

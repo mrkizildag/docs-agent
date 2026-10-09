@@ -103,6 +103,8 @@ func newGitRepo(t *testing.T) (string, string) {
 	}
 
 	run("init", "-q", "-b", "main")
+	// A detached auto-maintenance can outlive the test and break TempDir cleanup.
+	run("config", "maintenance.auto", "false")
 	run("config", "user.email", "test@example.com")
 	run("config", "user.name", "test")
 
@@ -822,6 +824,8 @@ func TestStart_TooManyCandidateDocsIsAnError(t *testing.T) {
 		}
 	}
 	run("init", "-q", "-b", "main")
+	// A detached auto-maintenance can outlive the test and break TempDir cleanup.
+	run("config", "maintenance.auto", "false")
 	run("config", "user.email", "test@example.com")
 	run("config", "user.name", "test")
 	if err := os.MkdirAll(filepath.Join(dir, "docs"), 0o700); err != nil {
