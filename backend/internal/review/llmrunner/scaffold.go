@@ -52,7 +52,7 @@ func (r *Runner) scaffold(ctx context.Context, req review.ScaffoldRequest) (revi
 
 	raw, _, err := agent.Run(ctx, r.m, agent.Task{
 		Model:    r.model,
-		System:   scaffoldSystemPrompt,
+		System:   scaffoldSystemPrompt(),
 		Prompt:   scaffoldUserPrompt(f, req.Owner, req.Repo, req.BaseSHA),
 		Root:     c.root,
 		Finish:   finish,

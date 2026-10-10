@@ -27,6 +27,8 @@ jobs:
           version: v2.12
           working-directory: backend
       - run: go test -race ./...
+      - run: make generated
+        working-directory: .
       - run: make eval-check
         working-directory: .
       - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

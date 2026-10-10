@@ -8,6 +8,8 @@ covers:
   - backend/internal/review/scaffold.go
   - backend/internal/review/llmrunner/scaffold.go
   - backend/internal/review/llmrunner/prompt.go
+  - backend/internal/review/instructions/**
+  - backend/cmd/genaction/**
   - backend/internal/review/actions/actions.go
   - action/run-claude.sh
   - backend/internal/docs/doc.go

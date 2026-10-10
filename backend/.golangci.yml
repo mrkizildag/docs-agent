@@ -69,6 +69,13 @@ linters:
           deny:
             - pkg: github.com/mrkizildag/pollux-agent/backend/internal/github
               desc: runners reach GitHub only through their own interfaces or a token func from cmd/server
+        instructions-leaf:
+          files:
+            - "**/internal/review/instructions/**"
+            - "!$test"
+          list-mode: strict
+          allow:
+            - $gostd
         llm-agent-leaf:
           files:
             - "**/internal/llm/**"
