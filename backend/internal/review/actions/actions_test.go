@@ -1416,7 +1416,12 @@ func requireNewDocIndexEntry(t *testing.T, raw []byte) {
 						} `json:"properties"`
 					} `json:"if"`
 					Then struct {
-						Required []string `json:"required"`
+						Required   []string `json:"required"`
+						Properties struct {
+							DocPath struct {
+								Pattern string `json:"pattern"`
+							} `json:"doc_path"`
+						} `json:"properties"`
 					} `json:"then"`
 					Else struct {
 						Properties struct {
@@ -1433,6 +1438,9 @@ func requireNewDocIndexEntry(t *testing.T, raw []byte) {
 		t.Fatalf("decode --json-schema: %v", err)
 	}
 	items := schema.Properties.Proposals.Items
+	if p := items.Then.Properties.DocPath.Pattern; p != `^docs/.*\.md$` {
+		t.Errorf("--json-schema new-doc doc_path pattern = %q, want .md files under docs/", p)
+	}
 	if c := items.If.Properties.Section.Const; c == nil || *c != "" || !slices.Contains(items.Then.Required, "index_entry") || items.Else.Properties.IndexEntry.MaxLength == nil || *items.Else.Properties.IndexEntry.MaxLength != 0 {
 		t.Errorf("--json-schema proposal items = %+v, want index_entry required iff section is empty", items)
 	}

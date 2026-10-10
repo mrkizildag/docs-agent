@@ -547,7 +547,7 @@ func (s session) draft(ctx context.Context, head cloneHead, rules finalize.Rules
 
 	task := agent.Task{
 		Model:  s.r.model,
-		System: draftSystemPrompt,
+		System: draftSystemPrompt(),
 		Prompt: prompt.user(s.fence, s.patch),
 		Root:   head.root,
 		Finish: finish,
